@@ -1,0 +1,21 @@
+[package]
+name = "talus-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+link-kernels = ["talus-kernels-sys/link-kernels"]
+
+[dependencies]
+talus-core-api = { path = "../talus-core-api" }
+talus-kernels-sys = { path = "../talus-kernels-sys" }
+
+[dev-dependencies]
+hip-sys = { path = "../hip-sys" }
+talus-gguf = { path = "../talus-gguf" }
+talus-hip = { path = "../talus-hip" }
+talus-mem = { path = "../talus-mem" }
+

@@ -1,0 +1,21 @@
+[package]
+name = "oracle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+default-run = "talus-oracle"
+
+[lib]
+name = "oracle"
+path = "src/lib.rs"
+
+[[bin]]
+name = "talus-oracle"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+talus-core-api = { path = "../../crates/talus-core-api" }
+thiserror = "2"

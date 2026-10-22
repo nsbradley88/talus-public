@@ -1,0 +1,19 @@
+[package]
+name = "talus-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+talus-core-api = { workspace = true }
+hip-sys = { workspace = true }
+talus-hip = { workspace = true }
+talus-kernels-sys = { workspace = true }
+talus-kernels = { workspace = true }
+talus-gguf = { workspace = true }
+talus-mem = { workspace = true }
+talus-spec = { workspace = true }
+talus-text = { workspace = true }
+
+

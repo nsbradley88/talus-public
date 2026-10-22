@@ -1,0 +1,11 @@
+[package]
+name = "talus-hip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+hip-sys = { path = "../hip-sys" }
+talus-core-api = { path = "../talus-core-api" }
+

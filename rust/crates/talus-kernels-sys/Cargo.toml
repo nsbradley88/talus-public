@@ -1,0 +1,12 @@
+[package]
+name = "talus-kernels-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+links = "talus_kernels"
+
+[features]
+default = []
+link-kernels = []
+

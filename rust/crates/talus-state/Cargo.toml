@@ -1,0 +1,13 @@
+[package]
+name = "talus-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+talus-core-api = { workspace = true }
+hip-sys = { workspace = true }
+talus-hip = { workspace = true }
+talus-mem = { workspace = true }
+

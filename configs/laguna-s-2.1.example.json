@@ -1,0 +1,41 @@
+{
+ "exe": "rust/target/release/talus-cli",
+ "args": [
+  "--model",
+  "/path/to/Laguna-S-2.1-Q4-lean-00001-of-00003.gguf",
+  "--max-context",
+  "262144",
+  "--kv-type",
+  "q8_0",
+  "--ubatch",
+  "4096",
+  "--eos-ids",
+  "2,24",
+  "--dflash-gguf",
+  "/path/to/laguna-dflash-f16.gguf",
+  "--spec",
+  "7",
+  "--serve"
+ ],
+ "cwd": "/path/to/talus",
+ "tokenizer": "/path/to/Laguna-S-2.1-Q4-lean-00001-of-00003.gguf",
+ "model_name": "laguna-s-2.1",
+ "stop_tokens": [
+  "〈|EOS|〉",
+  "</assistant>"
+ ],
+ "log": "/path/to/laguna-s-2.1/engine.log",
+ "lib_dirs": [
+  "/path/to/talus/build",
+  "/opt/rocm/lib"
+ ],
+ "port": 8001,
+ "backend": "hip",
+ "open_browser": false,
+ "sampling": {
+  "temperature": 1.0,
+  "top_p": 1.0,
+  "top_k": 20,
+  "min_p": 0.0
+ }
+}

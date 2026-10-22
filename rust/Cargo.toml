@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/talus-core-api",
+    "crates/hip-sys",
+    "crates/talus-kernels-sys",
+    "crates/talus-hip",
+    "crates/talus-kernels",
+    "crates/talus-gguf",
+    "crates/talus-mem",
+    "crates/talus-model",
+    "crates/talus-spec",
+    "crates/talus-state",
+    "crates/talus-sched",
+    "crates/talus-text",
+    "crates/talus-server",
+    "crates/talus-cli",
+    "crates/talus-presets",
+    "crates/talus-tui",
+    "tools/oracle",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+talus-core-api = { path = "crates/talus-core-api" }
+hip-sys = { path = "crates/hip-sys" }
+talus-kernels-sys = { path = "crates/talus-kernels-sys" }
+talus-hip = { path = "crates/talus-hip" }
+talus-kernels = { path = "crates/talus-kernels" }
+talus-gguf = { path = "crates/talus-gguf" }
+talus-mem = { path = "crates/talus-mem" }
+talus-model = { path = "crates/talus-model" }
+talus-spec = { path = "crates/talus-spec" }
+talus-state = { path = "crates/talus-state" }
+talus-sched = { path = "crates/talus-sched" }
+talus-text = { path = "crates/talus-text" }
+talus-server = { path = "crates/talus-server" }
+talus-cli = { path = "crates/talus-cli" }
+talus-presets = { path = "crates/talus-presets" }
+oracle = { path = "tools/oracle" }

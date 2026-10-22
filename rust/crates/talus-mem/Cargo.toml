@@ -1,0 +1,9 @@
+[package]
+name = "talus-mem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+talus-core-api = { path = "../talus-core-api" }

@@ -1,0 +1,21 @@
+[package]
+name = "talus-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "talus_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "talus-server"
+path = "src/main.rs"
+
+[dependencies]
+talus-core-api = { path = "../talus-core-api" }
+talus-text = { path = "../talus-text" }
+talus-presets = { path = "../talus-presets" }
+serde_json = "1"
+

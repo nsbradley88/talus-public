@@ -1,0 +1,13 @@
+[package]
+name = "talus-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Terminal UI for talus-server: serving stats, model picker and per-model tuning"
+
+[dependencies]
+talus-presets = { workspace = true }
+serde_json = "1"
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.28", default-features = false, features = ["events"] }

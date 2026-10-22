@@ -1,0 +1,40 @@
+{
+ "exe": "rust/target/release/talus-cli",
+ "args": [
+  "--model",
+  "/path/to/Qwen3.8-27B-UD-IQ4_XS.gguf",
+  "--max-context",
+  "65536",
+  "--mtp-gguf",
+  "/path/to/mtp-Qwen3.8-27B-Q4_0.gguf",
+  "--mtp",
+  "5",
+  "--spec-draft-vocab",
+  "/path/to/qwen-dv-65536.bin",
+  "--ngram",
+  "24",
+  "--dflash-gguf",
+  "/path/to/Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
+  "--serve"
+ ],
+ "cwd": "/path/to/talus",
+ "tokenizer": "/path/to/Qwen3.8-27B-UD-IQ4_XS.gguf",
+ "model_name": "qwen3.8-27b",
+ "stop_tokens": [
+  "<|im_end|>"
+ ],
+ "log": "/path/to/qwen3.8-27b/engine.log",
+ "lib_dirs": [
+  "/path/to/talus/build",
+  "/opt/rocm/lib"
+ ],
+ "port": 8002,
+ "backend": "hip",
+ "open_browser": false,
+ "sampling": {
+  "temperature": 1.0,
+  "top_p": 0.95,
+  "top_k": 20,
+  "min_p": 0.0
+ }
+}

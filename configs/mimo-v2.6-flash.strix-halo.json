@@ -1,0 +1,23 @@
+{ "exe": "<talus-repo>/rust/target/release/talus-cli",
+ "args": [
+  "--model", "<models-dir>/gguf/MiMo-V2.6-Flash-a4-x/MiMo-V2.6-Flash-a4-x-00001-of-00003.gguf",
+  "--max-context", "196608",
+  "--kv", "q8",
+  "--ubatch", "2048",
+  "--dflash-gguf", "<models-dir>/gguf/MiMo-V2.6-Flash-MOPD-BPW2.5/dflash-MiMo-V2.6-Flash-MOPD-Q8_0.gguf",
+  "--spec", "4",
+  "--spec-draft-vocab", "<models-dir>/gguf/MiMo-V2.6-Flash/DFlash/mimo-dv-65536.bin",
+  "--serve"
+ ],
+ "cwd": "<talus-repo>",
+ "tokenizer": "<models-dir>/gguf/MiMo-V2.6-Flash-a4-x/MiMo-V2.6-Flash-a4-x-00001-of-00003.gguf",
+ "model_name": "mimo-v2.6-flash",
+ "stop_tokens": ["<|im_end|>", "<|endoftext|>"],
+ "log": "talus-mimo.engine.log",
+ "lib_dirs": ["<talus-repo>/build", "<rocm-sdk>/lib", "<rocm-sdk>/lib/rocm_sysdeps/lib", "<rocm-sdk>/lib/llvm/lib"],
+ "host": "127.0.0.1",
+ "port": 8000,
+ "backend": "hip",
+ "open_browser": false,
+ "sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": 20, "min_p": 0.0}
+}

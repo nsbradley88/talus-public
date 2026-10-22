@@ -1,0 +1,9 @@
+[package]
+name = "talus-presets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Per-model presets and tuning options for Talus (shared by talus-server's control endpoint and talus-tui)"
+
+[dependencies]
