@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/assets/banner.jpg" alt="Talus: the LLM inference engine for AMD Strix Halo, written in Rust" width="100%"></p>
+
 # Talus
 
 Talus runs large open-weight language models on one AMD Strix Halo machine (Ryzen AI Max+ 395 with the Radeon 8060S,
