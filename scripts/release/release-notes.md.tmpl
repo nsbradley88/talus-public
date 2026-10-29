@@ -1,0 +1,71 @@
+# Talus {{TAG}}
+
+Prebuilt binaries for **AMD Strix Halo (gfx1151)**, Linux x86_64. Built from commit `{{COMMIT}}`.
+gfx1151 is the only supported GPU target: the binaries carry GPU code for gfx1151 only.
+
+## Supported models
+
+One model runs at a time. Files, defaults and memory per model: [docs/MODELS.md](https://github.com/nsbradley88/talus-public/blob/{{TAG}}/docs/MODELS.md).
+
+- Qwen3.8-27B (dense)
+- Qwen3.8-Flash-Next (MoE)
+- GLM-5.3-Flash (MoE, MLA attention)
+- MiMo-V2.6-Flash (MoE)
+- Laguna-S-2.1 (MoE, sliding-window attention)
+
+The measured speeds and quality results of this release: [docs/RESULTS.md](https://github.com/nsbradley88/talus-public/blob/{{TAG}}/docs/RESULTS.md).
+
+## Install
+
+The guided installer takes these prebuilt programs instead of compiling when you name the release (it downloads the
+tarball and checks its SHA-256); see [docs/INSTALL-GUIDED.md](https://github.com/nsbradley88/talus-public/blob/{{TAG}}/docs/INSTALL-GUIDED.md):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nsbradley88/talus-public/{{TAG}}/install.sh | TALUS_RELEASE={{TAG}} bash
+```
+
+By hand:
+
+```sh
+curl -fLO https://github.com/nsbradley88/talus-public/releases/download/{{TAG}}/{{PKG}}.tar.gz
+curl -fLO https://github.com/nsbradley88/talus-public/releases/download/{{TAG}}/{{PKG}}.tar.gz.sha256
+sha256sum -c {{PKG}}.tar.gz.sha256
+tar -xzf {{PKG}}.tar.gz
+ln -s /path/to/your/rocm-sdk-root {{PKG}}/rocm-sdk   # or set LD_LIBRARY_PATH to its lib/, or use /opt/rocm
+{{PKG}}/bin/talus-cli --help
+```
+
+## Requirements
+
+- ROCm **{{ROCM_VERSION}}** (not bundled). The release was built and measured with it:
+  `pip install --index-url https://nightly.repo.amd.com/rocm/whl-next/ "rocm[libraries,devel,device-gfx1151]=={{ROCM_VERSION}}"`
+  The binaries need `libamdhip64.so.7`, `libhipblas.so.3`, `libhipblaslt.so.1`.
+- glibc {{GLIBC_MIN}} or newer (Ubuntu 24.04+).
+- A Strix Halo (Ryzen AI Max) system; see docs/MODELS.md for memory and kernel settings per model.
+
+## What's in the tarball
+
+`bin/` talus-cli, talus-server, talus-tui{{SETUP_BIN}} and libtalus_kernels.so (gfx1151) · `configs/` · `docs/` ·
+`LICENSE`, `THIRD_PARTY_NOTICES.md`, `licenses/` (Rust crates, ggml, ROCm) · `MANIFEST.json` (commit, toolchains,
+ROCm fingerprint, targets) · `SHA256SUMS`.
+
+## License and credits
+
+Talus is MIT-licensed (`LICENSE`). It is built on [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the
+Strata contributors (MIT); kernels and formats also derive from [ggml and llama.cpp](https://github.com/ggml-org/llama.cpp)
+(MIT). `THIRD_PARTY_NOTICES.md` and `licenses/` in the tarball hold the full list with license texts (Rust crates,
+ggml, ROCm). Thanks to the model authors (Qwen, Z.ai, Xiaomi MiMo, poolside), to Unsloth for the GGUF quants, and to
+z-lab for the DFlash drafters.
+
+## Changes
+
+{{CHANGES}}
+
+## Checksums
+
+```
+{{SHA256SUMS}}
+```
+
+Rebuild it yourself: `scripts/release-build.sh --ref {{TAG}} --rocm-sdk <sdk>` (see scripts/release/README.md for
+what is and is not bit-reproducible).

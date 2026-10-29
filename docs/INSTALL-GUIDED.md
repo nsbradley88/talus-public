@@ -44,6 +44,8 @@ Press Enter to accept each suggested answer. The installer:
    you can skip the compile: `TALUS_RELEASE=<tag>` takes that release's prebuilt programs from GitHub
    (`talus-<tag>-linux-x86_64-gfx1151.tar.gz`, checked against its `.sha256`; `TALUS_PREBUILT_URL=<url>` for
    another copy). They find ROCm through the link `~/.local/share/talus/rocm-sdk`, so no `LD_LIBRARY_PATH` is needed.
+   The releases and their assets are listed at `https://github.com/nsbradley88/talus-public/releases`; for example
+   `curl -fsSL https://raw.githubusercontent.com/nsbradley88/talus-public/main/install.sh | TALUS_RELEASE=<tag> bash`.
 5. **Runs `talus setup`**, below.
 
 Run the same command again at any time: finished steps are skipped and a stopped download resumes.

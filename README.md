@@ -86,6 +86,17 @@ Talus, and starts `talus setup`: pick models (Qwen3.8-27B is suggested for a fir
 (it shows the change and asks; it never reboots). Afterwards `talus doctor` checks and repairs the install,
 `talus update` updates it, and `talus-tui` is the dashboard. Details: [docs/INSTALL-GUIDED.md](docs/INSTALL-GUIDED.md).
 
+To skip the compile, use the prebuilt programs of a [release](https://github.com/nsbradley88/talus-public/releases):
+each release has `talus-<tag>-linux-x86_64-gfx1151.tar.gz` with its `.sha256`, a build manifest and `SHA256SUMS`.
+`TALUS_RELEASE=<tag>` makes the installer download and check it instead of building:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nsbradley88/talus-public/main/install.sh | TALUS_RELEASE=<tag> bash
+```
+
+The release notes show how to unpack the tarball by hand; [scripts/release/README.md](scripts/release/README.md)
+describes its layout and how it is built.
+
 The manual steps follow.
 
 ### Build

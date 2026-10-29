@@ -1214,6 +1214,7 @@ target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 # The CPU computes a native expert with ggml-cpu's own dot products (`ggml_get_type_traits_cpu`), so an IQ
 # weight means exactly what it means in llama.cpp.  ggml is built static from a llama.cpp checkout: a local one
 # with -DSTRATA_GGML_DIR=..., otherwise the pinned upstream commit (third_party/ggml/VERSION.txt).
+set(STRATA_GGML_MARCH "" CACHE STRING "release builds: ggml-cpu ISA flags (a ;-list) instead of -march=native; empty = native")
 set(STRATA_GGML_DIR "" CACHE PATH "llama.cpp checkout to take ggml from (empty: fetch the pinned commit)")
 if(STRATA_PREFILL_MMQ AND NOT STRATA_NATIVE_EXPERTS)
   message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_NATIVE_EXPERTS=ON for GGML sources")
@@ -1251,6 +1252,15 @@ if(STRATA_NATIVE_EXPERTS)
                GGML_AVX512_BF16 GGML_AMX_TILE GGML_AMX_INT8 GGML_AMX_BF16)
       set(${_f} OFF CACHE BOOL "" FORCE)
     endforeach()
+  elseif(STRATA_GGML_MARCH)
+    # the prebuilt release (scripts/release-build.sh): ggml-cpu gets these flags instead of -march=native, so the
+    # result does not depend on the build host. The release passes what -march=native expands to on the Zen 4 host
+    # every measured build was made on, which makes ggml-cpu the same code as those builds.
+    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+    foreach(_f GGML_SSE42 GGML_AVX GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2 GGML_AVX_VNNI GGML_AVX512 GGML_AVX512_VBMI
+               GGML_AVX512_VNNI GGML_AVX512_BF16 GGML_AMX_TILE GGML_AMX_INT8 GGML_AMX_BF16)
+      set(${_f} OFF CACHE BOOL "" FORCE)
+    endforeach()
   else()
     set(GGML_NATIVE ON CACHE BOOL "" FORCE)
   endif()
@@ -1270,6 +1280,9 @@ if(STRATA_NATIVE_EXPERTS)
     add_subdirectory(${strata_llamacpp_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   endif()
   set_target_properties(ggml-base ggml-cpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  if(STRATA_GGML_MARCH AND NOT STRATA_PORTABLE AND NOT STRATA_ISA_FLOOR)
+    target_compile_options(ggml-cpu PRIVATE ${STRATA_GGML_MARCH})
+  endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
