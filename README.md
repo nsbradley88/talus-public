@@ -6,6 +6,34 @@ Talus runs large open-weight language models on one AMD Strix Halo machine (Ryze
 gfx1151) with 128 GB of unified memory. It is a Rust host over a library of HIP kernels tuned for that GPU, and it
 serves each model through an OpenAI-compatible HTTP API.
 
+## How fast is it?
+
+Tokens per second on the Ryzen AI Max+ 395 laptop (70 W), end to end through the HTTP server, each model in its shipped
+configuration and after passing every quality gate. `code` is the coding-prompt mix, `pp32k` prompt processing and
+`tg32k` generation at 32K tokens of context.
+
+| Model | Engine | code | pp32k | tg32k |
+|---|---|---|---|---|
+| Qwen3.8-27B | **Talus** | 59.9 | 416 | 34.3 |
+| | llama.cpp (our patched build) | 46.8 | 270 | 30.6 |
+| | gufo | 41.9 | 452 | 24.0 |
+| Qwen3.8-Flash-Next | **Talus** | 69.9 | 1,262 | 66.1 |
+| | gufo | 63.1 | 1,387 | 55.6 |
+| GLM-5.3-Flash | **Talus** | 33.1 | 465 | 33.2 |
+| | llama.cpp (our patched build) | 30.1 | 217 | 27.0 |
+| MiMo-V2.6-Flash | **Talus** | 43.0 | 526 | 32.8 |
+| | llama.cpp (our patched build) | 39.9 | 287 | 30.1 |
+| Laguna-S-2.1 | **Talus** | 43.7 | 783 | 33.4 |
+| | llama.cpp (our patched build) | 44.6 | 514 | 30.4 |
+
+Full tables (chat, edit, 2K cells, time to first token, memory, quality gates): [docs/RESULTS.md](docs/RESULTS.md).
+Every number there comes from each model's recorded freeze run, measured end to end
+through the HTTP server, with quality gates (long-context recall, an agentic coding suite, KL divergence against a
+reference, greedy byte-identity, a soak test) that each model must pass. A model whose release run has not passed
+shows "pending". The comparison rows are our own patched build of llama.cpp ("halo4"), not stock llama.cpp, and other
+engines measured on the same machine under stated conditions. How everything is measured:
+[docs/METHODOLOGY.md](docs/METHODOLOGY.md).
+
 Talus is a fork of [Strata](https://github.com/Niko1221/Strata) (MIT). Strata runs Qwen3.8-Flash-Next on consumer
 GPUs. Talus keeps Strata's kernels, ports the host and the server to Rust, and adds four more models and kernels tuned
 for Strix Halo.
@@ -40,15 +68,6 @@ One model runs at a time; the machine serves nothing else.
 | Laguna-S-2.1 | MoE, sliding-window attention | 4-bit quant ("Q4-lean") | DFlash drafter (Q8_0) + prompt lookup |
 
 Files, defaults, switches and memory per model: [docs/MODELS.md](docs/MODELS.md).
-
-## How fast is it?
-
-See [docs/RESULTS.md](docs/RESULTS.md). Every number there comes from each model's recorded freeze run, measured end to end
-through the HTTP server, with quality gates (long-context recall, an agentic coding suite, KL divergence against a
-reference, greedy byte-identity, a soak test) that each model must pass. A model whose release run has not passed
-shows "pending". The comparison rows are our own patched build of llama.cpp ("halo4"), not stock llama.cpp, and other
-engines measured on the same machine under stated conditions. How everything is measured:
-[docs/METHODOLOGY.md](docs/METHODOLOGY.md).
 
 ## Quick start
 
