@@ -1202,7 +1202,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
     std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
     std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
-    if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
+    if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Talus session file (magic)"; return false; }
     if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
     if (version != kVersion) { error = "session file: unsupported version " + std::to_string(version); return false; }
     if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }

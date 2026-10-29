@@ -838,7 +838,7 @@ fn draw_tuning(f: &mut Frame, area: Rect, app: &App) {
             kv(
                 "Note",
                 vec![Span::raw(
-                    "A key set with STRATA_API_KEY in the service environment wins.",
+                    "A key set with TALUS_API_KEY or STRATA_API_KEY in the service environment wins.",
                 )],
             ),
         ],

@@ -1649,7 +1649,7 @@ pub fn session_file_read(
     let hsize = u32::from_le_bytes([h[12], h[13], h[14], h[15]]);
     let (model, config, payload, r0, r1, hh) = (rd(16), rd(24), rd(32), rd(40), rd(48), rd(56));
     if h[..8] != MAGIC {
-        return Err("session file: not a Strata session file (magic)".to_string());
+        return Err("session file: not a Talus session file (magic)".to_string());
     }
     if hh != session_hash64(&h[..56], 0) {
         return Err("session file: header checksum mismatch".to_string());

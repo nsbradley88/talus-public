@@ -243,7 +243,7 @@ bool fits(int t, int64_t w_rows) {
             static bool said[GGML_TYPE_COUNT] = {};
             if (t >= 0 && t < GGML_TYPE_COUNT && !said[t]) {
                 said[t] = true;
-                std::fprintf(stderr, "strata: prompt kernels: llama.cpp's MMQ has no tile for %s (%lld rows) on GPU %d "
+                std::fprintf(stderr, "talus: prompt kernels: llama.cpp's MMQ has no tile for %s (%lld rows) on GPU %d "
                                      "(cc %d, %zu bytes of shared memory per block): that product takes the non-MMQ path "
                                      "(#420)\n", ggml_type_name((ggml_type) t), (long long) w_rows, id, cc, smpbo);
             }

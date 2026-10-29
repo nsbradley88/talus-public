@@ -17,6 +17,7 @@ members = [
     "crates/talus-cli",
     "crates/talus-presets",
     "crates/talus-tui",
+    "crates/talus-setup",
     "tools/oracle",
 ]
 

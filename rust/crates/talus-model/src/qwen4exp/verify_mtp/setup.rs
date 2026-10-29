@@ -779,7 +779,7 @@ unsafe fn ver_init(f: &R2vFfi, ver: *mut c_void) -> Result<bool, String> {
     st.device_plan = device_plan as i32;
     (f.ver_adopt)(ver, &st);
     eprintln!(
-        "strata verify: window up to {} tokens, {:.1} MiB of device buffers{}",
+        "talus verify: window up to {} tokens, {:.1} MiB of device buffers{}",
         max_t,
         count.used as f64 / MIB,
         if all_res {
@@ -1080,7 +1080,7 @@ unsafe fn mtp_load(f: &R2vFfi, mtp: *mut c_void, window: i64) -> Result<bool, St
             return Err("mtp: state init failed".into());
         }
         eprintln!(
-            "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM"
+            "talus mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM"
         );
         hipGetLastError();
         hipFree(state_arena);
@@ -1219,7 +1219,7 @@ unsafe fn mtp_load(f: &R2vFfi, mtp: *mut c_void, window: i64) -> Result<bool, St
     let ex_mib = ex_bytes as f64 / MIB;
     let dense_off = tensors.last().map_or(0, |t| t.4) as f64;
     eprintln!(
-        "strata mtp: draft layer loaded, {:.0} MiB of VRAM (experts {:.0}, dense {:.0}), files read in {:.2} s ({:.0} MiB/s)",
+        "talus mtp: draft layer loaded, {:.0} MiB of VRAM (experts {:.0}, dense {:.0}), files read in {:.2} s ({:.0} MiB/s)",
         vram as f64 / MIB,
         ex_mib,
         dense_off / MIB,
@@ -1244,7 +1244,7 @@ fn draft_head_hint(n_tokens: i64, row_bytes: i64) {
         String::new()
     };
     eprintln!(
-        "strata mtp: the draft head over {} tokens needs {:.0} MiB of VRAM{}.",
+        "talus mtp: the draft head over {} tokens needs {:.0} MiB of VRAM{}.",
         n_tokens,
         mib(n_tokens),
         free_s
@@ -1261,7 +1261,7 @@ fn draft_head_hint(n_tokens: i64, row_bytes: i64) {
     for (name, tokens, what) in smaller {
         if tokens < n_tokens {
             opts += &format!(
-                "{}--draft-vocab {} ({}, ~{:.0} MiB)",
+                "{}--mtp-draft-vocab data/draft_vocab_{}.bin ({}, ~{:.0} MiB)",
                 if opts.is_empty() { "" } else { " or " },
                 name,
                 what,
@@ -1271,13 +1271,12 @@ fn draft_head_hint(n_tokens: i64, row_bytes: i64) {
     }
     if !opts.is_empty() {
         eprintln!(
-            "strata mtp: hint: a smaller draft vocabulary needs less VRAM: {opts}. Start once with it - START-HERE.bat \
-             --draft-vocab en (Windows) or ./setup.sh --draft-vocab en - and the model keeps it (\"draft_vocab\" in its \
-             strata-*.json config); or a smaller --context in setup."
+            "talus mtp: hint: a smaller draft vocabulary needs less VRAM: {opts} in the model's args; or a smaller \
+             --max-context."
         );
     } else {
         eprintln!(
-            "strata mtp: hint: this is already the smallest shipped draft vocabulary: a smaller --context (or closing \
+            "talus mtp: hint: this is already the smallest shipped draft vocabulary: a smaller --context (or closing \
              what else uses the GPU) leaves it room."
         );
     }
@@ -1349,7 +1348,7 @@ unsafe fn mtp_bind(f: &R2vFfi, mtp: *mut c_void) -> Result<bool, String> {
                 (n * row_bytes) as u64 + raw.len() as u64,
             );
             eprintln!(
-                "strata mtp: draft head over {} tokens ({:.1} MiB)",
+                "talus mtp: draft head over {} tokens ({:.1} MiB)",
                 n,
                 (n * row_bytes) as f64 / MIB
             );

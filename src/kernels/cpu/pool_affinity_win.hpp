@@ -20,7 +20,7 @@ inline bool set_thread_group_affinity(int core, int worker) {
     target.Group = (WORD) (core / 64);
     target.Mask = KAFFINITY(1) << (core & 63);
     if (SetThreadGroupAffinity(GetCurrentThread(), &target, nullptr)) return true;
-    std::fprintf(stderr, "strata cpu pool: SetThreadGroupAffinity for worker %d (group %u, mask 0x%llx) failed: %lu; previous affinity kept\n",
+    std::fprintf(stderr, "talus cpu pool: SetThreadGroupAffinity for worker %d (group %u, mask 0x%llx) failed: %lu; previous affinity kept\n",
                  worker, (unsigned) target.Group, (unsigned long long) target.Mask, (unsigned long) GetLastError());
     return false;
 }

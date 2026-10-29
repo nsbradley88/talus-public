@@ -1111,7 +1111,7 @@ unsafe fn run_chunks(
             return Err("cancelled".into());
         }
         if e.trace {
-            eprintln!("strata trace: prompt chunk {c0} of {n}");
+            eprintln!("talus trace: prompt chunk {c0} of {n}");
         }
         let t_n = m.t.min(n - c0);
         let p0 = pos0 + c0;
@@ -1345,7 +1345,7 @@ unsafe fn run_chunks(
             let ms = ms_since(ts);
             if ms > 250.0 || a == 0 || b == 0 {
                 eprintln!(
-                    "strata pf-step: chunk from token {p0}, layer {layer}: {what} took {ms:.0} ms ({} / {})",
+                    "talus pf-step: chunk from token {p0}, layer {layer}: {what} took {ms:.0} ms ({} / {})",
                     if a != 0 { "no error" } else { "error" },
                     if b != 0 { "no error" } else { "error" }
                 );
@@ -2342,7 +2342,7 @@ unsafe fn run_chunks(
                     if fused_l {
                         static SAID: AtomicBool = AtomicBool::new(false);
                         if !SAID.swap(true, Ordering::Relaxed) {
-                            eprintln!("strata: prompt experts on the fused int8 kernels (STRATA_PF_FUSED=1, #136)");
+                            eprintln!("talus: prompt experts on the fused int8 kernels (STRATA_PF_FUSED=1, #136)");
                         }
                         c.pt.mark(PF_GATHER, cs);
                         (f.fused_quantize_act)(m.mixed, t_n, nn, m.xq, cs, fused_nat as i32);
@@ -2631,12 +2631,12 @@ unsafe fn run_chunks(
             );
         }
         eprintln!(
-            "strata prefill timing: {n} tokens, GPU timeline {total:.0} ms, wall {:.0} ms, host staging {:.0} ms:{line}",
+            "talus prefill timing: {n} tokens, GPU timeline {total:.0} ms, wall {:.0} ms, host staging {:.0} ms:{line}",
             ms_since(t_start),
             c.st().ms_experts_host
         );
         eprintln!(
-            "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) {host_setup_ms:.0} ms, waiting for each chunk {host_sync_ms:.0} ms, after each chunk (the draft layer, progress) {host_chunk_ms:.0} ms, PLE {:.0} ms",
+            "talus prefill timing: host: chunk setup (PLE rows, the expert stream plan) {host_setup_ms:.0} ms, waiting for each chunk {host_sync_ms:.0} ms, after each chunk (the draft layer, progress) {host_chunk_ms:.0} ms, PLE {:.0} ms",
             c.st().ms_ple
         );
     }
@@ -3691,7 +3691,7 @@ unsafe fn draft_kv(
     (f.mtp_add_ms_prefill)(mtp, ms_since(t0));
     if e.draft_timing {
         eprintln!(
-            "strata draft kv: {n} cells from {cell0} (first needed {}), batch {b_rows}: drafter idle {ms_idle:.1} ms, the batches {:.1} ms, all {:.1} ms",
+            "talus draft kv: {n} cells from {cell0} (first needed {}), batch {b_rows}: drafter idle {ms_idle:.1} ms, the batches {:.1} ms, all {:.1} ms",
             cell0 + r0,
             ms_since(tl0),
             ms_since(t0)

@@ -2127,7 +2127,7 @@ bool native_q6_k_pack(const void* weights, int n_in, int n_out, const char* what
                                              reinterpret_cast<const int*>(base + o_qh),
                                              reinterpret_cast<const int8_t*>(base + o_sc),
                                              reinterpret_cast<const half*>(base + o_d), n_in, n_out};
-    std::fprintf(stderr, "strata: STRATA_Q6_PACKED=1 packed the %s (%d x %d, +%.1f MiB)\n", what, n_out, n_in,
+    std::fprintf(stderr, "talus: STRATA_Q6_PACKED=1 packed the %s (%d x %d, +%.1f MiB)\n", what, n_out, n_in,
                  total / 1048576.0);
     // STRATA_Q6P_SELFTEST=1: bitwise check against the GGUF-layout kernels (1..4 columns) and paired timings
     if (const char* v = std::getenv("STRATA_Q6P_SELFTEST"); v && (v[0] == '1' || v[0] == '2')) {
@@ -2176,10 +2176,10 @@ bool native_q6_k_pack(const void* weights, int n_in, int n_out, const char* what
             }
             g_q6_bypass = false;
             std::sort(tb.begin(), tb.end()); std::sort(tc.begin(), tc.end());
-            std::fprintf(stderr, "strata: Q6_K packed self-test %s ncols %d: GGUF %.1f us (%.1f-%.1f), packed %.1f us "
+            std::fprintf(stderr, "talus: Q6_K packed self-test %s ncols %d: GGUF %.1f us (%.1f-%.1f), packed %.1f us "
                          "(%.1f-%.1f), 11 paired samples\n", what, nc, tb[5], tb[0], tb[10], tc[5], tc[0], tc[10]);
         }
-        std::fprintf(stderr, "strata: Q6_K packed self-test %s: outputs %s (1-4 columns)\n", what,
+        std::fprintf(stderr, "talus: Q6_K packed self-test %s: outputs %s (1-4 columns)\n", what,
                      same ? "BITWISE EQUAL" : "DIFFER");
         if (v[0] == '2') {   // grid sweep of the packed kernel
             for (int grid : {160, 320, 640, 1280, 2560, 5120, 20480}) {
@@ -2195,7 +2195,7 @@ bool native_q6_k_pack(const void* weights, int n_in, int n_out, const char* what
                         tc.push_back(ms * 1000.0f / 5);
                     }
                     std::sort(tc.begin(), tc.end());
-                    std::fprintf(stderr, "strata: Q6_K packed grid sweep %s grid %d ncols %d: %.1f us (%.1f-%.1f)\n",
+                    std::fprintf(stderr, "talus: Q6_K packed grid sweep %s grid %d ncols %d: %.1f us (%.1f-%.1f)\n",
                                  what, grid, nc, tc[3], tc[0], tc[6]);
                 }
             }
@@ -2760,9 +2760,9 @@ const std::vector<IlEnvRow>& il_env_rows() {
                 bool ok = true;
                 for (int i = 0; i < 5; ++i) { ok = ok && (r[i] == 0 || r[i] == 1 || r[i] == 2 || r[i] == 4); x.r[i] = (uint8_t) r[i]; }
                 if (ok) out.push_back(x);
-                else std::fprintf(stderr, "strata: STRATA_MMVQ_IL_ROWS: rows must be 0/1/2/4 - entry ignored\n");
+                else std::fprintf(stderr, "talus: STRATA_MMVQ_IL_ROWS: rows must be 0/1/2/4 - entry ignored\n");
             } else {
-                std::fprintf(stderr, "strata: STRATA_MMVQ_IL_ROWS: cannot read '%s' (type:ncols:r0,r1,r2,r3,r4) - ignored\n",
+                std::fprintf(stderr, "talus: STRATA_MMVQ_IL_ROWS: cannot read '%s' (type:ncols:r0,r1,r2,r3,r4) - ignored\n",
                              str.substr(pos, end - pos).c_str());
             }
             pos = end + 1;

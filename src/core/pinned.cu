@@ -306,7 +306,7 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         note += "; transparent huge pages NOT requested: only " + std::to_string(free_huge_bytes() >> 30) +
                 " GiB of free 2 MiB blocks for a " + std::to_string(bytes >> 30) +
                 " GiB arena, compaction would stall the load (STRATA_ARENA_THP=1 requests them anyway) (#2126)";
-        std::fprintf(stderr, "strata: expert arena: %s\n", note.c_str());   // said now: the load that follows can take minutes
+        std::fprintf(stderr, "talus: expert arena: %s\n", note.c_str());   // said now: the load that follows can take minutes
     } else if (std::getenv("STRATA_NO_LARGEPAGES") == nullptr && madvise(p, bytes, MADV_HUGEPAGE) == 0) {
         const std::string four_k = "; using 4 KB pages";
         if (note.size() >= four_k.size() && note.compare(note.size() - four_k.size(), four_k.size(), four_k) == 0)

@@ -301,11 +301,11 @@ impl ConvServe {
             ));
         }
         let lay = self.layout().map_err(|e| {
-            eprintln!("strata serve: checkpoint save: {e}");
+            eprintln!("talus serve: checkpoint save: {e}");
             String::new()
         })?;
         if let Err(e) = checkpoint_save(&mut c, &self.dev, &lay) {
-            eprintln!("strata serve: checkpoint save: {e}");
+            eprintln!("talus serve: checkpoint save: {e}");
             return Err(String::new());
         }
         self.check_clock += 1;
@@ -370,7 +370,7 @@ impl ConvServe {
     fn park_body(&mut self, held: usize) -> Result<(), String> {
         if !self.conversations.wants(self.live.len() as i64) {
             eprintln!(
-                "strata serve: conversation cache: skip parking ({} tokens, below the {} minimum; parked={})",
+                "talus serve: conversation cache: skip parking ({} tokens, below the {} minimum; parked={})",
                 self.live.len(),
                 self.opts.conversation_cache_min_tokens,
                 self.conversations.size()
@@ -385,7 +385,7 @@ impl ConvServe {
         );
         if dropped > 0 {
             eprintln!(
-                "strata serve: conversation cache: dropped {dropped} superseded cop{} of this conversation; parked={}",
+                "talus serve: conversation cache: dropped {dropped} superseded cop{} of this conversation; parked={}",
                 if dropped == 1 { "y" } else { "ies" },
                 self.conversations.size()
             );
@@ -402,7 +402,7 @@ impl ConvServe {
         let mut estimate = match snapshot_bytes(&view, &lay, draft) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("strata serve: conversation cache: skip parking ({e})");
+                eprintln!("talus serve: conversation cache: skip parking ({e})");
                 return Ok(());
             }
         };
@@ -418,7 +418,7 @@ impl ConvServe {
         }
         if !self.conversations.make_room(estimate, held) {
             eprintln!(
-                "strata serve: conversation cache: skip parking (snapshot {} MiB exceeds available budget)",
+                "talus serve: conversation cache: skip parking (snapshot {} MiB exceeds available budget)",
                 estimate >> 20
             );
             return Ok(());
@@ -447,7 +447,7 @@ impl ConvServe {
         }
         if !admit(&mut mem) {
             eprintln!(
-                "strata serve: conversation cache: skip parking (physical RAM admission; need {} MiB plus {} MiB floor, {}; evicted {}, {} still parked)",
+                "talus serve: conversation cache: skip parking (physical RAM admission; need {} MiB plus {} MiB floor, {}; evicted {}, {} still parked)",
                 additional >> 20,
                 self.opts.conversation_cache_min_free_mib,
                 ram_note(&mem),
@@ -458,7 +458,7 @@ impl ConvServe {
         }
         if evicted > 0 {
             eprintln!(
-                "strata serve: conversation cache: evicted {evicted} parked conversation{} to admit this snapshot ({} MiB plus {} MiB floor)",
+                "talus serve: conversation cache: evicted {evicted} parked conversation{} to admit this snapshot ({} MiB plus {} MiB floor)",
                 if evicted == 1 { "" } else { "s" },
                 additional >> 20,
                 self.opts.conversation_cache_min_free_mib
@@ -475,7 +475,7 @@ impl ConvServe {
         let mem_after = sample_host_memory(limit);
         if !memory_admit(mem_after.map(|m| m.available), 0, floor) {
             eprintln!(
-                "strata serve: conversation cache: skip parking (RAM floor after capture: {} MiB needed, {})",
+                "talus serve: conversation cache: skip parking (RAM floor after capture: {} MiB needed, {})",
                 self.opts.conversation_cache_min_free_mib,
                 ram_note(&mem_after)
             );
@@ -484,7 +484,7 @@ impl ConvServe {
         let snapshot_bytes_n = image.bytes();
         let stored = self.conversations.put(image, held);
         eprintln!(
-            "strata serve: conversation cache: {} {} tokens in {:.1} ms; parked={} bytes={} evictions={} snapshot_bytes={} reused_kv_bytes={}",
+            "talus serve: conversation cache: {} {} tokens in {:.1} ms; parked={} bytes={} evictions={} snapshot_bytes={} reused_kv_bytes={}",
             if stored { "parked" } else { "skipped" },
             self.live.len(),
             t0.elapsed().as_secs_f64() * 1000.0,
@@ -528,7 +528,7 @@ impl ConvServe {
             self.tail_ckpt_len = -1;
             let n_parked = self.conversations.clear();
             eprintln!(
-                "strata serve: after non-finite logits (#879): dropped the live session, {n_checks} checkpoint{}, {n_parked} parked conversation{} and 0 idle slots (0 running slots not kept after their reply); reading this prompt from token 0",
+                "talus serve: after non-finite logits (#879): dropped the live session, {n_checks} checkpoint{}, {n_parked} parked conversation{} and 0 idle slots (0 running slots not kept after their reply); reading this prompt from token 0",
                 if n_checks == 1 { "" } else { "s" },
                 if n_parked == 1 { "" } else { "s" }
             );
@@ -557,7 +557,7 @@ impl ConvServe {
                 .layout()
                 .and_then(|l| snapshot_validate(inc, &l, parked_draft(&l)));
             if let Err(e) = v {
-                eprintln!("strata serve: conversation cache: discard invalid snapshot ({e})");
+                eprintln!("talus serve: conversation cache: discard invalid snapshot ({e})");
                 incoming = None;
             }
         }
@@ -619,7 +619,7 @@ impl ConvServe {
                 self.conversations.retain(kv, self.live.len() as i64);
             }
             eprintln!(
-                "strata serve: conversation cache: restored {} tokens ({}) in {:.1} ms; parked={} bytes={}",
+                "talus serve: conversation cache: restored {} tokens ({}) in {:.1} ms; parked={} bytes={}",
                 resume,
                 if from_live { "live" } else { "checkpoint" },
                 t0.elapsed().as_secs_f64() * 1000.0,
@@ -674,7 +674,7 @@ impl ConvServe {
                 unsafe { (self.api.session_zero)(self.ctx) };
                 reread_to = resume;
                 eprintln!(
-                    "strata serve: STRATA_CKPT_REREAD: reading {resume} tokens again instead of restoring"
+                    "talus serve: STRATA_CKPT_REREAD: reading {resume} tokens again instead of restoring"
                 );
             } else {
                 let ok = match (ci, self.layout()) {
@@ -682,13 +682,13 @@ impl ConvServe {
                         match checkpoint_restore(&self.checks[i], &self.dev, &lay) {
                             Ok(()) => true,
                             Err(e) => {
-                                eprintln!("strata serve: checkpoint restore: {e}");
+                                eprintln!("talus serve: checkpoint restore: {e}");
                                 false
                             }
                         }
                     }
                     (Some(_), Err(e)) => {
-                        eprintln!("strata serve: checkpoint restore: {e}");
+                        eprintln!("talus serve: checkpoint restore: {e}");
                         false
                     }
                     (None, _) => false,
@@ -740,7 +740,7 @@ impl ConvServe {
             self.live_imgs.clear();
             self.live_ok = true;
             eprintln!(
-                "strata serve: cancelled request keeps its conversation: {pp_reached} tokens live"
+                "talus serve: cancelled request keeps its conversation: {pp_reached} tokens live"
             );
         }
     }
@@ -790,7 +790,7 @@ impl ConvServe {
         let ms = || t0.elapsed().as_secs_f64() * 1000.0;
         let refuse = |why: &str, kind: SessionError, published: bool| {
             eprintln!(
-                "strata serve: session {} {}: {}",
+                "talus serve: session {} {}: {}",
                 if save { "save" } else { "restore" },
                 path,
                 why
@@ -906,7 +906,7 @@ impl ConvServe {
                         self.tail_ckpt_len = -1;
                     }
                     eprintln!(
-                        "strata serve: save reclaimed {} checkpoints, {} parked, {} host bytes; checking RAM again",
+                        "talus serve: save reclaimed {} checkpoints, {} parked, {} host bytes; checking RAM again",
                         freed.checkpoints, freed.parked, freed.bytes
                     );
                 }
@@ -972,11 +972,11 @@ impl ConvServe {
                 };
             if st.dir_flush_unsupported {
                 eprintln!(
-                    "strata serve: session saved to {path}; this filesystem cannot flush a folder, so the new name is not flushed"
+                    "talus serve: session saved to {path}; this filesystem cannot flush a folder, so the new name is not flushed"
                 );
             }
             eprintln!(
-                "strata serve: session saved {} tokens, {} of {} checkpoints, {} bytes to {} in {:.1} ms (state {:.1} ms)",
+                "talus serve: session saved {} tokens, {} of {} checkpoints, {} bytes to {} in {:.1} ms (state {:.1} ms)",
                 self.live.len(),
                 kept,
                 self.checks.len(),
@@ -1048,7 +1048,7 @@ impl ConvServe {
             let lay = self.layout().unwrap_or(lay);
             let (o, e) = snapshot_restore(&image, &lay, &self.dev, Some(&lay.draft));
             if o != RestoreOutcome::Restored {
-                eprintln!("strata serve: session restore {path}: transfer failed: {e}");
+                eprintln!("talus serve: session restore {path}: transfer failed: {e}");
                 out_line(&format!(
                     "FATAL restoring the session file failed after the device state was changed: {e}"
                 ));
@@ -1071,12 +1071,12 @@ impl ConvServe {
             if unsafe { (api.take_nan_flush)(self.ctx) } != 0 {
                 let n_parked = self.conversations.clear();
                 eprintln!(
-                    "strata serve: after non-finite logits (#879): the restored session replaces the live one; dropped {n_parked} parked conversation{}",
+                    "talus serve: after non-finite logits (#879): the restored session replaces the live one; dropped {n_parked} parked conversation{}",
                     if n_parked == 1 { "" } else { "s" }
                 );
             }
             eprintln!(
-                "strata serve: session restored {} tokens, {} checkpoints, {} bytes from {} in {:.1} ms (read+check {:.1} ms)",
+                "talus serve: session restored {} tokens, {} checkpoints, {} bytes from {} in {:.1} ms (read+check {:.1} ms)",
                 self.live.len(),
                 self.checks.len(),
                 bytes,

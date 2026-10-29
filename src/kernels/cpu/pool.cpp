@@ -43,10 +43,10 @@ uint64_t umwait_cycles() {
         int r[4] = {0, 0, 0, 0};
         __cpuidex(r, 7, 0);
         if (((r[2] >> 5) & 1) == 0) {
-            std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: this CPU has no WAITPKG, the workers spin\n");
+            std::fprintf(stderr, "talus: STRATA_POOL_UMWAIT: this CPU has no WAITPKG, the workers spin\n");
             return (uint64_t) 0;
         }
-        std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: parked workers wait with UMWAIT (%lld cycles)\n", std::atoll(e));
+        std::fprintf(stderr, "talus: STRATA_POOL_UMWAIT: parked workers wait with UMWAIT (%lld cycles)\n", std::atoll(e));
         return (uint64_t) std::atoll(e);
 #else
         return (uint64_t) 0;
@@ -390,7 +390,7 @@ bool pin_this_thread(int core, [[maybe_unused]] int worker = -1) {
 #else
     const int error = detail::pin_thread_to_cpu(core);
     if (error != 0)
-        std::fprintf(stderr, "strata cpu pool: affinity for worker %d (CPU %d) failed: %d; previous affinity kept\n",
+        std::fprintf(stderr, "talus cpu pool: affinity for worker %d (CPU %d) failed: %d; previous affinity kept\n",
                      worker, core, error);
     return error == 0;
 #endif
@@ -405,7 +405,7 @@ ThreadAffinity pin_current_thread(int core) {
     ULONG target = 0;
     if (!detail::get_thread_cpu_sets(previous.cpu_sets) || !detail::cpu_set_for_core(core, target) ||
         !SetThreadSelectedCpuSets(GetCurrentThread(), &target, 1)) {
-        std::fprintf(stderr, "strata cpu pool: host CPU Set selection for processor %d failed: %lu; previous placement kept\n",
+        std::fprintf(stderr, "talus cpu pool: host CPU Set selection for processor %d failed: %lu; previous placement kept\n",
                      core, (unsigned long) GetLastError());
         return {};
     }
@@ -416,7 +416,7 @@ ThreadAffinity pin_current_thread(int core) {
     int error = detail::get_thread_affinity(previous.mask);
     if (error == 0) error = detail::pin_thread_to_cpu(core);
     if (error != 0) {
-        std::fprintf(stderr, "strata cpu pool: host affinity for CPU %d failed: %d; previous affinity kept\n", core, error);
+        std::fprintf(stderr, "talus cpu pool: host affinity for CPU %d failed: %d; previous affinity kept\n", core, error);
         return {};
     }
     previous.valid = true;
@@ -431,12 +431,12 @@ void restore_thread_affinity(const ThreadAffinity& previous) {
     // turning the caller's implicit Windows 11 affinity into an explicit single-group hard mask.
     if (!SetThreadSelectedCpuSets(GetCurrentThread(), previous.cpu_sets.empty() ? nullptr : previous.cpu_sets.data(),
                                  (ULONG) previous.cpu_sets.size()))
-        std::fprintf(stderr, "strata cpu pool: host CPU Set restoration failed: %lu\n",
+        std::fprintf(stderr, "talus cpu pool: host CPU Set restoration failed: %lu\n",
                      (unsigned long) GetLastError());
 #else
     const int error = detail::set_thread_affinity(previous.mask);
     if (error != 0)
-        std::fprintf(stderr, "strata cpu pool: host affinity restoration failed: %d\n", error);
+        std::fprintf(stderr, "talus cpu pool: host affinity restoration failed: %d\n", error);
 #endif
 }
 
@@ -606,7 +606,7 @@ int ExpertPool::claim(uint32_t epoch) {
 
 uint32_t ExpertPool::begin_batch(int n) {
     if (n < 0 || n > 0xffff) {
-        std::fprintf(stderr, "strata: expert pool batch of %d jobs is out of range\n", n);
+        std::fprintf(stderr, "talus: expert pool batch of %d jobs is out of range\n", n);
         std::abort();
     }
     // Every job of the previous batch has completed (`wait_done`), and a claim of it can no longer succeed, so
@@ -629,7 +629,7 @@ void ExpertPool::wait_parked(const char* what) {
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u) t0 = now;
         else if (now - t0 > kStall) {
-            std::fprintf(stderr, "strata: the CPU expert pool stalled %s (%u of %d workers parked) - stopping the engine "
+            std::fprintf(stderr, "talus: the CPU expert pool stalled %s (%u of %d workers parked) - stopping the engine "
                                  "so the server can start it again (issue #29)\n",
                          what, parked_.load(), n_);
             strata::core::release_gpu_waits(stderr);   // #267: the GPU may be spinning on this layer's flag
@@ -652,7 +652,7 @@ void ExpertPool::wait_done(int n) {
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u || d != seen) { t0 = now; seen = d; }     // progress restarts the clock
         else if (now - t0 > kStall) {
-            std::fprintf(stderr, "strata: the CPU expert pool stalled: %u of %d jobs done, %u of %d workers parked - "
+            std::fprintf(stderr, "talus: the CPU expert pool stalled: %u of %d jobs done, %u of %d workers parked - "
                                  "stopping the engine so the server can start it again (issue #29)\n",
                          d, n, parked_.load(), n_);
             strata::core::release_gpu_waits(stderr);   // #267

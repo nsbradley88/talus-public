@@ -377,11 +377,11 @@ bool prompt_f16() {
     const bool on = e != nullptr && e[0] == '1';
     hipDeviceProp_t p{};
     if (hipGetDeviceProperties(&p, dev) != hipSuccess) { (void) hipGetLastError(); p.gcnArchName[0] = 0; }
-    if (on) std::fprintf(stderr, "strata prefill: HIP device %d%s%s - STRATA_HIP_PROMPT_F16=1: the prompt's 16-bit GEMMs run FP16 in and out "
+    if (on) std::fprintf(stderr, "talus prefill: HIP device %d%s%s - STRATA_HIP_PROMPT_F16=1: the prompt's 16-bit GEMMs run FP16 in and out "
                                  "(rocBLAS is tuned only for that on gfx103x; not bit-identical to the default)%s",
                          dev, p.gcnArchName[0] ? " " : "", p.gcnArchName, "\n");
     else if (e == nullptr && std::strncmp(p.gcnArchName, "gfx103", 6) == 0)
-        std::fprintf(stderr, "strata prefill: HIP device %d %s - tip: STRATA_HIP_PROMPT_F16=1 reads long prompts about 2x faster here "
+        std::fprintf(stderr, "talus prefill: HIP device %d %s - tip: STRATA_HIP_PROMPT_F16=1 reads long prompts about 2x faster here "
                              "(FP16 prompt GEMMs, rocBLAS is tuned only for FP16 on gfx103x; the numbers differ slightly, see docs/AMD_HIP.md)%s",
                      dev, p.gcnArchName, "\n");
     cached[dev].store(on ? 2 : 1, std::memory_order_relaxed);
@@ -616,7 +616,7 @@ bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, flo
     static std::atomic<bool> told{false};
     if (!hipblaslt_state_ || N != 320 || K != 10240 || T < 1) {
         if (N == 320 && K == 10240 && !told.exchange(true))
-            std::fprintf(stderr, "strata: STRATA_HCD_EXACT: no hipBLASLt tuning table is loaded, so the exact kernel has nothing to match: "
+            std::fprintf(stderr, "talus: STRATA_HCD_EXACT: no hipBLASLt tuning table is loaded, so the exact kernel has nothing to match: "
                                  "the hyper-connection down projection stays on hipBLAS\n");
         return false;
     }
@@ -626,7 +626,7 @@ bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, flo
     const int id = hipblaslt_solution_for(hipblaslt_state_, strata::prefill::hipblaslt::InputType::bf16, T, N, K, N, 0.0f);
     if (!strata_pf_hcdown_exact_solution(id, static_cast<HipLtState*>(hipblaslt_state_)->table.version())) {
         if (T >= 4096 && !told.exchange(true))   // (a short chunk may legitimately get another solution: not worth a line)
-            std::fprintf(stderr, "strata: STRATA_HCD_EXACT: the tuning table gives the hyper-connection down projection (N 320, K 10240) "
+            std::fprintf(stderr, "talus: STRATA_HCD_EXACT: the tuning table gives the hyper-connection down projection (N 320, K 10240) "
                                  "solution %d at T %lld, not 1176 / 1177 / 1253: hipBLASLt runs it (a changed table or library; "
                                  "tools/hip/gfx1151-hipblaslt-100401.txt is the one measured)\n",
                          id, (long long) T);
@@ -906,7 +906,7 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
         unsigned long long bad = 0, zero_count = 0;
         (void) hipStreamSynchronize((hipStream_t) stream_);
         if (hipMemcpyFromSymbol(&bad, HIP_SYMBOL(g_f16_nonfinite), sizeof bad) == hipSuccess && bad != 0) {
-            std::fprintf(stderr, "strata prefill: STRATA_DBG_NAN: %llu non-finite FP16 GEMM outputs (T=%lld N=%lld K=%lld; FP16 ends at 65504)%s",
+            std::fprintf(stderr, "talus prefill: STRATA_DBG_NAN: %llu non-finite FP16 GEMM outputs (T=%lld N=%lld K=%lld; FP16 ends at 65504)%s",
                          bad, (long long) T, (long long) N, (long long) K, "\n");
             (void) hipMemcpyToSymbol(HIP_SYMBOL(g_f16_nonfinite), &zero_count, sizeof zero_count);
         }

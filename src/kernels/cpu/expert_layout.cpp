@@ -32,7 +32,7 @@ int cpu_isa_cap() {
         if (v == "avx2") return 2;
         if (v == "avx") return 1;
         if (v == "sse" || v == "sse4.2" || v == "none") return 0;
-        std::fprintf(stderr, "strata: STRATA_FORCE_ISA=%s is not avx2, avx or sse; ignored\n", f);
+        std::fprintf(stderr, "talus: STRATA_FORCE_ISA=%s is not avx2, avx or sse; ignored\n", f);
         return 3;
     }();
     return cap;
@@ -346,7 +346,7 @@ void cpu_require_expert_support() {
     const CpuFeatures f = cpu_features();
     if (f.usable()) return;
     std::fprintf(stderr,
-                 "strata: this CPU cannot run the expert kernel: %s.\n"
+                 "talus: this CPU cannot run the expert kernel: %s.\n"
                  "        The engine needs AVX512-VNNI and AVX512-VBMI (Intel Ice Lake / AMD Zen 4 or newer).\n"
                  "        The scalar fallback exists for tests only and is far too slow to decode with.\n",
                  f.reason());

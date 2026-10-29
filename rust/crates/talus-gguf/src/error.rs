@@ -221,7 +221,7 @@ impl fmt::Display for GgufError {
             Self::TensorNotFound { name } => {
                 write!(f, "tensor not found: '{name}'")
             }
-            Self::PackFormat { message } => write!(f, "strata pack error: {message}"),
+            Self::PackFormat { message } => write!(f, "talus pack error: {message}"),
             Self::MtpFormat { message } => write!(f, "mtp rt error: {message}"),
             Self::DraftVocabFormat { message } => write!(f, "draft vocab error: {message}"),
             Self::ShapeValidation { message } => write!(f, "shape validation error: {message}"),

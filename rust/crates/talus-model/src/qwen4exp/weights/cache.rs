@@ -96,7 +96,7 @@ pub(super) fn uma_headroom_gib() -> u64 {
             Ok(v) if (0..=1024).contains(&v) => v as u64,
             _ => {
                 eprintln!(
-                    "strata: STRATA_UMA_HEADROOM_GIB={h} is not a whole number of GiB (0-1024): using 6"
+                    "talus: STRATA_UMA_HEADROOM_GIB={h} is not a whole number of GiB (0-1024): using 6"
                 );
                 6
             }
@@ -257,7 +257,7 @@ pub fn plan_cache(inp: &CachePlanInput, mut free_bytes: impl FnMut() -> u64) -> 
         }
         p.expert_cache = slots.max(0).min(i32::MAX as i64);
         eprintln!(
-            "strata generate: expert cache auto: {:.2} GiB free, {} MiB reserved (+{} MiB for the draft head) -> {} slots",
+            "talus generate: expert cache auto: {:.2} GiB free, {} MiB reserved (+{} MiB for the draft head) -> {} slots",
             free_b as f64 / 1073741824.0,
             p.vram_reserve_mib,
             mtp_bind >> 20,
@@ -270,7 +270,7 @@ pub fn plan_cache(inp: &CachePlanInput, mut free_bytes: impl FnMut() -> u64) -> 
                 let avail = (kb << 10) as i64;
                 if cache_b > avail - host_headroom {
                     eprintln!(
-                        "strata generate: WARNING: this GPU shares system RAM, and the cache above ({:.2} GiB) is more than \
+                        "talus generate: WARNING: this GPU shares system RAM, and the cache above ({:.2} GiB) is more than \
                          the host memory available now ({:.2} GiB) less 4 GiB for the OS: the system may run out of \
                          memory; --expert-cache N sets the cache by hand",
                         cache_b as f64 / 1073741824.0,
@@ -294,7 +294,7 @@ pub fn plan_cache(inp: &CachePlanInput, mut free_bytes: impl FnMut() -> u64) -> 
                     s2 = s2.min(inp.profile.len() as i64);
                 }
                 eprintln!(
-                    "strata generate: expert cache auto: the {} MiB reserve leaves too few slots on this card (a working \
+                    "talus generate: expert cache auto: the {} MiB reserve leaves too few slots on this card (a working \
                      cache needs {}): a {} MiB reserve instead -> {} slots",
                     p.vram_reserve_mib, min_slots, r, s2
                 );
@@ -321,7 +321,7 @@ pub fn plan_cache(inp: &CachePlanInput, mut free_bytes: impl FnMut() -> u64) -> 
                 String::new()
             };
             eprintln!(
-                "strata generate: no VRAM is left for the expert cache: it needs at least {} slots ({} MiB), about {} MiB \
+                "talus generate: no VRAM is left for the expert cache: it needs at least {} slots ({} MiB), about {} MiB \
                  more than this card has free. To make room: a smaller --max-context (the session, mostly its KV cache, \
                  takes {} MiB at {} tokens), --kv q4_0, the English draft subset (setup --draft-vocab en; the draft head \
                  takes {} MiB now){}, images on the CPU, or close other programs that use the GPU",
@@ -340,7 +340,7 @@ pub fn plan_cache(inp: &CachePlanInput, mut free_bytes: impl FnMut() -> u64) -> 
         let fit = ((free_b - reserve) / blob).max(0);
         if p.expert_cache > fit {
             eprintln!(
-                "strata generate: WARNING: layer split: --expert-cache {} leaves no room for the prompt path's buffers \
+                "talus generate: WARNING: layer split: --expert-cache {} leaves no room for the prompt path's buffers \
                  ({} MiB) and the {} MiB reserve on CUDA0: {} slots instead (a smaller --vram-reserve-mib leaves more of \
                  them)",
                 p.expert_cache, inp.prefill_mib, p.vram_reserve_mib, fit
@@ -372,7 +372,7 @@ pub fn plan_cache(inp: &CachePlanInput, mut free_bytes: impl FnMut() -> u64) -> 
             }
             p.expert_cache = p.sized_slots.len() as i64;
             eprintln!(
-                "strata generate: per-layer slots use each layer's blob: {} uniform slots ({:.2} GiB) -> {} slots, {} per \
+                "talus generate: per-layer slots use each layer's blob: {} uniform slots ({:.2} GiB) -> {} slots, {} per \
                  layer ({:.2} GiB)",
                 asked,
                 budget as f64 / 1073741824.0,
@@ -402,7 +402,7 @@ pub fn plan_cache(inp: &CachePlanInput, mut free_bytes: impl FnMut() -> u64) -> 
             && p.expert_cache as usize > inp.profile.len()
         {
             eprintln!(
-                "strata generate: WARNING: --expert-cache {} is more than the {} pairs of the profile {}: {} slots (the \
+                "talus generate: WARNING: --expert-cache {} is more than the {} pairs of the profile {}: {} slots (the \
                  profile is the ceiling on a native pack; a profile that ranks every (layer, expert) pair lifts it - \
                  tools/make_profile.py)",
                 p.expert_cache,
@@ -937,7 +937,7 @@ pub fn build_cache(
                         if shrink_to(keep, &mut expert_cache, &mut sized_slots) {
                             failed += 1;
                             eprintln!(
-                                "strata generate: {err}; trying a smaller expert cache: {expert_cache} slots"
+                                "talus generate: {err}; trying a smaller expert cache: {expert_cache} slots"
                             );
                             attempt += 1;
                             continue;
@@ -971,7 +971,7 @@ pub fn build_cache(
             }
             let keep_bytes = c.bytes() - give;
             eprintln!(
-                "strata generate: only {} MiB free once the slots are written (reserve {} MiB); shrinking the expert cache",
+                "talus generate: only {} MiB free once the slots are written (reserve {} MiB); shrinking the expert cache",
                 free_b >> 20,
                 vram_reserve_mib
             );
@@ -983,7 +983,7 @@ pub fn build_cache(
         }
         if failed > 0 && expert_cache > 0 {
             eprintln!(
-                "strata generate: expert cache: {} slots ({:.2} GiB) after {} smaller tries - a bigger page file lets it \
+                "talus generate: expert cache: {} slots ({:.2} GiB) after {} smaller tries - a bigger page file lets it \
                  use more of the free VRAM",
                 expert_cache,
                 cache.as_ref().map(|c| c.bytes()).unwrap_or(0) as f64 / 1073741824.0,
@@ -1016,7 +1016,7 @@ pub fn build_cache(
                 {
                     fill_ahead = 0;
                 }
-                eprintln!("strata generate: the profile fill asks for {fill_ahead} pairs ahead (STRATA_FILL_AHEAD)");
+                eprintln!("talus generate: the profile fill asks for {fill_ahead} pairs ahead (STRATA_FILL_AHEAD)");
             }
             // unbuffered file tier: the pairs read in batches of 64, the next batch while this one is copied
             let read_batch = |f: &FileTierFill, at: i64| unsafe {
@@ -1099,7 +1099,7 @@ pub fn build_cache(
                 )?;
             }
             eprintln!(
-                "strata generate: pre-filled {} of {} slots from the profile in {:.1} s ({:.0} MB/s); slot 0 verified \
+                "talus generate: pre-filled {} of {} slots from the profile in {:.1} s ({:.0} MB/s); slot 0 verified \
                  (qwen4exp-p1: Rust)",
                 prefilled,
                 if per_layer { c.slots } else { want },
@@ -1165,7 +1165,7 @@ pub fn build_cache(
                     h = fnv1a64(&hs.to_le_bytes(), h);
                 }
                 eprintln!(
-                    "strata generate: expert cache checksum {h:016x} ({} slots{})",
+                    "talus generate: expert cache checksum {h:016x} ({} slots{})",
                     sl.len(),
                     if ok { "" } else { ", A READ-BACK FAILED" }
                 );

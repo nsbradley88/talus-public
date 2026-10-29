@@ -1519,7 +1519,7 @@ unsafe extern "C" fn cb_run_generate_loop(
             break;
         }
         if pos >= info.max_context {
-            eprintln!("strata generate: ran out of context at position {pos}");
+            eprintln!("talus generate: ran out of context at position {pos}");
             return 2;
         }
         let mut next = 0i32;
@@ -1652,7 +1652,7 @@ unsafe extern "C" fn cb_run_generate_loop(
             let timed_round = !first_window;
             window_hist[t as usize] += 1;
             if p + (t as i64) > info.max_context {
-                eprintln!("strata generate: ran out of context at position {p}");
+                eprintln!("talus generate: ran out of context at position {p}");
                 return 2;
             }
             window[0] = x;
@@ -1788,7 +1788,7 @@ unsafe extern "C" fn cb_run_generate_loop(
             }
             if rounds % 64 == 0 {
                 eprintln!(
-                    "strata generate: position {}, {} tokens, {} rounds",
+                    "talus generate: position {}, {} tokens, {} rounds",
                     p,
                     produced.len(),
                     rounds

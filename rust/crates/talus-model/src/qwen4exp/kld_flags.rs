@@ -389,9 +389,9 @@ impl LogitsDumpWriter {
     /// Creates (truncates) `path` like the C++ `fopen(path, "wb")` at startup.
     pub fn create(path: &str, n_vocab: i64, stride: i64, positions: i64) -> Result<Self, String> {
         if positions > i32::MAX as i64 || n_vocab > i32::MAX as i64 {
-            return Err("strata generate: logits dump dimensions exceed int32".to_string());
+            return Err("talus generate: logits dump dimensions exceed int32".to_string());
         }
-        let f = File::create(path).map_err(|_| format!("strata generate: cannot write {path}"))?;
+        let f = File::create(path).map_err(|_| format!("talus generate: cannot write {path}"))?;
         Ok(Self {
             path: path.to_string(),
             file: Some(BufWriter::with_capacity(1 << 20, f)),
@@ -420,14 +420,14 @@ impl LogitsDumpWriter {
             let h = [self.hdr[0].to_ne_bytes(), self.hdr[1].to_ne_bytes()].concat();
             if f.write_all(&h).is_err() {
                 self.file = None;
-                return Err("strata generate: cannot write logits header".to_string());
+                return Err("talus generate: cannot write logits header".to_string());
             }
             self.hdr_written = true;
         }
         if f.write_all(f32_bytes(row)).is_err() {
             self.file = None;
             return Err(format!(
-                "strata generate: cannot write logits at position {pos}"
+                "talus generate: cannot write logits at position {pos}"
             ));
         }
         self.rows += 1;
@@ -438,7 +438,7 @@ impl LogitsDumpWriter {
     pub fn finish(&mut self) -> Result<(), String> {
         if let Some(f) = self.file.take() {
             f.into_inner()
-                .map_err(|_| "strata generate: cannot finish logits dump".to_string())?
+                .map_err(|_| "talus generate: cannot finish logits dump".to_string())?
                 .sync_all()
                 .ok();
         }
@@ -890,12 +890,12 @@ impl Piece6KldFlags {
         };
         self.row.resize(self.n_vocab, 0.0);
         if (p5k.p6_step_logits)(ctx, self.row.as_mut_ptr()) < 0 {
-            return Err("strata generate: reading the logits back failed".to_string());
+            return Err("talus generate: reading the logits back failed".to_string());
         }
         let bad = count_nonfinite(&self.row);
         if bad != 0 {
             return Err(format!(
-                "strata generate: {bad} of {} logits are not finite at position {pos}",
+                "talus generate: {bad} of {} logits are not finite at position {pos}",
                 self.n_vocab
             ));
         }
@@ -935,7 +935,7 @@ impl Piece6KldFlags {
                 }
             );
             if rep.positions_scored == 0 {
-                eprintln!("strata generate: --kld-in scored no positions (a native pack or batched prefill skips the per-token path)");
+                eprintln!("talus generate: --kld-in scored no positions (a native pack or batched prefill skips the per-token path)");
             }
             println!("{}", format_kld_report(&name, &rep));
         }

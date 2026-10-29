@@ -5,6 +5,9 @@
 //! (`talus-model`), speculation (`talus-spec`), state/prefix caching (`talus-state`), and the
 //! scheduler/server (`talus-sched`, `talus-server`).
 
+pub mod env_alias;
+pub use env_alias::apply_env_aliases;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Range;

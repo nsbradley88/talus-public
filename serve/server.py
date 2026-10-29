@@ -388,6 +388,8 @@ ENGINE_REQUEST = re.compile(
 
 _echoing: set[str] = set()      # the logs echo_requests already follows (restart() runs StrataEngine.__init__ again)
 
+# the engine's own log lines start with "talus ..." (builds before the rename: "strata ..."); both are read
+ENGINE_LOG_PREFIXES = ("talus", "strata")
 DRAFT_HEAD_FAIL = "the draft head does not fit"
 DRAFT_HEAD_HINT = ("a smaller draft vocabulary needs less VRAM: --draft-vocab cyrillic (English, code and the Cyrillic "
                    "script) or --draft-vocab en (English and code, ~215 MiB less than the default). Start once with "
@@ -409,8 +411,9 @@ def start_failure_hint(log: str | None, offset: int) -> str:
         return ""
     if DRAFT_HEAD_FAIL not in text:
         return ""
-    said = [x.strip()[len("strata mtp: "):] for x in text.splitlines()
-            if x.strip().startswith("strata mtp: ") and ("draft head over" in x or "hint:" in x)]
+    mtp_lines = tuple(p + " mtp: " for p in ENGINE_LOG_PREFIXES)
+    said = [x.strip().split(" mtp: ", 1)[1] for x in text.splitlines()
+            if x.strip().startswith(mtp_lines) and ("draft head over" in x or "hint:" in x)]
     return ". mtp: " + DRAFT_HEAD_FAIL + ". " + (" ".join(said) if said else "Hint: " + DRAFT_HEAD_HINT)
 
 
@@ -541,7 +544,7 @@ def transient_start_failure(log: str | None, offset: int, elapsed_s: float, rc: 
     except (OSError, ValueError):
         return False
     lines = [x.strip() for x in text.splitlines() if x.strip()]
-    engine_lines = [x for x in lines if not x.startswith("[strata]")]
+    engine_lines = [x for x in lines if not x.startswith(("[talus]", "[strata]"))]
     if any(m in text for m in TRANSIENT_START_MARKS):
         return all(x.startswith("terminate called") or x.startswith("what()") or
                    any(m in x for m in TRANSIENT_START_MARKS) for x in engine_lines)
@@ -570,7 +573,7 @@ def echo_requests(log_path: str, offset: int) -> None:
             m = ENGINE_REQUEST.search(line)
             if m:
                 read_ms, gen_ms = float(m["read"]), float(m["gen_ms"])
-                print("[strata] request prompt %s cached %s output %s prompt_read %.0f ms total %.0f ms prefill %s "
+                print("[talus] request prompt %s cached %s output %s prompt_read %.0f ms total %.0f ms prefill %s "
                       "tok/s decode %s tok/s" % (m["prompt"], m["reused"], m["gen"], read_ms, read_ms + gen_ms, m["pp"],
                                                  m["tg"]), flush=True)
 
@@ -618,7 +621,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             last = time.time()
             print(text, flush=True)
 
-    say("weights", "[strata] starting the engine: reading the model's weights ...")
+    say("weights", "[talus] starting the engine: reading the model's weights ...")
     pos = offset
     while not done.wait(0.5):
         try:
@@ -632,24 +635,24 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             pos += cut
             for line in chunk[:cut].decode("utf-8", "replace").splitlines():
                 if "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # #505: mapped
-                    say("arena", f"[strata] {loading}\n"
+                    say("arena", f"[talus] {loading}\n"
                                  "         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.\n"
                                  "         Please wait and don't close this window; the browser opens when it is ready.")
                 elif " loaded " in line and "GiB at" in line:
-                    say("loaded", "[strata] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
+                    say("loaded", "[talus] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
                         f" ({time.time() - t0:.0f} s so far)")
                 elif "expert cache " in line and " slots, " in line and "auto" not in line:
                     n = line.split("expert cache ", 1)[1].split(";")[0].replace(" slots,", " experts,").strip()
-                    say("cache", f"[strata] filling the GPU's expert cache ({n}) ...")
+                    say("cache", f"[talus] filling the GPU's expert cache ({n}) ...")
                 elif "session is up" in line:
-                    say("up", "[strata] almost ready ...")
+                    say("up", "[talus] almost ready ...")
         if time.time() - last > heartbeat:
             last = time.time()
-            print(f"[strata] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
+            print(f"[talus] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
 
 
 class ConvCacheLog:
-    """#596: the engine's conversation cache as its log tells it (the engine writes "strata serve: conversation
+    """#596: the engine's conversation cache as its log tells it (the engine writes "talus serve: conversation
     cache: parked N tokens ...; parked=P bytes=B evictions=E" and "restored N tokens ...; parked=P bytes=B" to stderr,
     which is the log): read on from where it was last read, from the start of the engine's current run."""
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
@@ -806,7 +809,7 @@ class StrataEngine:
                 threading.Thread(target=echo_requests, args=(log, os.path.getsize(log)), daemon=True).start()
         if log:                                          # #779: when an engine started (a crash report has the time)
             try:
-                self.log.write(f"[strata] {time.strftime('%Y-%m-%d %H:%M:%S')} engine started: {exe} --serve "
+                self.log.write(f"[talus] {time.strftime('%Y-%m-%d %H:%M:%S')} engine started: {exe} --serve "
                                f"{' '.join(args)}\n")
                 self.log.flush()
             except OSError:
@@ -865,12 +868,12 @@ class StrataEngine:
                 wait_s = 2.0 * (2 ** _attempt)              # 2, 4, 8 s: the previous process's GPU queues go away
                 exit_words = engine_exit_words(self.proc.returncode)
                 if start_log_marks(log, log_start):         # the runtime said so itself (hsa_exception ...)
-                    print(f"[strata] the engine stopped while the GPU runtime was starting (most often right after "
+                    print(f"[talus] the engine stopped while the GPU runtime was starting (most often right after "
                           f"another engine exited, whose GPU queues were still being released"
                           f"{'; ' + exit_words if exit_words else ''}): starting it again in {wait_s:.0f} s "
                           f"(try {_attempt + 2} of {START_RETRIES + 1})", flush=True)
                 else:                                       # an exit with nothing in the log: say only what is known
-                    print(f"[strata] the engine exited before it wrote anything to its log"
+                    print(f"[talus] the engine exited before it wrote anything to its log"
                           f"{' (' + exit_words + ')' if exit_words else ''}; it may be a GPU runtime that was not "
                           f"ready yet: starting it again in {wait_s:.0f} s (try {_attempt + 2} of {START_RETRIES + 1})",
                           flush=True)
@@ -884,7 +887,7 @@ class StrataEngine:
             note = "" if timed_out else start_exit_note(self.proc.returncode)
             tail = start_log_tail(log, log_start)
             lines = [x for x in tail.split("\n")[2:] if x.strip()]
-            if tail and lines and all(x.strip().startswith("[strata]") for x in lines):
+            if tail and lines and all(x.strip().startswith(("[talus]", "[strata]")) for x in lines):
                 tail += "\n  (those are the launcher's own lines: the engine itself wrote nothing)"
             raise EngineDied(why + (f" (see {log})" if log else "") + note +
                              start_failure_hint(log, log_start) + tail)
@@ -901,7 +904,7 @@ class StrataEngine:
         asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
         self.batch = int(self.info.get("batch_slots") or 0)
         if asked and self.batch != asked:
-            print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
+            print(f"[talus] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
                   "(its log says why)", flush=True)
         _bg = args[args.index("--batch-groups") + 1] if "--batch-groups" in args else "default"
         # no `--batch-groups` (the default on a layer split) or `auto`: the engine picks the groups and says so
@@ -1004,7 +1007,7 @@ class StrataEngine:
         if rc is not None and rc >= 0 and self.last_err:  # its own last words on stdout: they say why
             return (f"The engine exited (code {rc}) after it reported: {self.last_err} - please report it at "
                     "github.com/Niko1221/Strata/issues with the log.")
-        last = next((x.strip() for x in reversed(tail.splitlines()) if x.strip().startswith(("strata", "ERR"))), "")
+        last = next((x.strip() for x in reversed(tail.splitlines()) if x.strip().startswith(("talus", "strata", "ERR"))), "")
         if rc is not None and rc >= 0 and last:          # it ended by itself: its own last words say why (#215)
             return (f"The engine exited (code {rc}). Its last log line: {last} - if that does not explain it, please "
                     "report it at github.com/Niko1221/Strata/issues with the log.")
@@ -1071,7 +1074,7 @@ class StrataEngine:
                         pass
                     if i == tries - 1:
                         raise
-                    print(f"[strata] the engine did not start (try {i + 1} of {tries}); again in "
+                    print(f"[talus] the engine did not start (try {i + 1} of {tries}); again in "
                           f"{self.RESTART_RETRY_S:g} s", flush=True)
                     time.sleep(self.RESTART_RETRY_S)
         finally:
@@ -1417,7 +1420,7 @@ class StrataEngine:
             else:
                 self._orphan_seen.pop(b, None)
         if freed:
-            print(f"[strata] parallel: slot(s) {', '.join(map(str, freed))} were marked busy with no request using them "
+            print(f"[talus] parallel: slot(s) {', '.join(map(str, freed))} were marked busy with no request using them "
                   "(issue #1603); freed, the waiting request goes on", flush=True)
             self.slot_cv.notify_all()
         return freed
@@ -1606,7 +1609,7 @@ class StrataEngine:
                                         if not admit_said:
                                             admit_said = True
                                             busy = [b for b, v in enumerate(self.slot_busy) if v]
-                                            print(f"[strata] parallel: a request has waited {time.monotonic() - admit_since:.0f} s "
+                                            print(f"[talus] parallel: a request has waited {time.monotonic() - admit_since:.0f} s "
                                                   f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
                                                   f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
                                     self._reap_orphan_slots()
@@ -1667,7 +1670,7 @@ class StrataEngine:
                         if not (self._ctl_erred and str(e).startswith("BGEN:") and left >= 1 and not cancel.is_set()):
                             raise
                         refused += 1
-                        print(f"[strata] parallel: the engine refused slot {slot} ({e}); trying another slot "
+                        print(f"[talus] parallel: the engine refused slot {slot} ({e}); trying another slot "
                               f"({refused}/{self.BGEN_REFUSALS_MAX}) (issue #1994)", flush=True)
                         if refused > self.BGEN_REFUSALS_MAX:
                             raise GpuBusy("the engine's batch slots are not free right now; try again in a moment",
@@ -2014,7 +2017,7 @@ class StrataEngine:
             state["base"], state["next"] = now, age + stall_s
             if not state.get("warned"):
                 state["warned"] = True
-                print(f"[strata] the engine has said nothing for {age:.0f} s but is still working; it is not ended (the "
+                print(f"[talus] the engine has said nothing for {age:.0f} s but is still working; it is not ended (the "
                       "limit is engine_silence_s). If it is stuck, \"engine_silence_s\" can be set lower.", flush=True)
         else:
             state["next"] = float("inf")   # no reading (psutil missing): nothing to decide on
@@ -2520,10 +2523,10 @@ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
         known = False
     role = tok.encode("system", parse_special=True)
     if not known or len(role) != 1:
-        print("[strata] effort_position \"end\" needs engine 0.1.39 or newer (--tail-role-token): the reasoning "
+        print("[talus] effort_position \"end\" needs engine 0.1.39 or newer (--tail-role-token): the reasoning "
               "effort stays at the top of the prompt", flush=True)
         return None
-    print("[strata] effort_position end: a request's non-default reasoning effort goes right before the answer, so "
+    print("[talus] effort_position end: a request's non-default reasoning effort goes right before the answer, so "
           "changing it keeps the cached conversation", flush=True)
     return ["--tail-role-token", str(role[0])]
 
@@ -2593,7 +2596,7 @@ def engine_args(cfg: dict) -> list[str]:
         if cfg["vision"].get("gpu") and "--vram-reserve-mib" not in args:
             args += ["--vram-reserve-mib", "700"]
             note += " and --vram-reserve-mib 700"
-        print(f'[strata] the config has a "vision" section but no --vision in its args: {note} (run setup again with '
+        print(f'[talus] the config has a "vision" section but no --vision in its args: {note} (run setup again with '
               "--vision to write them)", flush=True)
     if layer_split_of(cfg) and "--layer-split" not in args:
         args += ["--layer-split", layer_split_value(cfg)]
@@ -2624,13 +2627,13 @@ def parallel_args(cfg: dict, args: list[str]) -> list[str]:
     if n is None or n is False:
         return []
     if isinstance(n, bool) or not isinstance(n, int):
-        print(f'[strata] "parallel" must be a whole number of requests (2..{PARALLEL_MAX}), not {n!r}: ignored',
+        print(f'[talus] "parallel" must be a whole number of requests (2..{PARALLEL_MAX}), not {n!r}: ignored',
               flush=True)
         return []
     if n <= 1:
         return []
     if n > PARALLEL_MAX and "--batch-mtp" not in args and os.environ.get("STRATA_BATCH_MTP", "0") in ("", "0"):
-        print(f'[strata] "parallel": {n} - the engine runs at most {PARALLEL_MAX} requests together; it will use '
+        print(f'[talus] "parallel": {n} - the engine runs at most {PARALLEL_MAX} requests together; it will use '
               f"{PARALLEL_MAX}", flush=True)
     return ["--batch", str(n)]
 
@@ -2784,11 +2787,11 @@ def ordered_gpus(cfg: dict, scores=None, vrams=None) -> list[int]:
     if out != gl:
         vram = vrams if vrams is not None else (None if scores is not None else gpu_vram_mib(gl, hip))
         if vram is not None and all(i in vram for i in gl) and vram[out[-1]] < vram[gl[-1]]:
-            print(f"[strata] layer split: keeping card order {','.join(map(str, gl))} - the faster card has "
+            print(f"[talus] layer split: keeping card order {','.join(map(str, gl))} - the faster card has "
                   f"less VRAM than the one the split ends on ({vram[out[-1]]} vs {vram[gl[-1]]} MiB, #1576)",
                   flush=True)
             return gl
-        print(f"[strata] layer split: card order {','.join(map(str, out))} (the faster card last; "
+        print(f"[talus] layer split: card order {','.join(map(str, out))} (the faster card last; "
               f'"gpu_order": "as_given" keeps {",".join(map(str, gl))}, #1352)', flush=True)
     return out
 
@@ -2850,7 +2853,7 @@ def hip_env_guard(env: dict, cfg: dict) -> list[str]:
         else:
             said.append(f"{', '.join(bad)} not writable (AMD's runtime needs a writable temporary folder)")
     for line in said:
-        print(f"strata serve: AMD: {line}", file=sys.stderr, flush=True)
+        print(f"talus serve: AMD: {line}", file=sys.stderr, flush=True)
     return said
 
 
@@ -3251,10 +3254,10 @@ class Service:
             try:
                 out = self.engine.vram((self._engine_reserve() or 0) + v.elastic_mib)
                 self.vision_held = True
-                print(f"[strata] images: the expert cache keeps {v.elastic_mib} MiB free for the image encoder "
+                print(f"[talus] images: the expert cache keeps {v.elastic_mib} MiB free for the image encoder "
                       f"({out.get('expert_cache_mib')} of {out.get('expert_cache_full_mib')} MiB left)", flush=True)
             except ValueError as e:
-                print(f"[strata] images: the expert cache did not make room for the image encoder ({e}); starting "
+                print(f"[talus] images: the expert cache did not make room for the image encoder ({e}); starting "
                       "it anyway", flush=True)
         if self.vision_held:
             time.sleep(0.2)          # the driver's free-VRAM counter shows the cache's release a moment later
@@ -3262,7 +3265,7 @@ class Service:
         v.restart()
         free1 = self.free_vram_mib()
         took = f", {free0 - free1} MiB of VRAM" if free0 is not None and free1 is not None else ""
-        print(f"[strata] images: the image encoder started in {time.time() - t0:.1f} s{took}", flush=True)
+        print(f"[talus] images: the image encoder started in {time.time() - t0:.1f} s{took}", flush=True)
 
     def _vision_idle_down(self, force: bool = False) -> str:
         """An elastic encoder idle for elastic_idle_s (or force) stops, and the expert cache takes its VRAM back:
@@ -3279,7 +3282,7 @@ class Service:
             v.unload()
             if self.vision_held and hasattr(self.engine, "vram") and self.loaded():
                 out = self.engine.vram(self._engine_reserve())
-                print(f"[strata] images: the image encoder stopped after {v.elastic_idle_s:g} s without a picture; "
+                print(f"[talus] images: the image encoder stopped after {v.elastic_idle_s:g} s without a picture; "
                       f"the expert cache took its VRAM back ({out.get('expert_cache_mib')} of "
                       f"{out.get('expert_cache_full_mib')} MiB)", flush=True)
             self.vision_held = False
@@ -3291,7 +3294,7 @@ class Service:
         v = self.vision
         if not getattr(v, "elastic", False):
             return
-        print(f"[strata] images: the image encoder starts with the first picture and stops after {v.elastic_idle_s:g} s "
+        print(f"[talus] images: the image encoder starts with the first picture and stops after {v.elastic_idle_s:g} s "
               f"without one; while it runs the expert cache keeps {v.elastic_mib} MiB free for it", flush=True)
 
         def loop():
@@ -3300,7 +3303,7 @@ class Service:
                 try:
                     self._vision_idle_down()
                 except Exception as e:                 # tried again at the next turn; the thread keeps running
-                    print(f"[strata] images: stopping the idle image encoder: {e}", flush=True)
+                    print(f"[talus] images: stopping the idle image encoder: {e}", flush=True)
         threading.Thread(target=loop, daemon=True).start()
 
     def free_vram_mib(self) -> int | None:
@@ -3329,7 +3332,7 @@ class Service:
         hook_failed = None
         if self.before_load:
             cmd = self.before_load
-            print(f"[strata] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
+            print(f"[talus] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
             why = None
             try:
                 r = subprocess.run(cmd, shell=isinstance(cmd, str), timeout=self.before_load_timeout_s,
@@ -3346,18 +3349,18 @@ class Service:
                 # does not refuse: the card's free VRAM decides (min_free_vram_mib, checked just below); "strict" always
                 # refuses, "ignore" always loads.
                 if self.before_load_strict and not self.before_load_ignore_failure:
-                    print(f"[strata] the before_load command failed ({why}); the model stays unloaded and this "
+                    print(f"[talus] the before_load command failed ({why}); the model stays unloaded and this "
                           "request is answered 503 - try again (before_load_strict)", flush=True)
                     raise GpuBusy(f"the before_load command failed ({why}): the GPU was not given back, so the "
                                   "model was not loaded; try again in a moment", retry_after=15)
                 hook_failed = why
                 if self.before_load_ignore_failure or not self.min_free_vram_mib:
-                    print(f"[strata] the before_load command failed ({why}); loading anyway"
+                    print(f"[talus] the before_load command failed ({why}); loading anyway"
                           + ("" if self.before_load_ignore_failure else
                              " (set min_free_vram_mib to have the free VRAM checked, or before_load_strict to refuse)"),
                           flush=True)
                 else:
-                    print(f"[strata] the before_load command failed ({why}); checking the free VRAM", flush=True)
+                    print(f"[talus] the before_load command failed ({why}); checking the free VRAM", flush=True)
         if self.min_free_vram_mib and not (hook_failed and self.before_load_ignore_failure):
             free = self.free_vram_mib()
             deadline = time.time() + self.vram_free_wait_s   # memory another process just gave back can take a moment
@@ -3366,18 +3369,18 @@ class Service:
                 free = self.free_vram_mib()
             if free is not None and free < self.min_free_vram_mib:
                 if hook_failed and not self.before_load_ignore_failure:
-                    print(f"[strata] the before_load command failed ({hook_failed}) and only {free} MiB of VRAM is "
+                    print(f"[talus] the before_load command failed ({hook_failed}) and only {free} MiB of VRAM is "
                           f"free (the model needs {self.min_free_vram_mib}): not loading; 503", flush=True)
                 raise GpuBusy(f"the GPU is in use by another program: {free} MiB of VRAM free, the model needs "
                               f"{self.min_free_vram_mib} (min_free_vram_mib) - it stays unloaded until that is free"
                               + (f"; the before_load command failed ({hook_failed})" if hook_failed else ""),
                               retry_after=15)
             if hook_failed and not self.before_load_ignore_failure:
-                print(f"[strata] the before_load command failed ({hook_failed}), but {free} MiB of VRAM is free: "
+                print(f"[talus] the before_load command failed ({hook_failed}), but {free} MiB of VRAM is free: "
                       "loading", flush=True)
         vision_started = False
         if self._vision_down():                         # first, as at a start: a GPU encoder takes its VRAM before
-            print("[strata] starting the vision encoder ...", flush=True)   # the engine sizes its cache
+            print("[talus] starting the vision encoder ...", flush=True)   # the engine sizes its cache
             try:
                 self.vision.restart()
             except Exception as e:
@@ -3386,10 +3389,10 @@ class Service:
         if self.loaded():
             return
         if getattr(self.engine, "unloaded", False):
-            print("[strata] loading the model again (it was unloaded) ...", flush=True)
+            print("[talus] loading the model again (it was unloaded) ...", flush=True)
         else:
             code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
-            print(f"[strata] the engine had stopped (exit code {code}); starting it again "
+            print(f"[talus] the engine had stopped (exit code {code}); starting it again "
                   "(a minute or two) ...", flush=True)
         try:
             self.engine.restart()
@@ -3397,14 +3400,14 @@ class Service:
             if vision_started:
                 self.vision.unload()
             raise
-        print("[strata] the engine is running again", flush=True)
+        print("[talus] the engine is running again", flush=True)
         if self.restore_after_load:                      # an image job unloaded it: its conversation comes back
             images_api.restore_session(self)
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
             try:
                 self.engine.vram(self.vram_reserve)
             except (ValueError, EngineDied) as e:
-                print(f"[strata] the VRAM reserve ({self.vram_reserve} MiB) was not applied: {e}", flush=True)
+                print(f"[talus] the VRAM reserve ({self.vram_reserve} MiB) was not applied: {e}", flush=True)
 
     vram_wait_s = 300.0                                  # #533: how long POST /v1/vram waits for a running request
 
@@ -3431,7 +3434,7 @@ class Service:
             # an elastic encoder that runs keeps its VRAM on top of the asked reserve
             out = self.engine.vram((reserve_mib or 0) + self.vision.elastic_mib if self.vision_held else reserve_mib)
             self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
-            print(f"[strata] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
+            print(f"[talus] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
                   f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
             return {"status": "ok", **out}
         finally:
@@ -3443,7 +3446,7 @@ class Service:
         """The server window's line for an engine that died (or was ended, #481) in the middle of a request."""
         note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
         log = getattr(self.engine, "log_path", None)
-        print(f"[strata] {e}. {note} The next request starts the engine again."
+        print(f"[talus] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
     def load(self):
@@ -3510,7 +3513,7 @@ class Service:
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
             self.vision_held = False
-            print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
+            print(f"[talus] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
                   "the next request loads it again", flush=True)
             return "unloaded"
         finally:
@@ -3519,7 +3522,7 @@ class Service:
     def start_idle_unload(self):
         if not self.idle_unload_s or not hasattr(self.engine, "unload"):
             return
-        print(f"[strata] the model unloads after {self.idle_unload_s} s without requests", flush=True)
+        print(f"[talus] the model unloads after {self.idle_unload_s} s without requests", flush=True)
 
         def loop():
             while True:
@@ -3527,7 +3530,7 @@ class Service:
                 try:
                     self.unload(idle_for=self.idle_unload_s)
                 except EngineStuck as e:                # tried again at the next turn; the thread keeps running
-                    print(f"[strata] idle unload: {e}", flush=True)
+                    print(f"[talus] idle unload: {e}", flush=True)
         threading.Thread(target=loop, daemon=True).start()
 
     def set_shared(self, defaults) -> dict:
@@ -3540,7 +3543,7 @@ class Service:
                 else:
                     Path(self.shared_path).unlink(missing_ok=True)
             except OSError as e:
-                print(f"[strata] could not save the shared settings: {e}", flush=True)
+                print(f"[talus] could not save the shared settings: {e}", flush=True)
         return self.shared
 
     def effort_default(self) -> str | None:
@@ -3849,7 +3852,7 @@ class Service:
                     except (ValueError, OSError) as e:
                         why = str(e)
                 if why is not None:
-                    print(f"[strata] a picture a tool returned was left out of the prompt: {why}", flush=True)
+                    print(f"[talus] a picture a tool returned was left out of the prompt: {why}", flush=True)
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
         return fetched
 
@@ -3969,7 +3972,7 @@ class Service:
             if not isinstance(v, int) or isinstance(v, bool) or v < (0 if k == "message" else 1):
                 raise ValueError(f"strata_prefix.{k}: a whole number ({'0' if k == 'message' else '1'} or more)")
         if has_images:
-            print("[strata] strata_prefix ignored: the request has images", flush=True)
+            print("[talus] strata_prefix ignored: the request has images", flush=True)
             return {}
         what = ",".join(f"{k}={v}" for k, v in spec.items())
 
@@ -4003,7 +4006,7 @@ class Service:
         elif "messages" in spec:
             k = spec["messages"]
             if k >= len(messages):
-                print(f"[strata] strata_prefix.messages={k} ignored: the request has {len(messages)} message(s) and the "
+                print(f"[talus] strata_prefix.messages={k} ignored: the request has {len(messages)} message(s) and the "
                       "prefix must leave at least the last one", flush=True)
                 return {}
             head = head_ids(messages[:k])
@@ -4012,13 +4015,13 @@ class Service:
             i, chars = spec["message"], spec["chars"]
             text = messages[i].get("content") if 0 <= i < len(messages) else None
             if not isinstance(text, str) or chars > len(text):
-                print(f"[strata] strata_prefix ignored: message {i} has no text of {chars} characters", flush=True)
+                print(f"[talus] strata_prefix ignored: message {i} has no text of {chars} characters", flush=True)
                 return {}
             cut = messages[:i] + [{**messages[i], "content": text[:chars] + self.PREFIX_END}]
             head = head_ids(cut)
             n = lcp(head, ids)
         if n < 1 or n >= len(ids) - 1:
-            print(f"[strata] strata_prefix {what} ignored: it leaves no usable prefix of the {len(ids)}-token prompt "
+            print(f"[talus] strata_prefix {what} ignored: it leaves no usable prefix of the {len(ids)}-token prompt "
                   f"(common start {n})", flush=True)
             return {}
         return {"tokens": n}
@@ -4060,13 +4063,13 @@ class Service:
         if s.get("first_token") is None:
             pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
             done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
-            print(f"[strata] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
+            print(f"[talus] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
         else:
             rate = s["generated"] / max(1e-6, now - s["first_token"])
             # #984: while a thinking budget applies, the thinking line shows it, not the request's max_tokens
             limit = (f"budget {s['thinking_budget']} (max {s.get('max_tokens')})"
                      if s["phase"] == "thinking" and s.get("thinking_budget") else f"max {s.get('max_tokens')}")
-            print(f"[strata] {s['phase']}: {s['generated']} of {limit} tokens, {rate:.1f} tok/s, "
+            print(f"[talus] {s['phase']}: {s['generated']} of {limit} tokens, {rate:.1f} tok/s, "
                   f"{el:.0f} s", flush=True)
         return now
 
@@ -4095,7 +4098,7 @@ class Service:
             # it has no answer.  Close the thinking early enough to leave room for one.
             reserve = min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
             if budget > max_new - reserve:
-                print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
+                print(f"[talus] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
@@ -4311,7 +4314,7 @@ class Service:
                             raise
                         except ValueError as e:             # the engine's ERR line (it may have ended after it)
                             finish = "error"
-                            print(f"[strata] the engine reported an error: {e}", flush=True)
+                            print(f"[talus] the engine reported an error: {e}", flush=True)
                             raise
                         except GeneratorExit:               # the client went away: an engine that never acknowledges
                             leaving = True                  # the STOP below is ended, but no error replaces this
@@ -4336,17 +4339,17 @@ class Service:
                                 nf_retried = True
                                 # the retry reads from token 0: its DONE, not this one's, says what was reused
                                 del segments[segments_before:]
-                                print("[strata] the engine's logits became non-finite before the first token (#879); it "
+                                print("[talus] the engine's logits became non-finite before the first token (#879); it "
                                       "dropped its cached state: sending the request again once", flush=True)
                                 continue
                             if n == 0:
                                 finish = "error"
-                                print("[strata] the engine's logits became non-finite again on the retry (#879): the "
+                                print("[talus] the engine's logits became non-finite again on the retry (#879): the "
                                       "request ends with an error", flush=True)
                                 raise EngineNonFinite("the model's output became non-finite (NaN) twice in a row "
                                                       "(#879); the engine has dropped its cached state - send the "
                                                       "request again")
-                            print(f"[strata] the engine's logits became non-finite after {n} tokens (#879): the reply "
+                            print(f"[talus] the engine's logits became non-finite after {n} tokens (#879): the reply "
                                   "ends here as \"length\"; the engine dropped its cached state, so the next request "
                                   "reads its prompt from the start", flush=True)
                             finish = "length"
@@ -4367,7 +4370,7 @@ class Service:
                             if trace is not None:
                                 trace["reasoning_recoveries"] = recovery_count
                                 trace["reasoning_repeat_coverage"] = round(repeat_coverage, 3)
-                            print(f"[strata] repeated reasoning detected at {n} tokens "
+                            print(f"[talus] repeated reasoning detected at {n} tokens "
                                   f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
                                   "instruction (reasoning_loop_recovery)", flush=True)
                             continue
@@ -4380,7 +4383,7 @@ class Service:
                             close_retried = True
                             extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
                             if max_new - n - len(extra) >= 1:
-                                print("[strata] the reply ended inside its thinking with no answer: closing the "
+                                print("[talus] the reply ended inside its thinking with no answer: closing the "
                                       "thinking once and continuing (reasoning_close_retry)", flush=True)
                                 for t in extra:
                                     n += 1
@@ -4410,7 +4413,7 @@ class Service:
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
                         if wrap:
-                            print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
+                            print(f"[talus] thinking budget reached ({thought} tokens): wrapping up the thinking",
                                   flush=True)
                         for t in extra:
                             n += 1
@@ -4427,11 +4430,11 @@ class Service:
                     if cancel.is_set():
                         finish = "cancel"
                     elif looped:
-                        print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
+                        print(f"[talus] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
                               f"{n} tokens: ended as \"length\" (reasoning_loop_recovery: \"stop\" in "
                               "strata-<model>.json; remove it to turn this off)", flush=True)
                     elif repeated:
-                        print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
+                        print(f"[talus] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
                               "strata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
                               "same, restart the server and report it (#606)", flush=True)
@@ -4496,14 +4499,14 @@ class Service:
                             hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
                             if hit_msg and pcie_share:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
-                            print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
+                            print(f"[talus] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                             if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
-                                print("[strata] the reply reached max tokens while still thinking, so it has no "
+                                print("[talus] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
                                       "strata-<model>.json for every request) leaves room to answer", flush=True)
                             if os.environ.get("STRATA_DEBUG") and raw_ids:
-                                print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
+                                print(f"[talus] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                         st["busy"] = False
                         st.pop("tail", None)                     # #212: the answer's end is not kept once it is done
                         st.pop("tool", None)
@@ -4522,7 +4525,7 @@ class Service:
             yield "event", ev
         if parser.rescued or parser.refused:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
-            print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
+            print(f"[talus] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
                   f"reasoning (quoted, or the turn did not end on a stop)", flush=True)
         if stops is not None and stops.hit is None and stops.held:
             yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
@@ -4616,7 +4619,7 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
     if isinstance(body, list):
         body = " ".join(p.get("text", "") for p in body if isinstance(p, dict))
     preview = (str(body or "")[:80]).replace("\n", " ")
-    print(f"[strata] req {api}: msgs={len(messages)} tools={len(tools or [])} "
+    print(f"[talus] req {api}: msgs={len(messages)} tools={len(tools or [])} "
           f"max_tokens_raw={req.get('max_tokens')!r}/{req.get('max_completion_tokens')!r} "
           f"max_new={max_new} thinking={thinking} stream={bool(req.get('stream'))} "
           f"prompt_tokens={prompt_tokens} last={last.get('role')!r}:{preview!r}", flush=True)
@@ -4695,7 +4698,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             if "r" not in box:
                 break
             r = box["r"]
-            print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
+            print(f"[talus] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
             results.append(r["text"])
             yield "mcp", {"event": "result", "id": c.id, **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
@@ -5128,7 +5131,7 @@ def make_handler(svc: Service):
             host = self.headers.get("Host")
             if svc.api_key or host_allowed(host, svc.host_names, "*" in svc.allowed_hosts):
                 return True
-            print(f"[strata] refused a request for Host {host!r} from {self.client_address[0]}: not a name this server "
+            print(f"[talus] refused a request for Host {host!r} from {self.client_address[0]}: not a name this server "
                   f"answers to (add it to \"allowed_hosts\" in the config or STRATA_ALLOWED_HOSTS, or set an API key)",
                   flush=True)
             self._json(403, {"error": {"type": "forbidden", "message":
@@ -5147,7 +5150,7 @@ def make_handler(svc: Service):
                 return False
             if not origin_allowed(origin, self.headers.get("Host"), svc.host_names,
                                   [*svc.trusted_origins, *svc.cors_origins]):
-                print(f"[strata] refused an API request from the web page {origin!r} (no API key; add its host to "
+                print(f"[talus] refused an API request from the web page {origin!r} (no API key; add its host to "
                       f"\"allowed_hosts\" or its origin to \"cors_origins\" in the config)", flush=True)
                 self._json(403, {"error": {"type": "forbidden", "message":
                                  f"web pages of {origin} may not use this server without an API key; set \"api_key\", "
@@ -5537,11 +5540,11 @@ def make_handler(svc: Service):
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except EngineNonFinite as e:                    # #879, twice: not the request's fault
-                print(f"[strata] 503: {e}", flush=True)
+                print(f"[talus] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
                            else {"error": {"type": "server_error", "message": str(e)}})
             except ValueError as e:
-                print(f"[strata] 400 invalid request: {e}", flush=True)
+                print(f"[talus] 400 invalid request: {e}", flush=True)
                 if path == "/v1/responses":
                     self._json(400, responses_error_body(str(e)))
                 else:
@@ -5561,7 +5564,7 @@ def make_handler(svc: Service):
                 if getattr(self, "answer_started", False):
                     raise
                 import traceback
-                print(f"[strata] 400 malformed request ({type(e).__name__}: {e}):\n" + traceback.format_exc(),
+                print(f"[talus] 400 malformed request ({type(e).__name__}: {e}):\n" + traceback.format_exc(),
                       flush=True)
                 body = {"error": {"type": "invalid_request_error",
                                   "message": f"the request is malformed ({type(e).__name__}: {e})"}}
@@ -5600,7 +5603,7 @@ def make_handler(svc: Service):
             svc.last_request_at = time.time()
             cancel = threading.Event()
             self._watch_client(cancel)
-            print(f"[strata] image: {job['width']}x{job['height']}, n={job['n']}, {job['steps']} steps, "
+            print(f"[talus] image: {job['width']}x{job['height']}, n={job['n']}, {job['steps']} steps, "
                   f"seed {job['seed']}", flush=True)
             try:
                 with images_api.gpu_turn(svc, gen, job, cancel) as policy:
@@ -5610,7 +5613,7 @@ def make_handler(svc: Service):
                                            "message": str(e)}})
                 return
             figures["gpu_policy"] = policy
-            print(f"[strata] image done in {figures['seconds']:.1f} s ({policy})", flush=True)
+            print(f"[talus] image done in {figures['seconds']:.1f} s ({policy})", flush=True)
             host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
             scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
             self._json(200, gen.response(images, job, figures, f"{scheme}://{host}"))
@@ -5723,7 +5726,7 @@ def make_handler(svc: Service):
                 self._json(500, {"error": {"type": "server_error", "message": f"the run config cannot be written: {e}"}})
                 return
             if changed:
-                print(f"[strata] the Settings view changed {', '.join(changed)} in {Path(svc.config_path).name} "
+                print(f"[talus] the Settings view changed {', '.join(changed)} in {Path(svc.config_path).name} "
                       f"(the earlier file: {bak.name}); used from the next start", flush=True)
             self._json(200, {**runconfig.view(new, svc.config_path), "changed": changed})
         def _foreign_origin(self) -> bool:
@@ -5763,8 +5766,8 @@ def make_handler(svc: Service):
             except ValueError as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
-            print("[strata] other apps now use the Chat settings: " + ", ".join(f"{k}={v}" for k, v in shared.items())
-                  if shared else "[strata] other apps use their own settings again", flush=True)
+            print("[talus] other apps now use the Chat settings: " + ", ".join(f"{k}={v}" for k, v in shared.items())
+                  if shared else "[talus] other apps use their own settings again", flush=True)
             self._json(200, {"shared": bool(shared), "defaults": shared})
 
         def _sse(self):
@@ -6004,7 +6007,7 @@ def make_handler(svc: Service):
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # said once per tool, not per request
             if set(skipped) - noted:
-                print(f"[strata] /v1/responses: left out the hosted tools {', '.join(sorted(set(skipped) - noted))} "
+                print(f"[talus] /v1/responses: left out the hosted tools {', '.join(sorted(set(skipped) - noted))} "
                       f"(this server cannot run them)", flush=True)
                 noted.update(skipped)
             if req.get("max_output_tokens") is None and "max_tokens" in svc.shared:   # the shared Chat settings
@@ -6177,7 +6180,7 @@ def warn_tight_ram(arena_mib) -> None:
         return
     left = total / 2**30 - arena_mib / 1024
     if left < 6:
-        print(f"[strata] WARNING: RAM is tight - the model's experts take {arena_mib / 1024:.1f} GB of this PC's "
+        print(f"[talus] WARNING: RAM is tight - the model's experts take {arena_mib / 1024:.1f} GB of this PC's "
               f"{total / 2**30:.0f} GB, leaving {left:.1f} GB for everything else. "
               + ("Linux may stop the engine in the middle of an answer. " if os.name != "nt" else
                  "Windows will slow down (paging to disk). ")
@@ -6203,7 +6206,7 @@ def warn_budget_over_ram(args) -> str | None:
     msg = (f"WARNING: the RAM budget for experts is {budget:g} GiB (--resident-budget-gib), but this PC has "
            f"{free:.0f} GiB free of {total:.0f} GiB: what does not fit goes to swap or is read from disk, which can make "
            "decoding very slow. Lower it (setup sizes it for this PC) or remove the argument to let the engine choose.")
-    print("[strata] " + msg, flush=True)
+    print("[talus] " + msg, flush=True)
     return msg
 
 
@@ -6230,7 +6233,7 @@ def desktop_vram_note(backend, vram_free_mib, args: list, desktop: bool) -> str:
         reserve = 700
     if reserve >= DESKTOP_RESERVE_MIB:
         return ""
-    return (f"[strata] note: {vram_free_mib} MiB of VRAM free with the model loaded. If this AMD card also drives your "
+    return (f"[talus] note: {vram_free_mib} MiB of VRAM free with the model loaded. If this AMD card also drives your "
             "desktop and the desktop or apps crash after the start (the driver moves the expert cache to RAM and "
             "the OOM killer ends the session), keep more VRAM free: ./setup.sh --vram-reserve-mib "
             f"{DESKTOP_RESERVE_MIB} (remembered; the expert cache gets "
@@ -6422,7 +6425,7 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
         return []
     items = [value] if isinstance(value, str) else value
     if not isinstance(items, list) or not all(isinstance(x, str) for x in items):
-        raise SystemExit(f"[strata] {key}: expected an origin or a list of origins")
+        raise SystemExit(f"[talus] {key}: expected an origin or a list of origins")
     out = []
     for x in items:
         x = x.strip().rstrip("/")
@@ -6431,7 +6434,7 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
             continue
         scheme, sep, rest = x.partition("://")
         if scheme not in ("http", "https") or not sep or not rest or "/" in rest or "*" in rest:
-            raise SystemExit(f"[strata] {key}: {x!r} is not an origin like https://chat.example.com"
+            raise SystemExit(f"[talus] {key}: {x!r} is not an origin like https://chat.example.com"
                              + ("" if wildcard else " (no wildcards here)"))
         out.append(x)
     return out
@@ -6505,7 +6508,7 @@ def lift_reasoning_effort_arg(cfg: dict) -> None:
     cfg["args"] = out
     if cfg.get("reasoning_effort") is None:
         cfg["reasoning_effort"] = value
-    print("[strata] '--reasoning-effort' in the config's args is not an engine option: taken out of them. The thinking "
+    print("[talus] '--reasoning-effort' in the config's args is not an engine option: taken out of them. The thinking "
           "level is the config's 'reasoning_effort' key (outside 'args'); it is used as " +
           f"{cfg['reasoning_effort']!r}", flush=True)
 
@@ -6528,7 +6531,7 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     for alias, canon in SAMPLING_ALIASES.items():      # #1819: llama.cpp's names for the same two fields
         if block.get(alias) is not None:
             if block.get(canon) is not None:
-                raise SystemExit(f"[strata] config sampling: both {alias!r} and {canon!r} are set; they are the same "
+                raise SystemExit(f"[talus] config sampling: both {alias!r} and {canon!r} are set; they are the same "
                                  f"setting, keep one")
             block[canon] = block.pop(alias)
     for key, value in block.items():
@@ -6537,47 +6540,47 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "temperature":
             if not number or value < 0:
-                raise SystemExit(f"[strata] config sampling.temperature={value!r}: expected a number >= 0 (0 = greedy)")
+                raise SystemExit(f"[talus] config sampling.temperature={value!r}: expected a number >= 0 (0 = greedy)")
             out[key] = float(value)
         elif key == "top_p":
             if not number or not 0 < value <= 1:
-                raise SystemExit(f"[strata] config sampling.top_p={value!r}: expected 0 < top_p <= 1")
+                raise SystemExit(f"[talus] config sampling.top_p={value!r}: expected 0 < top_p <= 1")
             out[key] = float(value)
         elif key == "min_p":
             if not number or not 0 <= value <= 1:
-                raise SystemExit(f"[strata] config sampling.min_p={value!r}: expected 0 <= min_p <= 1")
+                raise SystemExit(f"[talus] config sampling.min_p={value!r}: expected 0 <= min_p <= 1")
             out[key] = float(value)
         elif key == "top_k":
             if not number or value != int(value) or not 1 <= value <= 64:
-                raise SystemExit(f"[strata] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
+                raise SystemExit(f"[talus] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
             out[key] = int(value)
         elif key == "presence_penalty":
             if not number or value < 0:
-                raise SystemExit(f"[strata] config sampling.presence_penalty={value!r}: expected a number >= 0")
+                raise SystemExit(f"[talus] config sampling.presence_penalty={value!r}: expected a number >= 0")
             out[key] = float(value)
         elif key == "frequency_penalty":
             if not number or value < 0:
-                raise SystemExit(f"[strata] config sampling.frequency_penalty={value!r}: expected a number >= 0")
+                raise SystemExit(f"[talus] config sampling.frequency_penalty={value!r}: expected a number >= 0")
             out[key] = float(value)
         elif key == "repetition_penalty":
             if not number or value <= 0:
-                raise SystemExit(f"[strata] config sampling.repetition_penalty={value!r}: expected a number > 0 (1 = off)")
+                raise SystemExit(f"[talus] config sampling.repetition_penalty={value!r}: expected a number > 0 (1 = off)")
             out[key] = float(value)
         elif key == "penalty_last_n":
             if not number or value != int(value) or value < 0:
-                raise SystemExit(f"[strata] config sampling.penalty_last_n={value!r}: expected a non-negative integer")
+                raise SystemExit(f"[talus] config sampling.penalty_last_n={value!r}: expected a non-negative integer")
             out[key] = int(value)
         elif key == "seed":
             if not number or value != int(value) or value <= 0:
-                raise SystemExit(f"[strata] config sampling.seed={value!r}: expected a positive integer")
+                raise SystemExit(f"[talus] config sampling.seed={value!r}: expected a positive integer")
             out[key] = int(value)
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
-                raise SystemExit(f"[strata] config sampling.experimental_speed_projection={value!r}: expected true or "
+                raise SystemExit(f"[talus] config sampling.experimental_speed_projection={value!r}: expected true or "
                                  "false (the default for requests that leave it out, when the engine has the vector)")
             out[key] = value
         else:
-            print(f"[strata] config sampling.{key}={value!r}: unknown key, ignored", flush=True)
+            print(f"[talus] config sampling.{key}={value!r}: unknown key, ignored", flush=True)
     return out
 
 
@@ -6587,7 +6590,7 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
     from serve import replicas as rp
     n = len(groups)
     cpus = rp.cpu_sets(n, cfg.get("replica_cpus") is not False)
-    print(f"[strata] {n} replicas on the cards {' | '.join(','.join(map(str, g)) for g in groups)}"
+    print(f"[talus] {n} replicas on the cards {' | '.join(','.join(map(str, g)) for g in groups)}"
           f"{' (own CPU cores each)' if cpus else ''}: requests go to the least busy one, a conversation back to its own",
           flush=True)
     engines: list = [None] * n
@@ -6619,7 +6622,7 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
                 except Exception:        # noqa: BLE001
                     pass
         i, e = errors[0]
-        raise SystemExit(f"[strata] replica {i} did not start: {e}")
+        raise SystemExit(f"[talus] replica {i} did not start: {e}")
     load = int(cfg.get("replica_load_tokens") or rp.LOAD_TOKENS)
     return rp.ReplicaEngine(engines, load_tokens=load)
 
@@ -6669,7 +6672,20 @@ def default_model_name(cfg: dict) -> str:
     return cfg.get("model_name") or FAMILY_MODEL_NAMES.get(cfg.get("arch") or "qwen4exp", "qwen3.8-flash-next")
 
 
+def apply_env_aliases(env=None) -> list:
+    """TALUS_X works as STRATA_X for the inherited STRATA_* switches (the Rust binaries do the same): set STRATA_X
+    from TALUS_X when STRATA_X is unset, so an existing setup that sets STRATA_X behaves exactly as before."""
+    env = os.environ if env is None else env
+    added = []
+    for k in sorted(env):
+        if k.startswith("TALUS_") and len(k) > 6 and "STRATA_" + k[6:] not in env:
+            env["STRATA_" + k[6:]] = env[k]
+            added.append("STRATA_" + k[6:])
+    return added
+
+
 def main() -> int:
+    apply_env_aliases()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
@@ -6755,7 +6771,7 @@ def main() -> int:
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
-            print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
+            print(f"[talus] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
         if cfg.get("vision"):
             elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True
@@ -6767,7 +6783,7 @@ def main() -> int:
                         if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
                     for k, v in cfg["vision"].items()}
             if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
-                print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
+                print('[talus] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
                       "encoder its VRAM): the encoder starts with the model instead", flush=True)
                 vcfg["elastic"] = False
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
@@ -6779,10 +6795,10 @@ def main() -> int:
             try:
                 split = layer_split_value(cfg)          # #644: before the (minutes-long) start
             except ValueError as e:
-                raise SystemExit(f"[strata] config {e}")
-            print(f"[strata] layer split across GPUs {gpu_list(cfg)} ({split})", flush=True)
+                raise SystemExit(f"[talus] config {e}")
+            print(f"[talus] layer split across GPUs {gpu_list(cfg)} ({split})", flush=True)
         elif len(gpu_list(cfg)) > 1:
-            print(f"[strata] GPUs {gpu_list(cfg)}: the later card(s) serve as the peer expert tier (--peer-device)",
+            print(f"[talus] GPUs {gpu_list(cfg)}: the later card(s) serve as the peer expert tier (--peer-device)",
                   flush=True)
         # a relative "exe" is the config's cwd's: Windows' CreateProcess resolves "engine/strata.exe" against nothing
         # it is told about (WinError 2), so it is made absolute here
@@ -6790,16 +6806,16 @@ def main() -> int:
         try:
             silence = engine_silence_s(cfg)             # #481: checked before the (minutes-long) start
         except ValueError as e:
-            raise SystemExit(f"[strata] config {e}")
+            raise SystemExit(f"[talus] config {e}")
         try:
             effort_end = effort_end_args(cfg, exe, tok)  # #458
         except ValueError as e:
-            raise SystemExit(f"[strata] config {e}")
+            raise SystemExit(f"[talus] config {e}")
         from serve import replicas as rp
         try:
             groups = rp.gpu_groups(cfg)
         except rp.ReplicaConfigError as e:
-            raise SystemExit(f"[strata] config {e}")
+            raise SystemExit(f"[talus] config {e}")
         if groups:
             engine = start_replicas(cfg, groups, exe, effort_end or [], lazy)
         else:
@@ -6832,63 +6848,63 @@ def main() -> int:
         try:
             svc.images = images_api.ImageGen(icfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None)
         except ValueError as e:
-            raise SystemExit(f"[strata] config: {e}")
+            raise SystemExit(f"[talus] config: {e}")
         gone = svc.images.missing()
         if gone:
-            print(f"[strata] image generation: missing {', '.join(gone)} - requests fail until setup --images has run "
+            print(f"[talus] image generation: missing {', '.join(gone)} - requests fail until setup --images has run "
                   "again", flush=True)
-        print(f"[strata] image generation: {svc.images.model} {icfg.get('quant') or ''} on "
+        print(f"[talus] image generation: {svc.images.model} {icfg.get('quant') or ''} on "
               f"{icfg.get('backend') or '?'} (POST /v1/images/generations; GPU policy {svc.images.policy})", flush=True)
     if cfg.get("prevent_sleep") is not None and not isinstance(cfg["prevent_sleep"], bool):
-        raise SystemExit(f"[strata] config \"prevent_sleep\" must be true or false, not {cfg['prevent_sleep']!r}")
+        raise SystemExit(f"[talus] config \"prevent_sleep\" must be true or false, not {cfg['prevent_sleep']!r}")
     from serve.keepawake import KeepAwake
     svc.keep_awake = KeepAwake.create(cfg.get("prevent_sleep") is True)      # #1727: opt-in, Windows only
     if cfg.get("reasoning_effort") is not None:         # #1641: the thinking level of requests that name none
         try:
             svc.config_effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}).get("reasoning_effort")
         except ValueError as e:
-            raise SystemExit(f"[strata] config {e}")
+            raise SystemExit(f"[talus] config {e}")
         if svc.config_effort:
-            print(f"[strata] thinking level: {svc.config_effort} (reasoning_effort in the config; a request, or the "
+            print(f"[talus] thinking level: {svc.config_effort} (reasoning_effort in the config; a request, or the "
                   "Chat settings shared with other apps, can set its own)", flush=True)
     svc.codex_thread_titles = cfg.get("codex_thread_titles") is True    # #923: opt-in, off by default
     svc.codex_compaction_cache = cfg.get("codex_compaction_cache") is True   # #924: opt-in, off by default
     try:
         svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
     except ValueError as e:
-        raise SystemExit(f"[strata] config {e}")
+        raise SystemExit(f"[talus] config {e}")
     if svc.aliases:
-        print(f"[strata] model aliases: {', '.join(svc.aliases)}", flush=True)
+        print(f"[talus] model aliases: {', '.join(svc.aliases)}", flush=True)
     if ("STRATA_API_KEY" in os.environ and not os.environ["STRATA_API_KEY"].strip()) or             any(x == "--api-key" and i + 1 < len(sys.argv) and not sys.argv[i + 1].strip() or x.strip() == "--api-key="
                 for i, x in enumerate(sys.argv)):
         # #213: an empty key would switch authentication off without a word
-        print("[strata] an API key was given but it is empty: set a key, or leave --api-key / STRATA_API_KEY out",
+        print("[talus] an API key was given but it is empty: set a key, or leave --api-key / STRATA_API_KEY out",
               file=sys.stderr)
         return 2
     try:
         svc.api_key = api_key_of(a.api_key or cfg.get("api_key", ""))
     except ValueError as e:
-        print(f'[strata] {e}: set a key, or leave --api-key / STRATA_API_KEY / "api_key" out', file=sys.stderr)
+        print(f'[talus] {e}: set a key, or leave --api-key / STRATA_API_KEY / "api_key" out', file=sys.stderr)
         return 2
     if not svc.api_key and "api_key" in cfg:             # #569: written, but empty: the server has none (a warning, not a stop)
-        print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
+        print("[talus] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     try:
         svc.allowed_hosts = allowed_hosts_of(cfg.get("allowed_hosts"), os.environ.get("STRATA_ALLOWED_HOSTS", ""))
     except ValueError as e:
-        raise SystemExit(f"[strata] config {e}")
+        raise SystemExit(f"[talus] config {e}")
     if svc.allowed_hosts:
-        print("[strata] Host check off: any name reaches this server (allowed_hosts \"*\")" if "*" in svc.allowed_hosts
-              else f"[strata] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)", flush=True)
+        print("[talus] Host check off: any name reaches this server (allowed_hosts \"*\")" if "*" in svc.allowed_hosts
+              else f"[talus] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)", flush=True)
     svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True
     if svc.api_monitor:
-        print("[strata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
+        print("[talus] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
               "memory" + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),
               flush=True)
     if svc.cors_origins:
-        print(f"[strata] CORS on /v1/* for {', '.join(svc.cors_origins)}"
+        print(f"[talus] CORS on /v1/* for {', '.join(svc.cors_origins)}"
               + ("" if svc.api_key or "*" not in svc.cors_origins else
                  " - WARNING: any web page may use the model (no API key)"), flush=True)
     svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
@@ -6898,7 +6914,7 @@ def main() -> int:
     try:
         svc.before_load_timeout_s = float(cfg.get("before_load_timeout_s") or svc.before_load_timeout_s)
     except (TypeError, ValueError):
-        print("[strata] \"before_load_timeout_s\" in the config is not a number; using "
+        print("[talus] \"before_load_timeout_s\" in the config is not a number; using "
               f"{svc.before_load_timeout_s:g} s", flush=True)
     svc.before_load_ignore_failure = cfg.get("before_load_ignore_failure") is True
     svc.before_load_strict = cfg.get("before_load_strict") is True
@@ -6909,25 +6925,25 @@ def main() -> int:
             svc.slot_save_path = slot_save_dir(a.slot_save_path) if a.slot_save_path else \
                 slot_save_dir(cfg["slot_save_path"], cfg.get("cwd"))
         except (ValueError, OSError) as e:
-            raise SystemExit(f"[strata] {e}")
-        print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
+            raise SystemExit(f"[talus] {e}")
+        print(f"[talus] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
-        raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
+        raise SystemExit(f"[talus] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
     recovery = cfg.get("tool_call_recovery", False)     # opt-in: see OutputParser's recover
     if not isinstance(recovery, bool):
-        raise SystemExit(f"[strata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
+        raise SystemExit(f"[talus] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
     svc.tool_call_recovery = recovery
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):
-        raise SystemExit(f"[strata] config \"env_to_user\" must be true or false, not {etu!r}")
+        raise SystemExit(f"[talus] config \"env_to_user\" must be true or false, not {etu!r}")
     import serve.frontend as _frontend
     _frontend.ENV_TO_USER = etu
     rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)   # #606: opt-out with 0
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
-        raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
+        raise SystemExit(f"[talus] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
@@ -6935,15 +6951,15 @@ def main() -> int:
             svc.reasoning_budget_tokens = cfg["reasoning_budget_tokens"]
             budget = svc.reasoning_budget({})
         except ValueError as e:
-            raise SystemExit(f"[strata] config {e}")
+            raise SystemExit(f"[talus] config {e}")
         if budget:
-            print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
+            print(f"[talus] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
     recovery = cfg.get("reasoning_loop_recovery", False)   # #728: false (default) | "stop" | "recover" (true)
     if recovery is True:
         recovery = "recover"
     if recovery is not False and recovery not in ("stop", "recover"):
-        raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
+        raise SystemExit("[talus] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
                          f"not {recovery!r}")
     svc.reasoning_loop_recovery = recovery
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
@@ -6959,14 +6975,14 @@ def main() -> int:
         try:
             svc.shared = clean_shared_defaults(json.loads(Path(svc.shared_path).read_text(encoding="utf-8")))
             if svc.shared:
-                print("[strata] other apps use the Chat settings: " +
+                print("[talus] other apps use the Chat settings: " +
                       ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
         except (OSError, ValueError):
             svc.shared = {}
     if hub is not None:
         import atexit
         svc.mcp = hub
-        print(f"[strata] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "
+        print(f"[talus] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "
               f"chat: {', '.join(hub.servers)}", flush=True)
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
@@ -7009,7 +7025,7 @@ def main() -> int:
         while True:
             time.sleep(1)                               # Windows never delivers Ctrl+C to an untimed Event.wait()
     except KeyboardInterrupt:
-        print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
+        print("\n[talus] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
         closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
         for close in filter(None, closers):
@@ -7022,8 +7038,8 @@ def main() -> int:
             from serve import cache_drop
             cache_drop.drop_after_exit(engine)           # opt-in (STRATA_DROP_CACHE_ON_EXIT=1), default unchanged
         except Exception as e:  # noqa: BLE001 - never block the exit
-            print(f"[strata] could not release the model files' cache: {e}", flush=True)
-        print("[strata] stopped", flush=True)
+            print(f"[talus] could not release the model files' cache: {e}", flush=True)
+        print("[talus] stopped", flush=True)
     return 0
 
 

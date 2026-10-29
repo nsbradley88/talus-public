@@ -2362,7 +2362,7 @@ void RouterLookahead::stats_score(int64_t layer, const int32_t* ids, int64_t n, 
     }
     if (layer == (int64_t) routers_.size() - 1 && (++st_windows_ % 100) == 0) {
         const uint64_t scored = st_layers_ - st_nopred_;
-        std::fprintf(stderr, "strata lookahead stats: %llu windows, %llu layers scored, %llu without a prediction (%.1f%%); "
+        std::fprintf(stderr, "talus lookahead stats: %llu windows, %llu layers scored, %llu without a prediction (%.1f%%); "
                      "%.2f actual non-resident experts/layer;",
                      (unsigned long long) st_windows_, (unsigned long long) scored, (unsigned long long) st_nopred_,
                      st_layers_ ? 100.0 * (double) st_nopred_ / (double) st_layers_ : 0.0,
@@ -3967,7 +3967,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (d.peer != nullptr) {                 // multi-GPU: start the second GPU's share before the CPU's own work
         std::string perr;
         if (!d.peer->launch(d.layers, x_f, ids, n_tok, k, kind, perr, out)) {
-            std::fprintf(stderr, "strata: %s (layer %lld)\n", perr.c_str(), (long long) d.layers);
+            std::fprintf(stderr, "talus: %s (layer %lld)\n", perr.c_str(), (long long) d.layers);
             d.failed = true;
             d.fail = "the peer GPU's experts could not be launched";
             d.fail_layer = d.layers;
@@ -4084,7 +4084,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (d.peer != nullptr) {                 // multi-GPU: the second GPU's rows, into the same mapped rows
         std::string perr;
         if (!d.peer->finish(out, perr)) {
-            std::fprintf(stderr, "strata: %s (layer %lld)\n", perr.c_str(), (long long) d.layers);
+            std::fprintf(stderr, "talus: %s (layer %lld)\n", perr.c_str(), (long long) d.layers);
             d.failed = true;
             d.fail = "the peer GPU's experts failed";
             d.fail_layer = d.layers;
@@ -4808,7 +4808,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
             st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20, rp, padded_ ? &pad_ : nullptr);
     }
     if (reg.joinable()) reg.join();
-    std::fprintf(stderr, "strata generate: expert arena read %s (%s)\n", unbuffered ? "unbuffered" : "through the file cache",
+    std::fprintf(stderr, "talus generate: expert arena read %s (%s)\n", unbuffered ? "unbuffered" : "through the file cache",
                  why.c_str());
     if (!st.ok) {
         delete a;
@@ -4821,7 +4821,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         return false;
     }
     if (std::getenv("STRATA_VERIFY_ARENA") != nullptr) {   // tests: the loaded arena's checksum, any loader
-        std::fprintf(stderr, "strata generate: expert arena checksum %016llx (%.2f GiB)\n",
+        std::fprintf(stderr, "talus generate: expert arena checksum %016llx (%.2f GiB)\n",
                      (unsigned long long) fnv1a64(a->data(), want), (double) want / (1ull << 30));
     }
     // the first start: write experts.bin for the mapped starts after this one - only when the drive has room for it
@@ -4831,7 +4831,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         std::filesystem::path(path).parent_path(), space_ec).available : 0;
     const bool room = !space_ec && free_disk >= want + (uint64_t) blob + (2ull << 30);
     if (arena_mmap && from_gguf && !room)
-        std::fprintf(stderr, "strata generate: STRATA_ARENA_MMAP: NOT writing %s - %.1f GiB free on that drive, it needs "
+        std::fprintf(stderr, "talus generate: STRATA_ARENA_MMAP: NOT writing %s - %.1f GiB free on that drive, it needs "
                              "%.1f GiB plus 2 GiB to spare; this start keeps the arena in RAM\n", path.c_str(),
                      (double) free_disk / 1073741824.0, (double) (want + (uint64_t) blob) / 1073741824.0);
     if (arena_mmap && from_gguf && room) {
@@ -4845,7 +4845,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         if (f) ok = std::fclose(f) == 0 && ok;
         if (ok) ok = std::rename(tmp.c_str(), path.c_str()) == 0;
         if (!ok) std::remove(tmp.c_str());
-        std::fprintf(stderr, "strata generate: STRATA_ARENA_MMAP: %s %s (the next start maps it)\n",
+        std::fprintf(stderr, "talus generate: STRATA_ARENA_MMAP: %s %s (the next start maps it)\n",
                      ok ? "wrote" : "could NOT write", path.c_str());
     }
     arena_ = a;
@@ -5112,7 +5112,7 @@ void ForesightSwap::fill_loop() {
         if (cudaMemcpyAsync((void*) sl.dptr, sl.src, sl.bytes, cudaMemcpyHostToDevice, s) != cudaSuccess ||
             cudaEventRecord((cudaEvent_t) sl.ev, s) != cudaSuccess) {
             cudaGetLastError();
-            if (!failed.exchange(true)) std::fprintf(stderr, "strata serve: foresight swap: a copy failed - swap space off\n");
+            if (!failed.exchange(true)) std::fprintf(stderr, "talus serve: foresight swap: a copy failed - swap space off\n");
             continue;   // never marked issued: the slot is never used
         }
         sl.issued.store(true, std::memory_order_release);
@@ -5258,7 +5258,7 @@ ForesightSwap* foresight_swap_from_env(int64_t layers, int64_t experts, const st
     const int slots = v ? std::atoi(v) : 0;
     if (slots <= 0) return nullptr;
     if (const char* dp = std::getenv("STRATA_VERIFY_DEVICE_PLAN"); dp && std::atoi(dp) != 0) {
-        std::fprintf(stderr, "strata serve: foresight swap: off beside STRATA_VERIFY_DEVICE_PLAN (the device would plan "
+        std::fprintf(stderr, "talus serve: foresight swap: off beside STRATA_VERIFY_DEVICE_PLAN (the device would plan "
                              "resident layers without the host)\n");
         return nullptr;
     }
@@ -5270,11 +5270,11 @@ ForesightSwap* foresight_swap_from_env(int64_t layers, int64_t experts, const st
     f->verify = env_int("STRATA_FS_VERIFY", 0, 0) != 0;
     std::string err;
     if (!f->init(std::min(slots, 64), layers, experts, card_of_layer, devices, err)) {
-        std::fprintf(stderr, "strata serve: foresight swap: %s - swap space off\n", err.c_str());
+        std::fprintf(stderr, "talus serve: foresight swap: %s - swap space off\n", err.c_str());
         delete f;
         return nullptr;
     }
-    std::fprintf(stderr, "strata serve: foresight swap: %d slots per layer on %zu card(s), up to %d copies per card and "
+    std::fprintf(stderr, "talus serve: foresight swap: %d slots per layer on %zu card(s), up to %d copies per card and "
                          "window, admit after %d miss(es), reuse after %d windows\n",
                  f->slots, devices.size(), f->budget, f->admit, f->depth);
     return f;

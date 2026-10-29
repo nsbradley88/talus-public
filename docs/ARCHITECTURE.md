@@ -74,7 +74,7 @@ can be added by adding a table row, not by changing the kernels or the host.
 | Exact speed switches | `src/core/arch_defaults.cpp` (applied by the Flash-Next path; the other engines set their own defaults) | prompt and decode switches on (all bitwise) | gfx1200/gfx1201 get the prompt half only (the decode half was slower there) |
 | Prompt kernels (`TpTune`) | `include/strata/prefill/tp_tune.hpp` | tuned row: GEMM variant per weight layout, MoE kernel version, fused gate/up, fp16 expert path | conservative default row |
 | Wave32 decode matvec (`W32Rule`) | `src/kernels/cuda/native_mmvq.cu` (`kW32Gfx1151`) | rows per wave, waves-per-EU cap and column groups per (type, columns) | generic table |
-| hipBLASLt solutions | `tools/hip/<arch>-hipblaslt-<version>.txt`, loaded by `rust/crates/talus-kernels/src/tuning.rs` | per ROCm version; when the runtime's version differs, the loader picks the file for the runtime | gfx1201 tables exist; RDNA 4 siblings share tables, gfx1151 needs an exact match |
+| hipBLASLt solutions | `tools/hip/<arch>-hipblaslt-<version>.txt`, loaded by `rust/crates/talus-kernels/src/tuning.rs` | per ROCm version; when the runtime's version differs, the loader picks the file for the runtime | no gfx1201 tables yet (the loader would let RDNA 4 siblings share one); gfx1151 needs an exact match |
 | Rust `KernelSet` | `rust/crates/talus-kernels/src/kernel_set.rs` | populated | returns `UnsupportedArch` for now |
 
 The kill switches for the architecture defaults are `STRATA_GFX1151_DEFAULTS=0` and `STRATA_GFX12_DEFAULTS=0`.
@@ -99,7 +99,9 @@ To build the kernels for more than one target, pass the list to CMake (for examp
 | `talus-sched` | Request slot, queue, cancellation, and the stdin/stdout engine protocol |
 | `talus-server` | HTTP server (OpenAI, Anthropic and llama.cpp-style endpoints) |
 | `talus-cli` | The `talus-cli` binary: picks the engine for a GGUF and runs it, one-shot or as an engine process |
-| `tools/oracle` | Compares golden dumps (tokens, logits, layer outputs) from a reference engine against Talus within tolerances |
+| `talus-presets` | The per-model tuned defaults and the switch catalog the server and the TUI share |
+| `talus-tui` | The `talus-tui` terminal dashboard ([TUI.md](TUI.md)) |
+| `rust/tools/oracle` | Compares golden dumps (tokens, logits, layer outputs) from a reference engine against Talus within tolerances |
 
 `talus-cli` reads `general.architecture` from the GGUF and picks the engine:
 
@@ -160,7 +162,7 @@ The server owns tokenization, chat templates, tool-call parsing and thinking con
 llama.cpp's `/tokenize`, `/detokenize` and `/completion`. It also serves `/health` and `/metrics`.
 
 Streaming uses server-sent events. Auth is `Authorization: Bearer` or `x-api-key`, with the key from
-`STRATA_API_KEY` or `--api-key`.
+`TALUS_API_KEY` (or `STRATA_API_KEY`) or `--api-key`.
 
 Strata's Python server (`serve/server.py --engine strata`) speaks the same protocol and reads the same config, so it
 can drive `talus-cli` too.

@@ -81,7 +81,7 @@ public:
         acquired_ = nullptr;
         cudaError_t e = cudaMemcpyAsync(dst, stage, bytes, cudaMemcpyHostToDevice, s);
         if (e != cudaSuccess) {
-            std::fprintf(stderr, "strata: pinned upload of %zu bytes failed: %s\n", bytes, cudaGetErrorString(e));
+            std::fprintf(stderr, "talus: pinned upload of %zu bytes failed: %s\n", bytes, cudaGetErrorString(e));
             return e;
         }
         if (sl != nullptr && cudaEventRecord(sl->ev, s) == cudaSuccess) {
@@ -97,7 +97,7 @@ public:
         if (bytes == 0) return cudaSuccess;
         cudaError_t e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, s);
         if (e == cudaSuccess) e = cudaStreamSynchronize(s);
-        if (e != cudaSuccess) std::fprintf(stderr, "strata: upload of %zu bytes failed: %s\n", bytes, cudaGetErrorString(e));
+        if (e != cudaSuccess) std::fprintf(stderr, "talus: upload of %zu bytes failed: %s\n", bytes, cudaGetErrorString(e));
         return e;
     }
 
@@ -109,7 +109,7 @@ public:
         if (e == cudaSuccess) e = cudaStreamSynchronize(s);
         if (e == cudaSuccess && stage != nullptr) std::memcpy(dst, stage, bytes);
         if (stage != nullptr) acquired_ = nullptr;   // no event: the stream was drained
-        if (e != cudaSuccess) std::fprintf(stderr, "strata: download of %zu bytes failed: %s\n", bytes, cudaGetErrorString(e));
+        if (e != cudaSuccess) std::fprintf(stderr, "talus: download of %zu bytes failed: %s\n", bytes, cudaGetErrorString(e));
         return e;
     }
 

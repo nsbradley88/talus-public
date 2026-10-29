@@ -253,7 +253,7 @@ struct Qwen4expP4Access {
         if (!made) return false;
         const cudaError_t ue = cudaGraphUpload(exec_t, v.cs_);
         const cudaError_t us = cudaStreamSynchronize(v.cs_);
-        std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
+        std::fprintf(stderr, "talus verify: captured the %d-token window (upload %s, sync %s)\n", T,
                      cudaGetErrorString(ue), cudaGetErrorString(us));
         return true;
     }
@@ -738,7 +738,7 @@ extern "C" int tk_qwen4exp_p4_env_flags(void) {
 
 #define P4_TRY(body)                                                    \
     try { body; return 0; } catch (const std::exception& e) {           \
-        std::fprintf(stderr, "strata verify commit: %s\n", e.what());   \
+        std::fprintf(stderr, "talus verify commit: %s\n", e.what());   \
         return -1;                                                      \
     }
 #define P4_TRY_ERR(body)                                                \
@@ -802,7 +802,7 @@ extern "C" int tk_qwen4exp_p4_k_gdn_commit_layers(float* state, int64_t state_st
                                                   gb_stride, conv_channels, h_k, h_v, n_max, n_layers, n_keep, stream)
                    ? 1 : 0;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata verify commit: %s\n", e.what());
+        std::fprintf(stderr, "talus verify commit: %s\n", e.what());
         return -1;
     }
 }

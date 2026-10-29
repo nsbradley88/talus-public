@@ -360,7 +360,7 @@ pub fn sample_host_memory_at(
         }
         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             eprintln!(
-                "[strata] memory guard: the cgroup memory files could not be read or parsed, using MemAvailable; \
+                "[talus] memory guard: the cgroup memory files could not be read or parsed, using MemAvailable; \
                  set --memory-limit-mib to the container's limit"
             );
         }

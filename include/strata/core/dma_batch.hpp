@@ -87,7 +87,7 @@ inline cudaError_t copy_blobs(void* const* dst, const void* const* src, const si
             static bool warned = false;
             if (!warned) {
                 warned = true;
-                std::fprintf(stderr, "strata: cudaMemcpyBatchAsync failed (%s); the uploads go one copy at a time\n",
+                std::fprintf(stderr, "talus: cudaMemcpyBatchAsync failed (%s); the uploads go one copy at a time\n",
                              cudaGetErrorString(e));
             }
             (void) cudaGetLastError();

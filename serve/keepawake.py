@@ -37,15 +37,15 @@ class KeepAwake:
         if not enabled:
             return None
         if not sys.platform.startswith("win"):
-            say('[strata] "prevent_sleep" is for Windows only: ignored here', flush=True)
+            say('[talus] "prevent_sleep" is for Windows only: ignored here', flush=True)
             return None
         try:
             ka = cls(_windows_call())
         except (ImportError, AttributeError, OSError) as e:
-            say(f'[strata] "prevent_sleep" could not be set up: {e}', flush=True)
+            say(f'[talus] "prevent_sleep" could not be set up: {e}', flush=True)
             return None
         atexit.register(ka.close)
-        say('[strata] prevent_sleep: Windows stays awake while a request is running or queued', flush=True)
+        say('[talus] prevent_sleep: Windows stays awake while a request is running or queued', flush=True)
         return ka
 
     def _loop(self):

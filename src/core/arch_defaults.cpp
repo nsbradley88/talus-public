@@ -72,7 +72,7 @@ std::vector<std::string> apply_arch_defaults(const char* gcn_arch) {
     }
     if (!set.empty()) {
         const bool g12 = strata::kernels::gfx_arch_is_gfx12(gcn_arch);
-        std::fprintf(stderr, "strata: %s: %zu exact speed switches on by default (%s=0 turns "
+        std::fprintf(stderr, "talus: %s: %zu exact speed switches on by default (%s=0 turns "
                              "them off; a switch you set is kept): ",
                      g12 ? "gfx12 (RDNA4)" : "gfx1151 (Strix Halo)", set.size(),
                      g12 ? "STRATA_GFX12_DEFAULTS" : "STRATA_GFX1151_DEFAULTS");

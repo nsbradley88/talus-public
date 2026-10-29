@@ -162,7 +162,7 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
                       cudaGetErrorString(host_err) + ", nor place it in VRAM";
                 return false;
             }
-            std::fprintf(stderr, "strata: native embedding: cannot pin %llu MiB, kept in VRAM instead\n",
+            std::fprintf(stderr, "talus: native embedding: cannot pin %llu MiB, kept in VRAM instead\n",
                          (unsigned long long) (bytes_ >> 20));
             dev_ = d;
         } else {
@@ -185,7 +185,7 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
                 }
                 cudaFreeHost(host_);   // the destructor frees dev_ when host_ is null
                 host_ = nullptr;
-                std::fprintf(stderr, "strata: native embedding: no device alias for the mapped table, kept in VRAM\n");
+                std::fprintf(stderr, "talus: native embedding: no device alias for the mapped table, kept in VRAM\n");
             }
 #else
             if (cudaHostGetDevicePointer(&d, host_, 0) != cudaSuccess) {

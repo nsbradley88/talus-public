@@ -57,7 +57,7 @@ size_t device_free_bytes() {
                 char* end = nullptr;
                 const long v = std::strtol(h, &end, 10);
                 if (end != h && *end == '\0' && v >= 0 && v <= 1024) return v;
-                std::fprintf(stderr, "strata: STRATA_UMA_HEADROOM_GIB=%s is not a whole number of GiB (0-1024): using 6\n", h);
+                std::fprintf(stderr, "talus: STRATA_UMA_HEADROOM_GIB=%s is not a whole number of GiB (0-1024): using 6\n", h);
                 return 6L;
             }();
             const unsigned long long head = (unsigned long long) gib << 30;

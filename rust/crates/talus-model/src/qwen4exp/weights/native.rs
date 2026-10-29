@@ -712,7 +712,7 @@ pub fn native_dense_load(
     nd.allocated = allocated;
     if hc_q8 {
         eprintln!(
-            "strata: STRATA_HC_Q8=1: {:.2} GiB of Q8_0 hyper-connection projections for the verify read",
+            "talus: STRATA_HC_Q8=1: {:.2} GiB of Q8_0 hyper-connection projections for the verify read",
             hc_q8_bytes as f64 / 1073741824.0
         );
     }
@@ -922,7 +922,7 @@ pub fn native_embed_load(
             )
         })?;
         eprintln!(
-            "strata: native embedding: cannot pin {} MiB, kept in VRAM instead",
+            "talus: native embedding: cannot pin {} MiB, kept in VRAM instead",
             bytes >> 20
         );
         out.dev = d as usize;
@@ -943,7 +943,7 @@ pub fn native_embed_load(
         let dd = dd.map_err(|_| {
             "native embedding: no device alias for the mapped table, and no VRAM to copy it into".to_string()
         })?;
-        eprintln!("strata: native embedding: no device alias for the mapped table, kept in VRAM");
+        eprintln!("talus: native embedding: no device alias for the mapped table, kept in VRAM");
         out.dev = dd as usize;
         return Ok(out);
     }

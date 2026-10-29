@@ -1,0 +1,9 @@
+# The ROCm SDK (AMD TheRock wheels) this Talus release is built and measured with. One place to re-pin:
+# install.sh installs exactly this version, and `talus doctor` compares the installed SDK against it.
+#   source:   pip install --index-url https://nightly.repo.amd.com/rocm/whl-next/ \
+#               "rocm[libraries,devel,device-gfx1151]==<version below>"
+#             (AMD moved its nightlies there on 2026-08-23; the old rocm.nightlies.amd.com/whl-multi-arch is tried next)
+#   fallback: only if this version is unreachable, AMD's stable 10.1.0 from https://stable.repo.amd.com/rocm/whl-next/
+#             (install.sh asks first; --yes takes it). Not measured with this release.
+# Lines starting with # are comments; the first other line is the version.
+10.2.0a20261014

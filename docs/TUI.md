@@ -43,7 +43,7 @@ the run config of each model you have installed:
    | MiMo-V2.6-Flash | `mimo-v2.6-flash.json` |
    | Laguna-S-2.1 | `laguna-s-2.1.json` |
 
-   Start from `configs/*.example.json` and the shipped arguments in [MODELS.md](MODELS.md), with your file
+   Start from `configs/*.example.json` (27B, MiMo, Laguna) or the shipped arguments in [MODELS.md](MODELS.md), with your file
    paths filled in. These files are "our tuned defaults": choosing the defaults in the TUI serves them unchanged.
    Models without a file show as "not installed".
 
@@ -261,7 +261,7 @@ Exact speed-ups, the ones that leave the output bit-identical, stay on at every 
 | Prompt cache reuse | Keeps recent conversations so a follow-up reads only the new part. Same output. | 27B, Flash-Next: `--prompt-cache 0`; GLM: `GLM_PROMPT_SNAPS=0` (off) |
 | Int8 prompt weights | An int8 copy of the weights for faster prompt reading, about 26 GiB more memory. Same output. | 27B: `TALUS_PF_I8=0` (off) |
 | Network access | This computer only (127.0.0.1) or the local network (0.0.0.0, needs an API key). | server `host` |
-| API key | Keep the current key or generate a new one. A new key is shown once and saved to `~/.config/talus/api-key` (readable by you only). A key set with `STRATA_API_KEY` in the service environment wins and can't be changed here. | server `api_key` |
+| API key | Keep the current key or generate a new one. A new key is shown once and saved to `~/.config/talus/api-key` (readable by you only). A key set with `TALUS_API_KEY` or `STRATA_API_KEY` in the service environment wins and can't be changed here. | server `api_key` |
 
 The Accuracy options are in the table above.
 

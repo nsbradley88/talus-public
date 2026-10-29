@@ -21,8 +21,8 @@ Every Talus figure comes from one machine:
 Notes on the context:
 
 - **One model at a time.** The box serves one model and nothing else, so each engine can spend memory for speed.
-  We keep at least 8 GiB of `MemAvailable` free while serving (GLM-5.3-Flash runs closest to it, at about 9 GiB). The serve scripts stop the
-  server if memory drops below that floor.
+  We keep at least 8 GiB of `MemAvailable` free while serving (GLM-5.3-Flash runs closest to it, at about 9 GiB). The engine's memory
+  accountant refuses any allocation that would take it below that floor.
 - **70 W is low for this chip.** Most published Strix Halo results come from desktops and mini-PCs that run the same
   APU at 85-140 W. Expect higher numbers on those machines, and lower ones under thermal load on a laptop.
 - **Served, end to end.** Every figure is measured through the HTTP server, with the client on another machine on
@@ -120,11 +120,11 @@ Prompt-only changes on 27B (such as the 4-bit prompt GEMM in [MODELS.md](MODELS.
 checked on four 4,096-token prompts cut from the corpus at offsets 0, 100K, 200K and 300K, processed in 2,048-token
 chunks as in serving and scored over the last 256 positions of each prompt (1,024 positions total) against
 llama.cpp's CPU backend on the same GGUF. In the same run we measure both the exact int8 prompt path
-(`TALUS_Q27_W4I=0`) and the default `.w4i` prompt path with the same flash attention and dense MMQ settings; the gate requires the `.w4i` path's mean KL to stay within the ratio threshold in the table above (`KL vs llama.cpp CPU reference (UD-IQ4_XS) <= 0.00291 (short prompts) and 4K-prompt KL ratio vs exact <= 1.35`), matching the headroom of the short-prompt gate. Both paths also run with `--kld-ref` against each other to record their direct divergence (reported in [RESULTS.md](RESULTS.md)).
+(`TALUS_Q27_W4I=0`, the default) and the opt-in `.w4i` prompt path (`TALUS_Q27_W4I=auto`) with the same flash attention and dense MMQ settings; the gate requires the `.w4i` path's mean KL to stay within the ratio threshold in the table above (`KL vs llama.cpp CPU reference (UD-IQ4_XS) <= 0.00291 (short prompts) and 4K-prompt KL ratio vs exact <= 1.35`), matching the headroom of the short-prompt gate. We also score the two paths against each other to record their direct divergence (reported in [RESULTS.md](RESULTS.md)).
 
 ### Soak
 
-The soak runs rounds of mixed traffic against the served model for an hour or more: two `code` requests (greedy),
+The soak runs rounds of mixed traffic against the served model for 45 minutes or more: two `code` requests (greedy),
 two `chat` requests (sampled, seeded), one `edit` (greedy), a cold 2K prompt, a cold 32K prompt and a warm 32K
 follow-up. It passes when there are no request errors or hangs, every greedy answer is byte-identical across rounds
 (against round 0 for cold-prompt requests, and against round 1 across rounds 1..N for requests served from the prefix
@@ -183,18 +183,18 @@ from `TALUS_API_KEY` (or `TALUS_API_KEY_FILE`); run them from another machine, o
      `DUMP=FILE` writes the greedy outputs for the byte-identity check);
    - `DEPTH_OFFSETS=0,100000,200000,300000 bench/bench.py LABEL 2000,32000` for `pp2k`, `pp32k`, the four-prompt
      `tg2k` / `tg32k` and the TTFT samples (`bench/chatdepth.py` does the same through `/v1/chat/completions`).
-     The corpus is the Python standard library of the client machine (`TALUS_CORPUS` points elsewhere).
+     The corpus is the Python standard library of the client machine.
 3. Gates:
    - `bench/needle.py LABEL 60000` (and `81000`; seeds 1, 2 and 3 by default);
    - `bench/agentic/run_agentic.py LABEL <provider/model>` with `BUBBLES_SRC` (a checkout of charmbracelet/bubbles
-     v0.21.1) and `OPENCODE_BIN` set; `AGENTIC_AUTOCOMPACT=1` for 64K-context models;
+     v0.21.1) and `opencode` on `PATH`; `AGENTIC_AUTOCOMPACT=1` for 64K-context models;
    - `bench/soak.py LABEL MINUTES` for the soak;
    - the KLD check with the CLI's KLD mode against the model's reference (above): teacher-forced logits from
      llama.cpp's CPU backend on the same GGUF (Qwen3.8-27B), first-token logits over the fixed prompt set from the
      reference engine with numerics switches off (Qwen3.8-Flash-Next), `llama-perplexity --kl-divergence` against
-     logits dumped on the original FP8 weights and the quant lineage (GLM-5.3-Flash), or `--kld-dump` / `--kld-ref`
-     teacher-forced logits at 2K and 32K from the reference build with numerics switches off (MiMo-V2.6-Flash and
-     Laguna-S-2.1).
+     logits dumped on the original FP8 weights and the quant lineage (GLM-5.3-Flash), or teacher-forced
+     full logits (`--dump-full-logits`) at 2K and 32K, scored as KL(reference || build) against the reference build with
+     numerics switches off (MiMo-V2.6-Flash and Laguna-S-2.1).
 4. Compare cell by cell with the noise bands above. Compare `tg` cells across engines only on the four-prompt
    aggregate.
 

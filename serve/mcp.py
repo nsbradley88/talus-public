@@ -425,13 +425,13 @@ class McpServer:
                     break
             self.tools, self.status = tools, "ready"
             names = ", ".join(x["name"] for x in tools[:8]) + (", ..." if len(tools) > 8 else "")
-            print(f"[strata] MCP server {self.name!r}: {len(tools)} tool{'s' * (len(tools) != 1)}"
+            print(f"[talus] MCP server {self.name!r}: {len(tools)} tool{'s' * (len(tools) != 1)}"
                   f"{' (' + names + ')' if tools else ''}", flush=True)
             return True
         except McpError as e:
             self.status, self.error, self.tools = "failed", str(e), []
             t.close()
-            print(f"[strata] MCP server {self.name!r} did not start: {e}. Its tools are left out; the chat works "
+            print(f"[talus] MCP server {self.name!r} did not start: {e}. Its tools are left out; the chat works "
                   "without them.", flush=True)
             return False
 
@@ -442,7 +442,7 @@ class McpServer:
                 # start is tried again at most every 10 s, so a broken command does not run on every call
                 if self.status == "failed" and time.monotonic() - self.last_start < 10:
                     raise McpError(f"the server is not running ({self.error or 'it stopped'})")
-                print(f"[strata] MCP server {self.name!r} had stopped; starting it again", flush=True)
+                print(f"[talus] MCP server {self.name!r} had stopped; starting it again", flush=True)
                 if not self._start():
                     raise McpError(f"the server could not be started again: {self.error}")
             t = self.transport
@@ -600,20 +600,20 @@ class McpHub:
 # ------------------------------------------------------------------------------------------------ config
 def _check_server(name, cfg, where) -> dict:
     if not isinstance(cfg, dict):
-        raise SystemExit(f"[strata] {where}: MCP server {name!r} must be an object with \"command\" or \"url\"")
+        raise SystemExit(f"[talus] {where}: MCP server {name!r} must be an object with \"command\" or \"url\"")
     if cfg.get("url"):
         if cfg.get("type") == "sse":
-            raise SystemExit(f"[strata] {where}: MCP server {name!r} uses the old SSE transport (\"type\": \"sse\"); "
+            raise SystemExit(f"[talus] {where}: MCP server {name!r} uses the old SSE transport (\"type\": \"sse\"); "
                              "Strata speaks Streamable HTTP - most servers offer it at /mcp")
         if not isinstance(cfg.get("headers") or {}, dict):
-            raise SystemExit(f"[strata] {where}: MCP server {name!r}: \"headers\" must be an object")
+            raise SystemExit(f"[talus] {where}: MCP server {name!r}: \"headers\" must be an object")
         return cfg
     if not isinstance(cfg.get("command"), str) or not cfg["command"].strip():
-        raise SystemExit(f"[strata] {where}: MCP server {name!r} needs \"command\" (a program to start) or \"url\"")
+        raise SystemExit(f"[talus] {where}: MCP server {name!r} needs \"command\" (a program to start) or \"url\"")
     if not isinstance(cfg.get("args") or [], list):
-        raise SystemExit(f"[strata] {where}: MCP server {name!r}: \"args\" must be a list")
+        raise SystemExit(f"[talus] {where}: MCP server {name!r}: \"args\" must be a list")
     if not isinstance(cfg.get("env") or {}, dict):
-        raise SystemExit(f"[strata] {where}: MCP server {name!r}: \"env\" must be an object")
+        raise SystemExit(f"[talus] {where}: MCP server {name!r}: \"env\" must be an object")
     return cfg
 
 
@@ -622,7 +622,7 @@ def servers_from(block, where: str) -> dict[str, dict]:
     if block is None:
         return {}
     if not isinstance(block, dict):
-        raise SystemExit(f"[strata] {where}: the MCP servers must be an object {{\"name\": {{...}}}}")
+        raise SystemExit(f"[talus] {where}: the MCP servers must be an object {{\"name\": {{...}}}}")
     return {str(n): _check_server(n, c, where) for n, c in block.items()
             if not (isinstance(c, dict) and c.get("disabled") is True)}
 
@@ -634,14 +634,14 @@ def settings_from(cfg: dict) -> dict:
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key in ("timeout_s", "start_timeout_s"):
             if not number or value <= 0:
-                raise SystemExit(f"[strata] config mcp.{key}={value!r}: expected a number of seconds > 0")
+                raise SystemExit(f"[talus] config mcp.{key}={value!r}: expected a number of seconds > 0")
             out[key] = float(value)
         elif key in ("max_result_chars", "max_rounds"):
             if not number or value != int(value) or value < 1:
-                raise SystemExit(f"[strata] config mcp.{key}={value!r}: expected a positive integer")
+                raise SystemExit(f"[talus] config mcp.{key}={value!r}: expected a positive integer")
             out[key] = int(value)
         else:
-            print(f"[strata] config mcp.{key}={value!r}: unknown key, ignored", flush=True)
+            print(f"[talus] config mcp.{key}={value!r}: unknown key, ignored", flush=True)
     return out
 
 
@@ -656,10 +656,10 @@ def hub_from_config(cfg: dict, mcp_config_path: str | None = None) -> McpHub | N
             with open(mcp_config_path, encoding="utf-8-sig") as f:
                 data = json.load(f)
         except (OSError, ValueError) as e:
-            raise SystemExit(f"[strata] --mcp-config {mcp_config_path}: {e}") from None
+            raise SystemExit(f"[talus] --mcp-config {mcp_config_path}: {e}") from None
         block = data.get("mcpServers", data.get("mcp_servers")) if isinstance(data, dict) else None
         if block is None:
-            raise SystemExit(f"[strata] --mcp-config {mcp_config_path}: expected {{\"mcpServers\": {{...}}}}")
+            raise SystemExit(f"[talus] --mcp-config {mcp_config_path}: expected {{\"mcpServers\": {{...}}}}")
         servers.update(servers_from(block, f"--mcp-config {mcp_config_path}"))
     if not servers:
         return None

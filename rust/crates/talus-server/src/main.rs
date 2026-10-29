@@ -5,6 +5,8 @@ use std::sync::Arc;
 use talus_server::{ByteTokenizer, ScriptedMockEngine, ServerConfig, ServiceState, TalusServer};
 
 fn main() {
+    // TALUS_X works as STRATA_X (TALUS_API_KEY for STRATA_API_KEY, ...); the engine it starts inherits both
+    talus_core_api::apply_env_aliases();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
@@ -65,7 +67,7 @@ fn main() {
 
     talus_server::control::mark_good(&server.state.config);
     let addr = server.local_addr();
-    println!("[strata] listening on http://{addr}");
+    println!("[talus] listening on http://{addr}");
     let _ = io::stdout().flush();
 
     server.run_blocking();

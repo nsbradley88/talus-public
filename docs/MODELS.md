@@ -10,13 +10,16 @@ How to read the switch tables:
   it has to pass the quality gates before it can become a default ([METHODOLOGY.md](METHODOLOGY.md#exact-and-opt-in-numerics)).
 - "Exact" (bitwise) switches change speed only: the output is identical either way.
 - A variable you export always wins over an engine's built-in default.
+- Every `STRATA_*` variable (the names Talus inherited from Strata) also works under its `TALUS_` name:
+  `TALUS_PF_FUSED=1` means `STRATA_PF_FUSED=1`. Existing configs keep working; when both names are set, the
+  `STRATA_*` value wins.
 
 `talus-cli` picks the engine from the GGUF's `general.architecture`. In the server's run config, put the arguments in
 `"args"` and the variables in its `"env"` (or export them before starting the server). Speed and quality
 figures for every model are on [RESULTS.md](RESULTS.md).
 
-All five models run with a minimum of free memory (`MemAvailable`) in mind: the serve scripts keep at least 8 GiB
-free and stop the server below that (GLM-5.3-Flash runs closest to it, at about 9 GiB). One model runs per machine.
+All five models run with a minimum of free memory (`MemAvailable`) in mind: the engine's memory accountant refuses any allocation
+that would leave less than 8 GiB free (GLM-5.3-Flash runs closest to it, at about 9 GiB). One model runs per machine.
 
 ## System setup
 
@@ -140,7 +143,7 @@ the kernel library (a pure-Rust port is in progress). All of Strata's flags and 
 |---|---|
 | Weights | Unsloth `Qwen3.8-Flash-Next-UD-IQ4_XS` GGUF, three shards (about 88 GB), from `unsloth/Qwen3.8-Flash-Next-GGUF` |
 | Pack | A Strata pack built from the GGUF with `tools/iq_pack.py --gguf <shard 1> --out <pack> --compat-bf16`; it also holds the tokenizer |
-| MTP | The MTP runtime directory built with `tools/mtp_fetch.py`, `tools/mtp_pack.py` and `tools/mtp_rt.py` (see `docs/UNSLOTH_Q4.md`) |
+| MTP | The MTP runtime directory built with `tools/mtp_fetch.py`, `tools/mtp_pack.py` and `tools/mtp_rt.py` (each script's header shows its usage) |
 | Expert profile | `data/expert-profile.bin` (in this repository) |
 | Context / KV | 256K shipped (`--max-context 262144`), int8 KV |
 | License | Qwen Community License 1.0. Note its condition 2: a business that offers model inference as a service or an AI coding / office assistant needs a separate license from Qwen for commercial use. |
@@ -172,8 +175,7 @@ catches up), or extends the head's drafts; the verify window is 8 tokens (`--spe
 from the English-and-code token subset `data/draft_vocab_en.bin` (40,525 tokens, an 81 MB head instead of the runtime
 directory's 106,299-token, 213 MB one): each draft step reads fewer bytes. Verification is unchanged, so greedy output
 stays exact and sampled requests keep their exact distribution; only the drafts differ. For mostly non-English (CJK)
-use, where tokens outside the subset cannot be drafted, remove the flag (the full head) or pass
-`data/draft_vocab_cyrillic.bin` (58,963 tokens: Latin and Cyrillic scripts).
+use, where tokens outside the subset cannot be drafted, remove the flag (the full head).
 
 **Defaults that change numerics** (on gfx1151, or with the shipped environment)
 
@@ -190,7 +192,7 @@ it is off by default.
 
 **Exact defaults.** `STRATA_GFX1151_DEFAULTS=0` turns off the whole gfx1151 table of bitwise speed switches (and the
 HC-down default above). The table is in `src/core/arch_defaults.cpp`; each entry can also be set on its own.
-`TALUS_FN_COPY=0` turns off long prompt copies. The turn-checkpoint GDN buffer pool omits unused `conv_state` staging to save host/device memory.
+`TALUS_COPY=0` turns off long prompt copies (in every engine). The turn-checkpoint GDN buffer pool omits unused `conv_state` staging to save host/device memory.
 
 **Memory.** Weights about 88 GB (`UD-IQ4_XS`), read through the expert cache (`--expert-cache` in MiB) and a resident budget
 (`--resident-budget-gib`). Unsloth's `UD-Q4_K_XL` GGUF also runs when packed with `tools/iq_pack.py`: its larger `K`-quant experts use more memory and increase expert-cache traffic on long prompts and long-context decode, while reading slightly faster on short cold prompts. Lowest `MemAvailable` in the release run: 51 GiB.
@@ -234,10 +236,7 @@ exits if it drops below `--minavail` GiB (default 8) while running. Start it on 
 
 **Exact defaults (kill switches, `=0`):** `GLM_SIDE_STREAM` (concurrent side stream), `GLM_PAIR`, `GLM_KQ_IDS2`
 (paired MTP matvecs), `GLM_DEV_GREEDY` (greedy argmax on the device), `GLM_KDA_FUSED` (fused KDA step),
-`GLM_FUSE_MOE_POST`, `GLM_FUSE_POST_NORM` (fused post-attention and post-FFN RMSNorm into the residual),
-`GLM_FUSE_GU_W16` (single-pass fp16 MoE gate+up dequant), `GLM_ACT_ONCE` (shared activation quant across routed and
-shared experts), `GLM_SWIGLU_Q8` (fused MoE SwiGLU into `q8_1`), `GLM_W16_CMP` (compact active-expert offset remap),
-`GLM_RSORT_PAR` (parallel router sort), `GLM_MV_B4` (4-row decode/verify matvec), `GLM_GRAPHS` (HIP graphs),
+`GLM_FUSE_MOE_POST`, `TALUS_W16_CMP` (compact active-expert grid for the fp16 prompt experts), `GLM_GRAPHS` (HIP graphs),
 `GLM_SPARSE_SKIP`, `STRATA_MMQ_KQ`, and `STRATA_PREFILL_NO_BLAS` (memory: no hipBLAS workspace).
 
 **Opt-ins:** `GLM_N4=1` (fp16 WMMA for the `Q4_K` attention and shared-expert projections in prompt windows; changes
@@ -289,12 +288,12 @@ drafter is found, the engine runs without drafting.
 | Default | Kill switch | Notes |
 |---|---|---|
 | Wave32 matvec for routed experts | `STRATA_IDS_W32=0` | The engine sets `STRATA_IDS_W32=1` unless `STRATA_IDS_W32` or `TALUS_MIMO_W32_DENSE` is already set (setting the latter at all, even to 0, keeps the default off). Logit differences are at floating-point rounding level. |
-| WMMA f16 flash attention in prompts | `TALUS_MIMO_FA=0` | `TALUS_MIMO_FA_V1=1` selects the earlier v1 tile. |
+| WMMA f16 flash attention in prompts | `TALUS_MIMO_FA=0` | `TALUS_MIMO_FA_VER=1` selects the earlier v1 tile. |
 
 **Exact defaults (kill switches, `=0`):** `TALUS_MIMO_ATT2`, `TALUS_MIMO_ATT2_DRAFT`, `TALUS_MIMO_ATT3` (decode and
 drafter attention kernels), `TALUS_MIMO_ATT_Q8`, `TALUS_MIMO_QKV_MULTI`, `TALUS_MIMO_ROPE_STORE`,
 `TALUS_MIMO_AXPY_NORM`, `TALUS_MIMO_MOE_ADDNORM` (fusions), `TALUS_MIMO_I8` (int8 prompt cache for dense `attn_qkv`
-and layer-0 `Q6_K` FFN), `TALUS_PF_MOE_IQ1M_ONE` (shared-input `IQ1_M` prompt GEMM), `TALUS_MIMO_COPY` (long prompt
+and layer-0 `Q6_K` FFN), `TP_MOE_IQ1M_ONE` (shared-input `IQ1_M` prompt GEMM), `TALUS_MIMO_COPY` (long prompt
 copies), `TALUS_MIMO_GRAPH` (HIP graphs), and the shared prompt switches `TALUS_PF_MOE`, `TALUS_PF_MOE_GU`,
 `TALUS_PF_DENSE_MOE`.
 
@@ -308,7 +307,7 @@ Mixture-of-experts model from poolside with sliding-window and full-attention la
 | | |
 |---|---|
 | Weights | `Laguna-S-2.1-Q4-lean` ([j2ipper/Laguna-S-2.1-Q4-lean](https://huggingface.co/j2ipper/Laguna-S-2.1-Q4-lean)), three shards (about 68 GB): Unsloth's UD-Q4_K_XL of `poolside/Laguna-S-2.1` with leaner attention and shared experts |
-| Drafter | `laguna-s-2.1-dflash-Q8_0.gguf` (DFlash block-diffusion drafter at Q8_0, about 1.6 GB), plus prompt lookup |
+| Drafter | Prompt lookup, plus the optional DFlash block-diffusion drafter `laguna-s-2.1-dflash-Q8_0.gguf` (Q8_0, about 1.2 GB) from [wimmmm/poolside-Laguna-S-2.1-DFlash-GGUF](https://huggingface.co/wimmmm/poolside-Laguna-S-2.1-DFlash-GGUF), a community conversion of `poolside/Laguna-S-2.1-DFlash`: its license is unclear, check the repository before use. Without it (drop `--dflash-gguf`), Laguna drafts with prompt lookup only. The guided install downloads it only when asked (`talus setup --advanced` or `--opt-in-drafters`). |
 | Context / KV | 256K, the model's own (`--max-context 262144`), q8_0 KV |
 | Stop tokens | `〈|EOS|〉`, `</assistant>` (`--eos-ids 2,24`) |
 | License | OpenMDW-1.1 (and poolside's Acceptable Use Policy) |
@@ -331,14 +330,15 @@ and prompt lookup (`--spec 7`) proposes up to 7 tokens when the recent text matc
 `--spec-min-match` tokens, default 8), sized per step from the measured acceptance. When both are enabled, the host
 compares DFlash's expected accepted tokens (`TALUS_LAGUNA_DF_P0`, default 0.85, scaled by `TALUS_LAGUNA_DF_P0_CMP`,
 default 0.6) against the available prompt-lookup or long-copy match before running the DFlash forward pass. Omit
-`--dflash-gguf` (or set `TALUS_LAGUNA_DFLASH=""`) for prompt lookup only; `--spec 0` turns prompt lookup off. An
+`--dflash-gguf` and set `TALUS_LAGUNA_DFLASH=0` for prompt lookup only (without the flag the engine still loads a
+`*dflash*Q8_0*.gguf` it finds next to the model); `--spec 0` turns prompt lookup off. An
 n-gram/suffix fallback exists as an opt-in (`TALUS_LAGUNA_SUFFIX=1`).
 
 **Long copies.** When the last few tokens match an earlier span in the prompt or answer (common in file edits), the
 engine can propose the continuation straight from that span, and if a neural drafter (MTP or DFlash) is active it can
 either skip the drafter for that step or extend the drafter's proposals up to the verify window. Verification is the
 same single model pass, so greedy output is bit-for-bit identical and sampled output keeps the target distribution.
-Long copies are on by default for Flash-Next (`TALUS_FN_COPY=0` turns them off), MiMo (`TALUS_MIMO_COPY=0`) and
+Long copies are on by default for Flash-Next (`TALUS_COPY=0` turns them off in every engine), MiMo (`TALUS_MIMO_COPY=0`) and
 Laguna (`TALUS_LAGUNA_COPY=0`), and opt-in for Qwen3.8-27B (`TALUS_Q27_COPY=1`) and GLM (`GLM_COPY=1`). The design was
 prompted by gufo's speculative-decoding notes (`THIRD_PARTY_NOTICES.md` §6).
 
@@ -376,7 +376,7 @@ These apply to every engine that uses the shared kernel library paths (all but F
 | `STRATA_GFX1151_DEFAULTS=0`, `STRATA_GFX12_DEFAULTS=0` | on | Architecture default tables off (applied by the Flash-Next path) |
 
 Loader and runtime: `TALUS_KERNELS_LIB` (path of `libtalus_kernels.so`), `TALUS_KERNELS_PREBUILT` (its directory),
-`TALUS_HIP_LIB` (path of `libamdhip64.so`), `ROCM_SDK` / `ROCM_PATH`, and `STRATA_API_KEY` for the server.
+`TALUS_HIP_LIB` (path of `libamdhip64.so`), `ROCM_SDK` / `ROCM_PATH`, and `TALUS_API_KEY` (or `STRATA_API_KEY`) for the server.
 
 Variables not listed here are tuning or debug knobs (`*_TRACE`, `*_DUMP*`, `*_PROF`, table overrides such as
 `STRATA_MMVQ_W32_TAB`). They are for development; leave them unset.

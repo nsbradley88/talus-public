@@ -1369,7 +1369,7 @@ impl RustVerifier {
         if off != (*cv.ar_off != 0) {
             *cv.ar_off = off as u8;
             eprintln!(
-                "strata verify: layers [{lb}, {le}) {}",
+                "talus verify: layers [{lb}, {le}) {}",
                 if off {
                     "have experts out of VRAM (a prompt loan, a shrink or a swap): the doorbell graph runs the windows"
                 } else {
@@ -1396,7 +1396,7 @@ impl RustVerifier {
         let mut total_b = 0usize;
         if hip_sys::hipMemGetInfo(&mut free_b, &mut total_b) == hipSuccess {
             eprintln!(
-                "strata verify: capturing the {t}-token window ({} MiB of VRAM free)",
+                "talus verify: capturing the {t}-token window ({} MiB of VRAM free)",
                 free_b >> 20
             );
         } else {
@@ -1744,7 +1744,7 @@ impl RustVerifier {
             let k = NF_WINDOWS.fetch_add(1, Ordering::SeqCst) + 1;
             if mask == 0 && env.nan_inject.contains(&k) {
                 mask = 1;
-                eprintln!("strata verify: STRATA_NAN_INJECT: window {k} reported as non-finite");
+                eprintln!("talus verify: STRATA_NAN_INJECT: window {k} reported as non-finite");
             }
         }
         *v.nf_mask = mask;
@@ -2077,7 +2077,7 @@ impl RustVerifier {
             if bad > 0 {
                 REPORTED.store(true, Ordering::Relaxed);
                 eprintln!(
-                    "strata dbg: verify window at position {}, row {}: {} of {} logits non-finite (token out {})",
+                    "talus dbg: verify window at position {}, row {}: {} of {} logits non-finite (token out {})",
                     pos0, ti, bad, nv, out[ti]
                 );
                 break;
@@ -2178,7 +2178,7 @@ impl RustVerifier {
             ct.pending = false;
             if ct.n > 0 && ct.n % 300 == 0 {
                 eprintln!(
-                    "strata verify: commit graph {:.3} ms GPU on average over {} commits",
+                    "talus verify: commit graph {:.3} ms GPU on average over {} commits",
                     ct.ms / ct.n as f64,
                     ct.n
                 );
@@ -3264,7 +3264,7 @@ impl Piece4VerifyMtp {
         let row = b.ver.nonfinite_row();
         if row >= 0 {
             eprintln!(
-                "strata serve: non-finite logits (#879) in a {} window at position {} (row {}): its tokens are not emitted, the request ends (DONE nonfinite) and the next request reads its prompt from token 0",
+                "talus serve: non-finite logits (#879) in a {} window at position {} (row {}): its tokens are not emitted, the request ends (DONE nonfinite) and the next request reads its prompt from token 0",
                 if first_window { "first decode" } else { "decode" },
                 b.ver.nonfinite_pos(),
                 row
@@ -3395,11 +3395,11 @@ impl Piece4VerifyMtp {
                 .ver
                 .run(t, window, pos, pool, b.info.pool_user, out_tokens, spec_q)
             {
-                eprintln!("strata generate: {e}");
+                eprintln!("talus generate: {e}");
                 return -1;
             }
             if let Some(d) = Self::drive_failed(&b) {
-                eprintln!("strata generate: {d}");
+                eprintln!("talus generate: {d}");
                 return -1;
             }
             let first = Self::hook(&b, TK_P4_HOOK_FIRST_VERIFIED, 0, 0) == 1;
@@ -3442,7 +3442,7 @@ impl Piece4VerifyMtp {
         Self::hook(b, TK_P4_HOOK_COMMIT_BEGIN, rounds, 0);
         if let Err(e) = b.ver.commit(keep) {
             Self::hook(b, TK_P4_HOOK_JOIN_ADAPT, 0, 0);
-            eprintln!("strata generate: {e}");
+            eprintln!("talus generate: {e}");
             return -1;
         }
         self.tokens_committed += keep.max(0) as u64;
@@ -3507,7 +3507,7 @@ impl Piece4VerifyMtp {
             return -1;
         }
         if let Err(e) = drafted {
-            eprintln!("strata generate: {e}");
+            eprintln!("talus generate: {e}");
             return -1;
         }
         1

@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/assets/banner.jpg" alt="Talus: the LLM inference engine for AMD Strix Halo, written in Rust" width="100%"></p>
+<p align="center"><img src="docs/assets/banner.jpg" alt="Talus: the LLM inference engine for AMD Strix Halo, written in Rust"></p>
 
 # Talus
 
@@ -52,6 +52,23 @@ engines measured on the same machine under stated conditions. How everything is 
 
 ## Quick start
 
+### Easy install
+
+On a Strix Halo machine, one command installs everything into your home directory and walks you through choosing
+and downloading a model:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nsbradley88/talus-public/main/install.sh | bash
+```
+
+It checks the machine, installs the build tools (asking before it uses `sudo`), Rust and the ROCm SDK, builds
+Talus, and starts `talus setup`: pick models (Qwen3.8-27B is suggested for a first install), download them
+(resumable, checksum-verified), and, for GLM-5.3-Flash and MiMo-V2.6-Flash, set the kernel parameters they need
+(it shows the change and asks; it never reboots). Afterwards `talus doctor` checks and repairs the install,
+`talus update` updates it, and `talus-tui` is the dashboard. Details: [docs/INSTALL-GUIDED.md](docs/INSTALL-GUIDED.md).
+
+The manual steps follow.
+
 ### Build
 
 You need a ROCm SDK with a clang that targets gfx1151, CMake 3.24 or newer, Ninja, and Rust (the toolchain version is
@@ -79,17 +96,12 @@ The release was built and measured with ROCm SDK 10.2.0a20261014.
 ### Get a model
 
 Download the GGUF files listed for the model in [docs/MODELS.md](docs/MODELS.md), with its drafter and draft
-vocabulary. Then extract the tokenizer and chat template from the GGUF into a directory the server reads:
-
-```bash
-python3 -c "import sys; sys.path.insert(0, 'tools'); import strata_tokenizer as ST; \
-            ST.extract('/models/Qwen3.8-27B-UD-IQ4_XS.gguf', '/models/qwen3.8-27b/tokenizer')"
-```
+vocabulary. The server reads the tokenizer and the chat template straight from the model's GGUF.
 
 ### Serve
 
-`talus-server` reads a run config: the engine binary and its arguments and environment, the tokenizer directory, stop
-tokens and default sampling. An example for Qwen3.8-27B:
+`talus-server` reads a run config: the engine binary and its arguments and environment, the tokenizer (the model's
+GGUF), stop tokens and default sampling. An example for Qwen3.8-27B:
 
 ```json
 {
@@ -99,16 +111,16 @@ tokens and default sampling. An example for Qwen3.8-27B:
            "--mtp-gguf", "/models/MTP/mtp-Qwen3.8-27B-Q4_0.gguf", "--mtp", "5",
            "--spec-draft-vocab", "/models/MTP/qwen-dv-65536.bin", "--ngram", "24",
            "--dflash-gguf", "/models/DFlash2/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"],
-  "tokenizer": "/models/qwen3.8-27b/tokenizer",
+  "tokenizer": "/models/Qwen3.8-27B-UD-IQ4_XS.gguf",
   "model_name": "qwen3.8-27b",
   "stop_tokens": ["<|im_end|>"],
   "env": {},
-  "lib_dirs": ["/path/to/rocm/lib", "/path/to/rocm/lib/llvm/lib"]
+  "lib_dirs": ["/path/to/rocm/lib", "/path/to/rocm/lib/llvm/lib", "/path/to/rocm/lib/rocm_sysdeps/lib"]
 }
 ```
 
 ```bash
-STRATA_API_KEY=<choose-a-key> rust/target/release/talus-server --config qwen27b.json --host 0.0.0.0 --port 8000
+TALUS_API_KEY=<choose-a-key> rust/target/release/talus-server --config qwen27b.json --host 0.0.0.0 --port 8000
 ```
 
 The other models' arguments are in [docs/MODELS.md](docs/MODELS.md). The engine loads the model (this takes a while
@@ -120,7 +132,7 @@ Any OpenAI-compatible client works:
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer $STRATA_API_KEY" -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TALUS_API_KEY" -H "Content-Type: application/json" \
   -d '{"model": "qwen3.8-27b", "messages": [{"role": "user", "content": "Write a haiku about rocks."}]}'
 ```
 
@@ -138,7 +150,7 @@ and chat UIs connect to it directly.
 - **Prompt cache:** a new request reuses the longest cached prefix of an earlier conversation and reads only the rest.
   The usage reports the reused tokens (`usage.prompt_tokens_details.cached_tokens`). A warm answer is identical to
   the same request read cold (see "exact" in [docs/METHODOLOGY.md](docs/METHODOLOGY.md#exact-and-opt-in-numerics)).
-- **Auth:** `Authorization: Bearer <key>` or `x-api-key`, with the key from `STRATA_API_KEY` or `--api-key`.
+- **Auth:** `Authorization: Bearer <key>` or `x-api-key`, with the key from `TALUS_API_KEY` (or `STRATA_API_KEY`) or `--api-key`.
 - **Timings:** each response carries prompt and decode timings, as llama.cpp's server does.
 
 `talus-server` starts the engine (`talus-cli`) as a subprocess and talks to it over stdin/stdout; see

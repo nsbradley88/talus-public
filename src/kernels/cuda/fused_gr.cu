@@ -2016,7 +2016,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             } else if (need2 <= limit)
                 // #375 (kenh0u): the S = 2 split (a 64 KB opt-in card: Turing) disagrees with itself in gr_parity
                 // (graph replay vs direct call) - such a card keeps the default read until that split is fixed
-                std::fprintf(stderr, "strata: STRATA_GR_V3=1 needs the two-half split on this card, which fails its "
+                std::fprintf(stderr, "talus: STRATA_GR_V3=1 needs the two-half split on this card, which fails its "
                                      "checks (#375): the default read is used\n");
             cudaGetLastError();   // drop any error the attempts left behind
             split3[dev3] = split;
@@ -2302,7 +2302,7 @@ void fused_gr_check() {
     const int want = env_variant();
     if (want == kHcPlain) {
         g_variant[dev].store(kHcPlain);
-        std::fprintf(stderr, "strata hc: CUDA%d: the hyper-connection read runs as the plain one (STRATA_HC_SPLIT=0)\n",
+        std::fprintf(stderr, "talus hc: CUDA%d: the hyper-connection read runs as the plain one (STRATA_HC_SPLIT=0)\n",
                      dev);
         return;
     }
@@ -2314,17 +2314,17 @@ void fused_gr_check() {
     else if (okv[kHcSplit]) use = kHcSplit;
     g_variant[dev].store(use);
     if (!ran)
-        std::fprintf(stderr, "strata hc: CUDA%d: the check of split/staged could not run (%s)\n", dev, why[0].c_str());
+        std::fprintf(stderr, "talus hc: CUDA%d: the check of split/staged could not run (%s)\n", dev, why[0].c_str());
     static const char* const name[4] = {"", "plain", "split", "staged"};
     for (int v = kHcStaged; v >= kHcSplit; --v)
         if (v <= want && !okv[v] && ran)
-            std::fprintf(stderr, "strata hc: CUDA%d: the %s read differs from the plain read on this card - not used: "
+            std::fprintf(stderr, "talus hc: CUDA%d: the %s read differs from the plain read on this card - not used: "
                                  "%s\n", dev, name[v], why[v].c_str());
     static const char* const what[4] = {
         "", "the plain read (the norm per token, the down projection on 41 blocks)",
         "split (the norm per token and stream, then the plain read's down projection)",
         "staged (the norm per token and stream, the down projection's activations staged ahead by cp.async)"};
-    std::fprintf(stderr, "strata hc: CUDA%d: the hyper-connection read runs as %s%s\n", dev, what[use],
+    std::fprintf(stderr, "talus hc: CUDA%d: the hyper-connection read runs as %s%s\n", dev, what[use],
                  use >= kHcSplit ? "; checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 "
                                    "for the earlier ones)" : "");
 }

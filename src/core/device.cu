@@ -173,10 +173,10 @@ static hipError_t first_mem_get_info(size_t* free_bytes, size_t* total_bytes) {
     hipError_t e = hipMemGetInfo(free_bytes, total_bytes);
     if (e == hipErrorInvalidValue && !retried.exchange(true)) {
         (void) hipGetLastError();
-        std::fprintf(stderr, "strata: hipMemGetInfo failed (%s); retrying once after 250 ms\n", hipGetErrorString(e));
+        std::fprintf(stderr, "talus: hipMemGetInfo failed (%s); retrying once after 250 ms\n", hipGetErrorString(e));
         Sleep(250);
         e = hipMemGetInfo(free_bytes, total_bytes);
-        std::fprintf(stderr, "strata: hipMemGetInfo retry: %s\n", e == hipSuccess ? "ok" : hipGetErrorString(e));
+        std::fprintf(stderr, "talus: hipMemGetInfo retry: %s\n", e == hipSuccess ? "ok" : hipGetErrorString(e));
     }
     return e;
 }
@@ -202,7 +202,7 @@ hipError_t mem_get_info(size_t* free_bytes, size_t* total_bytes) {
     const size_t withheld = *total_bytes - (size_t) local.Budget;   // the desktop's and other programs' share
     static std::atomic<bool> said{false};
     if (!said.exchange(true)) {
-        std::fprintf(stderr, "strata: Windows budgets %llu of this card's %llu MiB for this process; free VRAM is "
+        std::fprintf(stderr, "talus: Windows budgets %llu of this card's %llu MiB for this process; free VRAM is "
                              "counted within that (STRATA_WDDM_BUDGET=0: off)\n",
                      (unsigned long long) (local.Budget >> 20), (unsigned long long) (*total_bytes >> 20));
     }

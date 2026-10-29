@@ -647,7 +647,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     static thread_local bool query_swizzle_said = false;
     if (query_swizzle_trace && !query_swizzle_said) {
         query_swizzle_said = true;
-        std::fprintf(stderr, "strata attn-query-swizzle: active=%d nq=%lld cap=%lld kv_mode=%d lane_cell=%d\n",
+        std::fprintf(stderr, "talus attn-query-swizzle: active=%d nq=%lld cap=%lld kv_mode=%d lane_cell=%d\n",
                      use_query_swizzle, (long long) n_q, (long long) cap, kv_mode, lane_cell);
     }
 #endif
@@ -680,7 +680,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
             static thread_local bool said = false;
             if (trace && !said) {
                 said = true;
-                std::fprintf(stderr, "strata attn-reduce12: selected=1 query_swizzle=1 kv_mode=1 nq=%lld cap=%lld\n",
+                std::fprintf(stderr, "talus attn-reduce12: selected=1 query_swizzle=1 kv_mode=1 nq=%lld cap=%lld\n",
                              (long long) n_q, (long long) cap);
             }
         } else {

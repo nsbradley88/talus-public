@@ -1418,7 +1418,7 @@ bool hip_wmma_usable() {
         static bool told = false;
         if (!told) {
             told = true;
-            std::fprintf(stderr, "strata: STRATA_HIP_WMMA: the prompt attention on matrix cores %s (%s)\n",
+            std::fprintf(stderr, "talus: STRATA_HIP_WMMA: the prompt attention on matrix cores %s (%s)\n",
                          arch[dev] == 1 ? "on" : "unavailable", prop.gcnArchName);
         }
     }

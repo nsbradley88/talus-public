@@ -474,7 +474,7 @@ pub fn build_config(
             if env_key {
                 return Err(error(
                     409,
-                    "the API key comes from STRATA_API_KEY in the service environment; change it there",
+                    "the API key comes from TALUS_API_KEY (or STRATA_API_KEY) in the service environment; change it there",
                 ));
             }
             if k.trim().len() < MIN_API_KEY_LEN || k.chars().any(char::is_whitespace) {

@@ -336,7 +336,7 @@ inline std::string set_topology(int host_cpu, const std::vector<int>& worker_cpu
         std::lock_guard<std::mutex> lk(s.mu);
         moved = (long) s.original.size();
     }
-    return "strata aux cpus: threads that are neither pool workers nor the host go to CPUs " + note +
+    return "talus aux cpus: threads that are neither pool workers nor the host go to CPUs " + note +
            (!s.cfg.on ? " (off at start; a request's aux_cpus=1 turns it on)"
             : plan.empty() ? " (nothing to do)" : " (on; " + std::to_string(moved) + " threads placed so far)");
 }
@@ -354,7 +354,7 @@ inline int restore() { return 0; }
 inline void set_enabled(bool) {}
 inline bool enabled() { return false; }
 inline std::vector<int> plan() { return {}; }
-inline std::string set_topology(int, const std::vector<int>&) { return "strata aux cpus: not available on this system"; }
+inline std::string set_topology(int, const std::vector<int>&) { return "talus aux cpus: not available on this system"; }
 
 #endif
 

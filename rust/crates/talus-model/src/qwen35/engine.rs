@@ -1488,7 +1488,7 @@ impl Q36Engine {
             Ok(g) => g,
             Err(e) => {
                 eprintln!(
-                    "strata-q36: skipping tp_i8x expansion ({:.2} GiB): budget check refused ({e})",
+                    "talus-cli: skipping tp_i8x expansion ({:.2} GiB): budget check refused ({e})",
                     (total_bytes as f64) / ((1usize << 30) as f64)
                 );
                 return Ok(());
@@ -1534,7 +1534,7 @@ impl Q36Engine {
         let _ = self.budget.mark_materialized(guard.id());
         self.i8c.budget_guard = Some(guard);
         eprintln!(
-            "strata-q36: exact int8 prompt GEMM on {} expanded matrices, {:.2} GiB (TALUS_PF_I8=0: MMQ)",
+            "talus-cli: exact int8 prompt GEMM on {} expanded matrices, {:.2} GiB (TALUS_PF_I8=0: MMQ)",
             self.i8c.len(),
             (self.i8c.bytes as f64) / ((1usize << 30) as f64)
         );
@@ -1882,7 +1882,7 @@ impl Q36Engine {
         else {
             if env.is_some() {
                 eprintln!(
-                    "strata-q36: W4A4 prompt GEMMs off (TALUS_Q27_W4I={}): exact int8 prompt path",
+                    "talus-cli: W4A4 prompt GEMMs off (TALUS_Q27_W4I={}): exact int8 prompt path",
                     env.unwrap_or_default()
                 );
             }
@@ -1891,13 +1891,13 @@ impl Q36Engine {
         let path = path.to_string_lossy().into_owned();
         if !std::path::Path::new(&path).exists() {
             eprintln!(
-                "strata-q36: W4A4 sidecar {path} not found ({mode}): prompts stay on the exact int8 path \
+                "talus-cli: W4A4 sidecar {path} not found ({mode}): prompts stay on the exact int8 path \
                  (place the matching .w4i next to the GGUF, or TALUS_Q27_W4I=0 to silence this)"
             );
             return;
         }
         if !talus_pf_w4i_available() {
-            eprintln!("strata-q36: W4A4 sidecar {path} found but libtalus_kernels has no tp_w4i: prompts stay exact");
+            eprintln!("talus-cli: W4A4 sidecar {path} found but libtalus_kernels has no tp_w4i: prompts stay exact");
             return;
         }
         let planes =
@@ -1905,14 +1905,14 @@ impl Q36Engine {
         let mut f = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("strata-q36: W4A4 sidecar {path}: {e}: prompts stay exact");
+                eprintln!("talus-cli: W4A4 sidecar {path}: {e}: prompts stay exact");
                 return;
             }
         };
         let (idx, src) = match super::w4i::read_index(&mut f) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("strata-q36: W4A4 sidecar {path}: {e}: prompts stay exact");
+                eprintln!("talus-cli: W4A4 sidecar {path}: {e}: prompts stay exact");
                 return;
             }
         };
@@ -1920,7 +1920,7 @@ impl Q36Engine {
             let gsize = std::fs::metadata(g).map(|m| m.len()).unwrap_or(0);
             if src.size != 0 && src.size != gsize {
                 eprintln!(
-                    "strata-q36: W4A4 sidecar {path} was built for {} ({} bytes), not {} ({gsize} bytes): prompts stay exact",
+                    "talus-cli: W4A4 sidecar {path} was built for {} ({} bytes), not {} ({gsize} bytes): prompts stay exact",
                     src.name,
                     src.size,
                     g.display()
@@ -1947,7 +1947,7 @@ impl Q36Engine {
                 };
                 if e.n as i32 != w.n_out || e.k as i32 != w.n_in || e.n % 128 != 0 || e.k % 256 != 0
                 {
-                    eprintln!("strata-q36: TALUS_Q27_W4I: {name} shape mismatch, skipped");
+                    eprintln!("talus-cli: TALUS_Q27_W4I: {name} shape mismatch, skipped");
                     continue;
                 }
                 let wsb = if e.wg == 0 {
@@ -1960,9 +1960,7 @@ impl Q36Engine {
             }
         }
         if want.is_empty() {
-            eprintln!(
-                "strata-q36: TALUS_Q27_W4I: no selected matrix in {path}: prompts stay exact"
-            );
+            eprintln!("talus-cli: TALUS_Q27_W4I: no selected matrix in {path}: prompts stay exact");
             return;
         }
         let rows = self.max_batch.max(1);
@@ -1978,7 +1976,7 @@ impl Q36Engine {
             Ok(g) => g,
             Err(e) => {
                 eprintln!(
-                    "strata-q36: TALUS_Q27_W4I: budget check refused ({e}): prompts stay exact"
+                    "talus-cli: TALUS_Q27_W4I: budget check refused ({e}): prompts stay exact"
                 );
                 return;
             }
@@ -2034,7 +2032,7 @@ impl Q36Engine {
                 }
                 self.w4i.clear();
                 eprintln!(
-                    "strata-q36: TALUS_Q27_W4I: upload / allocation failed: prompts stay exact"
+                    "talus-cli: TALUS_Q27_W4I: upload / allocation failed: prompts stay exact"
                 );
                 return;
             }
@@ -2049,7 +2047,7 @@ impl Q36Engine {
         let _ = self.budget.mark_materialized(guard.id());
         self.w4i.budget_guard = Some(guard);
         eprintln!(
-            "strata-q36: W4A4 (tp_w4i, quality-gated, not bit-exact) FFN prompt GEMMs on {} matrices ({}, {mode}: {path}), {:.2} GiB sidecar, chunks of >= {} rows",
+            "talus-cli: W4A4 (tp_w4i, quality-gated, not bit-exact) FFN prompt GEMMs on {} matrices ({}, {mode}: {path}), {:.2} GiB sidecar, chunks of >= {} rows",
             self.w4i.mats.len(),
             planes,
             (self.w4i.bytes as f64) / ((1usize << 30) as f64),
@@ -3959,7 +3957,7 @@ impl Q36Engine {
         let _ = unsafe { hipStreamSynchronize(self.s_main) };
         self.reset();
         eprintln!(
-            "strata-q36: warmed up in {:.1} s (one prompt chunk, a decode step{})",
+            "talus-cli: warmed up in {:.1} s (one prompt chunk, a decode step{})",
             t0.elapsed().as_secs_f64(),
             if self.mtp_d > 0 {
                 ", a speculative step"

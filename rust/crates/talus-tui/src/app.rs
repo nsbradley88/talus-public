@@ -477,7 +477,7 @@ impl App {
         if self.gen_key && snap.api_key_from_env {
             self.message(
                 "API key set by the service",
-                vec!["The key comes from STRATA_API_KEY in the service environment; change it there.".into()],
+                vec!["The key comes from TALUS_API_KEY (or STRATA_API_KEY) in the service environment; change it there.".into()],
             );
             return;
         }

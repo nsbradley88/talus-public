@@ -1429,7 +1429,7 @@ impl PleTable {
                 m.lock_range = (a0, a1 - a0);
             } else {
                 eprintln!(
-                    "strata: PLE table mlock failed ({}; raise `ulimit -l`): its pages stay faulted in but may be reclaimed",
+                    "talus: PLE table mlock failed ({}; raise `ulimit -l`): its pages stay faulted in but may be reclaimed",
                     strerror_str(errno())
                 );
             }

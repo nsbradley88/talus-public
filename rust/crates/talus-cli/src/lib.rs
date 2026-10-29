@@ -283,8 +283,7 @@ pub fn parse_ids_arg(spec: &str) -> Result<Vec<i32>, String> {
         return Ok(Vec::new());
     }
     if let Some(path) = spec.strip_prefix('@') {
-        let raw =
-            fs::read_to_string(path).map_err(|_| format!("strata-q36: cannot read {path}"))?;
+        let raw = fs::read_to_string(path).map_err(|_| format!("talus-cli: cannot read {path}"))?;
         let normalized: String = raw
             .chars()
             .map(|c| {
@@ -310,7 +309,7 @@ pub fn parse_ids_arg(spec: &str) -> Result<Vec<i32>, String> {
         let parsed = parse_ids_str(&normalized);
         if parsed.is_empty() && !spec.trim().is_empty() {
             let raw =
-                fs::read_to_string(spec).map_err(|_| format!("strata-q36: cannot read {spec}"))?;
+                fs::read_to_string(spec).map_err(|_| format!("talus-cli: cannot read {spec}"))?;
             let file_norm: String = raw
                 .chars()
                 .map(|c| {
@@ -338,13 +337,13 @@ fn is_program_name(arg: &str) -> bool {
 fn parse_i32_arg(flag: &str, val: &str) -> Result<i32, String> {
     val.trim()
         .parse::<i32>()
-        .map_err(|_| format!("strata-q36: invalid integer for {flag}: {val}"))
+        .map_err(|_| format!("talus-cli: invalid integer for {flag}: {val}"))
 }
 
 fn parse_f32_arg(flag: &str, val: &str) -> Result<f32, String> {
     val.trim()
         .parse::<f32>()
-        .map_err(|_| format!("strata-q36: invalid float for {flag}: {val}"))
+        .map_err(|_| format!("talus-cli: invalid float for {flag}: {val}"))
 }
 
 /// Parses command-line arguments for `talus-cli` / `strata-q36`, supporting both
@@ -379,7 +378,7 @@ where
 
     let next_val = |idx: &mut usize, flag: &str| -> Result<String, String> {
         if *idx + 1 >= argv.len() {
-            return Err(format!("strata-q36: {flag} requires a value"));
+            return Err(format!("talus-cli: {flag} requires a value"));
         }
         *idx += 1;
         Ok(argv[*idx].clone())
@@ -437,7 +436,7 @@ where
                         cfg.mtp_gguf = Some(v);
                     } else {
                         eprintln!(
-                            "strata-q36: ignoring --mtp {v} (this family's MTP is the GGUF's own block: --mtp N drafts)"
+                            "talus-cli: ignoring --mtp {v} (this family's MTP is the GGUF's own block: --mtp N drafts)"
                         );
                     }
                 } else if cfg.mtp == 0 {
@@ -672,16 +671,16 @@ where
                 let has_val = i + 1 < argv.len() && !argv[i + 1].starts_with("--");
                 if has_val {
                     let val = &argv[i + 1];
-                    eprintln!("strata-q36: ignoring {a} {val} (not an option of this engine)");
+                    eprintln!("talus-cli: ignoring {a} {val} (not an option of this engine)");
                     cfg.ignored_flags.push(format!("{a} {val}"));
                     i += 1;
                 } else {
-                    eprintln!("strata-q36: ignoring {a} (not an option of this engine)");
+                    eprintln!("talus-cli: ignoring {a} (not an option of this engine)");
                     cfg.ignored_flags.push(a.to_string());
                 }
             }
             _ => {
-                return Err(format!("strata-q36: unknown argument: {a} (try --help)"));
+                return Err(format!("talus-cli: unknown argument: {a} (try --help)"));
             }
         }
         i += 1;
@@ -690,12 +689,15 @@ where
     Ok(cfg)
 }
 
-/// Prints the `strata-q36` / `talus-cli` usage message (`q36_engine.cu:3310–3347`).
+/// Prints the `talus-cli` usage message (`q36_engine.cu:3310–3347`).
 pub fn print_usage() {
     println!(
         "\
 Usage: talus-cli [serve] --model PATH.gguf [options]
-  --model, --native PATH     Qwen3.5/3.6 GGUF (35B-A3B MoE or 27B Dense)
+The engine follows the model: Qwen3.8-27B, MiMo-V2.6-Flash and Laguna-S-2.1 take the options below;
+GLM-5.3-Flash (picked from its GGUF) and Qwen3.8-Flash-Next (--pack DIR --native GGUF) have their own.
+Every model's shipped arguments: docs/MODELS.md. Environment switches: TALUS_X also sets an unset STRATA_X.
+  --model, --native PATH     the model's GGUF (the first shard of a split GGUF)
   --max-context, --ctx N     context length (default: 32768)
   --chunk, --prefill N|auto  prefill chunk (default: auto)
   --no-graph                 do not capture the single-token HIP graph
@@ -2077,7 +2079,7 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
     }
 
     let Some(ref model_path) = cfg.model else {
-        eprintln!("strata-q36: --model PATH.gguf is required (try --help)");
+        eprintln!("talus-cli: --model PATH.gguf is required (try --help)");
         return 2;
     };
 
@@ -2111,11 +2113,11 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
     };
 
     if cfg.mtp < 0 || cfg.mtp > 15 {
-        eprintln!("strata-q36: --mtp N must be in 0 .. 15");
+        eprintln!("talus-cli: --mtp N must be in 0 .. 15");
         return 2;
     }
     if cfg.chunk < 0 || cfg.chunk > 4096 || cfg.max_context < 256 {
-        eprintln!("strata-q36: bad --chunk or --max-context");
+        eprintln!("talus-cli: bad --chunk or --max-context");
         return 2;
     }
 
@@ -2143,7 +2145,7 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
             }
             Ok(_) => parse_ids_arg(&format!("@{dv_path}")).ok(),
             Err(e) => {
-                eprintln!("strata-q36: failed to open draft vocab {dv_path}: {e}");
+                eprintln!("talus-cli: failed to open draft vocab {dv_path}: {e}");
                 return 2;
             }
         },
@@ -2171,7 +2173,7 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
     ) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("strata-q36: failed to load model {model_path}: {e}");
+            eprintln!("talus-cli: failed to load model {model_path}: {e}");
             return 1;
         }
     };
@@ -2179,7 +2181,7 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
     let mut eng = match Q36Engine::new(&model, cfg.max_context) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("strata-q36: failed to initialize engine: {e}");
+            eprintln!("talus-cli: failed to initialize engine: {e}");
             return 1;
         }
     };
@@ -2197,7 +2199,7 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
         } else {
             eng.df.n_draft()
         };
-        eprintln!("strata-q36: {}", eng.dp.describe());
+        eprintln!("talus-cli: {}", eng.dp.describe());
     } else {
         eng.mtp_d = mtp_cli;
     }
@@ -2236,7 +2238,7 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
         let mut fz = force_tokens.clone();
         if pr.is_empty() && cfg.exact_test > 16 {
             if cfg.exact_test + 4 > eng.max_seq() {
-                eprintln!("strata-q36: --exact-test position exceeds --max-context");
+                eprintln!("talus-cli: --exact-test position exceeds --max-context");
                 return 2;
             }
             pr.resize(cfg.exact_test as usize, 0);
@@ -2251,7 +2253,7 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
         } else {
             let n = cfg.exact_test.min(16);
             if (pr.len() as i32) + n > eng.max_seq() {
-                eprintln!("strata-q36: --exact-test position exceeds --max-context");
+                eprintln!("talus-cli: --exact-test position exceeds --max-context");
                 return 2;
             }
             if fz.is_empty() {
@@ -2290,11 +2292,11 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
             let server = match talus_server::TalusServer::bind(state) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("strata-q36: bind error on port {port}: {e}");
+                    eprintln!("talus-cli: bind error on port {port}: {e}");
                     return 1;
                 }
             };
-            println!("[strata] listening on http://{}", server.local_addr());
+            println!("[talus] listening on http://{}", server.local_addr());
             let _ = io::stdout().flush();
             server.run_blocking();
             return 0;
@@ -2307,7 +2309,7 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
         let n_steps = cfg.bench_steps.max(1);
         if d_depth + n_steps * 9 + 16 > eng.max_seq() {
             eprintln!(
-                "strata-q36: --bench-depth needs --max-context >= {}",
+                "talus-cli: --bench-depth needs --max-context >= {}",
                 d_depth + n_steps * 9 + 16
             );
             return 2;
@@ -2416,7 +2418,7 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
     if cfg.bench_pp > 0 || cfg.bench_tg > 0 {
         let pp = cfg.bench_pp.max(1);
         if pp + cfg.bench_tg + 2 > eng.max_seq() {
-            eprintln!("strata-q36: bench exceeds --max-context");
+            eprintln!("talus-cli: bench exceeds --max-context");
             return 2;
         }
         let mut rng = SplitMix64::new(1234);
@@ -2466,7 +2468,7 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
         }
     }
     if prompt.is_empty() {
-        eprintln!("strata-q36: pass --serve, --tokens ID,ID,..., or --bench-pp/--bench-tg");
+        eprintln!("talus-cli: pass --serve, --tokens ID,ID,..., or --bench-pp/--bench-tg");
         return 2;
     }
     let n_gen = if !force_tokens.is_empty() {
@@ -2475,7 +2477,7 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
         cfg.max_new.max(0) as usize
     };
     if prompt.len() + n_gen + 2 > eng.max_seq() as usize {
-        eprintln!("strata-q36: prompt + max_new exceeds --max-context");
+        eprintln!("talus-cli: prompt + max_new exceeds --max-context");
         return 2;
     }
 
@@ -2483,7 +2485,7 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
         Some(path) => match File::create(path) {
             Ok(f) => Some(f),
             Err(e) => {
-                eprintln!("strata-q36: cannot open {path}: {e}");
+                eprintln!("talus-cli: cannot open {path}: {e}");
                 return 1;
             }
         },
@@ -2601,7 +2603,7 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
         out_toks.len().saturating_sub(1)
     };
     eprintln!(
-        "strata-q36: prompt {} tok in {:.1} ms ({:.1} tok/s), gen {} tok in {:.1} ms ({:.2} tok/s)",
+        "talus-cli: prompt {} tok in {:.1} ms ({:.1} tok/s), gen {} tok in {:.1} ms ({:.2} tok/s)",
         prompt.len(),
         pp_ms,
         (prompt.len() as f64) / (pp_ms / 1000.0).max(1e-9),
@@ -2611,7 +2613,7 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
     );
     if use_spec && offered > 0 {
         eprintln!(
-            "strata-q36: MTP {} drafts: {} of {} accepted ({:.0}%)",
+            "talus-cli: MTP {} drafts: {} of {} accepted ({:.0}%)",
             eng.mtp_d,
             accepted,
             offered,

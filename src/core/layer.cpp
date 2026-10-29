@@ -547,14 +547,14 @@ bool pool_grow(ElasticPool& p, int64_t cells, const std::function<strata::core::
             if (!p.range.mapped(c)) fresh.push_back(c);
         if (fresh.empty()) continue;
         if (!p.range.map_range(c0, c1, take)) {
-            std::fprintf(stderr, "strata: the elastic K/V could not map %zu chunks (the driver has no VRAM left)\n",
+            std::fprintf(stderr, "talus: the elastic K/V could not map %zu chunks (the driver has no VRAM left)\n",
                          fresh.size());
             return false;
         }
         // what the chunk held before (another pool's cells, an expert) is not K/V: zeroed, as a new session is
         for (const int64_t c : fresh)
             if (cudaMemset(p.range.base() + (uint64_t) c * G, 0, (size_t) G) != cudaSuccess) {
-                std::fprintf(stderr, "strata: the elastic K/V could not clear a chunk: %s\n",
+                std::fprintf(stderr, "talus: the elastic K/V could not clear a chunk: %s\n",
                              cudaGetErrorString(cudaGetLastError()));
                 return false;
             }
@@ -717,7 +717,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         pool->n_slots = p.slots;
         pool->page_size = s.page_size;
         if (!pool->range.reserve(at) || !pool_grow(*pool, g_kv_elastic_init, [] { return (strata::core::VmmChunk) 0; })) {
-            std::fprintf(stderr, "strata: the elastic K/V could not reserve or map its pools\n");
+            std::fprintf(stderr, "talus: the elastic K/V could not reserve or map its pools\n");
             return 0;
         }
         uint8_t* b = pool->range.base();
@@ -796,7 +796,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         if (cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
             // under WSL the NVIDIA driver pins only ~1 GiB in all, which is less than 128K of 8-bit KV needs
-            if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
+            if (p.mode == 1) std::fprintf(stderr, "talus: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
                                  "(%.2f GiB pinned so far) - lower the context, or run without --kv-resident (under "
                                  "WSL the driver pins only about 1 GiB in all)\n", (double) bytes / 1073741824.0,
                                  (double) g_kv_host_bytes / 1073741824.0);

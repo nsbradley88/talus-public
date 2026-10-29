@@ -195,7 +195,7 @@ class ImageGen:
         return [self.cfg[k] for k in ("exe", "diffusion_model", "vae", "llm") if not Path(self.cfg[k]).exists()]
 
     def _say(self, text: str) -> None:
-        print(f"[strata] {text}", flush=True)
+        print(f"[talus] {text}", flush=True)
         if self.log is not None:
             try:
                 self.log.write(f"[images] {text}\n")
@@ -462,9 +462,9 @@ def restore_session(svc) -> None:
     svc.restore_after_load = None
     try:
         r = svc.engine.session_file("restore", path)
-        print(f"[strata] the conversation from before the image job is back ({r.get('tokens')} tokens)", flush=True)
+        print(f"[talus] the conversation from before the image job is back ({r.get('tokens')} tokens)", flush=True)
     except Exception as e:                           # noqa: BLE001 - the engine runs, without the old cache
-        print(f"[strata] the conversation from before the image job was not restored ({e}); the next request "
+        print(f"[talus] the conversation from before the image job was not restored ({e}); the next request "
               "reads its prompt again", flush=True)
     finally:
         with contextlib.suppress(OSError):
