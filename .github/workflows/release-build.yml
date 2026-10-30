@@ -1,0 +1,86 @@
+# Builds the prebuilt release tarball (scripts/release-build.sh) on a GitHub-hosted runner and uploads it as a
+# workflow ARTIFACT (not a release: publishing stays a maintainer step, see scripts/release/README.md).
+# Manual only (workflow_dispatch): it never runs on push or pull requests, and it publishes nothing.
+#
+# Source: always the PUBLIC repository nsbradley88/talus-public at `ref` (a tag such as v0.1.1, or a commit), whichever
+# repository this workflow runs in. Release assets must come from the same tree the tag points at, so the job checks
+# that tree out (no token needed: it is public), resolves `ref` to a commit of it and refuses anything else. The
+# packaging scripts come from that checkout too, so the tarball name, its manifest commit and `--ref` all name the
+# public commit.
+#
+# Runner: the standard ubuntu-24.04 runner (4 vCPU, 16 GB RAM). The HIP kernel compile needs ~2 GB per job, so -j 4;
+# expect roughly 1-2 h (the job limit is 6 h). The ROCm SDK wheels (~1.7 GB download, ~7 GB installed) come from AMD's
+# index on every run: caching them would take most of the repository's 10 GB cache.
+name: release-build
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "tag or commit of nsbradley88/talus-public to build (e.g. v0.1.1)"
+        required: true
+      tag:
+        description: "release tag for the file names (empty: v<version>-g<sha>)"
+        required: false
+        default: ""
+permissions:
+  contents: read
+env:
+  PUBLIC_REPO: nsbradley88/talus-public
+jobs:
+  tarball:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check the inputs
+        env:
+          REF: ${{ inputs.ref }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "bad ref: $REF"; exit 1; }
+          [[ -z "$TAG" || "$TAG" =~ ^v[0-9A-Za-z._-]+$ ]] || { echo "bad tag: $TAG"; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PUBLIC_REPO }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: "Source check: the checkout is the public tree"
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          url=$(git remote get-url origin)
+          case "$url" in */"$PUBLIC_REPO"|*/"$PUBLIC_REPO".git) ;; *) echo "not the public repository: $url"; exit 1;; esac
+          sha=$(git rev-parse --verify "$REF^{commit}")
+          [ "$(git rev-parse HEAD)" = "$sha" ] || { echo "HEAD is not $REF"; exit 1; }
+          echo "SOURCE_SHA=$sha" >> "$GITHUB_ENV"
+          echo "building $PUBLIC_REPO $REF = $sha"
+      - name: Free disk space (the SDK, the build and the builder image need ~15 GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Install the pinned ROCm SDK (TheRock wheels)
+        run: |
+          V=$(sed -n 's/^ROCM_VERSION=\([^ ]*\).*/\1/p' scripts/release-build.sh)
+          I=$(sed -n 's/^ROCM_INDEX=\([^ ]*\).*/\1/p' scripts/release-build.sh)
+          python3 -m venv "$RUNNER_TEMP/rocm"
+          "$RUNNER_TEMP/rocm/bin/pip" install -q --no-cache-dir --index-url "$I" "rocm[libraries,devel,device-gfx1151]==$V"
+          "$RUNNER_TEMP/rocm/bin/rocm-sdk" init
+          echo "ROCM_SDK=$("$RUNNER_TEMP/rocm/bin/rocm-sdk" path --root)" >> "$GITHUB_ENV"
+      - name: Build the tarball
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          TAGARG=(); [ -n "$TAG" ] && TAGARG=(--tag "$TAG")
+          scripts/release-build.sh --ref "$SOURCE_SHA" "${TAGARG[@]}" --jobs 4 --rocm-sdk "$ROCM_SDK" --out "$RUNNER_TEMP/out"
+      - name: "Verify the tarball (no GPU on the runner: --help, dependencies, ldd -r against the SDK)"
+        run: |
+          scripts/release/verify-tarball.sh "$(ls "$RUNNER_TEMP"/out/*.tar.gz)" --rocm-sdk "$ROCM_SDK"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: talus-release-${{ github.run_id }}
+          path: ${{ runner.temp }}/out/
+          retention-days: 14
+      # Optional, needs `permissions: id-token: write, attestations: write`: signed build provenance for the tarball.
+      # - uses: actions/attest-build-provenance@v2
+      #   with:
+      #     subject-path: ${{ runner.temp }}/out/*.tar.gz
