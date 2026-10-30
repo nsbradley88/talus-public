@@ -1,0 +1,87 @@
+name: Memory and long-context report
+description: Share free memory, int8 prompt state and decode speed at long context from your machine (helps us size defaults for 64 GB and 128 GB boxes).
+title: "[memory] <model> on <RAM> GB, <context>"
+labels: ["memory-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping. We validate on a 128 GB Strix Halo, so numbers from other machines (64 GB especially)
+        tell us where the real limits are. Paste plain text; logs can go in the attachment box at the end.
+
+  - type: input
+    id: machine
+    attributes:
+      label: Machine
+      description: Device / board, total RAM, GPU memory split (BIOS UMA / GTT setting if you changed it), OS and kernel.
+      placeholder: "e.g. Framework Desktop, 64 GB, UMA auto, Ubuntu 24.04, 6.14"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Talus version and model
+      description: Release tag or commit, model and quant file.
+      placeholder: "e.g. v0.1.0, Qwen3.8-27B-UD-IQ4_XS"
+    validations:
+      required: true
+
+  - type: textarea
+    id: headless
+    attributes:
+      label: What else is running
+      description: Headless, or a desktop session? Any other services using memory (browsers, containers, other models)?
+    validations:
+      required: true
+
+  - type: textarea
+    id: meminfo
+    attributes:
+      label: Free memory after the model loads
+      description: |
+        Run `grep -E 'MemTotal|MemAvailable' /proc/meminfo` once the server reports it is ready and before any request,
+        for each run below. If you can, also the lowest MemAvailable seen while a long prompt is processed.
+      placeholder: |
+        int8 on  (default), --max-context 131072: MemTotal ... / MemAvailable ...
+        int8 off (TALUS_PF_I8=0), --max-context 131072: MemTotal ... / MemAvailable ...
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: loglines
+    attributes:
+      label: Engine log lines about context, int8 and memory
+      description: |
+        From the server output at startup, e.g. `grep -iE 'context|int8|i8|memory|MemAvailable|refus|skip'`
+        on the log. These show which features the engine turned on or skipped and why.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: speeds
+    attributes:
+      label: Speeds
+      description: |
+        Decode tok/s (and prompt tok/s if you have it) at the depths you tested, with int8 on and off.
+        Say how you measured (client, prompt length, drafters on or off).
+      placeholder: |
+        depth   int8  prompt tok/s  decode tok/s
+        ~2K     on    ...           ...
+        ~128K   on    ...           ...
+        ~128K   off   ...           ...
+      render: text
+
+  - type: textarea
+    id: changes
+    attributes:
+      label: Changes from the shipped config
+      description: Any flags or environment variables you changed (KV type, context, drafters, your own patches such as a quantized KV cache). Describe what they do.
+
+  - type: textarea
+    id: attachments
+    attributes:
+      label: Full logs (optional)
+      description: Drag files here. Remove API keys, hostnames and paths you don't want public before posting.
