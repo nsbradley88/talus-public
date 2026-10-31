@@ -121,7 +121,7 @@ arrow keys and press Enter to open a model's tuning panel. Applying there switch
  Talus   1 Status  2 Models  3 Tuning                                       ● http://127.0.0.1:8000
 ┌ Choose a model ──────────────────────────────────────────────────────────────────────────────────┐
 │  Model                Engine    Weights                            Context  On this server       │
-│  Qwen3.8-27B          qwen35    about 17 GB with drafters          64K      ● serving            │
+│  Qwen3.8-27B          qwen35    about 17 GB with drafters          256K     ● serving            │
 │  Qwen3.8-Flash-Next   qwen4exp  about 88 GB                        256K     installed            │
 │  GLM-5.3-Flash        glm       about 110 GB                       64K      not installed        │
 │▸ MiMo-V2.6-Flash      mimo      about 92 GB with the drafter       192K     installed            │

@@ -91,7 +91,7 @@ pub fn run_config(m: &ModelInstall, ch: &Choices, c: &Ctx) -> Value {
     let mut a = |xs: &[&str]| args.extend(xs.iter().map(|s| s.to_string()));
     let (stops, sampling, tokenizer): (Vec<&str>, Option<Value>, String) = match m.id {
         "qwen3.8-27b" => {
-            a(&["--model", &main, "--max-context", "65536"]);
+            a(&["--model", &main]);
             if drafters {
                 a(&["--mtp-gguf", &f(Role::Drafter, 0), "--mtp", "5"]);
                 a(&[
@@ -362,7 +362,7 @@ mod tests {
         let q = run_config(manifest::get("qwen3.8-27b").unwrap(), &ON, &c);
         assert_eq!(
             args(&q).join(" "),
-            "--model /m/x/Qwen3.8-27B-UD-IQ4_XS.gguf --max-context 65536 \
+            "--model /m/x/Qwen3.8-27B-UD-IQ4_XS.gguf \
              --mtp-gguf /m/x/mtp-Qwen3.8-27B-Q4_0.gguf --mtp 5 \
              --spec-draft-vocab /m/x/qwen-dv-65536.bin --ngram 24 \
              --dflash-gguf /m/x/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
@@ -382,7 +382,7 @@ mod tests {
         let q0 = run_config(manifest::get("qwen3.8-27b").unwrap(), &OFF, &c);
         assert_eq!(
             args(&q0).join(" "),
-            "--model /m/x/Qwen3.8-27B-UD-IQ4_XS.gguf --max-context 65536"
+            "--model /m/x/Qwen3.8-27B-UD-IQ4_XS.gguf"
         );
 
         let g = run_config(manifest::get("glm-5.3-flash").unwrap(), &ON, &c);

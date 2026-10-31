@@ -9,7 +9,7 @@ Sources (all pinned, so the token ids are reproducible):
     Qwen tool-call template), concatenated sources (long-context prompts);
   * the Debian/Ubuntu /usr/share/common-licenses texts GPL-3, GFDL-1.3, Apache-2.0, MPL-2.0 (prose).
 Plan (149,516 tokens): 20 x 2048 code, 12 x 4096 agentic, 10 x 2048 chat, 2 x 16384 long, 4 x 2048 prose
-(= the w4cal calib2 plan, whose sources were partly internal). Files are sorted before the seeded shuffle; the
+(= an earlier calibration plan whose sources were partly internal). Files are sorted before the seeded shuffle; the
 tokenizer is llama.cpp's llama-tokenize on the target GGUF. Writes OUTDIR/train-<cat><i>.ids (comma-separated ids)
 and OUTDIR/SHA256SUMS.
 """

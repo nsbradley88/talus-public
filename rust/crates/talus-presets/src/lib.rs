@@ -662,7 +662,7 @@ mod tests {
         );
         assert_eq!(args.join(" "), "--mtp rt --kv int8");
         assert!(!model("glm-5.3-flash").unwrap().has_fast());
-        // 27B (rc-a4): 4-bit prompt math is opt-in (off by default since 2026-10-28); Fast = the all-layer profile
+        // 27B: 4-bit prompt math is opt-in (off by default since 2026-10-28); Fast = the all-layer profile
         let q = model("qwen3.8-27b").unwrap();
         let f = q.edits(&q.level_selection(Level::Fast)).unwrap();
         assert_eq!(f, vec![Edit::Env("TALUS_Q27_W4I", "fast")]);

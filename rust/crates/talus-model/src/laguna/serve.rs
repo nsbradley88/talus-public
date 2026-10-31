@@ -756,6 +756,7 @@ pub fn serve_main(
     load_seconds: f64,
     mut df: Option<&mut LagunaDFlash>,
     fast_serve: bool,
+    disk: Option<&talus_state::disk::DiskCache>,
 ) -> Result<()> {
     // DFlash block size (drafts per round) and the prompt-lookup length that wins over a DFlash draft
     let df_k = std::env::var("TALUS_LAGUNA_DF_K")
@@ -839,6 +840,9 @@ pub fn serve_main(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
     let mut df_round_ctr: usize = 0;
+    // confident-prefix verify of the DFlash drafts (talus_spec::ConfPrefix; TALUS_LAGUNA_DF_CONF /
+    // TALUS_DF_CONF for greedy, default 0.45 (0 = off); _S for sampled requests, off). Drafting only: greedy output never depends on it.
+    let conf_rule = talus_spec::ConfPrefix::from_env("LAGUNA");
     let p_df0_init: f64 = p_df0;
     let mut p_df_all = [[p_df0_init; DF_MAX_BLOCK - 1]; 2];
     // the same estimates under the 0.6 prior (TALUS_LAGUNA_DF_P0_CMP), used only to compare a DFlash round
@@ -1191,6 +1195,47 @@ pub fn serve_main(
 
         // Reuse longest common prefix with cached tokens (at least 1 token must be prefilled)
         let tp = Instant::now();
+        // Disk tier: when a saved session shares a longer prefix than the live one, load it first; the live-cache
+        // logic below then runs on exactly the state the engine had when that session was saved.
+        if let (true, Some(dc)) = (use_cache, disk) {
+            let live = talus_state::disk::lcp(&cached, &ids).min(ids.len() - 1);
+            let ring_ok = |len: usize, n: usize| {
+                if eng.ring() >= eng.ctx16() {
+                    return true;
+                }
+                let first_swa = if swa_clear {
+                    Engine::swa_keep_from(n)
+                } else {
+                    n.saturating_sub(K_SWA - 1)
+                };
+                (len + K_MAX_VERIFY).saturating_sub(first_swa) <= eng.ring()
+            };
+            let best = dc.best_native(&ids, |e, n| ring_ok(e.tokens.len(), n));
+            if let Some((e, n)) = best.filter(|(_, n)| *n > live) {
+                match dc.load(&e) {
+                    Ok(l) => {
+                        let read_ms = l.ms;
+                        let path = l.external.expect("native entry");
+                        match eng.load_session(&path, |_, _| {}) {
+                            Ok((toks, bytes)) => {
+                                eprintln!(
+                                    "talus-pcache: disk hit {n} tokens (live {live}), {:.1} MiB verified in {read_ms:.1} ms, loaded in {:.1} ms",
+                                    bytes as f64 / (1u64 << 20) as f64,
+                                    ms_since(tp)
+                                );
+                                cached = toks;
+                            }
+                            Err(err) => {
+                                // The engine may hold part of the file: never resume from it.
+                                eprintln!("talus-pcache: disk entry not loaded ({err})");
+                                cached.clear();
+                            }
+                        }
+                    }
+                    Err(err) => eprintln!("talus-pcache: disk entry skipped ({err})"),
+                }
+            }
+        }
         let mut lcp = 0usize;
         if use_cache {
             while lcp < cached.len() && lcp < ids.len() && cached[lcp] == ids[lcp] {
@@ -1389,6 +1434,8 @@ pub fn serve_main(
                     acc_est += 0.05 * (0.9 - acc_est);
                 }
             }
+            let mut conf_tops: Vec<f32> = Vec::new();
+            let mut conf_k = 0usize;
             if let Some(d) = df.as_deref_mut() {
                 let kmax = df_k.min(room).min(wmax - 1);
                 let (mut k, _) = cost.best_k_rate(&p_df_all[usize::from(!fast)], kmax, cost.df_ms);
@@ -1423,6 +1470,13 @@ pub fn serve_main(
                     if k > 0 {
                         let t = Instant::now();
                         nd = d.draft(eng, next, pos_now, k, &mut drafts)?;
+                        // verify only the confident prefix (block rows do not condition on earlier drafts:
+                        // the cut depends on the drafter's own top-1 probabilities, never on a drawn draft)
+                        conf_k = nd;
+                        if conf_rule.active() && nd > 0 {
+                            conf_tops.extend_from_slice(d.last_tops());
+                            nd = conf_rule.keep(&conf_tops, nd, !fast);
+                        }
                         if ssamp_on && nd > 0 {
                             // draw draft i from q_i (the head's top-16 under the request's transforms); the block's
                             // rows do not condition on earlier drafts, so q_i is fixed for the round
@@ -1498,7 +1552,8 @@ pub fn serve_main(
             } else {
                 eng.verify(&toks[..nv], pos, &mut am[..nv], None)?;
             }
-            cost.record(nv, ms_since(t));
+            let verify_ms = ms_since(t);
+            cost.record(nv, verify_ms);
             if let Some(d) = df.as_deref_mut() {
                 // every verified row's context (rejected rows are overwritten by the next round)
                 d.inject(eng, 0, pos as usize, nv)?;
@@ -1570,6 +1625,9 @@ pub fn serve_main(
             }
             qs.clear();
             spec_svc.record_verify(nd, acc_here);
+            if df_last {
+                conf_rule.trace_round("laguna", !fast, &conf_tops, conf_k, nd, acc_here, verify_ms);
+            }
             if let (Some(cm), Some(c)) = (copied, lcopy.as_mut()) {
                 c.observe(&cm, nd, acc_here, false);
             }
@@ -1651,6 +1709,8 @@ pub fn serve_main(
             p_df_all[usize::from(!fast)][4],
             p_df_all[usize::from(!fast)][5]
         );
+        // Taken before DONE: a stop signal that follows the reply waits for this turn's disk write.
+        let _save_guard = (use_cache && disk.is_some()).then(talus_state::disk::SaveGuard::new);
         emit(&format!(
             "DONE {} {} {:.1} {:.1} {} {} {} {} 0 0 0 0 0 {}",
             gen,
@@ -1672,6 +1732,21 @@ pub fn serve_main(
             {
                 let toks: Vec<String> = out_log.iter().map(|t| t.to_string()).collect();
                 let _ = writeln!(f, "{}\nLCP {lcp}\nOUT {}", trimmed, toks.join(","));
+            }
+        }
+        // Disk tier: save the conversation (DONE is already out; the writer thread flushes it to disk).
+        if let (true, Some(dc)) = (use_cache, disk) {
+            let ts = Instant::now();
+            match dc.save_native(&cached, ids.len(), |p| {
+                eng.save_session(p, &cached, |_, _| {}).map(|b| b as u64)
+            }) {
+                Ok(true) => eprintln!(
+                    "talus-pcache: session of {} tokens staged for disk in {:.1} ms",
+                    cached.len(),
+                    ms_since(ts)
+                ),
+                Ok(false) => {}
+                Err(err) => eprintln!("talus-pcache: disk write skipped ({err})"),
             }
         }
     }

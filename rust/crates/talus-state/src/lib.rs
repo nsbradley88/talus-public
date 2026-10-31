@@ -7,10 +7,13 @@
 //! - Message-boundary chunking helpers: [`find_message_boundary`], [`find_msg_cut`]
 //! - [`talus_core_api::PrefixCache`] implementation for [`PromptCache`] and [`TalusPrefixCache`]
 //! - Per-layer [`Q36LayerStateView`] and [`Q36PromptCache`]
+//! - Persistent disk tier ([`disk::DiskCache`]) and its Qwen3.5/3.6 adapter ([`q36_disk`])
 
+pub mod disk;
 pub mod pcache;
 pub mod prefix_cache;
 pub mod q36_cache;
+pub mod q36_disk;
 
 pub use pcache::{
     find_message_boundary, find_msg_cut, hip_memcpy_2d_async, kv_bytes, kv_copy, state_bytes,
@@ -688,3 +691,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod disk_tests;

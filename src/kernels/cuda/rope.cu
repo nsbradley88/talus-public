@@ -119,7 +119,7 @@ __global__ void rope_neox_par_kernel(const float* __restrict__ x, float* __restr
                                      int head_dim, int n_rot, const float* __restrict__ cos_tab,
                                      const float* __restrict__ sin_tab, const int* __restrict__ pos,
                                      const int32_t* __restrict__ mtab) {
-    // in place (x == out) the tail copy writes each value onto itself: per = half (no tail threads; rc-mimo)
+    // in place (x == out) the tail copy writes each value onto itself: per = half (no tail threads)
     const int half = n_rot / 2, per = half + (x == out ? 0 : head_dim - n_rot);
     const long long g = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (g >= rows * per) return;

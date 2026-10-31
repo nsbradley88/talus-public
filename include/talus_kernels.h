@@ -1478,6 +1478,21 @@ tk_status tk_mmvq_w32_multi(
     tk_stream stream) TK_NOEXCEPT;
 
 /**
+ * the exact wide verify tiles (`strata::kernels::native_mmvq_tw`; default on, gfx1151; TALUS_MMVQ_WIDE=0 is
+ * the kill switch) and their tile-plane weight copies (+13.0 GB on the 27B), which the engine places by its memory plan:
+ * `talus_mmvq_wide_note` every matrix at load (1: a copy candidate), then `talus_mmvq_wide_pack_noted` (number of
+ * copies made) once `talus_mmvq_wide_noted_bytes` fit.  `talus_mmvq_wide_pack_mode`: TALUS_MMVQ_WIDE_PACK, -1 unset
+ * (auto), 0 never, 1 force.  Packing allocates and synchronizes. [NOT CAPTURABLE]
+ */
+int32_t talus_mmvq_wide_active(void) TK_NOEXCEPT;
+int32_t talus_mmvq_wide_pack_mode(void) TK_NOEXCEPT;
+int32_t talus_mmvq_wide_note(int32_t ggml_type, const void* weights, int32_t n_in, int32_t n_out) TK_NOEXCEPT;
+uint64_t talus_mmvq_wide_noted_bytes(void) TK_NOEXCEPT;
+int32_t talus_mmvq_wide_pack_noted(void) TK_NOEXCEPT;
+void talus_mmvq_wide_release(const void* weights) TK_NOEXCEPT;
+uint64_t talus_mmvq_wide_packed_bytes(void) TK_NOEXCEPT;
+
+/**
  * Batched heterogeneous MMVQ launch (`strata::kernels::native_mmvq_batch`), up to 8 items concurrently.
  * [CAPTURABLE]
  */

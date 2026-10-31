@@ -108,7 +108,9 @@ pin to a stable release after a GPU A/B.
 
 A manual (`workflow_dispatch`) GitHub Actions job can run the same script on a GitHub-hosted `ubuntu-24.04` runner:
 free disk space, pip-install the pinned ROCm SDK, `scripts/release-build.sh --jobs 4`, `verify-tarball.sh`, and upload
-the tarball as a workflow artifact (publishing stays a maintainer step).
+the tarball as a workflow artifact (publishing stays a maintainer step). It always builds the public repository
+`nsbradley88/talus-public` at the `ref` input (a tag or commit), checked and resolved to a commit first, so the
+artifact matches the tree the release tag points at.
 - Cost: standard runners are free and unmetered for public repositories (larger runners are billed per minute).
 - Hardware: 4 vCPU / 16 GB RAM -> `-j 4` for the HIP compile; disk is tight (~14 GB free on `/` by default), so the
   job deletes preinstalled toolchains first.

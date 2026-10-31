@@ -1235,25 +1235,13 @@ impl Engine for StdioSubprocessEngine {
                 .and_then(|_| stdin.flush())
                 .map_err(|e| EngineError::EngineDied(format!("SAVE write failed: {e}")))?;
         }
-        let mut line = String::new();
-        handle
-            .stdout
-            .read_line(&mut line)
-            .map_err(|e| EngineError::EngineDied(format!("SAVE read failed: {e}")))?;
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("SAVED") {
-            let n = rest.trim().parse::<usize>().unwrap_or(0);
-            let written = std::fs::metadata(path)
+        let (n, bytes, ms) = read_session_reply(&mut handle.stdout, "SAVE", "SAVED")?;
+        let written = bytes.unwrap_or_else(|| {
+            std::fs::metadata(path)
                 .map(|m| m.len() as usize)
-                .unwrap_or(0);
-            Ok((n, written, 1.0))
-        } else if let Some(rest) = trimmed.strip_prefix("ERR") {
-            Err(EngineError::InvalidRequest(rest.trim().to_string()))
-        } else {
-            Err(EngineError::EngineDied(format!(
-                "unexpected SAVE reply: {trimmed}"
-            )))
-        }
+                .unwrap_or(0)
+        });
+        Ok((n, written, ms.unwrap_or(1.0)))
     }
 
     fn restore_slot(
@@ -1270,25 +1258,13 @@ impl Engine for StdioSubprocessEngine {
                 .and_then(|_| stdin.flush())
                 .map_err(|e| EngineError::EngineDied(format!("RESTORE write failed: {e}")))?;
         }
-        let mut line = String::new();
-        handle
-            .stdout
-            .read_line(&mut line)
-            .map_err(|e| EngineError::EngineDied(format!("RESTORE read failed: {e}")))?;
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("RESTORED") {
-            let n = rest.trim().parse::<usize>().unwrap_or(0);
-            let read_bytes = std::fs::metadata(path)
+        let (n, bytes, ms) = read_session_reply(&mut handle.stdout, "RESTORE", "RESTORED")?;
+        let read_bytes = bytes.unwrap_or_else(|| {
+            std::fs::metadata(path)
                 .map(|m| m.len() as usize)
-                .unwrap_or(0);
-            Ok((n, read_bytes, 1.0))
-        } else if let Some(rest) = trimmed.strip_prefix("ERR") {
-            Err(EngineError::InvalidRequest(rest.trim().to_string()))
-        } else {
-            Err(EngineError::EngineDied(format!(
-                "unexpected RESTORE reply: {trimmed}"
-            )))
-        }
+                .unwrap_or(0)
+        });
+        Ok((n, read_bytes, ms.unwrap_or(1.0)))
     }
 
     fn erase_slot(&self, _slot_id: usize) -> Result<usize, EngineError> {
@@ -1311,6 +1287,55 @@ impl Engine for StdioSubprocessEngine {
         } else {
             Ok(0)
         }
+    }
+}
+
+/// Read the engine's reply to `SAVE` / `RESTORE` (`ok` = `SAVED` / `RESTORED`, followed by the token count and
+/// optionally the bytes and milliseconds). Engines with a session manager (Laguna, Flash-Next) print progress lines
+/// first (`SESSION done total`, `SWAIT ...`) and answer failures with `SERR kind 0 why`; others answer `ERR why`.
+fn read_session_reply<R: BufRead>(
+    r: &mut R,
+    cmd: &str,
+    ok: &str,
+) -> Result<(usize, Option<usize>, Option<f64>), EngineError> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = r
+            .read_line(&mut line)
+            .map_err(|e| EngineError::EngineDied(format!("{cmd} read failed: {e}")))?;
+        if n == 0 {
+            return Err(EngineError::EngineDied(format!(
+                "engine exited during {cmd}"
+            )));
+        }
+        let trimmed = line.trim();
+        let word = trimmed.split_whitespace().next().unwrap_or("");
+        if word.is_empty() || word == "SESSION" || word == "SWAIT" {
+            continue;
+        }
+        let rest = trimmed[word.len()..].trim();
+        if word == ok {
+            let mut f = rest.split_whitespace();
+            let n = f.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(0);
+            let bytes = f.next().and_then(|x| x.parse::<usize>().ok());
+            let ms = f.next().and_then(|x| x.parse::<f64>().ok());
+            return Ok((n, bytes, ms));
+        }
+        if word == "ERR" {
+            return Err(EngineError::InvalidRequest(rest.to_string()));
+        }
+        if word == "SERR" {
+            // `SERR <kind> <tokens> <why>`
+            let mut f = rest.splitn(3, ' ');
+            let kind = f.next().unwrap_or("io");
+            let _ = f.next();
+            let why = f.next().unwrap_or("").trim();
+            return Err(EngineError::InvalidRequest(format!("{kind}: {why}")));
+        }
+        return Err(EngineError::EngineDied(format!(
+            "unexpected {cmd} reply: {trimmed}"
+        )));
     }
 }
 
@@ -1346,5 +1371,59 @@ impl Drop for StdioSubprocessEngine {
             let _ = handle.child.kill();
             let _ = handle.child.wait();
         }
+    }
+}
+
+#[cfg(test)]
+mod session_reply_tests {
+    use super::{read_session_reply, EngineError};
+    use std::io::Cursor;
+
+    #[test]
+    fn plain_reply() {
+        let mut r = Cursor::new("SAVED 120\n");
+        assert_eq!(
+            read_session_reply(&mut r, "SAVE", "SAVED").unwrap(),
+            (120, None, None)
+        );
+    }
+
+    #[test]
+    fn progress_lines_are_skipped_and_fields_parsed() {
+        // Laguna: SESSION progress, then `SAVED <tokens> <bytes> <ms>`; Flash-Next adds SWAIT.
+        let mut r = Cursor::new(
+            "SESSION 1 4\nSWAIT commit\nSESSION 4 4\n\nRESTORED 9024 441253888 113.3\n",
+        );
+        let (n, b, ms) = read_session_reply(&mut r, "RESTORE", "RESTORED").unwrap();
+        assert_eq!((n, b), (9024, Some(441253888)));
+        assert!((ms.unwrap() - 113.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn serr_and_err_are_request_errors() {
+        let mut r = Cursor::new("SESSION 0 4\nSERR invalid 0 nothing to save\n");
+        match read_session_reply(&mut r, "SAVE", "SAVED") {
+            Err(EngineError::InvalidRequest(m)) => assert_eq!(m, "invalid: nothing to save"),
+            other => panic!("{other:?}"),
+        }
+        let mut r = Cursor::new("ERR no such file\n");
+        match read_session_reply(&mut r, "RESTORE", "RESTORED") {
+            Err(EngineError::InvalidRequest(m)) => assert_eq!(m, "no such file"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn eof_and_garbage_are_engine_errors() {
+        let mut r = Cursor::new("SESSION 1 2\n");
+        assert!(matches!(
+            read_session_reply(&mut r, "SAVE", "SAVED"),
+            Err(EngineError::EngineDied(_))
+        ));
+        let mut r = Cursor::new("T 5\n");
+        assert!(matches!(
+            read_session_reply(&mut r, "SAVE", "SAVED"),
+            Err(EngineError::EngineDied(_))
+        ));
     }
 }

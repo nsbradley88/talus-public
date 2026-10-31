@@ -112,6 +112,12 @@ pub struct ModelInstall {
     pub min_start_gib: Option<u32>,
     /// Lowest `MemAvailable` (GiB) in the release run (headless).
     pub release_free_gib: u32,
+    /// GiB the engine gives back on a smaller machine by sizing its context to the memory (the 27B's auto context
+    /// steps 256K -> 64K: 12 GiB of KV cache); 0 for a fixed context.
+    pub auto_context_gib: u32,
+    /// GiB of optional speed copies the engine places only when they fit (the 27B's wide verify tile-plane copies,
+    /// 13 GiB: dropped first, before the context shrinks, when memory is short or other programs use it); 0: none.
+    pub auto_pack_gib: u32,
     /// Release run: answer speed in chat (tok/s) and prompt speed at 2K (tok/s).
     pub chat_tps: f32,
     pub prompt_tps: f32,
@@ -255,10 +261,15 @@ pub const MODELS: &[ModelInstall] = &[
         desktop_fit: DesktopFit::Yes,
         needs_big_gtt: false,
         min_start_gib: None,
-        release_free_gib: 66,
+        // 66 at the old 64K default minus 11.9 GiB measured for 256K (same session);
+        // minus the wide verify tile-plane copies (12.0 GiB, on by default when they fit; served 256K min
+        // MemAvailable 46.1 GiB with them vs 58.5 GiB without them (TALUS_MMVQ_WIDE=0))
+        release_free_gib: 41,
+        auto_context_gib: 12,
+        auto_pack_gib: 13,
         chat_tps: 46.7,
         prompt_tps: 443.0,
-        context: "64K",
+        context: "256K",
     },
     ModelInstall {
         id: "qwen3.8-flash-next",
@@ -292,6 +303,8 @@ pub const MODELS: &[ModelInstall] = &[
         needs_big_gtt: false,
         min_start_gib: None,
         release_free_gib: 51,
+        auto_context_gib: 0,
+        auto_pack_gib: 0,
         chat_tps: 58.9,
         prompt_tps: 970.0,
         context: "256K",
@@ -341,6 +354,8 @@ pub const MODELS: &[ModelInstall] = &[
         needs_big_gtt: true,
         min_start_gib: Some(112),
         release_free_gib: 9,
+        auto_context_gib: 0,
+        auto_pack_gib: 0,
         chat_tps: 32.4,
         prompt_tps: 452.0,
         context: "64K",
@@ -390,6 +405,8 @@ pub const MODELS: &[ModelInstall] = &[
         needs_big_gtt: true,
         min_start_gib: None,
         release_free_gib: 14,
+        auto_context_gib: 0,
+        auto_pack_gib: 0,
         chat_tps: 35.8,
         prompt_tps: 597.0,
         context: "192K",
@@ -433,6 +450,8 @@ pub const MODELS: &[ModelInstall] = &[
         needs_big_gtt: false,
         min_start_gib: None,
         release_free_gib: 38,
+        auto_context_gib: 0,
+        auto_pack_gib: 0,
         chat_tps: 34.6,
         prompt_tps: 965.0,
         context: "256K",

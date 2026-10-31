@@ -443,6 +443,9 @@ pub fn serve_main(engine: &mut MimoEngine) -> Result<()> {
             if lcp == ids.len() && lcp > 0 {
                 lcp -= 1;
             }
+            // never resume where the DFlash window would read a last-layer tap row that a pruned prefill
+            // skipped (no-op without tail pruning or without a drafter); re-prefills at most window + margin rows
+            lcp = engine.exact_resume_floor(lcp, ids.len());
             let max_rollback = engine.swa_stride().saturating_sub(SWA_WINDOW as usize);
             if lcp == 0 || engine.n_pos().saturating_sub(lcp) > max_rollback {
                 engine.reset();
@@ -459,6 +462,8 @@ pub fn serve_main(engine: &mut MimoEngine) -> Result<()> {
         let mut done = 0usize;
         let mut last_logits = Vec::new();
         let mut prefill_err: Option<CoreError> = None;
+        // the chunk calls below are one prompt ending at ids.len()
+        engine.set_prefill_hint(Some(ids.len()), ids.len());
         while done < n_read {
             let n = ubatch.min(n_read - done);
             let is_last = done + n == n_read;
@@ -481,6 +486,7 @@ pub fn serve_main(engine: &mut MimoEngine) -> Result<()> {
             };
             emit(&format!("PP {done} {n_read} {:.0} {:.1}", ms, tps));
         }
+        engine.set_prefill_hint(None, 0);
         if let Some(e) = prefill_err {
             engine.reset();
             emit(&format!("ERR {e}"));
@@ -509,6 +515,9 @@ pub fn serve_main(engine: &mut MimoEngine) -> Result<()> {
         let mut next = sample(&mut last_logits, &sp, &recent, &mut rng);
         let fast = sp.greedy_plain();
         let use_dflash = engine.use_dflash();
+        // confident-prefix verify of the DFlash drafts (talus_spec::ConfPrefix; TALUS_MIMO_DF_CONF /
+        // TALUS_DF_CONF for greedy, default 0.6 (0 = off); _S for sampled requests, off)
+        let conf_rule = talus_spec::ConfPrefix::from_env("MIMO");
         let env_sampled_cap = std::env::var("TALUS_MIMO_SPEC_SAMPLED").ok();
         let draft_max = effective_request_draft_max(
             engine.config().draft_max,
@@ -625,6 +634,15 @@ pub fn serve_main(engine: &mut MimoEngine) -> Result<()> {
                 if copied.is_none() && drafts.len() > draft_cap {
                     drafts.truncate(draft_cap);
                 }
+                // verify only the confident prefix (rows are drafted in parallel: the cut depends on the
+                // drafter's own top-1 probabilities only, never on a drawn draft)
+                let conf_k = drafts.len();
+                let mut conf_tops: Vec<f32> = Vec::new();
+                if copied.is_none() && conf_rule.active() {
+                    conf_tops.extend_from_slice(engine.last_draft_tops());
+                    let keep = conf_rule.keep(&conf_tops, conf_k, !fast);
+                    drafts.truncate(keep);
+                }
                 // ssamp: draw each draft from its row's q (the drafter's top-16 under the request's transforms) with
                 // the request's RNG; the DFlash rows do not condition on earlier drafts, so q_i is fixed per round.
                 // A row without candidates keeps its argmax draft as a point mass (the exact-match rule).
@@ -649,6 +667,7 @@ pub fn serve_main(engine: &mut MimoEngine) -> Result<()> {
                     let k = drafts.len();
                     drafted += k as i64;
                     let pos_before_verify = engine.n_pos();
+                    let t_verify = Instant::now();
                     let mut verify_batch = Vec::with_capacity(k + 1);
                     verify_batch.push(next);
                     verify_batch.extend_from_slice(&drafts);
@@ -710,6 +729,15 @@ pub fn serve_main(engine: &mut MimoEngine) -> Result<()> {
                             c.observe(&m, k, kept_acc, false);
                         } else {
                             spec_svc.record_verify(k, kept_acc);
+                            conf_rule.trace_round(
+                                "mimo",
+                                false,
+                                &conf_tops,
+                                conf_k,
+                                k,
+                                outcome.accepted.len(),
+                                t_verify.elapsed().as_secs_f64() * 1e3,
+                            );
                         }
                         if ended_in_drafts {
                             engine.rollback_kv_to(pos_before_verify + 1 + kept_acc);
@@ -780,6 +808,17 @@ pub fn serve_main(engine: &mut MimoEngine) -> Result<()> {
                             break;
                         }
                         spec_svc.record_verify(k, kept_acc);
+                        if copied.is_none() {
+                            conf_rule.trace_round(
+                                "mimo",
+                                true,
+                                &conf_tops,
+                                conf_k,
+                                k,
+                                kept_acc,
+                                t_verify.elapsed().as_secs_f64() * 1e3,
+                            );
+                        }
                         engine.rollback_kv_to(pos_before_verify + 1 + kept_acc);
                         if ended_in_drafts {
                             break;

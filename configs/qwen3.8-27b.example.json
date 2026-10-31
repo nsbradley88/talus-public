@@ -3,8 +3,6 @@
  "args": [
   "--model",
   "/path/to/Qwen3.8-27B-UD-IQ4_XS.gguf",
-  "--max-context",
-  "65536",
   "--mtp-gguf",
   "/path/to/mtp-Qwen3.8-27B-Q4_0.gguf",
   "--mtp",

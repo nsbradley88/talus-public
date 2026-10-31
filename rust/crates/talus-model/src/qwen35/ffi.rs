@@ -186,6 +186,20 @@ struct LoadedKernels {
     // the opt-in W4A4 (iu4, integer group scales) prompt GEMM of src/prefill/tp_w4i.cu (optional symbols)
     w4i_pack: Option<W4iPackFn>,
     w4i_gemm: Option<W4iGemmFn>,
+    // the wide verify tiles' state and their tile-plane weight copies (optional symbols)
+    wide: Option<WideFns>,
+}
+
+/// `talus_mmvq_wide_*` (include/talus_kernels.h)
+#[derive(Clone, Copy)]
+struct WideFns {
+    active: unsafe extern "C" fn() -> c_int,
+    pack_mode: unsafe extern "C" fn() -> c_int,
+    note: unsafe extern "C" fn(c_int, *const c_void, c_int, c_int) -> c_int,
+    noted_bytes: unsafe extern "C" fn() -> u64,
+    pack_noted: unsafe extern "C" fn() -> c_int,
+    release: unsafe extern "C" fn(*const c_void),
+    packed_bytes: unsafe extern "C" fn() -> u64,
 }
 
 /// `talus_pf_w4i_pack(x, gate, T, K, ldx, signs, wg, xq, xk, xS, stream)`
@@ -267,7 +281,7 @@ fn load_kernels_once() -> &'static std::result::Result<LoadedKernels, String> {
         let (lib, chosen_path) = loaded_lib.ok_or(last_err)?;
 
         #[cfg(unix)]
-        let (set_w32, set_w32_waves, w32_config, w32_active, w4i_pack, w4i_gemm) = unsafe {
+        let (set_w32, set_w32_waves, w32_config, w32_active, w4i_pack, w4i_gemm, wide) = unsafe {
             let c_path = CString::new(chosen_path).ok();
             let handle = c_path
                 .as_ref()
@@ -286,6 +300,15 @@ fn load_kernels_once() -> &'static std::result::Result<LoadedKernels, String> {
             let p4 = resolve(b"_ZN6strata7kernels22native_mmvq_w32_activeEv\0");
             let p5 = resolve(b"talus_pf_w4i_pack\0");
             let p6 = resolve(b"talus_pf_w4i_gemm\0");
+            let pw = [
+                resolve(b"talus_mmvq_wide_active\0"),
+                resolve(b"talus_mmvq_wide_pack_mode\0"),
+                resolve(b"talus_mmvq_wide_note\0"),
+                resolve(b"talus_mmvq_wide_noted_bytes\0"),
+                resolve(b"talus_mmvq_wide_pack_noted\0"),
+                resolve(b"talus_mmvq_wide_release\0"),
+                resolve(b"talus_mmvq_wide_packed_bytes\0"),
+            ];
             (
                 if p1.is_null() {
                     None
@@ -329,11 +352,44 @@ fn load_kernels_once() -> &'static std::result::Result<LoadedKernels, String> {
                 } else {
                     Some(std::mem::transmute::<*mut c_void, W4iGemmFn>(p6))
                 },
+                if pw.iter().any(|p| p.is_null()) {
+                    None
+                } else {
+                    Some(WideFns {
+                        active: std::mem::transmute::<*mut c_void, unsafe extern "C" fn() -> c_int>(
+                            pw[0],
+                        ),
+                        pack_mode: std::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn() -> c_int,
+                        >(pw[1]),
+                        note: std::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(c_int, *const c_void, c_int, c_int) -> c_int,
+                        >(pw[2]),
+                        noted_bytes: std::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn() -> u64,
+                        >(pw[3]),
+                        pack_noted: std::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn() -> c_int,
+                        >(pw[4]),
+                        release: std::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(*const c_void),
+                        >(pw[5]),
+                        packed_bytes: std::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn() -> u64,
+                        >(pw[6]),
+                    })
+                },
             )
         };
         #[cfg(not(unix))]
-        let (set_w32, set_w32_waves, w32_config, w32_active, w4i_pack, w4i_gemm) =
-            (None, None, None, None, None, None);
+        let (set_w32, set_w32_waves, w32_config, w32_active, w4i_pack, w4i_gemm, wide) =
+            (None, None, None, None, None, None, None);
 
         Ok(LoadedKernels {
             lib,
@@ -343,8 +399,50 @@ fn load_kernels_once() -> &'static std::result::Result<LoadedKernels, String> {
             w32_active,
             w4i_pack,
             w4i_gemm,
+            wide,
         })
     })
+}
+
+fn wide_fns() -> Option<WideFns> {
+    load_kernels_once().as_ref().ok().and_then(|k| k.wide)
+}
+
+/// the wide verify tiles are on (gfx1151 default; TALUS_MMVQ_WIDE=0 is the kill switch).
+pub fn mmvq_wide_active() -> bool {
+    wide_fns().is_some_and(|f| unsafe { (f.active)() } != 0)
+}
+
+/// TALUS_MMVQ_WIDE_PACK as the library read it: -1 unset (auto), 0 never, 1 force.
+pub fn mmvq_wide_pack_mode() -> i32 {
+    wide_fns().map_or(0, |f| unsafe { (f.pack_mode)() })
+}
+
+/// note a 2-D weight matrix as a tile-plane copy candidate (load time; nothing is allocated).
+pub fn mmvq_wide_note(ggml_type: i32, w: *const c_void, n_in: i32, n_out: i32) -> bool {
+    wide_fns().is_some_and(|f| unsafe { (f.note)(ggml_type, w, n_in, n_out) } != 0)
+}
+
+/// bytes the noted copies would take.
+pub fn mmvq_wide_noted_bytes() -> usize {
+    wide_fns().map_or(0, |f| unsafe { (f.noted_bytes)() } as usize)
+}
+
+/// make every noted copy (allocates and synchronizes: before graph capture); returns how many.
+pub fn mmvq_wide_pack_noted() -> i32 {
+    wide_fns().map_or(0, |f| unsafe { (f.pack_noted)() })
+}
+
+/// bytes held by the copies.
+pub fn mmvq_wide_packed_bytes() -> usize {
+    wide_fns().map_or(0, |f| unsafe { (f.packed_bytes)() } as usize)
+}
+
+/// forget `w` (free its copy; no-op when there is none).
+pub fn mmvq_wide_release(w: *const c_void) {
+    if let Some(f) = wide_fns() {
+        unsafe { (f.release)(w) };
+    }
 }
 
 /// true when libtalus_kernels exports the W4A4 (tp_w4i) entry points.

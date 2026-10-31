@@ -2317,7 +2317,7 @@ struct WideQ8 {
     int n_mats;
     int H;
 };
-// PF (rc-glm, GLM_MVW_PF=0 = off): the 8 tokens' x loads of a K step issued together before their FMAs (the same
+// PF (GLM_MVW_PF=0 = off): the 8 tokens' x loads of a K step issued together before their FMAs (the same
 // expressions in the same order per accumulator: bitwise; the PF = false form waits for each token's loads in turn)
 template <int KS, int RW, bool PF = false>
 __global__ __launch_bounds__(256) void k_wide_q8_0(WideQ8 m, int n_in, int T) {
@@ -2775,7 +2775,7 @@ static bool tile_mv_launch(bool q8, const TileMV& m, int n_mats, int n_out_max, 
 
 namespace talus::prefill { extern int g_w16_ed16; }
 #include <utility>
-// rc-glm N2 (default ON, GLM_N2=0 = the fp32 wide kernels; output-changing: summation order only): the wide Q8_0 mat-vecs (MLA wk_b / wv_b per
+// N2 (default ON, GLM_N2=0 = the fp32 wide kernels; output-changing: summation order only): the wide Q8_0 mat-vecs (MLA wk_b / wv_b per
 // head, KDA f_b / g_b) as fp16 WMMA GEMMs. A = the Q8_0 codes (exact in fp16), B = x split into fp16 hi + lo
 // (x = hi + lo to ~22 bits; both products accumulate in fp32), each 32-value block's partial scaled by its d in fp32:
 // numerically an fp32 dot product with a different association. Tile 64 rows x 64 tokens per block, K by 32.
@@ -2885,7 +2885,7 @@ static bool wide_q8_launch(const WideQ8& m, int n_groups, int n_out_max, int n_i
     // For n_in > 512 (KDA f_a / g_a / beta, 4096 inputs), the register-resident form uses 128 weight VGPRs
     // with low occupancy and the same x traffic, so keep 8-token tiles.
     if (!glm_mv_wide_on() || n_in % 32 || n_in > 512) return false;
-    static const bool n2 = [] { const char* e = std::getenv("GLM_N2"); return !e || e[0] != '0'; }();   // default ON (rc-glm card; GLM_N2=0 = fp32 wide kernels)
+    static const bool n2 = [] { const char* e = std::getenv("GLM_N2"); return !e || e[0] != '0'; }();   // default ON (GLM_N2=0 = fp32 wide kernels)
     if (n2 && n_out_max % 64 == 0) {   // fp16 WMMA (default on, output-changing)
         const dim3 g((unsigned) (n_out_max / 64), (unsigned) ((T + 63) / 64), (unsigned) n_groups);
         hipLaunchKernelGGL(k_wide_q8_wmma, g, dim3(256), 0, st, m, n_in, T);
@@ -3275,7 +3275,7 @@ int tkg_hc_post_mix16(const float* xo, void* xhc, const float* pc, const void* w
 
 int tkg_hc_post_mix_moe16(const float* y, const float* w, const float* shexp, void* xhc, const float* pc,
                           const void* w_next, float* parts, int T, int k, int n_embd, int fmt, void* s) {
-    if (talus::prefill::g_w16_ed16) return err(hipErrorInvalidValue);   // rc-glm N4 is not combined with GLM_HC_BF16
+    if (talus::prefill::g_w16_ed16) return err(hipErrorInvalidValue);   // N4 is not combined with GLM_HC_BF16
     if (n_embd % (HC_NS * 2) || (fmt != 1 && fmt != 2)) return err(hipErrorInvalidValue);
     const dim3 g(HC_NS, T);
     if (fmt == 1)

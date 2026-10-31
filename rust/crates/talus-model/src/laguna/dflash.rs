@@ -92,6 +92,10 @@ pub struct LagunaDFlash {
     // top-16 candidates (ids, logits) per block row for sampled requests (DF_MAX_BLOCK x 16)
     bcand: *mut i32,
     bunary: *mut f32,
+    // confident-prefix verify (talus_spec::ConfPrefix): tk_q36_draft_conf scalars ([0] tau 0, [1] lmin -inf,
+    // [2] pick -1 as i32 bits) and outputs ([16, 32) conf, [32, 48) per-row top-1 probability); null when off
+    conf_dev: *mut f32,
+    conf_tops: Vec<f32>,
     q8_row: usize,
     // pinned host staging: [0, 16) block tokens, [16, 32) drafts out, [32, 32 + DF_POS_SLOTS) chunk positions
     host: *mut i32,
@@ -304,6 +308,16 @@ impl LagunaDFlash {
             let pos = alloc(16)? as *mut i32;
             let bcand = alloc(nb * 16 * 4)? as *mut i32;
             let bunary = alloc(nb * 16 * 4)? as *mut f32;
+            let conf_dev = if talus_spec::ConfPrefix::from_env("LAGUNA").active() {
+                let p = alloc(64 * 4)? as *mut f32;
+                let mut init = [0f32; 64];
+                init[1] = f32::NEG_INFINITY;
+                init[2] = f32::from_bits((-1i32) as u32);
+                hip.copy_h2d(p as *mut c_void, init.as_ptr() as *const c_void, 64 * 4)?;
+                p
+            } else {
+                std::ptr::null_mut()
+            };
             let q8_row = q8b(K_EMBD, 1);
             let host = hip.alloc_pinned((32 + DF_POS_SLOTS) * 4)? as *mut i32;
             Ok(Self {
@@ -344,6 +358,8 @@ impl LagunaDFlash {
                 pos,
                 bcand,
                 bunary,
+                conf_dev,
+                conf_tops: Vec::new(),
                 q8_row,
                 host,
                 g_draft: [std::ptr::null_mut(); DF_MAX_BLOCK + 1],
@@ -710,6 +726,48 @@ impl LagunaDFlash {
             self.g_draft[n] = ex;
         }
         res?;
+        // the drafter's top-1 probability per draft row (blogits row i = draft i), outside the graph
+        self.conf_tops.clear();
+        if !self.conf_dev.is_null() {
+            let ctx = eng.tk_ctx.as_ptr();
+            let cd = self.conf_dev;
+            for i in 0..k {
+                check_tk(
+                    ctx,
+                    unsafe {
+                        (eng.tk.tk_q36_draft_conf)(
+                            ctx,
+                            self.blogits.add(i * K_VOCAB) as *const f32,
+                            K_VOCAB as i32,
+                            cd as *const f32,
+                            cd.add(1) as *const f32,
+                            cd.add(2) as *const i32,
+                            std::ptr::null(),
+                            cd.add(16),
+                            cd.add(32),
+                            i as i32,
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            eng.s as tk_stream,
+                        )
+                    },
+                    "tk_q36_draft_conf(laguna dflash)",
+                )?;
+            }
+            self.conf_tops.resize(k, 0.0);
+            check_hip(
+                unsafe {
+                    (eng.hip.hipMemcpyAsync)(
+                        self.conf_tops.as_mut_ptr() as *mut c_void,
+                        cd.add(32) as *const c_void,
+                        k * 4,
+                        HipRuntime::MEMCPY_D2H,
+                        eng.s,
+                    )
+                },
+                "hipMemcpyAsync(dflash conf)",
+            )?;
+        }
         check_hip(
             unsafe {
                 (eng.hip.hipMemcpyAsync)(
@@ -732,6 +790,12 @@ impl LagunaDFlash {
         self.n_rounds += 1;
         self.n_drafted += k as u64;
         Ok(k)
+    }
+
+    /// the drafter's top-1 probability of each row of the last [`Self::draft`] (empty unless a
+    /// confident-prefix switch or its trace is on; talus_spec::ConfPrefix).
+    pub fn last_tops(&self) -> &[f32] {
+        &self.conf_tops
     }
 
     /// the top-16 head candidates `(token id, logit)` of each of the `k` rows the last [`Self::draft`]

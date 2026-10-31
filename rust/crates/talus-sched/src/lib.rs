@@ -178,6 +178,22 @@ impl CancelToken {
     }
 }
 
+/// Non-empty protocol lines queued and not yet taken, over every [`RequestQueue`] of the process.
+static LINES_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// True when a request line has arrived and waits for the engine thread (e.g. the next GEN arrived while the
+/// engine still does after-reply work such as staging a prompt-cache disk write, which it can then skip).
+pub fn requests_waiting() -> bool {
+    LINES_WAITING.load(Ordering::Acquire) > 0
+}
+
+fn took_line(line: &Option<String>) {
+    if line.as_deref().is_some_and(|l| !l.is_empty()) {
+        // every non-empty line was counted when it was pushed
+        LINES_WAITING.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[derive(Debug, Default)]
 struct RequestQueueState {
     lines: VecDeque<String>,
@@ -230,6 +246,7 @@ impl RequestQueue {
                 self.cancel.reset();
             }
             st.active_or_queued += 1;
+            LINES_WAITING.fetch_add(1, Ordering::AcqRel);
         }
         st.lines.push_back(line.to_string());
         cv.notify_one();
@@ -250,14 +267,18 @@ impl RequestQueue {
         while !st.eof && st.lines.is_empty() {
             st = cv.wait(st).unwrap();
         }
-        st.lines.pop_front()
+        let line = st.lines.pop_front();
+        took_line(&line);
+        line
     }
 
     /// Attempts to pop a queued line without blocking.
     pub fn try_pop_line(&self) -> Option<String> {
         let (mu, _) = &*self.inner;
         let mut st = mu.lock().unwrap();
-        st.lines.pop_front()
+        let line = st.lines.pop_front();
+        took_line(&line);
+        line
     }
 
     /// Marks one non-empty dequeued request as completed and resets the cancel token for the next request.

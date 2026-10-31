@@ -140,11 +140,45 @@ bool native_mmvq_xt(int ggml_type, const void* weights, const void* x_q8_1, floa
                     void* stream);
 bool native_mmvq_w32(int ggml_type, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                      void* stream);
+/// 27B verify widths: `ncols` (1..16) columns of IQ4_XS / IQ3_S / IQ3_XXS / IQ2_XS / IQ2_S / Q4_K / Q5_K in one
+/// launch on the gfx11 matrix cores, 16 rows x 16 columns a block, every column bitwise the single-column wave32 result.
+/// On by default on gfx1151 for a process whose model loader opts in (the 27B's, by native_mmvq_tw_note at load), for
+/// the (type, columns, shape) cells of the per-arch table; TALUS_MMVQ_WIDE=0 is the kill switch, =1 turns it on for
+/// every caller; TALUS_MMVQ_WIDE_TAB overrides cells.  Returns false (nothing launched) where it does not apply.
+bool native_mmvq_tw(int ggml_type, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                    void* stream);
+/// The same for n (1..3) matrices of one type with one input (gate + up, qkv + z) in one launch.
+bool native_mmvq_tw_multi(int ggml_type, int n, const void* const* w, float* const* y, const int* n_out,
+                          const void* x_q8_1, int n_in, int ncols, void* stream);
+/// The tile-plane copies (the same bytes, permuted; talus_wide_fmt.hpp) the tiles read instead of the GGUF rows where the
+/// table says so.  They cost the matrices' bytes again (27B: +13.0 GB), so the engine decides: native_mmvq_tw_note at
+/// load for every matrix (false: not covered / tiles off / TALUS_MMVQ_WIDE_PACK=0), then, after its context and int8
+/// prompt weights are placed, native_mmvq_tw_pack_noted when native_mmvq_tw_noted_bytes fit (TALUS_MMVQ_WIDE_PACK unset:
+/// auto, 1: force, 0: never; native_mmvq_tw_pack_mode -1 / 1 / 0).  Packing allocates and synchronizes: load time
+/// only, never during graph capture.  native_mmvq_tw_prepare: one explicit copy (benches).
+bool native_mmvq_tw_active();
+int native_mmvq_tw_pack_mode();
+bool native_mmvq_tw_pack_enabled();
+bool native_mmvq_tw_note(int ggml_type, const void* weights, int n_in, int n_out);
+std::size_t native_mmvq_tw_noted_bytes();
+int native_mmvq_tw_pack_noted();
+bool native_mmvq_tw_prepare(int ggml_type, const void* weights, int n_in, int n_out);
+void native_mmvq_tw_release(const void* weights);
+std::size_t native_mmvq_tw_packed_bytes();
+/// Benches: force the mode of every covered call (-1: the table, 0: off, 1: GGUF rows, 2: packed copy when registered;
+/// 3 = one row per lane (dp4a, wave-uniform activations; packed copy only, else not taken), 4 = the tiles
+/// with the decode split between the half-waves (packed copy when registered)).  TALUS_MMVQ_WIDE_TAB takes the same modes.
+void native_mmvq_tw_set(int mode);
+
 // mode 0 off, 1 on; rows per wave (0: the table).  For benches; set before graph capture.
 void native_mmvq_set_w32(int mode, int rows);
 // Talus: force the waves-per-EU cap of the w32 instances (-1: the per-arch table), and read the (R, W)
 // the table picks for a (type, column count)
 void native_mmvq_set_w32_waves(int w);
+/// the w32 kernels' (2..8 columns, gfx1151 table cells) tsum epilogue - same bits, fewer cross-lane moves.
+/// -1 = TALUS_MMVQ_W32_TS (unset = on where a model loader opted in to the wide tiles - the 27B; 0 = the kill switch,
+/// 1 = on for every caller), 0 off, 1 on.  For benches; before capture.
+void native_mmvq_set_w32_ts(int mode);
 void native_mmvq_w32_config(int type, int ncols, int* r, int* w);
 /// Talus: n (1..3) matrices of type ggml_type with the same input in one launch (each as native_mmvq_w32 computes it);
 /// false when not available (STRATA_MMVQ_MULTI=0, a type without wave32 kernels): the caller launches them one by one.

@@ -116,6 +116,90 @@ pub fn att_chunk_count(ctx: i32, ck: i32) -> i32 {
     (small + 127) / 128 + (rest + cs - 1) / cs
 }
 
+/// The 27B's memory budget: `talus_mem::Budget::strix_default()` (8 GiB `MemAvailable` floor), capped at
+/// `TALUS_MEM_LIMIT_MIB` when set (an operator cap: the engine then plans as if the machine had that much memory in
+/// total; used to check smaller boxes, e.g. 64 GB, on a 128 GB one).
+pub fn q27_budget() -> talus_mem::Budget {
+    let cap_mib = std::env::var("TALUS_MEM_LIMIT_MIB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    if cap_mib > 0 {
+        talus_mem::Budget::new(talus_mem::LinuxProcMemProbe::new().with_memory_limit_mib(cap_mib))
+    } else {
+        talus_mem::Budget::strix_default()
+    }
+}
+
+/// Context-scaled device bytes per token of `--max-context`: K + transposed V (+ the std-layout V when a
+/// legacy prompt-attention path needs it, #29) for every attention state (attention layers + the MTP layer), plus
+/// the prompt-attention score scratch (16 x n_head f32 + f16 per token).
+pub fn q27_bytes_per_token(model: &Q36Model) -> usize {
+    let g = &model.g;
+    let n_state = model
+        .layers
+        .iter()
+        .take(g.n_layer as usize)
+        .filter(|l| l.is_attn)
+        .count()
+        + usize::from(model.has_mtp);
+    let tp_fa = model.opts.use_fattn
+        && talus_pf_fa_prefill_ok(g.head_dim as i32, g.n_head as i32, g.n_head_kv as i32)
+        && std::env::var("TALUS_PF_FA")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+    let vc = !tp_fa
+        || std::env::var("TALUS_Q27_VC")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+    let row = (g.kv_dim() as usize) * 2;
+    n_state * row * if vc { 3 } else { 2 } + 16 * (g.n_head as usize) * 6
+}
+
+/// Context ladder for the 27B when no `--max-context` is given.
+pub const Q27_AUTO_CONTEXTS: [i32; 3] = [262_144, 131_072, 65_536];
+/// Reserve beside the weights, the int8 expansion and the KV cache: drafter (DFlash2 + its window), scratch,
+/// graphs, the first prompt-cache snapshots (GiB).
+pub const Q27_AUTO_RESERVE_GIB: f64 = 3.0;
+
+/// Pick the 27B's context when no `--max-context` is given: the largest of 256K / 128K / 64K whose
+/// KV cache fits in the memory budget beside the loaded weights and the int8 prompt expansion (`tp_i8x`, skipped
+/// with a warning when it does not fit). Call after `Q36Model::load` (weights resident). Returns the context and
+/// a one-line reason.
+pub fn q27_auto_context(model: &Q36Model) -> (i32, String) {
+    let gib = |b: f64| b / f64::from(1u32 << 30);
+    let budget = q27_budget();
+    let head = budget.headroom_bytes() as f64;
+    let i8 = i8x_candidates(model).1 as f64;
+    let per_tok = q27_bytes_per_token(model) as f64;
+    let reserve = Q27_AUTO_RESERVE_GIB * f64::from(1u32 << 30);
+    let need = |c: i32| i8 + per_tok * f64::from(c) + reserve;
+    let pick = Q27_AUTO_CONTEXTS
+        .iter()
+        .copied()
+        .find(|&c| need(c) <= head)
+        .unwrap_or(Q27_AUTO_CONTEXTS[Q27_AUTO_CONTEXTS.len() - 1]);
+    let why = format!(
+        "context {pick} (auto, no --max-context): {:.1} GiB free above the {:.0} GiB floor; needs {:.1} GiB = int8 \
+         prompt weights {:.1} + KV {:.0} KiB/token x {pick} ({:.1}) + reserve {:.0}{}",
+        gib(head),
+        gib(budget.floor_bytes() as f64),
+        gib(need(pick)),
+        gib(i8),
+        per_tok / 1024.0,
+        gib(per_tok * f64::from(pick)),
+        Q27_AUTO_RESERVE_GIB,
+        if need(pick) > head {
+            "; does not fit even at the smallest step (the int8 expansion will be skipped)"
+        } else if pick < Q27_AUTO_CONTEXTS[0] {
+            "; 256K would not fit beside the int8 weights (set --max-context to choose)"
+        } else {
+            ""
+        }
+    );
+    (pick, why)
+}
+
 #[inline]
 pub(crate) fn hip_alloc_zeroed<T>(count: usize, allocs: &mut Vec<*mut c_void>) -> Result<*mut T> {
     let bytes = (count * std::mem::size_of::<T>()).max(16);
@@ -274,6 +358,8 @@ pub struct Q36Engine {
     // Talus prefill: expanded int8 trunk cache, budget guard, GDN [alpha; beta] rows, tp_fa / tp_fuse
     pub budget: talus_mem::Budget,
     pub i8c: I8Cache,
+    /// the budget reservation of the wide verify tiles' tile-plane weight copies (None: no copies)
+    pub wide_guard: Option<talus_mem::ReservationGuard>,
     /// opt-in W4A4 FFN prompt GEMMs (`TALUS_Q27_W4I`), empty by default
     pub w4i: super::w4i::W4iCache,
     pub ab_w: Vec<*mut f32>,
@@ -563,8 +649,9 @@ impl Q36Engine {
             dq_bounds_t: 0,
             sk_part: ptr::null_mut(),
             sk_part_elems: 0,
-            budget: talus_mem::Budget::strix_default(),
+            budget: q27_budget(),
             i8c: I8Cache::default(),
+            wide_guard: None,
             w4i: super::w4i::W4iCache::default(),
             ab_w: Vec::new(),
             ab_tmp: ptr::null_mut(),
@@ -825,6 +912,22 @@ impl Q36Engine {
         let kv_elems = (ctx_len as usize) * (g.kv_dim() as usize) + 256 * (g.head_dim as usize);
         let vt_elems = (self.vt_ctx as usize) * (g.kv_dim() as usize);
 
+        // TALUS_PF_FA=1 is the default on the Rust 27B host; TALUS_PF_FA=0 restores the legacy path.
+        self.tp_fa = self.opts.use_fattn
+            && talus_pf_fa_prefill_ok(g.head_dim as i32, g.n_head as i32, g.n_head_kv as i32)
+            && std::env::var("TALUS_PF_FA")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        // the std-layout f16 V copy `vc` is read only by the legacy prefill paths
+        // (TALUS_PF_FA=0 / STRATA_FATTN=0 / an unsupported head shape: tk_attn_prefill_fa and the BLAS prefill) and
+        // by --attn-test.  Default decode (tk_q36_attn_wmma) and prefill (talus_pf_fa_prefill) read kc + vtc only, so
+        // `vc` is not allocated unless one of those paths is selected (TALUS_Q27_VC=1 forces it).  Saves 32 KiB/token
+        // (8 GiB at 256K); null `vc` is skipped by tk_q36_attn_prep, kv_copy and the stash.
+        let need_vc = !self.tp_fa
+            || std::env::var("TALUS_Q27_VC")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+
         self.kc.resize(self.n_attn_state as usize, ptr::null_mut());
         self.vc.resize(self.n_attn_state as usize, ptr::null_mut());
         self.vtc.resize(self.n_attn_state as usize, ptr::null_mut());
@@ -834,7 +937,9 @@ impl Q36Engine {
             .resize(self.n_attn_state as usize, ptr::null_mut());
         for i in 0..(self.n_attn_state as usize) {
             self.kc[i] = hip_alloc_zeroed::<u16>(kv_elems, &mut self.allocs)?;
-            self.vc[i] = hip_alloc_zeroed::<u16>(kv_elems, &mut self.allocs)?;
+            if need_vc {
+                self.vc[i] = hip_alloc_zeroed::<u16>(kv_elems, &mut self.allocs)?;
+            }
             self.vtc[i] = hip_alloc_zeroed::<u16>(vt_elems, &mut self.allocs)?;
             self.k_cache[i] = self.kc[i].cast::<c_void>();
             self.v_cache[i] = self.vc[i].cast::<c_void>();
@@ -964,12 +1069,6 @@ impl Q36Engine {
             }
         }
 
-        // TALUS_PF_FA=1 is the default on the Rust 27B host; TALUS_PF_FA=0 restores the legacy path.
-        self.tp_fa = self.opts.use_fattn
-            && talus_pf_fa_prefill_ok(HD as i32, H as i32, g.n_head_kv as i32)
-            && std::env::var("TALUS_PF_FA")
-                .map(|v| v != "0")
-                .unwrap_or(true);
         self.tp_fuse = std::env::var("TALUS_PF_FUSE")
             .map(|v| v != "0")
             .unwrap_or(true);
@@ -1005,6 +1104,7 @@ impl Q36Engine {
                 self.tp_levers_init(model)?;
                 self.w4i_init(model);
             }
+            self.wide_pack_init();
         } else {
             let K_used = g.n_expert_used as usize;
             let NE = g.n_expert as usize;
@@ -1442,39 +1542,7 @@ impl Q36Engine {
             return Ok(());
         }
 
-        type I8Candidate = (usize, *const u8, i32, i32, i32, i32, usize, usize);
-        let mut candidates: Vec<I8Candidate> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut total_bytes = 0usize;
-        for L in &model.layers {
-            let mats = [
-                &L.wqkv,
-                &L.wgate,
-                &L.ssm_out_mat,
-                &L.wq_mat,
-                &L.wk_mat,
-                &L.wv_mat,
-                &L.wo_mat,
-                &L.ffn_gate_mat,
-                &L.ffn_up_mat,
-                &L.ffn_down_mat,
-            ];
-            for w in mats {
-                if w.is_null() {
-                    continue;
-                }
-                let key = w.d as usize;
-                if !seen.insert(key) {
-                    continue;
-                }
-                let raw_qt = w.raw_qtype();
-                let mode = talus_pf_i8x_mode(raw_qt);
-                if let Some((qb, wb)) = talus_pf_i8x_bytes(w.n_out, w.n_in, mode) {
-                    total_bytes += qb + wb;
-                    candidates.push((key, w.d, raw_qt, w.n_out, w.n_in, mode, qb, wb));
-                }
-            }
-        }
+        let (candidates, total_bytes) = i8x_candidates(model);
         if candidates.is_empty() || total_bytes == 0 {
             return Ok(());
         }
@@ -1488,13 +1556,133 @@ impl Q36Engine {
             Ok(g) => g,
             Err(e) => {
                 eprintln!(
-                    "talus-cli: skipping tp_i8x expansion ({:.2} GiB): budget check refused ({e})",
-                    (total_bytes as f64) / ((1usize << 30) as f64)
+                    "talus-cli: WARN: int8 prompt weights ({:.1} GiB) do not fit beside the {}-token KV cache: prompts \
+                     run on the slower MMQ path. A smaller --max-context, or TALUS_PF_I8=0 \
+                     to skip the expansion on purpose, trades this off. ({e})",
+                    (total_bytes as f64) / ((1usize << 30) as f64),
+                    self.ctx_len
                 );
                 return Ok(());
             }
         };
+        self.tp_i8x_expand(candidates, guard)
+    }
+}
 
+impl Q36Engine {
+    /// place the wide verify tiles' tile-plane weight copies (+13.0 GiB on the 27B) after the context (KV
+    /// cache) and the int8 prompt weights. Priority: context > int8 prompt weights > copies - the copies take only
+    /// what is left above the budget floor beside the reserve (`Q27_AUTO_RESERVE_GIB`: drafter, scratch, graphs), so
+    /// neither the automatic context nor the int8 expansion ever shrinks for them. Without the copies the tiles read
+    /// the GGUF rows (16-row pass 100.8 ms instead of 93.6; wave32 134). TALUS_MMVQ_WIDE_PACK=1 forces them, =0 skips
+    /// them, TALUS_MMVQ_WIDE=0 turns the tiles off. One log line says what was decided and why.
+    pub fn wide_pack_init(&mut self) {
+        let gib = |b: usize| (b as f64) / ((1usize << 30) as f64);
+        if !mmvq_wide_active() {
+            eprintln!("talus-cli: wide verify tiles off (TALUS_MMVQ_WIDE=0, or not gfx1151): wave32 mat-vecs");
+            return;
+        }
+        let mode = mmvq_wide_pack_mode();
+        let need = mmvq_wide_noted_bytes();
+        if mode == 0 || need == 0 {
+            eprintln!(
+                "talus-cli: wide verify tiles on (TALUS_MMVQ_WIDE=0: off), tile-plane copies off{}",
+                if mode == 0 {
+                    " (TALUS_MMVQ_WIDE_PACK=0)"
+                } else {
+                    " (no candidate matrix)"
+                }
+            );
+            return;
+        }
+        let reserve = (Q27_AUTO_RESERVE_GIB * f64::from(1u32 << 30)) as usize;
+        let head = self.budget.headroom_bytes();
+        let fits = need + reserve <= head;
+        if !fits && mode != 1 {
+            eprintln!(
+                "talus-cli: wide verify tiles on without tile-plane copies: they need {:.1} GiB + {:.0} GiB reserve, \
+                 {:.1} GiB free beside the weights, the {}-token KV cache and the int8 prompt weights \
+                 (priority: context > int8 prompt weights > copies; TALUS_MMVQ_WIDE_PACK=1 forces them)",
+                gib(need),
+                Q27_AUTO_RESERVE_GIB,
+                gib(head),
+                self.ctx_len
+            );
+            return;
+        }
+        let guard = self.budget.try_reserve_guard(
+            talus_mem::BudgetCategory::Weights,
+            "mmvq_wide_tile_copies",
+            need,
+        );
+        let n = mmvq_wide_pack_noted();
+        let held = mmvq_wide_packed_bytes();
+        if let Ok(g) = guard {
+            let _ = self.budget.mark_materialized(g.id());
+            self.wide_guard = Some(g);
+        }
+        eprintln!(
+            "talus-cli: wide verify tiles on with tile-plane copies of {n} matrices, {:.1} GiB ({}; {:.1} GiB was \
+             free beside the weights, the {}-token KV cache and the int8 prompt weights; TALUS_MMVQ_WIDE_PACK=0: off)",
+            gib(held),
+            if fits { "auto: they fit with the reserve" } else { "forced by TALUS_MMVQ_WIDE_PACK=1" },
+            gib(head),
+            self.ctx_len
+        );
+    }
+}
+
+type I8Candidate = (usize, *const u8, i32, i32, i32, i32, usize, usize);
+
+/// The dense trunk matrices tp_i8x expands and their total bytes (0 when TALUS_PF_I8=0).
+fn i8x_candidates(model: &Q36Model) -> (Vec<I8Candidate>, usize) {
+    let mut candidates: Vec<I8Candidate> = Vec::new();
+    if !std::env::var("TALUS_PF_I8")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+    {
+        return (candidates, 0);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut total_bytes = 0usize;
+    for L in &model.layers {
+        let mats = [
+            &L.wqkv,
+            &L.wgate,
+            &L.ssm_out_mat,
+            &L.wq_mat,
+            &L.wk_mat,
+            &L.wv_mat,
+            &L.wo_mat,
+            &L.ffn_gate_mat,
+            &L.ffn_up_mat,
+            &L.ffn_down_mat,
+        ];
+        for w in mats {
+            if w.is_null() {
+                continue;
+            }
+            let key = w.d as usize;
+            if !seen.insert(key) {
+                continue;
+            }
+            let raw_qt = w.raw_qtype();
+            let mode = talus_pf_i8x_mode(raw_qt);
+            if let Some((qb, wb)) = talus_pf_i8x_bytes(w.n_out, w.n_in, mode) {
+                total_bytes += qb + wb;
+                candidates.push((key, w.d, raw_qt, w.n_out, w.n_in, mode, qb, wb));
+            }
+        }
+    }
+    (candidates, total_bytes)
+}
+
+impl Q36Engine {
+    fn tp_i8x_expand(
+        &mut self,
+        candidates: Vec<I8Candidate>,
+        guard: talus_mem::ReservationGuard,
+    ) -> Result<()> {
         let stream = self.s_main.cast::<c_void>();
         for (key, w_ptr, raw_qt, n_out, n_in, mode, qb, wb) in candidates {
             let qs = match hip_malloc_bytes(qb) {
@@ -4059,7 +4247,10 @@ impl Q36Engine {
         let HKV = g.n_head_kv as usize;
         let HD = g.head_dim as usize;
         let vp = ((n_pos as usize) + 15) / 16 * 16;
-        (self.n_attn_state as usize) * HKV * (2 * (n_pos as usize) + vp) * HD * 2
+        let na = self.n_attn_state as usize;
+        // the std-layout V block only for states that hold `vc` (not allocated by default, #29)
+        let nv = self.vc.iter().take(na).filter(|p| !p.is_null()).count();
+        (na * HKV * ((n_pos as usize) + vp) + nv * HKV * (n_pos as usize)) * HD * 2
     }
 
     /// Copy KV caches for `n_pos` positions to/from `buf` (`Engine::kv_copy`).
@@ -4090,13 +4281,15 @@ impl Q36Engine {
                     }
                     p = p.add(hb);
 
-                    let v_ptr = self.vc[s].add(h * (self.ctx_len as usize) * HD);
-                    if to_host {
-                        let _ = hipMemcpy(p.cast::<c_void>(), v_ptr.cast::<c_void>(), hb, kind);
-                    } else {
-                        let _ = hipMemcpy(v_ptr.cast::<c_void>(), p.cast::<c_void>(), hb, kind);
+                    if !self.vc[s].is_null() {
+                        let v_ptr = self.vc[s].add(h * (self.ctx_len as usize) * HD);
+                        if to_host {
+                            let _ = hipMemcpy(p.cast::<c_void>(), v_ptr.cast::<c_void>(), hb, kind);
+                        } else {
+                            let _ = hipMemcpy(v_ptr.cast::<c_void>(), p.cast::<c_void>(), hb, kind);
+                        }
+                        p = p.add(hb);
                     }
-                    p = p.add(hb);
 
                     let vt_ptr = self.vtc[s].add(h * (self.vt_ctx as usize) * HD);
                     if to_host {
@@ -4268,6 +4461,24 @@ impl Q36Engine {
 
     /// Run attention WMMA vs scalar reference self-test (`Engine::attn_selftest`).
     pub fn attn_selftest(&mut self) -> bool {
+        // the scalar reference (tk_q36_attn_part) reads the std-layout V copy, which is not allocated by default
+        if self.vc.first().is_some_and(|p| p.is_null()) {
+            let kv_elems = {
+                let g = &self.model().g;
+                (self.ctx_len as usize) * (g.kv_dim() as usize) + 256 * (g.head_dim as usize)
+            };
+            match hip_alloc_zeroed::<u16>(kv_elems, &mut self.allocs) {
+                Ok(p) => {
+                    self.vc[0] = p;
+                    self.v_cache[0] = p.cast::<c_void>();
+                }
+                Err(e) => {
+                    eprintln!("attn_selftest: vc alloc failed: {e}");
+                    return false;
+                }
+            }
+        }
+
         let g = &self.model().g;
         let H = g.n_head as i32;
         let HKV = g.n_head_kv as i32;

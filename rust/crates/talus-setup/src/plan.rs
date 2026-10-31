@@ -35,7 +35,10 @@ pub fn predicted_free_gib(m: &ModelInstall, sys: &SysInfo) -> f64 {
     let used_now = (total - sys.mem_avail_gib()).max(0.0);
     let extra = (used_now - HEADLESS_USED_GIB).max(0.0);
     let short = (REF_TOTAL_GIB - total).max(0.0);
-    m.release_free_gib as f64 - extra - short
+    // a smaller machine also gets a shorter automatic context (the 27B: down to 64K), and the engine drops its
+    // optional speed copies (the 27B's wide tile-plane copies) first when memory is short or other programs use it
+    let loss = extra + (short - m.auto_context_gib as f64).max(0.0);
+    m.release_free_gib as f64 - (loss - m.auto_pack_gib as f64).max(0.0)
 }
 
 /// Whether `m` fits now. `pool_ok`: the GPU memory pool is already raised (only matters for the models that need it).
@@ -177,7 +180,15 @@ mod tests {
             live_fit(id("laguna-s-2.1"), &busy, true),
             Fit::NotNow(_)
         ));
-        assert_eq!(live_fit(id("qwen3.8-27b"), &busy, true), Fit::Tight);
+        // the 27B's 256K default context needs about 12 GiB more than the old 64K
+        assert!(matches!(
+            live_fit(id("qwen3.8-27b"), &busy, true),
+            Fit::NotNow(_)
+        ));
+        assert_eq!(
+            live_fit(id("qwen3.8-27b"), &sys(125.0, 78.0), true),
+            Fit::Tight
+        );
     }
 
     #[test]

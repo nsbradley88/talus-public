@@ -512,7 +512,7 @@ struct MqArgs {
     int64_t ldd = 0;
     float limit = 0.0f;
     int n_experts = 0;               // CMP: the experts behind bounds (the compact item grid scans them)
-    // CMP only (rc-glm GLM entries): src = the activation row of routed row r is xq row src[r] (xq quantized once per
+    // CMP only (GLM entries): src = the activation row of routed row r is xq row src[r] (xq quantized once per
     // token, not per route; xstride then spans the token rows); hq (GU) = the SwiGLU rows quantized in the kernel to
     // MMQ q8_1 D4 blocks at the routed (sorted) row, quantize_mmq_q8_1's arithmetic (127 / amax per 32 values),
     // hq_stride bytes between 128-feature blocks; dst unused then
@@ -520,11 +520,11 @@ struct MqArgs {
     uint8_t* hq = nullptr;
     uint32_t hq_stride = 0;
     int ft = 0;                      // CMP: full items take the token-tile loop without exits (TALUS_W16_FT=1)
-    int dst16 = 0;                   // CMP down: dst rows written as fp16 (rc-glm N4, GLM_N4=1; output-changing)
+    int dst16 = 0;                   // CMP down: dst rows written as fp16 (N4, GLM_N4=1; output-changing)
 };
 constexpr int MQ_XB = 144;   // block_q8_1_mmq
 
-// CMP (rc-glm, MQ only; bitwise the CMP = false kernel): a compact work-item grid (blockIdx.x = weight block, blockIdx.y =
+// CMP (MQ only; bitwise the CMP = false kernel): a compact work-item grid (blockIdx.x = weight block, blockIdx.y =
 // the item among all experts' BM-row chunks, found by a block-wide scan of the bounds; no blocks per (expert, empty
 // chunk)), the item found before the LDS tables are built (blocks past the last item exit at once), the table init
 // unrolled (its global loads in flight together), and the rows' range scale read with all threads in flight (the max
@@ -1156,7 +1156,7 @@ bool moe_gemm_w16(const MoeProduct& p, void* stream, bool force) {
     const int bm = env_bm == 64 ? 64 : env_bm == 128 ? 128 : (mean >= 64 ? 128 : 64);
     const hipStream_t s = (hipStream_t) stream;
     const dim3 grid((unsigned) ((p.max_rows + bm - 1) / bm), (unsigned) (p.n / (gu ? 128 : 256)), (unsigned) p.n_experts);
-    // rc-glm compact item grid (TALUS_W16_CMP=0: the per-(expert, chunk) grid above; bitwise the same products): x = weight
+    // compact item grid (TALUS_W16_CMP=0: the per-(expert, chunk) grid above; bitwise the same products): x = weight
     // block (the blocks sharing an item's activation rows run together), y = item; sum over experts of ceil(rows / bm)
     // <= total_rows / bm + n_experts
     static const bool cmp = [] { const char* v = std::getenv("TALUS_W16_CMP"); return v == nullptr || v[0] != '0'; }();
@@ -1237,7 +1237,7 @@ int w16_bb(int t) { return t == GGML_TYPE_IQ2_S ? 82 : 110; }
 
 }  // namespace talus::prefill
 
-// rc-glm GLM entries (tkg_ prefix: looked up as optional symbols by the GLM engine). Return 0 = launched, -1 = not
+// GLM entries (tkg_ prefix: looked up as optional symbols by the GLM engine). Return 0 = launched, -1 = not
 // covered (nothing launched: the caller runs the tp_moe path), > 0 = HIP error.
 // gu_q8: fused gate/up + clamped SwiGLU over the routed rows; activation row r = xq row src[r] (xq: MMQ q8_1 D4 rows of
 // the n_src_rows tokens); output = MMQ q8_1 D4 rows (n_ff wide) at the routed rows into hq (bitwise tp_moe's

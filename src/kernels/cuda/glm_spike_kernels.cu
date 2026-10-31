@@ -1829,7 +1829,7 @@ void glm_kda_step_v2_kernel(
     }
 }
 
-// rc-glm v3 KDA step: v2's arithmetic expression for expression (bitwise v2), software-pipelined for prompt windows:
+// v3 KDA step: v2's arithmetic expression for expression (bitwise v2), software-pipelined for prompt windows:
 // wave 0 holds the next token's raw q / k / g / beta in registers (loaded one token ahead) and every wave its next
 // v values, so a token step waits for no global load (v2: two dependent global round trips per token).
 template <int CPW, int NWV>
@@ -3312,7 +3312,7 @@ hipError_t glm_kda_step(
     }
     if (cols_per_wave >= 10000) {   // GLM HIP v2: 10000 + 100 * waves per WG + columns per wave
         const int nwv = (cols_per_wave - 10000) / 100, cpw = cols_per_wave % 100;
-        // rc-glm v3 (bitwise v2, pipelined loads) for prompt windows (T > 8 per sequence); GLM_KDA_V3=0: v2
+        // v3 (bitwise v2, pipelined loads) for prompt windows (T > 8 per sequence); GLM_KDA_V3=0: v2
         static const bool v3 = [] { const char* e = std::getenv("GLM_KDA_V3"); return e == nullptr || e[0] != '0'; }();
         if (v3 && T / n_B > 8 && cpw == 8 && nwv == 8) {
             const dim3 grid(static_cast<uint32_t>(H), static_cast<uint32_t>(S_v / 64), static_cast<uint32_t>(n_B));
@@ -3431,7 +3431,7 @@ bool li_v1_dispatch(const GlmLiCfg& c, const float* q, const void* k, const floa
 }
 } // namespace
 
-// rc-glm N3 (default ON, GLM_N3=0 = the fp32 indexer kernels; output-changing): prompt-window lightning indexer as fp16 WMMA. score[t][key] =
+// N3 (default ON, GLM_N3=0 = the fp32 indexer kernels; output-changing): prompt-window lightning indexer as fp16 WMMA. score[t][key] =
 // sum_h w[t][h] relu(q[t][h] . k[key]); q rounded to fp16 (k is the f16 pooled cache), products accumulated in fp32.
 // Block: 4 tokens x 64 keys; wave w: token w / 2, keys 32 (w & 1) .. + 31 (2 tiles), all 32 heads (2 tiles).
 typedef _Float16 n3h16 __attribute__((ext_vector_type(16)));
@@ -3511,8 +3511,8 @@ hipError_t glm_dsa_lightning_indexer_cfg(
     hipStream_t stream)
 {
     if (D != 128) return hipErrorInvalidValue;
-    static const bool n3 = [] { const char* e = std::getenv("GLM_N3"); return !e || e[0] != '0'; }();   // default ON (rc-glm card; GLM_N3=0 = fp32 indexer)
-    if (n3 && !cfg && k_is_f16 && H == 32 && n_tokens > 8) {   // rc-glm N3 (default on, output-changing)
+    static const bool n3 = [] { const char* e = std::getenv("GLM_N3"); return !e || e[0] != '0'; }();   // default ON (GLM_N3=0 = fp32 indexer)
+    if (n3 && !cfg && k_is_f16 && H == 32 && n_tokens > 8) {   // N3 (default on, output-changing)
         const dim3 grid(static_cast<uint32_t>((n_kv + 63) / 64), static_cast<uint32_t>((n_tokens + 3) / 4), static_cast<uint32_t>(n_streams));
         hipLaunchKernelGGL(glm_dsa_li_wmma_kernel, grid, dim3(256), 0, stream, q, static_cast<const __half*>(k), w, dst,
                            static_cast<uint32_t>(n_kv), static_cast<uint32_t>(n_tokens));

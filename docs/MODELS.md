@@ -47,26 +47,28 @@ Dense model with gated delta net and attention layers. Engine `qwen35`.
 
 | | |
 |---|---|
-| Weights | `Qwen3.8-27B-UD-IQ4_XS.gguf` from [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) (about 14 GB). `UD-Q4_K_XL` also runs. |
+| Weights | `Qwen3.8-27B-UD-IQ4_XS.gguf` from [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) (about 14 GB, the default). `UD-Q4_K_XL` (about 17 GB) from the same repository is a supported quality option: see **Choosing the quant** below. |
 | MTP head | `MTP/mtp-Qwen3.8-27B-Q4_0.gguf` from the same repository (about 1.3 GB) |
 | DFlash2 drafter | `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` from [z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF), z-lab's block-diffusion drafter (about 1.1 GB) |
 | Draft vocabulary | `qwen-dv-65536.bin` ([j2ipper/draft-vocab](https://huggingface.co/j2ipper/draft-vocab)): 64K token ids in llama.cpp's int32 format |
 | 4-bit prompt weights | `Qwen3.8-27B-UD-IQ4_XS.w4i` ([j2ipper/Qwen3.8-27B-W4A4-prompt](https://huggingface.co/j2ipper/Qwen3.8-27B-W4A4-prompt), about 2.0 GiB), placed next to the GGUF. Optional (opt-in `TALUS_Q27_W4I=auto`): by default prompts run on the exact int8 path. `Qwen3.8-27B-UD-IQ4_XS.fast.w4i` (about 8.0 GiB) only for the opt-in fast profile. Built for `UD-IQ4_XS` only. |
-| Context / KV | 64K shipped (`--max-context 65536`), f16 KV |
+| Context / KV | Sized to the machine when `--max-context` is not given: the largest of 256K (the model's native context, no RoPE scaling), 128K and 64K that fits in memory beside the weights and the int8 prompt weights (see **Context by machine** below). f16 KV: 68 KiB per token (K and a transposed V copy for the 16 attention layers plus the MTP layer; 17 GiB at 256K) |
 | Stop token | `<|im_end|>` |
 | License | Apache-2.0 (model, MTP head, DFlash2 drafter) |
 
 Shipped arguments:
 
 ```
---model Qwen3.8-27B-UD-IQ4_XS.gguf --max-context 65536
+--model Qwen3.8-27B-UD-IQ4_XS.gguf
 --mtp-gguf mtp-Qwen3.8-27B-Q4_0.gguf --mtp 5
 --spec-draft-vocab qwen-dv-65536.bin --ngram 24
 --dflash-gguf Qwen3.8-27B-DFlash2-Q4_K_M.gguf
 ```
 
 No environment variables are needed. 4-bit prompt math is an opt-in (`TALUS_Q27_W4I=auto`, see **4-bit prompt
-math** below). Without `--max-context` the CLI starts at 32K. Without the drafter flags, no speculative decoding runs.
+math** below). Without `--max-context` (or with `--max-context auto`) the engine picks the context by memory and logs
+the choice and the reason in one line; an explicit `--max-context` is always honoured. Without the drafter flags, no
+speculative decoding runs.
 
 **Drafting.** With both the MTP head and DFlash2 loaded, the drafter is chosen by context depth (`--drafter auto`,
 the default when both are given). DFlash2 drafts while the window starts below 16K tokens (32K for sampled
@@ -96,6 +98,10 @@ the sampled text differs; we keep it off by default.
 | Repacked Q8_0 decode weights | `STRATA_Q8_PACKED=0` |
 | Wave32 decode matvec | `STRATA_MMVQ_W32=0` |
 | 16-row verify windows | `STRATA_Q36_VERIFY16=0` or `--no-v16` (8 rows) |
+| Wide verify tiles: the 12-16-row windows' IQ4_XS / IQ3_S / IQ3_XXS / IQ2_S / IQ2_XS mat-vecs and the 8-16-row Q4_K / Q5_K ones on the matrix cores (16 rows x 16 columns a tile), every row bitwise the 1-row result; gfx1151 (served edit mix at 256K: 109.4 tok/s with the tiles, 87.9 tok/s without) | `TALUS_MMVQ_WIDE=0` |
+| Narrow verify cells (row-per-lane and split tile decode for 5-16-row windows, per weight type and width, measured on gfx1151) and the wave32 mat-vecs' tree-sum epilogue at 2-8 rows, every row bitwise the 1-row result (chat 4.7 %, code 5.4 %, edit 3.2 % faster than the wide tiles alone) | `TALUS_MMVQ_W32_TS=0` (epilogue); `TALUS_MMVQ_WIDE_TAB="13:5-7:0;13:8-10:2;12:6-7:0;12:8-10:2;22:6-11:0;22:12-15:2;21:7:0;21:9:0;21:10-16:2;23:9-11:0;18:9-11:0;18:12-16:2"` (the earlier cell table) |
+| Tile-plane copies of those weights (same bytes, regrouped so a wave reads whole cache lines; 13 GB, placed only when they fit, see **Memory** below) | `TALUS_MMVQ_WIDE_PACK=0` (`=1` forces them) |
+| DPP softmax reductions in decode/verify attention (same pairing order as the shuffle version) | `TALUS_ATTN_RED=0` |
 | GDN commit fused into the next forward pass, and draft/verify rounds on the device | `STRATA_FUSED=0`; `STRATA_NO_DEV_ROUNDS=1` keeps the fusion but runs rounds on the host |
 | Depth switch between drafters | `STRATA_DRAFTER=mtp` or `--drafter mtp` (MTP only); `--drafter dflash` (DFlash2 only) |
 | Adaptive draft length | `STRATA_ADRAFT=0` (fixed length) |
@@ -128,11 +134,58 @@ Do not set `STRATA_BF16_KV`: it only changes the KV layout that the prompt cache
 
 **Prompt cache.** `--prompt-cache N` state snapshots (default 8) and `--kv-stash-mib` of stashed KV (default 8192).
 Warm answers equal cold answers; `--cache-live 1` keeps live decode state instead, with fewer tokens re-read per turn
-but warm answers that may differ from cold.
+but warm answers that may differ from cold. The cache is also kept on disk so it survives restarts and model switches
+(on by default; see [Prompt cache on disk](#prompt-cache-on-disk)).
 
 **Memory.** Weights and drafters are about 17 GB. The int8 prompt GEMM expands the trunk weights at load time and
-uses about 26 GiB more GPU memory (`TALUS_PF_I8=0` frees it). The 4-bit prompt weights add about 2.0 GiB (8.0 GiB
-with the fast profile). Lowest `MemAvailable` in the release run: 66 GiB.
+uses about 26 GiB more GPU memory (`TALUS_PF_I8=0` frees it). The KV cache is sized by the context: 68 KiB per token,
+about 17 GiB at 256K, 8.5 GiB at 128K and 4.3 GiB at 64K; output is identical at any length the shorter context holds.
+The legacy prompt attention (`TALUS_PF_FA=0` or `STRATA_FATTN=0`) keeps a second V copy, 34 KiB more per token
+(8.5 GiB at 256K). The 4-bit prompt weights add about 2.0 GiB (8.0 GiB with the fast profile). The wide verify
+tiles' tile-plane copies add 13 GB (12.0 GiB) when they fit: they come last (context > int8 prompt weights > copies),
+take only what is left above the 8 GiB floor and a 3 GiB reserve, and never shrink the automatic context. Without them
+the tiles read the GGUF rows, somewhat slower. One log line says which and why (`wide verify tiles on with tile-plane
+copies of 387 matrices, 12.0 GiB (auto: they fit with the reserve; ...)`). Lowest `MemAvailable`
+in the release run (64K context): 66 GiB.
+
+**Context by machine.** Without `--max-context` the engine takes the largest of 256K, 128K and 64K whose KV cache fits
+beside the weights, the int8 prompt weights and a 3 GiB reserve, keeping 8 GiB of `MemAvailable` free, and logs one
+line such as `context 65536 (auto, no --max-context): 37.1 GiB free above the 8 GiB floor; needs 33.4 GiB = ...`.
+
+| Machine | Automatic context | Notes |
+|---|---|---|
+| 128 GB Strix Halo | 256K | int8 prompt weights and the wide tiles' copies on. Lowest `MemAvailable` while serving: about 46 GiB at 256K (59 GiB without the copies), 66 GiB at 64K. |
+| 64 GB Strix Halo | 64K (checked with a 62 GiB budget, `TALUS_MEM_LIMIT_MIB=63488`, on a 128 GB machine) | int8 prompt weights on; the wide tiles run without their copies. `--max-context 131072` still keeps the int8 prompt weights, by about 0.3 GiB when nothing else runs; a desktop session or other programs push them out. `--max-context 262144` does not leave room for them. |
+
+An explicit `--max-context` is always honoured. When the int8 prompt weights do not fit beside its KV cache, the engine
+prints a `WARN` and runs prompts on the slower MMQ path; to get the int8 path back, pick a smaller `--max-context`.
+`TALUS_PF_I8=0` skips the expansion on purpose. `TALUS_MEM_LIMIT_MIB=N` caps the engine's memory budget at N MiB of
+total use, to check a smaller machine.
+
+Long context costs time, not accuracy: the needle test (five codenames spread through the prompt) passed
+15/15 at 120K, 15/15 at 170K and 15/15 at 250K.
+Decode slows with depth because every token reads the whole KV cache: about 23 tok/s at 128K,
+16.5 tok/s at 170K and 18-20 tok/s at 250K (greedy, with the drafters, on 128 GB; different
+prompts; the 250K figure is a follow-up turn on a cached prompt). A cold 250K prompt takes about
+19 minutes; later turns reuse the cached prefix and start in seconds.
+
+**Choosing the quant.** `UD-IQ4_XS` is the default: it is the smaller file and the faster one in Talus (compare the
+`Talus` and `Talus (UD-Q4_K_XL)` rows in [RESULTS.md](RESULTS.md#qwen38-27b)). `UD-Q4_K_XL` stays closer to the
+original weights, most of all on code. Divergence from the BF16 weights, measured with llama.cpp's KL-divergence tool
+on the GPU (2,048-token windows; text = the wikitext-2 test set, first 60 windows; code = Python standard-library
+source, 26 windows; the `Q8_0` row is the measurement floor):
+
+| Quant | text: mean KL | text: same top-1 token | text: PPL ratio | code: mean KL | code: same top-1 token | code: PPL ratio |
+|---|---|---|---|---|---|---|
+| `UD-IQ4_XS` (default, 13.3 GiB) | 0.0181 | 94.4 % | 1.003 | 0.0819 | 93.5 % | 1.038 |
+| `UD-Q4_K_XL` (16.3 GiB) | 0.0113 | 95.0 % | 1.003 | 0.0373 | 95.5 % | 1.017 |
+| `Q8_0` (floor) | 0.0012 | 98.2 % | 1.000 | 0.0018 | 98.9 % | 1.001 |
+
+On prose the two 4-bit files are close. On code `UD-Q4_K_XL` has about half the divergence of `UD-IQ4_XS`; the median
+token is nearly unchanged in both, and the difference sits in a tail of uncertain tokens. To run `UD-Q4_K_XL`, download
+`Qwen3.8-27B-UD-Q4_K_XL.gguf` and pass it to `--model` (and as the server's `tokenizer`); everything else stays the same,
+except the opt-in 4-bit prompt weights (`.w4i`), which exist for `UD-IQ4_XS` only. Talus does not run the BF16 or F16
+weights: its decode kernels are built for quantized weights.
 
 ## Qwen3.8-Flash-Next
 
@@ -289,6 +342,8 @@ drafter is found, the engine runs without drafting.
 |---|---|---|
 | Wave32 matvec for routed experts | `STRATA_IDS_W32=0` | The engine sets `STRATA_IDS_W32=1` unless `STRATA_IDS_W32` or `TALUS_MIMO_W32_DENSE` is already set (setting the latter at all, even to 0, keeps the default off). Logit differences are at floating-point rounding level. |
 | WMMA f16 flash attention in prompts | `TALUS_MIMO_FA=0` | `TALUS_MIMO_FA_VER=1` selects the earlier v1 tile. |
+| Confident-prefix verify for greedy requests | `TALUS_MIMO_DF_CONF=0` | After the DFlash drafter runs, the round verifies only the longest prefix of its drafts whose running product of the drafter's own confidence in each draft stays at or above 0.6; the rest would mostly be rejected. Greedy output is unchanged (every token is still the model's own argmax); code about 6 % faster. Sampled requests keep the full block (`TALUS_MIMO_DF_CONF_S=<threshold>` opts in) |
+| Last-layer tail-row pruning in prompts | `TALUS_MIMO_TAIL_PRUNE=0` | The last layer computes only the rows the output head and the drafter read (about 3 % faster prompts at 32K). Prompt results are bitwise equal; a short request that resumes inside another prompt's pruned rows re-reads up to 1152 rows (1-2 s), so its text can differ from a run without pruning |
 
 **Exact defaults (kill switches, `=0`):** `TALUS_MIMO_ATT2`, `TALUS_MIMO_ATT2_DRAFT`, `TALUS_MIMO_ATT3` (decode and
 drafter attention kernels), `TALUS_MIMO_ATT_Q8`, `TALUS_MIMO_QKV_MULTI`, `TALUS_MIMO_ROPE_STORE`,
@@ -349,6 +404,7 @@ is lower. It needs q8 KV.
 
 | Default | Kill switch | Notes |
 |---|---|---|
+| Confident-prefix verify for greedy requests | `TALUS_LAGUNA_DF_CONF=0` | After the DFlash drafter runs, the round verifies only the longest prefix of its drafts whose running product of the drafter's own confidence in each draft stays at or above 0.45; the rest would mostly be rejected. Greedy output is unchanged (every token is still the model's own argmax); code about 12 % faster. Sampled requests keep the full block (`TALUS_LAGUNA_DF_CONF_S=<threshold>` opts in) |
 | Sparse decode from 32K | omit `--sparse` (dense everywhere); `LAGUNA_SPARSE_32K=0` (start from `MIN`, floored at four times `BS`×`K`); `LAGUNA_SPARSE_MIN=65536` (start later) | Changes numerics past the start. |
 
 **Exact defaults (kill switches):** `LAGUNA_EXPERT_MAJOR=0` (expert-major routed matvec), `STRATA_MMVQ_XT=0` (wide
@@ -359,8 +415,43 @@ decode matvec without wave32 to match its reference.
 
 **Opt-ins (change numerics):** `LAGUNA_SPARSE_UNION=1`, `LAGUNA_SPARSE_F32=1`.
 
+**Prompt cache.** The engine reuses the KV of the live conversation and also saves each conversation to disk, so it
+survives restarts and model switches (on by default; see [Prompt cache on disk](#prompt-cache-on-disk)).
+
 **Memory.** Weights about 68 GB; 256K of q8 KV for the full-attention layers fits in the rest. Lowest
 `MemAvailable` in the release run: 38 GiB.
+
+## Prompt cache on disk
+
+Qwen3.8-27B and Laguna keep their prompt cache on disk as well as in memory. After each reply the engine writes the
+conversation's state to disk in the background; when a request continues a conversation that is on disk but not in
+memory (after a server restart, a model switch in talus-tui, or because memory evicted it), the engine loads it instead
+of reading the whole prompt again.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `TALUS_PCACHE_DISK` (27B also `--prompt-cache-disk`) | on: `$XDG_CACHE_HOME/talus/pcache`, else `~/.cache/talus/pcache` | A folder, or `0` / `off` to turn the disk cache off |
+| `TALUS_PCACHE_DISK_GIB` (`--prompt-cache-disk-gib`) | 32 | Disk budget; the least recently used entries are deleted first (all models share it). `0` turns it off |
+| `TALUS_PCACHE_DISK_MIN` (`--prompt-cache-disk-min`) | 1024 | Shortest prompt, in tokens, worth an entry |
+
+In a talus-server run config, `"prompt_cache_disk": false` (or `"off"`, or a folder) and `"prompt_cache_disk_gib": N`
+set the same variables for the engine. talus-tui shows the setting as "Prompt cache on disk".
+
+- **Exact.** For Qwen3.8-27B a restore from disk puts the same bytes back through the same code as a hit in memory,
+  so answers are bit-identical to an engine that never restarted. Laguna reloads the KV its live cache held; greedy
+  answers are identical, and the drafter starts without context after a restore.
+- **Never stale.** Entries are keyed by the model files, the engine build, the kernel and BLAS libraries, the GPU and
+  every numerics switch, so a cache written by another model, quant, build or setting is never read. A file that
+  fails any check is deleted and the prompt is read normally.
+- **Safe writes.** Files are written under a temporary name, flushed and renamed. At most one write runs at a time,
+  and a write is skipped when copying the state would leave less than 8 GiB of `MemAvailable`.
+- **Never fills the disk.** Besides its budget, the cache does not grow while its filesystem has less than
+  max(20 GiB, a tenth of its size) free; it logs this once and keeps using the entries it has.
+- **Back-to-back requests.** If the next request is already waiting when a reply ends (or arrives while the turn is
+  copied off the GPU), that turn is not written, so the next request is not delayed. A continuing conversation loses
+  nothing (its next turn writes a deeper entry); separate long conversations sent back to back may not all reach the
+  disk. A stop (SIGTERM / Ctrl-C) waits up to 60 s for the turn being written.
+- **Not yet:** MiMo-V2.6-Flash, Qwen3.8-Flash-Next and GLM-5.3-Flash keep their prompt cache in memory only.
 
 ## Shared switches
 

@@ -199,7 +199,9 @@ inline void tk_dispatch_mmvq_cols(
         const int32_t chunk = std::min<int32_t>(ncols - col_off, cmax);
         const void* chunk_x = static_cast<const uint8_t*>(x_q8_1) + static_cast<size_t>(col_off) * col_q8_bytes;
         float* chunk_y = y + static_cast<size_t>(col_off) * static_cast<size_t>(n_out);
-        strata::kernels::native_mmvq(ggml_type, w, chunk_x, chunk_y, n_in, n_out, chunk, stream);
+        // the exact wide tiles where the TALUS_MMVQ_WIDE table picks them (default on), else the wave32 kernels
+        if (!strata::kernels::native_mmvq_tw(ggml_type, w, chunk_x, chunk_y, n_in, n_out, chunk, stream))
+            strata::kernels::native_mmvq(ggml_type, w, chunk_x, chunk_y, n_in, n_out, chunk, stream);
         col_off += chunk;
     }
 }
@@ -1695,6 +1697,10 @@ tk_status tk_mmvq_w32_multi(
     }
     TK_TRY_BEGIN
     void* const s = tk_effective_stream(stream);
+    // one launch on the exact wide tiles when the table picks them for every matrix
+    if (strata::kernels::native_mmvq_tw_multi(static_cast<int>(qtype), n_mats, w_ptrs, y_ptrs, n_out_per_mat, x_q8_1,
+                                              n_in, ncols, s))
+        return TK_OK;
     if (!strata::kernels::native_mmvq_w32_multi(
             static_cast<int>(qtype), n_mats, w_ptrs, y_ptrs, n_out_per_mat, x_q8_1, n_in, ncols, s)) {
         for (int32_t m = 0; m < n_mats; ++m) {
@@ -1704,6 +1710,38 @@ tk_status tk_mmvq_w32_multi(
     }
     return TK_OK;
     TK_TRY_END(ctx)
+}
+
+/* the wide verify tiles (default on, gfx1151; TALUS_MMVQ_WIDE=0 off) and their tile-plane copies, which the
+ * engine places by its memory plan: note every matrix at load, then pack the noted ones when they fit.  Packing
+ * allocates and synchronizes: load time only, never during graph capture. */
+int32_t talus_mmvq_wide_active(void) TK_NOEXCEPT { return strata::kernels::native_mmvq_tw_active() ? 1 : 0; }
+int32_t talus_mmvq_wide_pack_mode(void) TK_NOEXCEPT { return strata::kernels::native_mmvq_tw_pack_mode(); }
+int32_t talus_mmvq_wide_note(int32_t ggml_type, const void* weights, int32_t n_in, int32_t n_out) TK_NOEXCEPT {
+    try {
+        return strata::kernels::native_mmvq_tw_note(ggml_type, weights, n_in, n_out) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+uint64_t talus_mmvq_wide_noted_bytes(void) TK_NOEXCEPT {
+    return static_cast<uint64_t>(strata::kernels::native_mmvq_tw_noted_bytes());
+}
+int32_t talus_mmvq_wide_pack_noted(void) TK_NOEXCEPT {
+    try {
+        return strata::kernels::native_mmvq_tw_pack_noted();
+    } catch (...) {
+        return 0;
+    }
+}
+void talus_mmvq_wide_release(const void* weights) TK_NOEXCEPT {
+    try {
+        strata::kernels::native_mmvq_tw_release(weights);
+    } catch (...) {
+    }
+}
+uint64_t talus_mmvq_wide_packed_bytes(void) TK_NOEXCEPT {
+    return static_cast<uint64_t>(strata::kernels::native_mmvq_tw_packed_bytes());
 }
 
 tk_status tk_mmvq_batch(

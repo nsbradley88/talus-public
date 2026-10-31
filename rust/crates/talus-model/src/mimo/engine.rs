@@ -26,6 +26,7 @@ use crate::mimo::weights::{
     MimoDFlashCatalog, MimoDraftVocabInfo, MimoHparams, MimoModel, DEFAULT_ATTN_SCALE,
     DFLASH_5L_TARGET_TAPS, DFLASH_DEFAULT_DRAFT_MAX, MIMO_DRAFT_VOCAB_SIZE, N_EXPERT_USED,
 };
+use crate::tail_prune::{self, first_prunable_layer, plan_on_grid, Grid, LayerAttn, TailRequest};
 
 /// One gibibyte in bytes (`1024^3`).
 pub const GIB: usize = 1024 * 1024 * 1024;
@@ -441,6 +442,8 @@ pub struct MimoDispatchTrace {
     pub non_null_vzero_mmvq_calls: usize,
     /// Target layer tap indices captured for DFlash speculation during this pass.
     pub captured_dflash_taps: Vec<u32>,
+    /// last-layer rows whose attention / wo / FFN / tap the exact tail pruning skipped.
+    pub tail_pruned_rows: usize,
 }
 
 /// Configured DFlash `n4` speculation state for `MiMo-V2.6-Flash`.
@@ -653,6 +656,12 @@ struct MimoDFlashGpuState {
     df_cand_dev: *mut i32,
     /// Top-16 candidate unary scores per block row (`[B * 16]` `f32`).
     df_unary_dev: *mut f32,
+    /// confident-prefix verify (talus_spec::ConfPrefix): device scalars + outputs for `tk_q36_draft_conf`
+    /// (`[0]` tau = 0, `[1]` lmin = -inf, `[2]` pick = -1 (i32 bits), `[16, 32)` conf, `[32, 48)` per-row top-1
+    /// probability); null when the switch is off.
+    df_conf_dev: *mut f32,
+    /// Top-1 probability of each draft row of the last proposal (empty when the switch is off).
+    df_conf_tops: Vec<f32>,
     /// Number of context tokens already injected into the DFlash KV cache.
     injected_pos: usize,
     allocs: Vec<*mut c_void>,
@@ -725,7 +734,7 @@ struct MimoGpuState {
     decode_logits_graphs: [HipGraphExec; 9],
     df_graphs: [HipGraphExec; 17],
     dflash_gpu: Option<MimoDFlashGpuState>,
-    /// rc-gemm stage 2: int8 prefill cache of the dense projections, keyed by the GGUF tensor's device pointer:
+    /// int8 prefill cache of the dense projections, keyed by the GGUF tensor's device pointer:
     /// (expanded int8 values, per-32 / per-16 scales, tp_i8gemm mode). Empty when TALUS_MIMO_I8=0.
     i8c: Arc<std::collections::HashMap<usize, (usize, usize, i32)>>,
     /// Budget reservation backing `i8c`.
@@ -809,7 +818,20 @@ pub struct MimoEngine {
     dflash: Option<MimoDFlashRunner>,
     /// Cumulative kernel dispatch trace.
     trace: MimoDispatchTrace,
+    /// `(final_end, min_query)` of the prompt being prefilled across several calls (serve sets it around its
+    /// chunk loop); `None` = each call ends its own prompt. Feeds the exact last-layer tail pruning.
+    prefill_hint: Option<(usize, usize)>,
+    /// prompt rows `[a, b)` whose last-layer output (the DFlash tap) a pruned prefill skipped.
+    tap_stale: Vec<(usize, usize)>,
 }
+
+/// tail pruning keeps a suffix of each chunk that starts on a multiple of this many rows from the chunk start
+/// (the prompt-attention kernels group queries from the chunk's first row; <= 256 rows per group).
+const TAIL_ALIGN: usize = 256;
+/// never run the pruned layer on fewer rows than this (the kernels pick other variants for small batches).
+const TAIL_MIN_ROWS: usize = 128;
+/// rows kept past the drafter's window (its 32-key chunks and block positions).
+const TAIL_DF_MARGIN: usize = 128;
 
 impl MimoEngine {
     /// Construct a real GPU-backed [`MimoEngine`] from a loaded [`MimoModel`], [`LibTalusKernels`],
@@ -1203,6 +1225,17 @@ impl MimoEngine {
                 alloc_raw(&hip, &mut df_allocs, b_max * 16 * 4, "df_cand")? as *mut i32;
             let df_unary_dev =
                 alloc_raw(&hip, &mut df_allocs, b_max * 16 * 4, "df_unary")? as *mut f32;
+            // confident-prefix verify scalars (only with TALUS_MIMO_DF_CONF / TALUS_DF_CONF[_S] / _TRACE)
+            let df_conf_dev = if talus_spec::ConfPrefix::from_env("MIMO").active() {
+                let p = alloc_raw(&hip, &mut df_allocs, 64 * 4, "df_conf")? as *mut f32;
+                let mut init = [0f32; 64];
+                init[1] = f32::NEG_INFINITY;
+                init[2] = f32::from_bits((-1i32) as u32);
+                hip.copy_h2d(p as *mut c_void, init.as_ptr() as *const c_void, 64 * 4)?;
+                p
+            } else {
+                ptr::null_mut()
+            };
 
             Some(MimoDFlashGpuState {
                 tap_devs,
@@ -1221,6 +1254,8 @@ impl MimoEngine {
                 df_logits,
                 df_cand_dev,
                 df_unary_dev,
+                df_conf_dev,
+                df_conf_tops: Vec::new(),
                 injected_pos: 0,
                 allocs: df_allocs,
             })
@@ -1405,12 +1440,14 @@ impl MimoEngine {
             token_history: Vec::new(),
             dflash,
             trace: MimoDispatchTrace::default(),
+            prefill_hint: None,
+            tap_stale: Vec::new(),
         };
         eng.build_i8_cache();
         Ok(eng)
     }
 
-    /// rc-gemm stage 2: expand the dense prefill projections (the attention Q / K / V of every layer and the FFN of
+    /// expand the dense prefill projections (the attention Q / K / V of every layer and the FFN of
     /// the dense layer) into the int8 prefill cache (`talus_pf_i8x_expand`, MMQ's own tile loaders). The prefill
     /// product then runs `talus_pf_i8gemm` on the same MMQ-layout activations: the same output bits as
     /// `tk_prefill_mmq` (both are bitwise MMQ), faster on gfx1151. Budget-guarded; `TALUS_MIMO_I8=0` disables.
@@ -1581,6 +1618,8 @@ impl MimoEngine {
             token_history: Vec::new(),
             dflash,
             trace: MimoDispatchTrace::default(),
+            prefill_hint: None,
+            tap_stale: Vec::new(),
         })
     }
 
@@ -1658,6 +1697,8 @@ impl MimoEngine {
             token_history: Vec::new(),
             dflash,
             trace: MimoDispatchTrace::default(),
+            prefill_hint: None,
+            tap_stale: Vec::new(),
         })
     }
 
@@ -1718,6 +1759,7 @@ impl MimoEngine {
     pub fn reset(&mut self) {
         self.n_pos = 0;
         self.token_history.clear();
+        self.tap_stale.clear();
         self.kv_state.fill(0);
         self.trace = MimoDispatchTrace::default();
         if let Some(ref mut df) = self.dflash {
@@ -1845,7 +1887,7 @@ impl MimoEngine {
                     )?;
                     *cached_q8 = Some(layout);
                 }
-                // rc-gemm stage 2: the int8 prefill cache (same output bits as tk_prefill_mmq)
+                // the int8 prefill cache (same output bits as tk_prefill_mmq)
                 if let Some(&(qs, ws, mode)) = i8c.get(&(w.dev as usize)) {
                     let rc = unsafe {
                         (lib.talus_pf_i8gemm)(
@@ -1966,6 +2008,63 @@ impl MimoEngine {
             all_positions.as_ptr() as *const c_void,
             tokens.len() * 4,
         )?;
+
+        // exact tail-row pruning. Every row's KV is still written on every layer; the last layer's attention /
+        // wo / FFN / tap run only for the rows the head and the DFlash window read (default on; TALUS_MIMO_TAIL_PRUNE=0: off).
+        let tail_out_from: Option<usize> = {
+            let on = std::env::var("TALUS_MIMO_TAIL_PRUNE")
+                .map(|v| !v.starts_with('0'))
+                .unwrap_or(true);
+            let call_end = self.n_pos + tokens.len();
+            if on && tokens.len() > N_EXPERT_USED {
+                let df_win = if gpu.dflash_gpu.is_some() {
+                    model
+                        .dflash
+                        .as_ref()
+                        .map(|dw| dw.catalog.sliding_window as usize)
+                } else {
+                    None
+                };
+                let (final_end, min_query) = self
+                    .prefill_hint
+                    .map(|(e, m)| (e.max(call_end), m))
+                    .unwrap_or((call_end, call_end));
+                let layers: Vec<LayerAttn> = model
+                    .layers
+                    .iter()
+                    .map(|l| {
+                        if l.is_swa {
+                            LayerAttn::Window(l.sliding_window as usize)
+                        } else {
+                            LayerAttn::Full
+                        }
+                    })
+                    .collect();
+                let req = TailRequest {
+                    final_end,
+                    out_rows: 1 + df_win.map_or(0, |w| w + TAIL_DF_MARGIN),
+                    min_query,
+                    taps: Vec::new(),
+                };
+                let grid = Grid {
+                    start: self.n_pos,
+                    ubatch: gpu.ub,
+                    align: TAIL_ALIGN,
+                    min_rows: TAIL_MIN_ROWS,
+                    small_nb: N_EXPERT_USED,
+                };
+                let rows = plan_on_grid(&layers, &req, Some(&grid));
+                // implemented: the last layer's post-KV part, when it is the only prunable layer and a full one
+                match first_prunable_layer(&rows) {
+                    Some(l) if l + 1 == layers.len() && layers[l] == LayerAttn::Full => {
+                        Some(rows[l].out_from)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        };
 
         let mut chunk_start = 0usize;
         while chunk_start < tokens.len() {
@@ -2381,6 +2480,65 @@ impl MimoEngine {
                         )?;
                     }
 
+                    // the last layer's KV is written above for every row; from here on it runs only the rows
+                    // from `tail_ks` on (the rows before it feed nothing but the head / the drafter taps, which never
+                    // read them). The kept suffix starts on a TAIL_ALIGN boundary from the chunk start, so each kept
+                    // row sees the same query grouping as in the unpruned chunk.
+                    let tail_ks = match tail_out_from {
+                        Some(f) if il + 1 == n_layers && !capturing => {
+                            tail_prune::chunk_tail_offset(
+                                pos0,
+                                nb,
+                                f,
+                                TAIL_ALIGN,
+                                TAIL_MIN_ROWS,
+                                N_EXPERT_USED,
+                            )
+                        }
+                        _ => 0,
+                    };
+                    if tail_ks > 0 {
+                        if let (Some(df_gpu), Some(df_weights)) =
+                            (gpu.dflash_gpu.as_ref(), model.dflash.as_ref())
+                        {
+                            let one_based = df_weights
+                                .catalog
+                                .target_layers
+                                .contains(&(n_layers as u32));
+                            if let Some(slot) =
+                                df_weights.catalog.target_layers.iter().position(|&t| {
+                                    if one_based {
+                                        (t as usize) == il + 1
+                                    } else {
+                                        (t as usize).min(n_layers.saturating_sub(1)) == il
+                                    }
+                                })
+                            {
+                                // the skipped rows' tap: zeros (finite) instead of a stale buffer; never read
+                                hip_memset_async(
+                                    &hip,
+                                    df_gpu.tap_devs[slot] as *mut c_void,
+                                    0,
+                                    tail_ks * d * 4,
+                                    stream,
+                                )?;
+                                let (a, b) = (pos0, pos0 + tail_ks);
+                                match self.tap_stale.last_mut() {
+                                    Some(last) if last.1 == a => last.1 = b,
+                                    _ => self.tap_stale.push((a, b)),
+                                }
+                            }
+                        }
+                        self.trace.tail_pruned_rows += tail_ks;
+                    }
+                    if tail_ks == nb {
+                        continue;
+                    }
+                    let nb = nb - tail_ks;
+                    let chunk_pos_dev = unsafe { chunk_pos_dev.add(tail_ks) };
+                    let q_cur = unsafe { gpu.q.add(tail_ks * q_dim) };
+                    let x_cur = unsafe { gpu.x.add(tail_ks * d) };
+
                     // 5. Hybrid Attention Dispatch:
                     //    - 40 SWA layers (`il % 6 != 5`): `tk_attn_swa_sinks`
                     //    - 8 Full-attention layers (`il % 6 == 5`): `tk_attn_k192_v128`
@@ -2396,7 +2554,7 @@ impl MimoEngine {
                                 unsafe {
                                     (lib.tk_attn_swa_sinks_q8)(
                                         ctx,
-                                        gpu.q,
+                                        q_cur,
                                         gpu.k_pool[il],
                                         gpu.v_pool[il],
                                         gpu.k_scale[il],
@@ -2426,7 +2584,7 @@ impl MimoEngine {
                                 unsafe {
                                     (lib.tk_attn_k192_v128_q8)(
                                         ctx,
-                                        gpu.q,
+                                        q_cur,
                                         gpu.k_pool[il],
                                         gpu.v_pool[il],
                                         gpu.k_scale[il],
@@ -2458,7 +2616,7 @@ impl MimoEngine {
                             unsafe {
                                 (lib.tk_attn_swa_sinks_mmq)(
                                     ctx,
-                                    gpu.q,
+                                    q_cur,
                                     gpu.k_pool[il],
                                     gpu.v_pool[il],
                                     layer.attn_sinks.dev as *const f32,
@@ -2491,7 +2649,7 @@ impl MimoEngine {
                                 unsafe {
                                     (lib.tk_attn_swa_sinks)(
                                         ctx,
-                                        gpu.q,
+                                        q_cur,
                                         gpu.k_pool[il],
                                         gpu.v_pool[il],
                                         gpu.k_scale[il],
@@ -2520,7 +2678,7 @@ impl MimoEngine {
                                 unsafe {
                                     (lib.tk_attn_k192_v128)(
                                         ctx,
-                                        gpu.q,
+                                        q_cur,
                                         gpu.k_pool[il],
                                         gpu.v_pool[il],
                                         gpu.k_scale[il],
@@ -2578,7 +2736,7 @@ impl MimoEngine {
                             unsafe {
                                 (lib.tk_axpy)(
                                     ctx,
-                                    gpu.x,
+                                    x_cur,
                                     gpu.att,
                                     hp.attn_value_scale,
                                     (nb * d) as i32,
@@ -2595,7 +2753,7 @@ impl MimoEngine {
                             unsafe {
                                 (lib.tk_axpy_norm_quant)(
                                     ctx,
-                                    gpu.x,
+                                    x_cur,
                                     gpu.att as *const f32,
                                     hp.attn_value_scale,
                                     layer.ffn_norm.dev as *const f32,
@@ -2615,7 +2773,7 @@ impl MimoEngine {
                             unsafe {
                                 (lib.tk_add_norm_quant)(
                                     ctx,
-                                    gpu.x,
+                                    x_cur,
                                     ptr::null(),
                                     ptr::null(),
                                     ptr::null(),
@@ -2638,7 +2796,7 @@ impl MimoEngine {
                                 (lib.tk_rms_norm_to)(
                                     ctx,
                                     gpu.xn,
-                                    gpu.x,
+                                    x_cur,
                                     layer.ffn_norm.dev as *const f32,
                                     nb as i32,
                                     d as i32,
@@ -2803,7 +2961,7 @@ impl MimoEngine {
                         }
                         check_tk(
                             unsafe {
-                                (lib.tk_axpy)(ctx, gpu.x, gpu.m_out, 1.0, (nb * d) as i32, stream)
+                                (lib.tk_axpy)(ctx, x_cur, gpu.m_out, 1.0, (nb * d) as i32, stream)
                             },
                             "tk_axpy(layer0)",
                         )?;
@@ -3037,7 +3195,7 @@ impl MimoEngine {
                                     unsafe {
                                         (lib.tk_axpy)(
                                             ctx,
-                                            gpu.x,
+                                            x_cur,
                                             gpu.m_out,
                                             1.0,
                                             (nb * d) as i32,
@@ -3053,7 +3211,7 @@ impl MimoEngine {
                                     unsafe {
                                         (lib.tk_moe_add_slots)(
                                             ctx,
-                                            gpu.x,
+                                            x_cur,
                                             gpu.zero_shared_dev,
                                             gpu.moe_y,
                                             gpu.ident_dev,
@@ -3439,7 +3597,7 @@ impl MimoEngine {
                                     unsafe {
                                         (lib.tk_axpy)(
                                             ctx,
-                                            gpu.x,
+                                            x_cur,
                                             gpu.m_out,
                                             1.0,
                                             (nb * d) as i32,
@@ -3453,7 +3611,7 @@ impl MimoEngine {
                                     unsafe {
                                         (lib.tk_moe_add_slots)(
                                             ctx,
-                                            gpu.x,
+                                            x_cur,
                                             gpu.zero_shared_dev,
                                             gpu.moe_y,
                                             gpu.moe_slots,
@@ -3489,8 +3647,9 @@ impl MimoEngine {
                             {
                                 hip_copy_d2d_async(
                                     &hip,
-                                    df_gpu.tap_devs[slot] as *mut c_void,
-                                    gpu.x as *const c_void,
+                                    unsafe { df_gpu.tap_devs[slot].add(tail_ks * d) }
+                                        as *mut c_void,
+                                    x_cur as *const c_void,
                                     nb * d * 4,
                                     stream,
                                 )?;
@@ -4377,8 +4536,50 @@ impl MimoEngine {
                 }
             }
         }
+        // per-row top-1 probability of the drafter (rows 1 .. b_rows = drafts 0 .. draft_max), outside the
+        // captured graph; draft-side only (talus_spec::ConfPrefix)
+        let conf_n = if df_gpu.df_conf_dev.is_null() {
+            0
+        } else {
+            b_rows - 1
+        };
+        if conf_n > 0 {
+            let n_out = head_tensor.n_out;
+            let cd = df_gpu.df_conf_dev;
+            for r in 1..b_rows {
+                check_tk(
+                    unsafe {
+                        (lib.tk_q36_draft_conf)(
+                            ctx,
+                            df_gpu.df_logits.add(r * n_out) as *const f32,
+                            n_out as i32,
+                            cd as *const f32,
+                            cd.add(1) as *const f32,
+                            cd.add(2) as *const i32,
+                            ptr::null(),
+                            cd.add(16),
+                            cd.add(32),
+                            (r - 1) as i32,
+                            ptr::null(),
+                            ptr::null(),
+                            stream,
+                        )
+                    },
+                    "tk_q36_draft_conf(dflash rows)",
+                )?;
+            }
+        }
         let mut cand_host = vec![0i32; b_rows * 16];
         let _ = unsafe { (hip.hipStreamSynchronize)(gpu.stream) };
+        df_gpu.df_conf_tops.clear();
+        if conf_n > 0 {
+            df_gpu.df_conf_tops.resize(conf_n, 0.0);
+            hip.copy_d2h(
+                df_gpu.df_conf_tops.as_mut_ptr() as *mut c_void,
+                unsafe { df_gpu.df_conf_dev.add(32) } as *const c_void,
+                conf_n * 4,
+            )?;
+        }
         hip.copy_d2h(
             cand_host.as_mut_ptr() as *mut c_void,
             df_gpu.df_cand_dev as *const c_void,
@@ -4658,7 +4859,47 @@ impl MimoEngine {
         if new_pos < self.n_pos {
             self.n_pos = new_pos;
             self.token_history.truncate(new_pos);
+            // rows from new_pos on are prefilled again
+            self.tap_stale.retain(|&(a, _)| a < new_pos);
+            for r in self.tap_stale.iter_mut() {
+                r.1 = r.1.min(new_pos);
+            }
         }
+    }
+
+    /// declare the prompt end (and the lowest position a later query may resume at) for the prefill calls
+    /// that follow (`None` clears it). With it each chunk call knows which last-layer rows are never read.
+    pub fn set_prefill_hint(&mut self, final_end: Option<usize>, min_query: usize) {
+        self.prefill_hint = final_end.map(|e| (e, min_query.min(e)));
+    }
+
+    /// the largest resume point `<= lcp` for a request whose prompt ends at `end` such that no row the DFlash
+    /// drafter reads holds a last-layer tap a pruned prefill skipped. The drafter's first block after the prompt reads
+    /// rows `end - (window + margin) ..`, later blocks only newer ones, so only stale rows in
+    /// `[end - window - margin, lcp)` matter: the resume drops to the first of them (rows from there on are prefilled
+    /// again, with fresh taps), never below `end - window - margin`. Returns `lcp` without tail pruning / a drafter.
+    pub fn exact_resume_floor(&self, lcp: usize, end: usize) -> usize {
+        let Some(win) = self.dflash_window() else {
+            return lcp;
+        };
+        let lo = end.saturating_sub(win + TAIL_DF_MARGIN);
+        let mut r = lcp;
+        for &(a, b) in &self.tap_stale {
+            if a < r && b > lo {
+                r = a.max(lo);
+            }
+        }
+        r
+    }
+
+    /// The DFlash drafter's attention window over the target taps (rows), when a drafter is loaded on GPU.
+    fn dflash_window(&self) -> Option<usize> {
+        let g = self.gpu.as_ref()?;
+        g.dflash_gpu.as_ref()?;
+        g.model
+            .dflash
+            .as_ref()
+            .map(|dw| dw.catalog.sliding_window as usize)
     }
 
     /// Ring capacity (slots) of the 40 SWA KV caches.
@@ -4690,6 +4931,15 @@ impl MimoEngine {
                 .expect("dflash runner required")
                 .propose_draft_tokens(last_tok, pos)
         }
+    }
+
+    /// the drafter's top-1 probability of each draft row of the last GPU proposal (empty unless a
+    /// confident-prefix switch or its trace is on; talus_spec::ConfPrefix).
+    pub fn last_draft_tops(&self) -> &[f32] {
+        self.gpu
+            .as_ref()
+            .and_then(|g| g.dflash_gpu.as_ref())
+            .map_or(&[][..], |d| d.df_conf_tops.as_slice())
     }
 
     /// [`Self::propose_drafts`] plus each draft row's top-16 drafter candidates `(target id, logit)` for exact

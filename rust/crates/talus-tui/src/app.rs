@@ -840,8 +840,8 @@ mod tests {
         for _ in 0..r {
             a.on_key(key(KeyCode::Down));
         }
-        a.on_key(key(KeyCode::Left)); // 64K -> 32K
-        assert_eq!(a.draft.get("context").map(String::as_str), Some("32768"));
+        a.on_key(key(KeyCode::Left)); // Auto -> 256K
+        assert_eq!(a.draft.get("context").map(String::as_str), Some("262144"));
         a.on_key(key(KeyCode::Char('d')));
         assert!(a.draft.is_empty());
         a.on_key(key(KeyCode::Left));
@@ -849,7 +849,10 @@ mod tests {
         let Modal::Confirm { body, lines, .. } = a.modal.clone() else {
             panic!("{:?}", a.modal)
         };
-        assert_eq!(lines[0], "Context length: 64K -> 32K");
+        assert_eq!(
+            lines[0],
+            "Context length: Auto (by memory, up to 256K) -> 256K"
+        );
         assert!(lines.last().unwrap().contains("pauses briefly"));
         a.modal = Modal::None;
         let k = a.on_apply_result(Ok((202, json!({"status": "restarting"}))), None);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""w4i_convert.py [--gguf SRC.gguf] [--layers A-B] OUT.w4i IN.tw4 [IN.tw4 ...] : rc-a4 - convert w4cal .tw4 W4A4 sidecars (format v1, int4 weights in
+"""w4i_convert.py [--gguf SRC.gguf] [--layers A-B] OUT.w4i IN.tw4 [IN.tw4 ...] : convert .tw4 W4A4 sidecars (format v1, int4 weights in
 the 256-block Hadamard basis, one scale per 16-row tile x weight group) into the tp_w4i layout the Rust 27B engine
 loads with TALUS_Q27_W4I (see rust/crates/talus-model/src/qwen35/w4i.rs for the format).  A .tw4 whose weight group
 equals the matrix width becomes per-row scales (wg 0); 256-value groups stay wg 256.  Later inputs win on duplicate

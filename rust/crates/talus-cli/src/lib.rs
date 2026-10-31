@@ -13,6 +13,7 @@
     clippy::too_many_arguments
 )]
 
+mod disk_tier;
 pub mod glm_serve;
 use core::ffi::c_void;
 use std::fs::{self, File};
@@ -71,6 +72,12 @@ pub struct CliConfig {
     pub kv_stash_mib: i32,
     /// Minimum tokens before message-boundary snapshot (`--snap-msg <N>`, default `1024`).
     pub snap_msg: i32,
+    /// Disk tier folder (`--prompt-cache-disk DIR|auto|off`; else `TALUS_PCACHE_DISK`; default off).
+    pub prompt_cache_disk: Option<String>,
+    /// Disk tier budget in GiB (`--prompt-cache-disk-gib N`; else `TALUS_PCACHE_DISK_GIB`; default 32).
+    pub prompt_cache_disk_gib: Option<String>,
+    /// Shortest prompt written to the disk tier (`--prompt-cache-disk-min N`; else `TALUS_PCACHE_DISK_MIN`).
+    pub prompt_cache_disk_min: Option<String>,
     /// Prompt cache live continuation policy (`--cache-live <N>`, default `0` = grid-aligned cold-exact policy).
     pub cache_live: i32,
     /// Run warm vs cold prompt cache exactness self-test (`--livecold-test <N>`, default `0`).
@@ -205,6 +212,9 @@ impl Default for CliConfig {
             prompt_cache: 8,
             kv_stash_mib: 8192,
             snap_msg: 1024,
+            prompt_cache_disk: None,
+            prompt_cache_disk_gib: None,
+            prompt_cache_disk_min: None,
             cache_live: 0,
             livecold_test: 0,
             serve: false,
@@ -408,8 +418,11 @@ where
             }
             "--max-context" | "--ctx" => {
                 let v = next_val(&mut i, a)?;
-                cfg.max_context = parse_i32_arg(a, &v)?;
-                cfg.ctx_explicit = true;
+                // `auto` = as if not given (the 27B then sizes its context to the memory)
+                if v != "auto" {
+                    cfg.max_context = parse_i32_arg(a, &v)?;
+                    cfg.ctx_explicit = true;
+                }
             }
             "--chunk" | "--prefill" => {
                 let v = next_val(&mut i, a)?;
@@ -502,6 +515,15 @@ where
             "--snap-msg" => {
                 let v = next_val(&mut i, a)?;
                 cfg.snap_msg = parse_i32_arg(a, &v)?;
+            }
+            "--prompt-cache-disk" => {
+                cfg.prompt_cache_disk = Some(next_val(&mut i, a)?);
+            }
+            "--prompt-cache-disk-gib" => {
+                cfg.prompt_cache_disk_gib = Some(next_val(&mut i, a)?);
+            }
+            "--prompt-cache-disk-min" => {
+                cfg.prompt_cache_disk_min = Some(next_val(&mut i, a)?);
             }
             "--cache-live" => {
                 let v = next_val(&mut i, a)?;
@@ -712,6 +734,11 @@ Every model's shipped arguments: docs/MODELS.md. Environment switches: TALUS_X a
   --prompt-cache N           state snapshots kept by --serve across turns (default: 8)
   --kv-stash-mib M           device memory budget in MiB for KV stashes (default: 8192)
   --snap-msg N               snapshot before last user/tool message after >= N tokens (default: 1024)
+  --prompt-cache-disk DIR    keep prompt-cache entries on disk across restarts (27B, Laguna serve); DIR, auto, or
+                             off/0 (env TALUS_PCACHE_DISK; default: on, $XDG_CACHE_HOME/talus/pcache or
+                             ~/.cache/talus/pcache; never fills the disk past max(20 GiB, 10 %) free)
+  --prompt-cache-disk-gib N  disk budget in GiB, least recently used entries go first (default: 32)
+  --prompt-cache-disk-min N  shortest prompt worth a disk entry (default: 1024)
   --cache-live N             1 = continue from live decoded cells; 0 = grid-aligned cold-exact policy (default: 0)
   --livecold-test N          verify warm turns match cold greedy output for N tokens
   --serve, --engine-protocol run the line-oriented GEN/STOP/T/DONE protocol on stdin/stdout
@@ -799,6 +826,8 @@ pub struct Q36StdioBackend {
     pub ngram_k: i32,
     pub n_spec: i32,
     pub snap_msg: i32,
+    /// Disk tier of the prompt cache (`--prompt-cache-disk`), `None` when off.
+    pub disk: Option<talus_state::disk::DiskCache>,
 }
 
 impl Q36StdioBackend {
@@ -829,7 +858,7 @@ impl Q36StdioBackend {
         } else {
             24
         };
-        Self {
+        let mut me = Self {
             eng,
             pc,
             live: Vec::new(),
@@ -839,7 +868,10 @@ impl Q36StdioBackend {
             ngram_k: cfg.ngram,
             n_spec,
             snap_msg,
-        }
+            disk: None,
+        };
+        me.disk = disk_tier::open(&mut me, cfg);
+        me
     }
 }
 
@@ -912,6 +944,9 @@ impl EngineProtocolBackend for Q36StdioBackend {
             if !self.live.is_empty() {
                 self.pc
                     .stash_kv_with_pf(&view, &self.live, lcp, self.live_pf);
+            }
+            if self.disk.is_some() {
+                disk_tier::restore_into_ram(self, &view, ids, gridc);
             }
             let (r, r_from) = if gridc {
                 self.pc
@@ -1274,7 +1309,16 @@ impl EngineProtocolBackend for Q36StdioBackend {
             reuse,
             fresh: fresh as i64,
         };
-        write_done_line(out, &done)
+        // Taken before DONE: a stop signal that follows the reply waits for this turn's disk write.
+        let _save_guard =
+            (self.disk.is_some() && cache_enabled).then(talus_state::disk::SaveGuard::new);
+        write_done_line(out, &done)?;
+        if self.disk.is_some() && cache_enabled {
+            // The reply is complete: let the client have it before the state is copied off the GPU.
+            out.flush()?;
+            disk_tier::save_after_turn(self);
+        }
+        Ok(())
     }
 }
 
@@ -2009,7 +2053,7 @@ pub fn run_laguna_cli(cfg: &CliConfig, model_path: &Path) -> i32 {
             return 1;
         }
     };
-    let mut df = match df_path {
+    let mut df = match df_path.clone() {
         Some(p) => match talus_model::laguna::LagunaDFlash::load(Path::new(&p), &eng, ctx) {
             Ok(d) => {
                 eprintln!("talus-laguna: dflash drafter {p}");
@@ -2024,6 +2068,8 @@ pub fn run_laguna_cli(cfg: &CliConfig, model_path: &Path) -> i32 {
     };
 
     if cfg.serve {
+        let disk =
+            disk_tier::open_laguna(cfg, model_path, df_path.as_deref(), eng.ring(), eng.ctx16());
         return match talus_model::laguna::serve_main(
             &mut eng,
             &cfg.eos_ids,
@@ -2032,6 +2078,7 @@ pub fn run_laguna_cli(cfg: &CliConfig, model_path: &Path) -> i32 {
             load_s,
             df.as_mut(),
             fast_serve_mode,
+            disk.as_ref(),
         ) {
             Ok(()) => 0,
             Err(e) => {
@@ -2165,7 +2212,7 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
     opts.no_v16 = cfg.no_v16;
     opts.dflash_path = cfg.dflash_gguf.clone().unwrap_or_default();
 
-    let model = match Q36Model::load(
+    let mut model = match Q36Model::load(
         Path::new(model_path),
         opts.mtp_gguf.as_deref(),
         draft_vocab_vec.as_deref(),
@@ -2176,6 +2223,20 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
             eprintln!("talus-cli: failed to load model {model_path}: {e}");
             return 1;
         }
+    };
+    // without --max-context the 27B takes the largest of 256K / 128K / 64K that fits in memory beside
+    // the weights and the int8 prompt expansion. An explicit --max-context is always honoured.
+    let mut auto_cfg;
+    let cfg = if model.dense && !cfg.ctx_explicit {
+        let (ctx, why) = talus_model::qwen35::engine::q27_auto_context(&model);
+        eprintln!("talus-cli: {why}");
+        model.cfg.max_seq = ctx;
+        model.opts.max_seq = ctx;
+        auto_cfg = cfg.clone();
+        auto_cfg.max_context = ctx;
+        &auto_cfg
+    } else {
+        cfg
     };
 
     let mut eng = match Q36Engine::new(&model, cfg.max_context) {
@@ -2912,6 +2973,26 @@ mod tests {
         assert_eq!(cfg.max_new, 64);
         assert_eq!(cfg.bench_steps, 32);
         assert_eq!(cfg.hybrid_rows, 128);
+        assert_eq!(cfg.prompt_cache_disk, None);
+
+        let d = parse_cli_args([
+            "--model",
+            "m.gguf",
+            "--serve",
+            "--prompt-cache-disk",
+            "auto",
+            "--prompt-cache-disk-gib",
+            "48",
+            "--prompt-cache-disk-min",
+            "2048",
+        ])
+        .unwrap();
+        assert_eq!(d.prompt_cache_disk.as_deref(), Some("auto"));
+        let dc = disk_tier::disk_config(&d).unwrap();
+        assert_eq!(dc.budget_bytes, 48 << 30);
+        assert_eq!(dc.min_tokens, 2048);
+        let off = parse_cli_args(["--model", "m.gguf", "--prompt-cache-disk", "off"]).unwrap();
+        assert!(disk_tier::disk_config(&off).is_none());
 
         // Leading `serve` subcommand with `--engine-protocol`
         let cfg2 = parse_cli_args([

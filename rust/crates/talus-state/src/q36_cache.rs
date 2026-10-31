@@ -163,10 +163,19 @@ pub fn q36_kv_bytes(eng: &Q36LayerStateView, n: i32, n0: i32) -> usize {
         return 0;
     }
     let na = eng.kc.iter().filter(|&&p| !p.is_null()).count();
+    // std-layout V block only for layers that hold `vc` (the 27B does not allocate it by default, #29)
+    let nv = eng
+        .kc
+        .iter()
+        .enumerate()
+        .filter(|&(l, &p)| {
+            !p.is_null() && !eng.vc.get(l).copied().unwrap_or(ptr::null_mut()).is_null()
+        })
+        .count();
     let row = (eng.n_head_kv.max(0) as usize) * (eng.head_dim.max(0) as usize) * 2;
     let vt0 = if n0 > 0 { (n0 / 16) * 16 } else { 0 };
     let vt_span = (vt_round(n) - vt0).max(0) as usize;
-    let mut b = na * (((n - n0) as usize) * 2 + vt_span) * row;
+    let mut b = (na * (((n - n0) as usize) + vt_span) + nv * ((n - n0) as usize)) * row;
     if n0 <= 0 && !eng.dfl_k_ring.is_empty() {
         let dfl_rows = eng.dfl_keep.max(0) as usize;
         let dfl_rb = (eng.dfl_kv_dim.max(0) as usize) * 4;
@@ -315,7 +324,9 @@ fn q36_kv_copy_range_dfl(
                 .cast::<u8>();
 
             cp2(kc_ptr, dev_kv_cells, buf_kv_cells, a_clamped, b_clamped);
-            cp2(vc_ptr, dev_kv_cells, buf_kv_cells, a_clamped, b_clamped);
+            if !vc_ptr.is_null() {
+                cp2(vc_ptr, dev_kv_cells, buf_kv_cells, a_clamped, b_clamped);
+            }
             if !vtc_ptr.is_null() {
                 cp2(vtc_ptr, dev_vt_cells, buf_vt_cells, vt_c0, vt_c1);
             }
@@ -438,8 +449,8 @@ pub fn q36_kv_copy(eng: &Q36LayerStateView, buf: *mut u8, n: i32, to_buf: bool, 
                         eng.st,
                     );
                     assert!(st2.is_success());
+                    p = p.add(hkv * w);
                 }
-                p = p.add(hkv * w);
 
                 if !vtc_ptr.is_null() && vtw > 0 {
                     let st3 = hip_memcpy_2d_async(
@@ -481,8 +492,8 @@ pub fn q36_kv_copy(eng: &Q36LayerStateView, buf: *mut u8, n: i32, to_buf: bool, 
                         eng.st,
                     );
                     assert!(st2.is_success());
+                    p = p.add(hkv * w);
                 }
-                p = p.add(hkv * w);
 
                 if !vtc_ptr.is_null() && vtw > 0 {
                     let st3 = hip_memcpy_2d_async(
@@ -788,22 +799,15 @@ impl Q36PromptCache {
         }
     }
 
-    pub fn restore(&mut self, eng: &mut Q36LayerStateView, ids: &[i32], live: &[i32]) -> usize {
-        self.restore_with_pf(eng, ids, live, usize::MAX, false).0
-    }
-
-    pub fn restore_with_pf(
-        &mut self,
-        eng: &mut Q36LayerStateView,
+    /// The restore point [`Self::restore_with_pf`] would pick: `(snapshot index, stash index if KV must be
+    /// copied, restored length)`.
+    fn find_best(
+        &self,
         ids: &[i32],
-        live: &[i32],
-        live_pf: usize,
+        in_cache: usize,
         pf_only: bool,
-    ) -> (usize, &'static str) {
-        let in_cache = live_pf.min(Self::lcp(live, ids));
-
-        let mut best_idx: Option<usize> = None;
-        let mut best_kv_idx: Option<usize> = None;
+    ) -> Option<(usize, Option<usize>, usize)> {
+        let mut best: Option<(usize, Option<usize>, usize)> = None;
         let mut best_n = 0usize;
 
         for (i, s) in self.snaps.iter().enumerate() {
@@ -826,12 +830,145 @@ impl Q36PromptCache {
                     continue;
                 }
             }
-            best_idx = Some(i);
-            best_kv_idx = kv_i;
+            best = Some((i, kv_i, n));
             best_n = n;
         }
+        best
+    }
 
-        let Some(b_idx) = best_idx else {
+    /// How many tokens of `ids` [`Self::restore_with_pf`] would restore, without touching any state.
+    pub fn peek_with_pf(&self, ids: &[i32], live: &[i32], live_pf: usize, pf_only: bool) -> usize {
+        let in_cache = live_pf.min(Self::lcp(live, ids));
+        self.find_best(ids, in_cache, pf_only)
+            .map_or(0, |(_, _, n)| n)
+    }
+
+    /// Insert a recurrent-state snapshot from host bytes (a disk entry), as [`Self::save`] would have stored it.
+    /// Returns false if the size does not match this engine's snapshot size or `max_snaps == 0`.
+    pub fn insert_snap_host(
+        &mut self,
+        eng: &Q36LayerStateView,
+        ids: &[i32],
+        msg: bool,
+        host: &[u8],
+    ) -> bool {
+        let cap = if msg { self.max_msg } else { self.max_snaps };
+        if self.max_snaps == 0 || cap == 0 || ids.is_empty() {
+            return false;
+        }
+        if self.snap_bytes == 0 {
+            self.snap_bytes = q36_state_bytes(eng);
+        }
+        if host.len() != self.snap_bytes {
+            return false;
+        }
+        self.clock += 1;
+        let now = self.clock;
+        let idx = if let Some(idx) = self.snaps.iter().position(|s| s.ids.as_slice() == ids) {
+            idx
+        } else if self.snaps.iter().filter(|s| s.msg == msg).count() < cap {
+            let mut raw: *mut c_void = ptr::null_mut();
+            if !unsafe { hipMalloc(&mut raw, self.snap_bytes) }.is_success() {
+                return false;
+            }
+            self.snaps.push(Q36Snap {
+                ids: Vec::new(),
+                buf: raw.cast::<u8>(),
+                msg,
+                used: 0,
+            });
+            self.snaps.len() - 1
+        } else {
+            self.snaps
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.msg == msg)
+                .min_by_key(|(_, s)| s.used)
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        if !h2d(self.snaps[idx].buf, host, eng.st) {
+            return false;
+        }
+        let s = &mut self.snaps[idx];
+        s.ids.clear();
+        s.ids.extend_from_slice(ids);
+        s.msg = msg;
+        s.used = now;
+        true
+    }
+
+    /// Insert a KV stash from host bytes (a disk entry), as [`Self::stash_kv_with_pf`] would have stored it.
+    /// Returns false if the size does not match `q36_kv_bytes(eng, ids.len(), 0)` or the budget is too small.
+    pub fn insert_stash_host(
+        &mut self,
+        eng: &Q36LayerStateView,
+        ids: &[i32],
+        pf: usize,
+        host: &[u8],
+    ) -> bool {
+        let need = q36_kv_bytes(eng, ids.len() as i32, 0);
+        if need == 0 || host.len() != need || need > self.stash_budget {
+            return false;
+        }
+        if let Some(i) = self.stashes.iter().position(|s| s.ids.as_slice() == ids) {
+            let removed = self.stashes.remove(i);
+            unsafe {
+                let _ = hipFree(removed.buf.cast::<c_void>());
+            }
+            self.stash_used = self.stash_used.saturating_sub(removed.bytes);
+        }
+        while self.stash_used + need > self.stash_budget && !self.stashes.is_empty() {
+            let old = self
+                .stashes
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| s.used)
+                .map(|(i, _)| i)
+                .unwrap();
+            let removed = self.stashes.remove(old);
+            unsafe {
+                let _ = hipFree(removed.buf.cast::<c_void>());
+            }
+            self.stash_used = self.stash_used.saturating_sub(removed.bytes);
+        }
+        let mut raw: *mut c_void = ptr::null_mut();
+        if !unsafe { hipMalloc(&mut raw, need) }.is_success() {
+            return false;
+        }
+        let buf = raw.cast::<u8>();
+        if !h2d(buf, host, eng.st) {
+            unsafe {
+                let _ = hipFree(raw);
+            }
+            return false;
+        }
+        self.stash_used += need;
+        self.clock += 1;
+        self.stashes.push(Q36Stash {
+            ids: ids.to_vec(),
+            buf,
+            bytes: need,
+            used: self.clock,
+            pf: pf.min(ids.len()),
+        });
+        true
+    }
+
+    pub fn restore(&mut self, eng: &mut Q36LayerStateView, ids: &[i32], live: &[i32]) -> usize {
+        self.restore_with_pf(eng, ids, live, usize::MAX, false).0
+    }
+
+    pub fn restore_with_pf(
+        &mut self,
+        eng: &mut Q36LayerStateView,
+        ids: &[i32],
+        live: &[i32],
+        live_pf: usize,
+        pf_only: bool,
+    ) -> (usize, &'static str) {
+        let in_cache = live_pf.min(Self::lcp(live, ids));
+        let Some((b_idx, best_kv_idx, best_n)) = self.find_best(ids, in_cache, pf_only) else {
             return (0, "");
         };
 
@@ -891,6 +1028,42 @@ impl Q36PromptCache {
     }
 }
 
+/// Synchronous host-to-device copy on `st`.
+fn h2d(dst: *mut u8, host: &[u8], st: hipStream_t) -> bool {
+    if host.is_empty() {
+        return true;
+    }
+    unsafe {
+        hipMemcpyAsync(
+            dst.cast::<c_void>(),
+            host.as_ptr().cast::<c_void>(),
+            host.len(),
+            hipMemcpyHostToDevice,
+            st,
+        )
+        .is_success()
+            && hipStreamSynchronize(st).is_success()
+    }
+}
+
+/// Synchronous device-to-host copy on `st`.
+pub(crate) fn d2h(host: &mut [u8], src: *const u8, st: hipStream_t) -> bool {
+    if host.is_empty() {
+        return true;
+    }
+    unsafe {
+        hipMemcpyAsync(
+            host.as_mut_ptr().cast::<c_void>(),
+            src.cast::<c_void>(),
+            host.len(),
+            hipMemcpyDeviceToHost,
+            st,
+        )
+        .is_success()
+            && hipStreamSynchronize(st).is_success()
+    }
+}
+
 impl Drop for Q36PromptCache {
     fn drop(&mut self) {
         for s in &mut self.snaps {
@@ -909,5 +1082,56 @@ impl Drop for Q36PromptCache {
                 s.buf = ptr::null_mut();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod vc_layout_tests {
+    use super::*;
+
+    fn view(with_vc: bool) -> Q36LayerStateView {
+        // dangling non-null pointers: q36_kv_bytes only tests them for null
+        let nn = ptr::NonNull::<u8>::dangling().as_ptr().cast::<c_void>();
+        let vc = if with_vc { nn } else { ptr::null_mut() };
+        Q36LayerStateView {
+            ssm_d_conv: 4,
+            ssm_conv_channels: 8,
+            ssm_v_heads: 2,
+            ssm_state_size: 4,
+            n_head_kv: 4,
+            head_dim: 256,
+            n_embd: 16,
+            ctx: 4096,
+            vt_ctx: 4096,
+            has_mtp: false,
+            conv: Vec::new(),
+            s: Vec::new(),
+            kc: vec![ptr::null_mut(), nn, nn],
+            vc: vec![ptr::null_mut(), vc, vc],
+            vtc: vec![ptr::null_mut(), nn, nn],
+            hlast: ptr::null_mut(),
+            gctl: ptr::null_mut(),
+            gdn_pending: 0,
+            pos: 0,
+            st: ptr::null_mut(),
+            dfl_k_ring: Vec::new(),
+            dfl_v_ring: Vec::new(),
+            dfl_ring: 0,
+            dfl_keep: 0,
+            dfl_kv_dim: 0,
+            dfl_block: 0,
+            dctx_lo: 0,
+            dctx_hi: 0,
+        }
+    }
+
+    #[test]
+    fn kv_bytes_skips_absent_std_v() {
+        let row = 4 * 256 * 2;
+        // 2 attention layers, n = 100 (vt rounds to 112)
+        assert_eq!(q36_kv_bytes(&view(true), 100, 0), 2 * (2 * 100 + 112) * row);
+        assert_eq!(q36_kv_bytes(&view(false), 100, 0), 2 * (100 + 112) * row);
+        // incremental range [40, 100): vt from 32
+        assert_eq!(q36_kv_bytes(&view(false), 100, 40), 2 * (60 + 80) * row);
     }
 }

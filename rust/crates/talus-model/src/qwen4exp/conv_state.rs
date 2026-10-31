@@ -288,7 +288,7 @@ fn gdn_buffer(mut v: Vec<u8>, n: usize) -> Vec<u8> {
     }
 }
 
-/// Gives a discarded checkpoint's GDN buffer to the pool (rc-fn; see gdn_buffer).
+/// Gives a discarded checkpoint's GDN buffer to the pool (see gdn_buffer).
 pub fn recycle_gdn(v: Vec<u8>) {
     if v.capacity() < GDN_POOL_MIN_BYTES {
         return;

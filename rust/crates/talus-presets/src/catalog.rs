@@ -52,9 +52,36 @@ const SPEC_SAMPLING_DESC: &str =
 const SPEC_SAMPLING_TRADE: &str =
     "Same output distribution. Off only to reproduce older runs: a given seed gives different text.";
 
+// Disk tier of the prompt cache (shared by the engines that have one). On by default (32 GiB, per-user folder).
+const PCACHE_DISK_DEFAULT: &str = "32";
+const PCACHE_DISK: [Choice; 3] = [
+    Choice {
+        value: "32",
+        label: "On, up to 32 GiB",
+        edits: &[],
+    },
+    Choice {
+        value: "128",
+        label: "On, up to 128 GiB",
+        edits: &[Edit::Env("TALUS_PCACHE_DISK_GIB", "128")],
+    },
+    Choice {
+        value: OFF,
+        label: "Off",
+        edits: &[Edit::Env("TALUS_PCACHE_DISK", "0")],
+    },
+];
+const PCACHE_DISK_LABEL: &str = "Prompt cache on disk";
+const PCACHE_DISK_DESC: &str =
+    "Saves conversation state to disk, so after a restart or model switch a long chat resumes without re-reading.";
+const PCACHE_DISK_SWITCH: &str =
+    "TALUS_PCACHE_DISK=0 (off) | DIR, TALUS_PCACHE_DISK_GIB=N (default on: ~/.cache/talus/pcache, 32 GiB)";
+
 // ------------------------------------------------------------------------------------------------- Qwen3.8-27B
 
-const Q27_CTX: [Choice; 3] = [
+// no --max-context = auto: the largest of 256K (native, no RoPE scaling) / 128K / 64K that fits in
+// memory beside the weights and the int8 prompt weights (talus-cli logs the choice).
+const Q27_CTX: [Choice; 6] = [
     Choice {
         value: "16384",
         label: "16K",
@@ -68,6 +95,21 @@ const Q27_CTX: [Choice; 3] = [
     Choice {
         value: "65536",
         label: "64K",
+        edits: &[Edit::Arg("--max-context", "65536")],
+    },
+    Choice {
+        value: "131072",
+        label: "128K",
+        edits: &[Edit::Arg("--max-context", "131072")],
+    },
+    Choice {
+        value: "262144",
+        label: "256K",
+        edits: &[Edit::Arg("--max-context", "262144")],
+    },
+    Choice {
+        value: "auto",
+        label: "Auto (by memory, up to 256K)",
         edits: &[],
     },
 ];
@@ -116,7 +158,7 @@ const Q27_OPTIONS: &[TuneOption] = &[
         switch: "--max-context N",
         group: Group::Common,
         quality: Quality::Exact,
-        default: "65536",
+        default: "auto",
         choices: &Q27_CTX,
         requires: None,
     },
@@ -167,6 +209,18 @@ const Q27_OPTIONS: &[TuneOption] = &[
         default: ON,
         choices: &Q27_PCACHE,
         requires: None,
+    },
+    TuneOption {
+        id: "prompt_cache_disk",
+        label: PCACHE_DISK_LABEL,
+        description: PCACHE_DISK_DESC,
+        tradeoff: "Uses up to 32 or 128 GiB of disk and writes each long turn in the background. Output is identical.",
+        switch: PCACHE_DISK_SWITCH,
+        group: Group::Common,
+        quality: Quality::Exact,
+        default: PCACHE_DISK_DEFAULT,
+        choices: &PCACHE_DISK,
+        requires: Some(("prompt_cache", ON)),
     },
     TuneOption {
         id: "numerics",
@@ -664,6 +718,18 @@ const LAG_OPTIONS: &[TuneOption] = &[
         quality: Quality::Reduced,
         default: OFF,
         choices: &LAG_VGEMM,
+        requires: None,
+    },
+    TuneOption {
+        id: "prompt_cache_disk",
+        label: PCACHE_DISK_LABEL,
+        description: PCACHE_DISK_DESC,
+        tradeoff: "Uses up to 32 or 128 GiB of disk. Greedy output is identical; the drafter starts cold after a restore.",
+        switch: PCACHE_DISK_SWITCH,
+        group: Group::Common,
+        quality: Quality::Exact,
+        default: PCACHE_DISK_DEFAULT,
+        choices: &PCACHE_DISK,
         requires: None,
     },
 ];

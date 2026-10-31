@@ -32,6 +32,9 @@ Placeholders
   {{rel:<model>:<key>:<engine>}}  the same figure for a reference engine re-measured in that run (e.g. halo4, cpp)
   {{rel:build:<key>}}             facts of the frozen build (commit, tag, date, rocm)
   {{rel:rocm_version}}            short form of {{rel:build:rocm}} (also {{rel:commit}}, {{rel:tag}})
+  {{rel:meas:<key>}}              a measurement outside the release runs (e.g. quant quality vs BF16, long-context
+                                  cells), from the values file's "measurements" object: {"<key>": {"value": "...",
+                                  "source": "..."}}. Each entry names the record it was taken from.
   {{rel:gate:<key>}}              the pass criteria the release run was judged by (noise bands band_<metric>,
                                   text_noise_1p / text_noise_4p, soak_rss, soak_drift, kld_<model>)
   <model> is one of qwen27b, flashnext, glm, mimo, laguna. Keys used by the docs: chat code edit pp2k pp32k tg2k
@@ -144,6 +147,12 @@ def allowed_numbers(values):
         return ok
     items = [(k, str(v)) for k, v in (values.get("build") or {}).items()]
     items += [(k, str(v)) for k, v in (values.get("gates") or {}).items()]
+    meas = [str((e or {}).get("value", "")) for e in (values.get("measurements") or {}).values() if isinstance(e, dict)]
+    for t in meas:                       # a measurement may fill any kind of claim
+        nums = {norm_num(n) for n in re.findall(r"\d[\d,]*(?:\.\d+)?(?:[eE][-+]?\d+)?|\.\d+", t)}
+        nums |= {f"{a}/{b}" for a, b in re.findall(r"(\d+)\s*/\s*(\d+)", t)}
+        for rule in ok:
+            ok[rule] |= nums
     for m in (values.get("models") or {}).values():
         if isinstance(m, dict) and m.get("status") == "pass":
             items += [(k.split(":")[0], str(v)) for k, v in (m.get("values") or {}).items()]
@@ -162,6 +171,13 @@ def resolve(values, scope, key, engine):
         if scope not in ALIASES:
             return PENDING, False
         scope, key = ALIASES[scope]
+    if scope == "meas":
+        known = engine is None and re.fullmatch(r"[a-z0-9_]+", key or "") is not None
+        e = ((values or {}).get("measurements") or {}).get(key) if values else None
+        v = e.get("value") if isinstance(e, dict) else None
+        if values and v in (None, ""):
+            return PENDING, False        # a measurement key the values file does not have is an error, not pending
+        return (str(v) if v not in (None, "") else PENDING), known
     if scope in ("build", "gate"):
         known = key in (BUILD_KEYS if scope == "build" else GATE_KEYS) and engine is None
         v = (values or {}).get(scope if scope == "build" else "gates", {}).get(key) if values else None

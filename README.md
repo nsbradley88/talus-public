@@ -137,7 +137,6 @@ GGUF), stop tokens and default sampling. An example for Qwen3.8-27B:
 {
   "exe": "rust/target/release/talus-cli",
   "args": ["--model", "/models/Qwen3.8-27B-UD-IQ4_XS.gguf",
-           "--max-context", "65536",
            "--mtp-gguf", "/models/MTP/mtp-Qwen3.8-27B-Q4_0.gguf", "--mtp", "5",
            "--spec-draft-vocab", "/models/MTP/qwen-dv-65536.bin", "--ngram", "24",
            "--dflash-gguf", "/models/DFlash2/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"],

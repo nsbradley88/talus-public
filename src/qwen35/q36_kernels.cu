@@ -336,7 +336,7 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
         const int kh = head - H;
         kc[((size_t) kh * ctx + pos) * HD + i] = __float2half(v);
         const __half hv = __float2half(vx[((size_t) t * HKV + kh) * HD + i]);
-        vc[((size_t) kh * ctx + pos) * HD + i] = hv;
+        if (vc) vc[((size_t) kh * ctx + pos) * HD + i] = hv;   // null: std-layout V not allocated
         if (vt) vt[vt_index(kh, pos, i, vt_ctx)] = hv;   // k_attn_wmma's cell-blocked copy
     }
 }
@@ -431,7 +431,109 @@ __device__ __forceinline__ tq_f8 tq_wmma(tq_h16 a, tq_h16 b, tq_f8 c) {
     return c;   // (never launched: wmma_attn_ok() is false off gfx11)
 #endif
 }
-template <int RT>
+// the softmax row max / sum over the 16 lanes of a row, three ways that give the same bits (TALUS_ATTN_RED).
+// RED 0: the `__shfl_xor` butterfly (offsets 1, 2, 4, 8; ds_bpermute on gfx11).  RED 1: the same butterfly with DPP
+// row_xmask moves (no LDS round trip).  RED 2: RED 1, and the iterations whose two rows are both past the block's R rows
+// (all -inf / all 0: max -inf, sum +0) skip the reduction and write those values.  RED 3: a transposed reduction of the
+// 8 values of a lane (LSB first: at offset 1 a lane keeps half of its values and adds the partner's copy of that half,
+// at 2 half again, at 4 one is left, then a plain step at 8) - the same pairs at every level as the butterfly (fp add
+// and max commute), 4 + 2 + 1 + 1 moves instead of 32; value i ends in the lanes att_tred_lane(i) and att_tred_lane(i) + 8.
+// Idea from libstrix (asf0/libstrix, MIT: xor_shuffle via DPP); the transposed sum after Strata S26 tsum (s26_tsum.cuh).
+template <int O>
+__device__ __forceinline__ float att_x16(float v) {   // the value of lane ^ O (O = 1, 2, 4, 8: inside a row of 16)
+#if defined(__gfx11__) || defined(__GFX11__) || defined(__gfx12__) || defined(__GFX12__)
+    return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x160 + O, 0xf, 0xf, false));   // row_xmask:O
+#else
+    return __shfl_xor(v, O, 32);
+#endif
+}
+template <bool MAX>
+__device__ __forceinline__ float att_op(float a, float b) { return MAX ? fmaxf(a, b) : a + b; }
+template <bool MAX>
+__device__ __forceinline__ float att_bfly16(float v) {   // RED 1: the butterfly's order, DPP moves
+    v = att_op<MAX>(v, att_x16<1>(v));
+    v = att_op<MAX>(v, att_x16<2>(v));
+    v = att_op<MAX>(v, att_x16<4>(v));
+    v = att_op<MAX>(v, att_x16<8>(v));
+    return v;
+}
+template <bool MAX, int O, int CNT>
+__device__ __forceinline__ void att_tred_lvl(float* v, int l16) {
+    const bool up = (l16 & O) != 0;
+#pragma unroll
+    for (int j = 0; j < CNT / 2; ++j) {
+        const float send = up ? v[j] : v[j + CNT / 2];
+        const float keep = up ? v[j + CNT / 2] : v[j];
+        v[j] = att_op<MAX>(keep, att_x16<O>(send));
+    }
+}
+template <bool MAX>
+__device__ __forceinline__ float att_tred16(float (&v)[8], int l16) {   // RED 3: returns value att_tred_idx(l16)'s result
+    att_tred_lvl<MAX, 1, 8>(v, l16);
+    att_tred_lvl<MAX, 2, 4>(v, l16);
+    att_tred_lvl<MAX, 4, 2>(v, l16);
+    return att_op<MAX>(v[0], att_x16<8>(v[0]));
+}
+__host__ __device__ constexpr int att_tred_idx(int l16) { return ((l16 & 1) << 2) | (l16 & 2) | ((l16 >> 2) & 1); }
+// One tile row block's softmax statistics (rows rt * 16 + 2 i + hi, i = 0..7): the masked scores sv -> the row maxima
+// into mx (lanes l16 == 0, or the transposed lanes), as k_attn_wmma's RED 0 code did inline.
+template <int RED>
+__device__ __forceinline__ void att_rowmax(const float (&sv)[8], float* mx, int rbase, int hi, int l16, int R) {
+    if constexpr (RED == 3) {
+        float v[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) v[i] = sv[i];
+        const float m = att_tred16<true>(v, l16);
+        if (l16 < 8) mx[rbase + 2 * att_tred_idx(l16) + hi] = m;
+    } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            float m = sv[i];
+            if constexpr (RED == 2) {
+                if (rbase + 2 * i >= R) {   // both rows of this iteration are past R: every score is -inf
+                    if (l16 == 0) mx[rbase + 2 * i + hi] = -INFINITY;
+                    continue;
+                }
+            }
+            if constexpr (RED == 0) {
+#pragma unroll
+                for (int o = 1; o < 16; o <<= 1) m = fmaxf(m, __shfl_xor(m, o, 32));
+            } else {
+                m = att_bfly16<true>(m);
+            }
+            if (l16 == 0) mx[rbase + 2 * i + hi] = m;
+        }
+    }
+}
+template <int RED>
+__device__ __forceinline__ void att_rowsum(const float (&pv)[8], float* sm, int rbase, int hi, int l16, int R) {
+    if constexpr (RED == 3) {
+        float v[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) v[i] = pv[i];
+        const float s = att_tred16<false>(v, l16);
+        if (l16 < 8) sm[rbase + 2 * att_tred_idx(l16) + hi] = s;
+    } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            float s = pv[i];
+            if constexpr (RED == 2) {
+                if (rbase + 2 * i >= R) {   // both rows past R: every p is 0, the butterfly's sum +0
+                    if (l16 == 0) sm[rbase + 2 * i + hi] = 0.f;
+                    continue;
+                }
+            }
+            if constexpr (RED == 0) {
+#pragma unroll
+                for (int o = 1; o < 16; o <<= 1) s += __shfl_xor(s, o, 32);
+            } else {
+                s = att_bfly16<false>(s);
+            }
+            if (l16 == 0) sm[rbase + 2 * i + hi] = s;
+        }
+    }
+}
+template <int RT, int RED = 0>
 __global__ void __launch_bounds__(128) k_attn_wmma(const float* __restrict__ q, const __half* __restrict__ kc,
                                                    const __half* __restrict__ vt, const int32_t* pos0, int T, int H,
                                                    int HKV, int ctx, int vt_ctx, float scale, int chunk, int n_chunk,
@@ -506,6 +608,7 @@ __global__ void __launch_bounds__(128) k_attn_wmma(const float* __restrict__ q, 
         }
         __syncthreads();
         if (kh == 0) {   // the scores (masked per row: token t sees the cells < p0 + t + 1), the tile's row maxima
+            if constexpr (RED == 0) {
 #pragma unroll
             for (int rt = 0; rt < RT; ++rt)
 #pragma unroll
@@ -519,9 +622,24 @@ __global__ void __launch_bounds__(128) k_attn_wmma(const float* __restrict__ q, 
                     for (int o = 1; o < 16; o <<= 1) m = fmaxf(m, __shfl_xor(m, o, 32));
                     if (l16 == 0) mxw[ct][r] = m;
                 }
+            } else {   // the same maxima (att_rowmax)
+#pragma unroll
+                for (int rt = 0; rt < RT; ++rt) {
+                    float sv[8];
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const int r = rt * 16 + 2 * i + hi;
+                        const bool ok = r < R && cell < p0 + (r + r0) / G + 1;
+                        sv[i] = ok ? (sacc[rt][i] + Sp[r][ct * 16 + l16]) * scale : -INFINITY;
+                        sacc[rt][i] = sv[i];
+                    }
+                    att_rowmax<RED>(sv, mxw[ct], rt * 16, hi, l16, R);
+                }
+            }
         }
         __syncthreads();
         if (kh == 0) {   // P = exp(S - the new running max) as FP16, the tile's row sums
+            if constexpr (RED == 0) {
 #pragma unroll
             for (int rt = 0; rt < RT; ++rt)
 #pragma unroll
@@ -535,6 +653,20 @@ __global__ void __launch_bounds__(128) k_attn_wmma(const float* __restrict__ q, 
                     for (int o = 1; o < 16; o <<= 1) s += __shfl_xor(s, o, 32);
                     if (l16 == 0) smw[ct][r] = s;
                 }
+            } else {   // the same sums (att_rowsum)
+#pragma unroll
+                for (int rt = 0; rt < RT; ++rt) {
+                    float pv[8];
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const int r = rt * 16 + 2 * i + hi;
+                        const float mn = fmaxf(m_run[r], fmaxf(mxw[0][r], mxw[1][r]));
+                        pv[i] = sacc[rt][i] == -INFINITY ? 0.f : expf(sacc[rt][i] - mn);
+                        P16[r * PP + ct * 16 + l16] = (_Float16) pv[i];
+                    }
+                    att_rowsum<RED>(pv, smw[ct], rt * 16, hi, l16, R);
+                }
+            }
         }
         __syncthreads();
         if (tid < MR) {
@@ -627,7 +759,7 @@ __global__ void __launch_bounds__(128) k_attn_wmma(const float* __restrict__ q, 
 /// tiles x 4 quarters of the head dim (the quarters summed in order), O over 8 x 32 dims.  The same per-row
 /// independence (a verify row is the decode row bitwise); its sums differ from k_attn_wmma's (another split of the
 /// head dim).  grid (n_chunk, HKV), block 256.
-template <int RT>
+template <int RT, int RED = 0>
 __global__ void __launch_bounds__(256) k_attn_wmma8(const float* __restrict__ q, const __half* __restrict__ kc,
                                                     const __half* __restrict__ vt, const int32_t* pos0, int T, int H,
                                                     int HKV, int ctx, int vt_ctx, float scale, int chunk, int n_chunk,
@@ -708,6 +840,7 @@ __global__ void __launch_bounds__(256) k_attn_wmma8(const float* __restrict__ q,
         }
         __syncthreads();
         if (kq == 0) {
+            if constexpr (RED == 0) {
 #pragma unroll
             for (int rt = 0; rt < RT; ++rt)
 #pragma unroll
@@ -723,9 +856,25 @@ __global__ void __launch_bounds__(256) k_attn_wmma8(const float* __restrict__ q,
                     for (int o = 1; o < 16; o <<= 1) m = fmaxf(m, __shfl_xor(m, o, 32));
                     if (l16 == 0) mxw[ct][r] = m;
                 }
+            } else {   // the same maxima (att_rowmax)
+#pragma unroll
+                for (int rt = 0; rt < RT; ++rt) {
+                    float sv[8];
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const int r = rt * 16 + 2 * i + hi;
+                        const bool ok = r < R && cell < p0 + r / G + 1;
+                        const int cc = ct * 16 + l16;
+                        sv[i] = ok ? (((sacc[rt][i] + Sp[0][r][cc]) + Sp[1][r][cc]) + Sp[2][r][cc]) * scale : -INFINITY;
+                        sacc[rt][i] = sv[i];
+                    }
+                    att_rowmax<RED>(sv, mxw[ct], rt * 16, hi, l16, R);
+                }
+            }
         }
         __syncthreads();
         if (kq == 0) {
+            if constexpr (RED == 0) {
 #pragma unroll
             for (int rt = 0; rt < RT; ++rt)
 #pragma unroll
@@ -739,6 +888,20 @@ __global__ void __launch_bounds__(256) k_attn_wmma8(const float* __restrict__ q,
                     for (int o = 1; o < 16; o <<= 1) sm += __shfl_xor(sm, o, 32);
                     if (l16 == 0) smw[ct][r] = sm;
                 }
+            } else {   // the same sums (att_rowsum)
+#pragma unroll
+                for (int rt = 0; rt < RT; ++rt) {
+                    float pv[8];
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const int r = rt * 16 + 2 * i + hi;
+                        const float mn = fmaxf(m_run[r], fmaxf(mxw[0][r], mxw[1][r]));
+                        pv[i] = sacc[rt][i] == -INFINITY ? 0.f : expf(sacc[rt][i] - mn);
+                        P16[r * PP + ct * 16 + l16] = (_Float16) pv[i];
+                    }
+                    att_rowsum<RED>(pv, smw[ct], rt * 16, hi, l16, R);
+                }
+            }
         }
         __syncthreads();
         if (tid < MR) {
@@ -1481,11 +1644,12 @@ __global__ void k_flush_read(const float4* p, size_t n, float* out) {
 namespace talus::q36 {
 
 /// k_attn_wmma (4 waves) or k_attn_wmma8 (8 waves, w8) for T rows, RT = ceil(T G / 16) tiles of 16 query rows.
-void launch_attn_wmma(bool w8, dim3 grid, cudaStream_t st, const float* q, const __half* kc, const __half* vt,
+template <int RED>
+static void launch_attn_wmma_red(bool w8, dim3 grid, cudaStream_t st, const float* q, const __half* kc, const __half* vt,
                       const int32_t* pos0, int T, int H, int HKV, int ctx, int vt_ctx, float sc, int chunk, int n_chunk,
                       float* pacc, float* pm, float* pl) {
     const int rt = (T * (H / HKV) + 15) / 16;
-#define TQ_ATT(K, R, NT) K<R><<<grid, NT, 0, st>>>(q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl)
+#define TQ_ATT(K, R, NT) K<R, RED><<<grid, NT, 0, st>>>(q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl)
     if (w8) {
         if (rt == 1) TQ_ATT(k_attn_wmma8, 1, 256);
         else if (rt == 2) TQ_ATT(k_attn_wmma8, 2, 256);
@@ -1499,7 +1663,7 @@ void launch_attn_wmma(bool w8, dim3 grid, cudaStream_t st, const float* q, const
         static const int rt1g = [] { const char* e = std::getenv("TALUS_ATTN_RT1G"); return e ? std::atoi(e) : 1; }();
         if (rt > 1 && rt1g) {
             const int ng = (T * (H / HKV) + 15) / 16;
-            k_attn_wmma<1><<<dim3(grid.x * ng, grid.y), 128, 0, st>>>(q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk,
+            k_attn_wmma<1, RED><<<dim3(grid.x * ng, grid.y), 128, 0, st>>>(q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk,
                                                                       n_chunk, pacc, pm, pl, 0, ng);
             return;
         }
@@ -1511,18 +1675,60 @@ void launch_attn_wmma(bool w8, dim3 grid, cudaStream_t st, const float* q, const
             const int R = T * (H / HKV);
             if (split) {
                 const int ng = (R + 31) / 32;
-                k_attn_wmma<2><<<dim3(grid.x * ng, grid.y), 128, 0, st>>>(q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk,
+                k_attn_wmma<2, RED><<<dim3(grid.x * ng, grid.y), 128, 0, st>>>(q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk,
                                                                           n_chunk, pacc, pm, pl, 0, ng);
             } else
                 for (int r0 = 0; r0 < R; r0 += 32) {
                     if (R - r0 > 16)
-                        k_attn_wmma<2><<<grid, 128, 0, st>>>(q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl, r0);
+                        k_attn_wmma<2, RED><<<grid, 128, 0, st>>>(q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl, r0);
                     else
-                        k_attn_wmma<1><<<grid, 128, 0, st>>>(q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl, r0);
+                        k_attn_wmma<1, RED><<<grid, 128, 0, st>>>(q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl, r0);
                 }
         }
     }
 #undef TQ_ATT
+}
+// the softmax reduction of k_attn_wmma / k_attn_wmma8 (same bits every way; see att_rowmax):
+// TALUS_ATTN_RED=0 the __shfl_xor butterfly (ds_bpermute), 1 DPP butterfly, 2 DPP + skip the rows past R, 3 transposed
+// (3 is the default: the fastest in talus-q27-attn-red timing on gfx1151).
+int g_attn_red = [] { const char* e = std::getenv("TALUS_ATTN_RED"); const int v = e ? std::atoi(e) : 3; return v >= 0 && v <= 3 ? v : 3; }();
+void launch_attn_wmma(bool w8, dim3 grid, cudaStream_t st, const float* q, const __half* kc, const __half* vt,
+                      const int32_t* pos0, int T, int H, int HKV, int ctx, int vt_ctx, float sc, int chunk, int n_chunk,
+                      float* pacc, float* pm, float* pl) {
+    switch (g_attn_red) {
+    case 1: launch_attn_wmma_red<1>(w8, grid, st, q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl); break;
+    case 2: launch_attn_wmma_red<2>(w8, grid, st, q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl); break;
+    case 3: launch_attn_wmma_red<3>(w8, grid, st, q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl); break;
+    default: launch_attn_wmma_red<0>(w8, grid, st, q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl);
+    }
+}
+// test hook (talus-q27-attn-red): one instance - w8 0/1, RT 1..3, RED 0..3, rows r0 / ngrp row groups
+// (k_attn_wmma only; grid.x = n_chunk * ngrp) - so every instance is checked, not only the ones the launcher picks.
+template <int RED>
+static void attn_inst_red(int w8, int rt, dim3 grid, cudaStream_t st, const float* q, const __half* kc, const __half* vt,
+                          const int32_t* pos0, int T, int H, int HKV, int ctx, int vt_ctx, float sc, int chunk,
+                          int n_chunk, float* pacc, float* pm, float* pl, int r0, int ngrp) {
+#define TQ_I(K, R, NT, ...) K<R, RED><<<grid, NT, 0, st>>>(q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl __VA_ARGS__)
+    if (w8) {
+        if (rt == 1) TQ_I(k_attn_wmma8, 1, 256);
+        else if (rt == 2) TQ_I(k_attn_wmma8, 2, 256);
+        else TQ_I(k_attn_wmma8, 3, 256);
+    } else {
+        if (rt == 1) TQ_I(k_attn_wmma, 1, 128, , r0, ngrp);
+        else if (rt == 2) TQ_I(k_attn_wmma, 2, 128, , r0, ngrp);
+        else TQ_I(k_attn_wmma, 3, 128, , r0, ngrp);
+    }
+#undef TQ_I
+}
+void launch_attn_wmma_inst(int w8, int rt, int red, dim3 grid, cudaStream_t st, const float* q, const __half* kc,
+                           const __half* vt, const int32_t* pos0, int T, int H, int HKV, int ctx, int vt_ctx, float sc,
+                           int chunk, int n_chunk, float* pacc, float* pm, float* pl, int r0, int ngrp) {
+    switch (red) {
+    case 1: attn_inst_red<1>(w8, rt, grid, st, q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl, r0, ngrp); break;
+    case 2: attn_inst_red<2>(w8, rt, grid, st, q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl, r0, ngrp); break;
+    case 3: attn_inst_red<3>(w8, rt, grid, st, q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl, r0, ngrp); break;
+    default: attn_inst_red<0>(w8, rt, grid, st, q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl, r0, ngrp);
+    }
 }
 bool g_attn_w8 = false;   // k_attn_wmma8: no faster (--attn-bench) and not exact (its P V is the shared WMMA); kept for reference
 

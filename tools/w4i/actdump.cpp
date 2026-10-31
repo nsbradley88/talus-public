@@ -1,6 +1,6 @@
 // Copyright (c) 2026 nsbradley88
 // SPDX-License-Identifier: MIT
-// actdump (tools/w4i, from rc-a4 / w4cal): llama.cpp CPU forward over calibration sequences; dumps the input activations of the trunk
+// actdump (tools/w4i): llama.cpp CPU forward over calibration sequences; dumps the input activations of the trunk
 // projections (one file per layer x input: gdn_in, gdn_out, attn_in, attn_out, ffn_in, ffn_down) as fp16 rows [T][k].
 // W4C_LAYERS (comma list of layer indices, default all), W4C_KINDS (comma list of kinds to dump, e.g. ffn_in,ffn_down; default all).
 // Usage: actdump --model GGUF --out DIR SEQ.ids... (each file: comma/space separated token ids)

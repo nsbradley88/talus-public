@@ -936,7 +936,7 @@ __device__ __forceinline__ void swq8_store(const float (&s0)[8], const float (&s
     }
 }
 
-/// OPT (rc-gemm, schedule only: every output's arithmetic and order unchanged): bit 0 = the A scales of a stage are
+/// OPT (schedule only: every output's arithmetic and order unchanged): bit 0 = the A scales of a stage are
 /// staged through LDS with B (one 16 B load per thread per stage instead of 2 x 16 B per row tile and block at use;
 /// needs !kPS), bit 1 = no scheduling barriers between the two blocks of a K step.
 template <int MODE, int WGN, int WGT, int WM, int WT, int KS, bool kPS, int EPI, int OPT = 0>
@@ -947,7 +947,7 @@ __device__ __forceinline__ void i8v10_body(const int8_t* __restrict__ qs, const 
     constexpr int MT = WGN * WM, BT = 16 * WGT * WT;
     static_assert(KS % 2 == 0 && (KS % 4 == 0 || KS == 2), "KS");
     constexpr bool kSL = (OPT & 1) != 0, kNoSB = (OPT & 2) != 0;
-    // OPT 2048 (rc-gemm v122): the A tiles too are staged through LDS (with their scales, bit 0): every compute operand
+    // OPT 2048: the A tiles too are staged through LDS (with their scales, bit 0): every compute operand
     // comes from LDS, the stage's global loads are issued a whole stage ahead; each A tile is fetched once per block
     constexpr bool kAL = (OPT & 2048) != 0;
     static_assert(!(kSL && kPS), "OPT bit 0 replaces the prefetched scales");
@@ -1283,7 +1283,7 @@ __device__ __forceinline__ void i8v10_body(const int8_t* __restrict__ qs, const 
                             sum[a][b][i] = __builtin_fmaf(dw[SC - 1][i], sx[b], sum[a][b][i]);
                         }
                 } else if constexpr ((OPT & 8) != 0 && WT % 2 == 0) {
-                    // rc-gemm (mode 0): the same expressions, emitted diagonally ((i, b) next to (i ^ 1, b + 1))
+                    // (mode 0): the same expressions, emitted diagonally ((i, b) next to (i ^ 1, b + 1))
 #pragma unroll
                     for (int b = 0; b < WT; b += 2) {
 #pragma unroll

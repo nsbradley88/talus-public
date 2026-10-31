@@ -1870,6 +1870,7 @@ impl Deref for Q36Model {
 impl Drop for Q36Model {
     fn drop(&mut self) {
         for &(orig, pk, _) in &self.packed {
+            mmvq_wide_release(orig); // no-op without a tile-plane copy
             tk_q36_q8_0_packed_unregister(orig);
             if !pk.is_null() && pk != orig as *mut c_void {
                 unsafe {
@@ -2050,6 +2051,19 @@ impl Q36Model {
                 },
                 "hipMemcpy(upload_mat)",
             )?;
+            // note the matrix as a tile-plane copy candidate for the wide verify tiles (nothing allocated here:
+            // the engine packs the noted ones after placing its context and int8 prompt weights, if they fit).
+            // Tracked in `packed` as (d, d, 0): Drop forgets it / frees its copy (pk == orig: nothing else is freed).
+            if ne2 == 1
+                && mmvq_wide_note(
+                    orig_qtype as i32,
+                    d.cast::<c_void>(),
+                    ne0 as i32,
+                    ne1 as i32,
+                )
+            {
+                packed.push((d.cast::<c_void>(), d.cast::<c_void>(), 0));
+            }
 
             let is_token_embd = name == "token_embd.weight";
             let is_output_head = name == "output.weight";

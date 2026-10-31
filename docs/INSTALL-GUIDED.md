@@ -57,7 +57,7 @@ Run the same command again at any time: finished steps are skipped and a stopped
 ```
 [2/6] Models
   #  Model                Download  Context With desktop   Answer / prompt  License
-  1  Qwen3.8-27B             17 GB  64K     yes            .. / ... tok/s   Apache-2.0
+  1  Qwen3.8-27B             17 GB  256K    yes            .. / ... tok/s   Apache-2.0
   2  Qwen3.8-Flash-Next      94 GB  256K    yes            .. / ... tok/s   Qwen Community License 1.0
   3  GLM-5.3-Flash          118 GB  64K     headless only  .. / ... tok/s   MIT
   4  MiMo-V2.6-Flash         98 GB  192K    tight          .. / ... tok/s   MIT

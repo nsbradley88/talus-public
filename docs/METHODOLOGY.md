@@ -16,7 +16,7 @@ Every Talus figure comes from one machine:
 | Power | 70 W firmware ceiling. We change no clocks or power limits. |
 | Kernel / boot | Linux 7.0, headless (`multi-user.target`, no desktop session). Kernel parameters: `ttm.pages_limit=31457280 ttm.page_pool_size=31457280` (GPU memory pool 120 GiB instead of the default), `kho=off` (Ubuntu's default kexec-handover reserve otherwise keeps about 9 GiB away from the GPU), `amd_iommu=off`, `amdgpu.lockup_timeout=10000,60000,10000,10000` (compute jobs may run 60 s). GLM-5.3-Flash and MiMo-V2.6-Flash do not fit without the first two. See [MODELS.md](MODELS.md#system-setup). |
 | OS / runtime | Linux; ROCm SDK 10.2.0a20261014 |
-| Talus build | release commit 43c94474c43d; each model's figures come from its own frozen release run (see [RESULTS.md](RESULTS.md)) |
+| Talus build | the builds released as Talus v0.1.0; each model's figures come from its own frozen release run (see [RESULTS.md](RESULTS.md)) |
 
 Notes on the context:
 
@@ -99,7 +99,7 @@ Speed counts only if the output is right. Each model has to pass all of these at
 | Soak | Continuous mixed traffic on the served configuration (below) | see below |
 
 The needle prompts use temperature 1.0 / top-p 0.95 with a fixed seed. The agentic suite runs the model's own
-sampling defaults. 64K-context configurations (Qwen3.8-27B, GLM-5.3-Flash) let opencode compact the conversation.
+sampling defaults. 64K-context configurations (GLM-5.3-Flash, and Qwen3.8-27B in the release runs) let opencode compact the conversation.
 
 ### KLD references per model
 

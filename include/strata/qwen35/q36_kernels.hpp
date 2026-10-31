@@ -75,6 +75,7 @@ struct GdnPend {
 };
 
 extern bool g_attn_w8;
+extern int g_attn_red;   // k_attn_wmma softmax reduction (TALUS_ATTN_RED, default 3; same bits)
 
 void launch_rms(int rows, cudaStream_t st, const float* x, const float* w, float* y, int n, float eps,
                 void* q8 = nullptr);
@@ -111,6 +112,10 @@ void launch_attn_merge(int rows, int HD, cudaStream_t st, const float* pacc, con
 void launch_attn_wmma(bool w8, dim3 grid, cudaStream_t st, const float* q, const __half* kc, const __half* vt,
                       const int32_t* pos0, int T, int H, int HKV, int ctx, int vt_ctx, float sc, int chunk, int n_chunk,
                       float* pacc, float* pm, float* pl);
+/// test hook: one k_attn_wmma (w8 = 0) / k_attn_wmma8 (w8 = 1) instance, RT tiles, reduction RED.
+void launch_attn_wmma_inst(int w8, int rt, int red, dim3 grid, cudaStream_t st, const float* q, const __half* kc,
+                           const __half* vt, const int32_t* pos0, int T, int H, int HKV, int ctx, int vt_ctx, float sc,
+                           int chunk, int n_chunk, float* pacc, float* pm, float* pl, int r0, int ngrp);
 void launch_group(cudaStream_t st, const int32_t* ids, int n_ent, int K_, int n_expert, const uint8_t* blobs,
                   unsigned long long blob, unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups,
                   int32_t* ent_dst, int32_t* ent_tok);

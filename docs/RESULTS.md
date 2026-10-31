@@ -7,21 +7,22 @@ release run has not passed every gate shows "pending", and so does a reference e
 | Release | |
 |---|---|
 | Runs | one freeze run per model (below); reference runs 2026-10-24 |
-| Talus commit | 43c94474c43d |
+| Talus | the builds released as v0.1.0 |
 | ROCm SDK | 10.2.0a20261014 |
 | Machine | HP ZBook Ultra G1a, Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), 128 GB, 70 W firmware ceiling |
 
-Each model was frozen on its own release run as its changes landed; the release commit `43c94474c43d`
-incorporates every freeze commit plus later changes that were verified greedy byte-identical on that model
-(`code` + `edit` greedy prompts; the cross-check runs are in the last column):
+Each model was frozen on its own release run as its changes landed, on the development builds that became v0.1.0.
+Later changes in the v0.1.0 source were checked to give greedy output byte-identical to the frozen build on that model
+(`code` and `edit` greedy prompts), or left that model's code unchanged. Releases after v0.1.0 list their changes,
+with any new measurements, in their release notes.
 
-| Model | Freeze run | Commit | Date | Cross-check on `43c94474c43d` |
-|---|---|---|---|---|
-| Qwen3.8-27B | `rel-final-43c9` | `43c94474c43d` | 2026-10-28 | Frozen directly on `43c94474c43d` (`9/9` greedy match vs `96221159`) |
-| Qwen3.8-Flash-Next | `rel-final-e6cf` | `e6cf959e1cad` | 2026-10-28 | Frozen on `e6cf959e1cad` (model code unchanged in `43c94474c43d`; `9/9` greedy match vs `0e0a5ffe`) |
-| GLM-5.3-Flash | `rel-final-e6cf` | `e6cf959e1cad` | 2026-10-28 | Frozen on `e6cf959e1cad` (model code unchanged in `43c94474c43d`) |
-| MiMo-V2.6-Flash | `rel-final-e6cf` | `e6cf959e1cad` | 2026-10-28 | Frozen on `e6cf959e1cad` (model code unchanged in `43c94474c43d`; `9/9` greedy match vs `0e0a5ffe`) |
-| Laguna-S-2.1 | `rel-final-e6cf` | `e6cf959e1cad` | 2026-10-28 | Frozen on `e6cf959e1cad` (model code unchanged in `43c94474c43d`; `9/9` greedy match vs `0e0a5ffe`) |
+| Model | Release run |
+|---|---|
+| Qwen3.8-27B | 2026-10-28 |
+| Qwen3.8-Flash-Next | 2026-10-28 |
+| GLM-5.3-Flash | 2026-10-28 |
+| MiMo-V2.6-Flash | 2026-10-28 |
+| Laguna-S-2.1 | 2026-10-28 |
 
 Read the tables with these points in mind:
 

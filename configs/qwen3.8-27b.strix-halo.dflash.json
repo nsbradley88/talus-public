@@ -2,7 +2,6 @@
  "exe": "<talus-repo>/rust/target/release/talus-cli",
  "args": [
   "--model", "<models-dir>/gguf/Qwen3.8-27B/Qwen3.8-27B-UD-IQ4_XS.gguf",
-  "--max-context", "65536",
   "--mtp-gguf", "<models-dir>/gguf/Qwen3.8-27B/MTP/mtp-Qwen3.8-27B-Q4_0.gguf",
   "--mtp", "5",
   "--spec-draft-vocab", "<models-dir>/gguf/Qwen3.8-27B/MTP/qwen-dv-65536.bin",

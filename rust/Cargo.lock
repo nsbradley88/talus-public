@@ -250,7 +250,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hip-sys"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "ident_case"
@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "oracle"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -662,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "talus-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hip-sys",
  "oracle",
@@ -682,18 +682,18 @@ dependencies = [
 
 [[package]]
 name = "talus-core-api"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "talus-gguf"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "talus-core-api",
 ]
 
 [[package]]
 name = "talus-hip"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hip-sys",
  "talus-core-api",
@@ -701,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "talus-kernels"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hip-sys",
  "talus-core-api",
@@ -713,18 +713,18 @@ dependencies = [
 
 [[package]]
 name = "talus-kernels-sys"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "talus-mem"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "talus-core-api",
 ]
 
 [[package]]
 name = "talus-model"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hip-sys",
  "talus-core-api",
@@ -734,16 +734,17 @@ dependencies = [
  "talus-kernels-sys",
  "talus-mem",
  "talus-spec",
+ "talus-state",
  "talus-text",
 ]
 
 [[package]]
 name = "talus-presets"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "talus-sched"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hip-sys",
  "talus-core-api",
@@ -760,7 +761,7 @@ dependencies = [
 
 [[package]]
 name = "talus-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde_json",
  "talus-core-api",
@@ -770,7 +771,7 @@ dependencies = [
 
 [[package]]
 name = "talus-setup"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "serde",
@@ -781,7 +782,7 @@ dependencies = [
 
 [[package]]
 name = "talus-spec"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hip-sys",
  "talus-core-api",
@@ -794,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "talus-state"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hip-sys",
  "talus-core-api",
@@ -804,7 +805,7 @@ dependencies = [
 
 [[package]]
 name = "talus-text"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aho-corasick",
  "fancy-regex",
@@ -816,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "talus-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crossterm",
  "ratatui",

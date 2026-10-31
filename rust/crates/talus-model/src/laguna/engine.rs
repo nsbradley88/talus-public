@@ -112,7 +112,7 @@ pub struct Engine {
     tk: Arc<LibTalusKernels>,
     hip: Arc<HipRuntime>,
     _kv_reservation: Option<ReservationGuard>,
-    /// rc-gemm stage 2: int8 prefill cache of dense projections (default Q5_K / Q6_K / Q8_0: every dense projection;
+    /// int8 prefill cache of dense projections (default Q5_K / Q6_K / Q8_0: every dense projection;
     /// TALUS_LAGUNA_I8_TYPES selects types), keyed by the GGUF tensor's device pointer: (int8 values, scales, tp_i8gemm
     /// mode). Empty with TALUS_LAGUNA_I8=0.
     i8c: std::collections::HashMap<usize, (usize, usize, i32)>,
@@ -831,7 +831,7 @@ impl Engine {
         Ok(eng)
     }
 
-    /// rc-gemm stage 2: expand the Q5_K dense prefill projections (attn_q, attn_output) into the int8 prefill cache
+    /// expand the Q5_K dense prefill projections (attn_q, attn_output) into the int8 prefill cache
     /// (`talus_pf_i8x_expand`, MMQ's tile loaders). Prefill products (nb >= 128) then run `talus_pf_i8gemm` on the
     /// same MMQ-layout activations: the same output bits as `tk_prefill_moe_mmq` (both bitwise MMQ). Budget-guarded;
     /// `TALUS_LAGUNA_I8=0` disables.
@@ -1315,7 +1315,7 @@ impl Engine {
                 )?;
                 *cached_layout = Some(layout);
             }
-            // rc-gemm stage 2: prefill products on the int8 cache (same output bits as tk_prefill_moe_mmq)
+            // prefill products on the int8 cache (same output bits as tk_prefill_moe_mmq)
             if nb >= 128 {
                 if let Some(&(qs, ws, mode)) = self.i8c.get(&(W.dev as usize)) {
                     let rc = unsafe {

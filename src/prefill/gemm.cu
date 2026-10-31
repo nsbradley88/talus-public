@@ -620,7 +620,7 @@ bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, flo
                                  "the hyper-connection down projection stays on hipBLAS\n");
         return false;
     }
-    // The kernel copies hipBLASLt solution 1176 / 1177's summation order (100401; 1253 on 100500, the same order: rc-fn,
+    // The kernel copies hipBLASLt solution 1176 / 1177's summation order (100401; 1253 on 100500, the same order:
     // talus-pf-bench hcd), which is only true of the library builds measured: take it only when the table makes hipBLASLt
     // pick one of those for this T (strata_pf_hcdown_exact_solution).
     const int id = hipblaslt_solution_for(hipblaslt_state_, strata::prefill::hipblaslt::InputType::bf16, T, N, K, N, 0.0f);

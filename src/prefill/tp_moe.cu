@@ -864,7 +864,7 @@ constexpr int kQB = 36;       // bytes per q8_1 block
 // GU: fused gate / up + SwiGLU - the block's 64 tile rows are 32 gate rows (wq) and the same 32 up rows (wq2); wave wp
 // multiplies gate tile wp (a = 0) and up tile wp (a = 1) and writes g / (1 + exp(-g)) u (tk_silu_mul's expression).
 // TOKT: routed rows per block (64: 8 waves; 128: 16 waves, one pass for experts up to 128 rows)
-// ONE (rc-mimo, TP_MOE_IQ1M_ONE=1): one C tile per wave (TOKT / 4 waves: token tile w >> 2, tile row block w & 3) -
+// ONE (TP_MOE_IQ1M_ONE=1): one C tile per wave (TOKT / 4 waves: token tile w >> 2, tile row block w & 3) -
 // half the accumulator / tree registers per wave; the leaf's activations staged in LDS once per block (the 4 waves of
 // a token tile share them); GU: the up waves hand their results to the gate waves through LDS.  Every C element's
 // operand sequence (WMMAs, epilogue, leaf chain, tree) is unchanged: bitwise.
@@ -881,7 +881,7 @@ __global__ void __launch_bounds__(TOKT * (ONE ? 8 : 4)) k_moe1m(const char* __re
     constexpr int SCS = NI + 1;   // float4 per weight row of the scale table (+1: 16 lanes' b128 reads hit distinct banks)
     __shared__ __attribute__((aligned(16))) float4 wsc[2][kRows * SCS];
     __shared__ __attribute__((aligned(16))) float d8s[2][(TOKT / 16) * NI * 16];
-    // rc-mimo (LDSG, TP_MOE_IQ1M_LDSGRID=1): the IQ1_S/M grid (2048 x 32 bits) in LDS, so the decode's lookups do not
+    // LDSG (TP_MOE_IQ1M_LDSGRID=1): the IQ1_S/M grid (2048 x 32 bits) in LDS, so the decode's lookups do not
     // wait on global memory, and each block's activations loaded one block ahead; the same words and operands (bitwise)
     __shared__ uint32_t gtab[LDSG ? NGRID_IQ1S : 1];
     // ONE: the leaf's activation bytes [2][TOKT rows][NI blocks x 32 B + 16 B pad] (ints)
@@ -996,7 +996,7 @@ __global__ void __launch_bounds__(TOKT * (ONE ? 8 : 4)) k_moe1m(const char* __re
             A0 = (v4i){pi[0], pi[1], pi[2], pi[3]};
             A1 = (v4i){pi[4], pi[5], pi[6], pi[7]};
         };
-        v4i An0, An1;   // LDSG: block i + 1's activations loaded before block i's WMMAs (rc-mimo)
+        v4i An0, An1;   // LDSG: block i + 1's activations loaded before block i's WMMAs
         if constexpr (LDSG) aload(0, An0, An1);
 #pragma unroll
         for (int i = 0; i < NI; ++i) {
@@ -1324,9 +1324,9 @@ bool moe_gemm_iq1m_q8_1(const MoeProduct& p, void* stream) {
     const cudaStream_t s = (cudaStream_t) stream;
 #define TP_1M_ARGS (const char*) p.w, p.expert_bytes, p.k, p.n, (const char*) p.xq, p.bounds, p.ids, (int) p.total_rows, p.dst, p.ld_dst, (const char*) p.w_up
     const dim3 gg(gx, (unsigned) (p.n / (iq1m::kRows / 2)), (unsigned) p.n_experts), gs(gx, (unsigned) (p.n / iq1m::kRows), (unsigned) p.n_experts);
-    // TP_MOE_IQ1M_LDSGRID=1 (rc-mimo): the grid table in LDS (bitwise: the same table words)
+    // TP_MOE_IQ1M_LDSGRID=1: the grid table in LDS (bitwise: the same table words)
     static const bool ldsg = [] { const char* v = std::getenv("TP_MOE_IQ1M_LDSGRID"); return v != nullptr && v[0] == '1'; }();
-    // rc-mimo phase 2, TP_MOE_IQ1M_ONE (default 1; 0 = the 2-tile kernel): one C tile per wave, 16 waves per 64 routed
+    // phase 2, TP_MOE_IQ1M_ONE (default 1; 0 = the 2-tile kernel): one C tile per wave, 16 waves per 64 routed
     // rows, the leaf's activations staged in LDS (169 VGPRs vs 249; bench GU 2048 tok: 46.6 -> 42.8 ms; bitwise)
     static const bool one = [] { const char* v = std::getenv("TP_MOE_IQ1M_ONE"); return v == nullptr || v[0] != '0'; }();
     if (one && t == 64 && !ldsg) {

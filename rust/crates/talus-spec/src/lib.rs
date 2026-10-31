@@ -17,6 +17,7 @@
 pub const CRATE_NAME: &str = "talus-spec";
 
 pub mod adraft;
+pub mod confpre;
 pub mod copy;
 pub mod dflash;
 pub mod draft_vocab;
@@ -33,6 +34,7 @@ pub use adraft::{
     INITIAL_EMA_RATE, K_MAX, MAX_HIST_DRAFTS, THRESH_DOWNSHIFT, THRESH_DOWNSHIFT_FAST,
     THRESH_DOWNSHIFT_MILD, THRESH_UPSHIFT,
 };
+pub use confpre::ConfPrefix;
 pub use copy::{
     copy_cfg_from_env, copy_enabled, copy_env_f64, CopyCfg, CopyMatch, CopyProposer, CopyStats,
     COPY_KEY,

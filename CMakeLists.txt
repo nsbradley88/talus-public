@@ -260,6 +260,8 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_split_test tests/core/gguf_split_test.cpp)
   target_link_libraries(gguf_split_test PRIVATE strata_artifact)
   add_test(NAME gguf_split_test COMMAND gguf_split_test)
+  add_executable(att_tred_test tests/core/att_tred_test.cpp)   # CPU model of the k_attn_wmma reductions
+  add_test(NAME att_tred_test COMMAND att_tred_test)
   # the model families (qwen4exp, qwen35moe): the guards, the geometry from metadata, the layout tables (synthetic)
   add_executable(model_family_test tests/core/model_family_test.cpp)
   target_link_libraries(model_family_test PRIVATE strata_artifact)
@@ -282,6 +284,12 @@ if(STRATA_BUILD_TESTS)
   add_executable(model_desc_test tests/core/model_desc_test.cpp)
   target_link_libraries(model_desc_test PRIVATE strata_artifact)
   add_test(NAME model_desc_test COMMAND model_desc_test)
+
+  # the wide verify tiles' formats (repack round trip, record GGUF vs tile planes, dequant equality against a
+  # CPU reference, the tile order vs the wave32 lane order): header-only, no GPU
+  add_executable(talus_wide_fmt_test tests/core/talus_wide_fmt_test.cpp)
+  target_include_directories(talus_wide_fmt_test PRIVATE include third_party/ggml)
+  add_test(NAME talus_wide_fmt_test COMMAND talus_wide_fmt_test)
 
   # the auto layer split's minimum stage size (#1616): header-only rule, no GPU
   add_executable(split_rules_test tests/program/split_rules_test.cpp)
@@ -635,6 +643,21 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_source_files_properties(tests/hip/gdn_scan_bench.cpp PROPERTIES LANGUAGE HIP)
     target_link_libraries(talus-gdn-bench PRIVATE talus_kernels ${_strata_gpu_runtime_target})
     target_include_directories(talus-gdn-bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  endif()
+  if(STRATA_ENABLE_HIP)
+    # k_attn_wmma softmax reduction variants (bitwise vs the shfl butterfly + timing), the GDN prompt
+    # recurrences on repeated tokens / pathological gates + the residency sweep
+    add_executable(talus-q27-attn-red tests/hip/q27_attn_red.cpp)
+    add_executable(talus-gdn-repeat tests/hip/gdn_repeat.cpp)
+    set_source_files_properties(tests/hip/q27_attn_red.cpp tests/hip/gdn_repeat.cpp PROPERTIES LANGUAGE HIP)
+    foreach(_rde talus-q27-attn-red talus-gdn-repeat)
+      target_link_libraries(${_rde} PRIVATE talus_kernels ${_strata_gpu_runtime_target})
+      target_include_directories(${_rde} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    endforeach()
+    # DRAM channel-camping probe (standalone: no engine code)
+    add_executable(talus-chan-probe tests/hip/chan_probe.cpp)
+    set_source_files_properties(tests/hip/chan_probe.cpp PROPERTIES LANGUAGE HIP)
+    target_link_libraries(talus-chan-probe PRIVATE ${_strata_gpu_runtime_target})
   endif()
 
   if(STRATA_BUILD_TESTS)
@@ -1579,6 +1602,9 @@ if(STRATA_NATIVE_EXPERTS)
     # Laguna wide-verify kernels (grouped experts bitwise vs per-id, dense widths) outside the engine
     add_executable(talus-laguna-wide-bench tests/hip/laguna_wide_bench.cpp)
     target_link_libraries(talus-laguna-wide-bench PRIVATE strata_kernels strata_hip_runtime)
+    # 27B wide verify tiles on the real model (per-type/width weight-pass table, bitwise per-row check 1..16)
+    add_executable(talus-q27w-bench tests/hip/q27_wide_bench.cpp)
+    target_link_libraries(talus-q27w-bench PRIVATE strata_kernels strata_hip_runtime)
     add_executable(talus-attn-bench tests/hip/laguna_attn_bench.cpp)
     target_link_libraries(talus-attn-bench PRIVATE strata_hip_runtime)
     # MiMo prompt attention (full K192/V128 + SWA sinks) bitwise hash + timing on synthetic pools

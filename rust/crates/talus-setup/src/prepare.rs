@@ -6,7 +6,8 @@
 //!    checkpoint (pinned revision, each tensor checked against SHA-256), `tools/mtp_pack.py --experts q2_0` and
 //!    `tools/mtp_rt.py` turn them into the runtime files, and `data/draft_vocab.bin` goes next to them.
 //!
-//! The tools run in a private Python environment (numpy, regex) with llama.cpp's gguf-py at the commit Strata pins.
+//! The tools run in a private Python environment (numpy, regex, plus gguf-py's own dependencies pyyaml, tqdm and
+//! requests) with llama.cpp's gguf-py at the commit Strata pins.
 
 use crate::config::{flash_next_mtp, flash_next_pack};
 use crate::exec::Exec;
@@ -60,7 +61,7 @@ fn python_env(x: &Exec, paths: &Paths) -> Result<(PathBuf, PathBuf, PathBuf), St
         )?;
     }
     let ok = std::process::Command::new(&py)
-        .args(["-c", "import numpy, regex"])
+        .args(["-c", "import numpy, regex, yaml, tqdm, requests"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
@@ -74,8 +75,11 @@ fn python_env(x: &Exec, paths: &Paths) -> Result<(PathBuf, PathBuf, PathBuf), St
                 "-q".into(),
                 "numpy".into(),
                 "regex".into(),
+                "pyyaml".into(),
+                "tqdm".into(),
+                "requests".into(),
             ],
-            "numpy and regex for the pack tools",
+            "numpy, regex and gguf-py's dependencies for the pack tools",
         )?;
     }
     let llama = env.join(format!("llama.cpp-{}", &LLAMA_CPP_COMMIT[..7]));

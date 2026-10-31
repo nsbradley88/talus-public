@@ -494,6 +494,28 @@ impl ServerConfig {
                 cfg.engine_env.push((k.clone(), s));
             }
         }
+        // Disk tier of the prompt cache: run-config keys for the engine's TALUS_PCACHE_DISK* environment
+        // ("prompt_cache_disk": "auto" | folder | false, "prompt_cache_disk_gib": N). An explicit "env" entry wins.
+        let disk = match val.get("prompt_cache_disk") {
+            Some(JsonValue::Str(s)) => Some(s.clone()),
+            Some(JsonValue::Bool(true)) => Some("auto".to_string()),
+            Some(JsonValue::Bool(false)) => Some("off".to_string()),
+            _ => None,
+        };
+        let disk_gib = val
+            .get("prompt_cache_disk_gib")
+            .and_then(|v| v.as_f64())
+            .map(|g| format!("{g}"));
+        for (k, v) in [
+            ("TALUS_PCACHE_DISK", disk),
+            ("TALUS_PCACHE_DISK_GIB", disk_gib),
+        ] {
+            if let Some(v) = v {
+                if !cfg.engine_env.iter().any(|(ek, _)| ek == k) {
+                    cfg.engine_env.push((k.to_string(), v));
+                }
+            }
+        }
         if let Some(libs) = val.get("lib_dirs").and_then(|v| v.as_array()) {
             for item in libs {
                 if let Some(s) = item.as_str().filter(|s| !s.is_empty()) {

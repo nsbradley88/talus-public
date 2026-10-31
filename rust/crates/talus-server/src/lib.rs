@@ -92,6 +92,34 @@ mod tests {
             .any(|(k, v)| k == "LD_LIBRARY_PATH" && v.starts_with("/opt/rocm/lib:/usr/local/lib")));
         assert!(!cfg.engine_args.iter().any(|a| a == "--reasoning-effort"));
 
+        assert!(!cfg
+            .engine_env
+            .iter()
+            .any(|(k, _)| k.starts_with("TALUS_PCACHE")));
+
+        // Prompt-cache disk tier keys become engine environment; an explicit "env" entry wins.
+        let disk = JsonValue::parse(
+            r#"{"model": "m", "prompt_cache_disk": true, "prompt_cache_disk_gib": 48,
+                "env": {"TALUS_PCACHE_DISK_GIB": "8"}, "args": ["--native", "/m.gguf"]}"#,
+        )
+        .unwrap();
+        let dc = ServerConfig::from_json(&disk).unwrap();
+        let env = |k: &str| {
+            dc.engine_env
+                .iter()
+                .find(|(ek, _)| ek == k)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(env("TALUS_PCACHE_DISK").as_deref(), Some("auto"));
+        assert_eq!(env("TALUS_PCACHE_DISK_GIB").as_deref(), Some("8"));
+        let dir =
+            JsonValue::parse(r#"{"model": "m", "prompt_cache_disk": "/var/cache/talus"}"#).unwrap();
+        let dc = ServerConfig::from_json(&dir).unwrap();
+        assert!(dc
+            .engine_env
+            .iter()
+            .any(|(k, v)| k == "TALUS_PCACHE_DISK" && v == "/var/cache/talus"));
+
         let state = ServiceState::from_config(cfg).expect("ServiceState::from_config");
         assert!(state.chat_template.is_some());
         assert_eq!(state.tokenizer.stop_ids().len(), 4);

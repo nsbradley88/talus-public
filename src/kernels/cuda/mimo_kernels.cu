@@ -1276,7 +1276,7 @@ void mimo_attn_swa_sinks_prefill_kernel(
     }
 }
 
-/// rc-mimo SWA prefill v2 (TALUS_MIMO_SWA_VER=2): bitwise mimo_attn_swa_sinks_prefill_kernel<4, 8, 16> per
+/// SWA prefill v2 (TALUS_MIMO_SWA_VER=2): bitwise mimo_attn_swa_sinks_prefill_kernel<4, 8, 16> per
 /// (token, head), with the per-key work spread over lanes instead of repeated in every lane.
 /// The v1 per (token, head) arithmetic, read from its source:
 ///   per key p ascending in [p_start, q_pos]: lane L's partial P_L = q[4L..4L+3] . k[4L..4L+3] + q[128+2L..] . k[128+2L..]
@@ -2795,7 +2795,7 @@ void mimo_attn_k192_v128_wmma_prefill_kernel(
     }
 }
 
-/// rc-mimo v2 of the WMMA FlashAttention prefill kernel above (TALUS_MIMO_FA_VER 2..5; 1 = v1).  Per query column the
+/// v2 of the WMMA FlashAttention prefill kernel above (TALUS_MIMO_FA_VER 2..5; 1 = v1).  Per query column the
 /// instruction sequence is v1's (same 32-key tiles from key 0 in order, same LDS layouts / WMMA operands / softmax).
 /// Changes: (a) the transposed V tile is written as whole dwords - lane pairs (keys 2m, 2m + 1) swap halves by DPP and
 /// each writes 4 dwords - instead of 8 half stores with a per-lane element select (v1: ~110 VALU per tile); the LDS
@@ -2820,10 +2820,10 @@ void mimo_attn_k192_v128_wmma_prefill_v2_kernel(
     constexpr int kBQ = NW * 16;
     constexpr int kBK = 32;
     constexpr int kT  = NW * 32;
-    // rc-mimo phase 2: 8 / 16 waves + padded rows issue all of a tile's global loads before its LDS stores (VMEM waits
+    // phase 2: 8 / 16 waves + padded rows issue all of a tile's global loads before its LDS stores (VMEM waits
     // at 30K: 5.3G -> 1.7G cycles; 30K chunk 124 -> 113 ms; the same values stored)
     constexpr bool kBatch = kPad && NW >= 8;
-    // kPad (rc-mimo, from the counters: LDS-wait bound with bank conflicts): K rows 200 halves apart (100 dwords: the 16
+    // kPad (from the counters: LDS-wait bound with bank conflicts): K rows 200 halves apart (100 dwords: the 16
     // rows of a fragment read start in 16 distinct 4-bank groups) and V^T rows 24 halves apart (12 dwords: likewise),
     // instead of v1's 192 + XOR swizzle and 16; the operands read are the same values
     constexpr int KRS = kPad ? 200 : 192;   // halves per K row

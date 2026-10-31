@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""gptq_sidecar.py (tools/w4i, from rc-a4 / w4cal): build a .tw4 int4 weight sidecar (format v1, read by
+"""gptq_sidecar.py (tools/w4i): build a .tw4 int4 weight sidecar (format v1, read by
 w4i_convert.py) with selectable rounding method, from the weights the exact path multiplies.
 
   --src deployed  : quantize the weights the exact path multiplies (the GGUF's own tensors, any ggml type, dequantized
