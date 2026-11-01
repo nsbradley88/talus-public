@@ -165,6 +165,30 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model": "qwen3.8-27b", "messages": [{"role": "user", "content": "Write a haiku about rocks."}]}'
 ```
 
+## Known issues (v0.1.1)
+
+**Flash-Next prompt speed with a manual tarball install.** If you unpacked the release tarball yourself instead of
+using `install.sh`, Flash-Next can't find its prompt-processing tuning table and falls back to a slower path: prompt
+processing is about 22% slower at 2K tokens and 7% slower at 32K, and outputs can differ slightly at the rounding level.
+Decode speed and the other four models are not affected. Installs made with `install.sh` already have the table.
+
+Workaround: get the table from this repository (`tools/hip/gfx1151-hipblaslt-100401.txt`) and point Talus at it with an
+absolute path, e.g.
+
+    export STRATA_HIPBLASLT_TUNING=/path/to/talus/tools/hip/gfx1151-hipblaslt-100401.txt
+
+The same applies to the `data/...` files in the Flash-Next example in `docs/MODELS.md`: use absolute paths to a
+checkout of this repository. v0.1.2 will ship these files in the tarball and warn at startup when they are missing.
+
+**Our numbers were measured with the "performance" power profile.** On laptops (and some mini PCs) the default
+`balanced` ACPI platform profile can cut speed a lot; GLM chat dropped from about 24 to about 11 tok/s in our test.
+To match our numbers:
+
+    echo performance | sudo tee /sys/firmware/acpi/platform_profile
+
+(not persistent across reboots; check your distribution's power-profile tool to make it stick). v0.1.2's installer
+will offer to set this for you.
+
 ## The server
 
 The server speaks the OpenAI API (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/models`), the
