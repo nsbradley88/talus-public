@@ -522,11 +522,18 @@ impl<'a> Parser<'a> {
             } else if b < 0x20 {
                 return Err(format!("unescaped control character at byte {}", self.pos));
             } else {
-                let rest = std::str::from_utf8(&self.bytes[self.pos..])
+                // Copy the whole run of plain bytes up to the next quote, backslash or control byte at once.
+                // These delimiters are ASCII, so the run ends on a char boundary; validating just the run keeps the
+                // string linear (validating the rest of the buffer per character was O(n^2): ~0.6 s for a 256 KB
+                // prompt, talus#51).
+                let end = self.bytes[self.pos..]
+                    .iter()
+                    .position(|&c| c == b'"' || c == b'\\' || c < 0x20)
+                    .map_or(self.bytes.len(), |n| self.pos + n);
+                let run = std::str::from_utf8(&self.bytes[self.pos..end])
                     .map_err(|_| "invalid UTF-8 in string".to_string())?;
-                let ch = rest.chars().next().unwrap();
-                out.push(ch);
-                self.pos += ch.len_utf8();
+                out.push_str(run);
+                self.pos = end;
             }
         }
         Err("unterminated string".to_string())
@@ -785,4 +792,37 @@ pub fn base64_url_decode(s: &str) -> Result<Vec<u8>, String> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod string_tests {
+    use super::JsonValue;
+
+    #[test]
+    fn strings_with_multibyte_and_escapes() {
+        let v = JsonValue::parse(r#"{"a":"héllo 〈|EOS|〉 \"q\" \\ \n é 😀 end","b":""}"#).unwrap();
+        assert_eq!(v.get_str("a"), Some("héllo 〈|EOS|〉 \"q\" \\ \n é 😀 end"));
+        assert_eq!(v.get_str("b"), Some(""));
+        assert!(JsonValue::parse("\"abc").is_err());
+        assert!(JsonValue::parse("\"a\u{1}b\"").is_err());
+    }
+
+    #[test]
+    fn long_string_parses_in_linear_time() {
+        // talus#51: a 32K-token prompt (~128 KB) cost ~0.15 s and 256 KB ~0.6 s with the per-character re-validation;
+        // 4 MB would take minutes. Linear: well under a second even unoptimized.
+        let body: String = "def f(x):\n    return x  # é〈\n".repeat(4 << 20 >> 5);
+        let json = format!(
+            "{{\"prompt\":{}}}",
+            JsonValue::from(body.as_str()).to_json_string()
+        );
+        let t = std::time::Instant::now();
+        let v = JsonValue::parse(&json).unwrap();
+        assert_eq!(v.get_str("prompt"), Some(body.as_str()));
+        assert!(
+            t.elapsed().as_secs_f64() < 3.0,
+            "parse took {:?}",
+            t.elapsed()
+        );
+    }
 }

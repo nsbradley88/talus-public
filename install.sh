@@ -19,7 +19,7 @@
 #          --allow-system-changes (with --yes: apply the kernel parameters too) --force (continue on unsupported
 #          hardware) --build-only (steps 1-4, no setup; what `talus update` runs, so the GPU check only warns) --src DIR (a Talus checkout to build) --no-setup
 # Environment: TALUS_HOME, ROCM_SDK (use an SDK you have), TALUS_ROCM_VERSION / TALUS_ROCM_INDEX (override the pin
-#              in rocm.version / AMD's nightly index), TALUS_ROCM_STABLE, TALUS_REPO, TALUS_BRANCH,
+#              in rocm.version / AMD's nightly index), TALUS_ROCM_STABLE, TALUS_REPO, TALUS_BRANCH (default: the newest release tag),
 #              TALUS_RELEASE=<tag> or TALUS_PREBUILT_URL=<tar.gz> (a release tarball instead of compiling),
 #              HF_TOKEN (optional, never stored).
 
@@ -28,7 +28,7 @@ main() {
 set -eu
 
 REPO=${TALUS_REPO:-https://github.com/nsbradley88/talus-public}
-BRANCH=${TALUS_BRANCH:-main}
+BRANCH=${TALUS_BRANCH:-}   # empty: the release tag of the binaries (release_ref below), not main
 DATA=${TALUS_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/talus}
 ROCM_PIN=10.2.0a20261014   # used only when the source has no rocm.version (the pin; read once the source is here)
 ROCM_INDEX=${TALUS_ROCM_INDEX:-https://nightly.repo.amd.com/rocm/whl-next/}
@@ -57,7 +57,8 @@ done
 # ---- output and questions (answers come from the terminal, not from the pipe that carries this script)
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   C=$(printf '\033[36m') G=$(printf '\033[32m') Y=$(printf '\033[33m') R=$(printf '\033[31m') B=$(printf '\033[1m') D=$(printf '\033[90m') N=$(printf '\033[0m')
-else C="" G="" Y="" R="" B="" D="" N=""; fi
+  BN=$(printf '\033[30;46;1m')   # the banner
+else C="" G="" Y="" R="" B="" D="" N="" BN=""; fi   # NO_COLOR or not a terminal: no escape codes at all
 T_START=$(date +%s) T_STEP=""
 took() { [ -z "$T_STEP" ] || note "($(( $(date +%s) - T_STEP )) s)"; T_STEP=$(date +%s); }
 step() { took; printf '\n%s[%s/5]%s %s%s%s\n' "$C" "$1" "$N" "$B" "$2" "$N"; }
@@ -85,6 +86,19 @@ run() {
   "$@"
 }
 have() { command -v "$1" >/dev/null 2>&1; }
+# The source to clone: the release the binaries come from, so data files, tools and the build match them (talus#50
+# A3). TALUS_BRANCH (any branch or tag) overrides; then TALUS_RELEASE, the tag in TALUS_PREBUILT_URL, the newest
+# vX.Y.Z tag of the repository; main only when the repository has no release tag.
+release_ref() {
+  if [ -n "$BRANCH" ]; then echo "$BRANCH"; return; fi
+  if [ -n "${TALUS_RELEASE:-}" ]; then echo "$TALUS_RELEASE"; return; fi
+  case ${TALUS_PREBUILT_URL:-} in
+    */releases/download/*/*) echo "$TALUS_PREBUILT_URL" | sed 's#.*/releases/download/\([^/]*\)/.*#\1#'; return ;;
+  esac
+  t=$(git ls-remote --tags --refs "$REPO" 'v*' 2>/dev/null | sed 's#.*refs/tags/##' \
+      | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+  echo "${t:-main}"
+}
 # run a long command with its output in a log file; on failure show the end of the log
 logged() {
   name=$1; shift
@@ -97,7 +111,7 @@ logged() {
 SUDO=""
 if [ "$(id -u)" != 0 ]; then SUDO=sudo; fi
 
-printf '\n%s Talus %s %sinstaller%s%s\n' "$(printf '\033[30;46;1m')" "$N" "$B" "$N" "$( [ "$DRY" = 1 ] && echo " (dry run: nothing is changed)" )"
+printf '\n%s Talus %s %sinstaller%s%s\n' "$BN" "$N" "$B" "$N" "$( [ "$DRY" = 1 ] && echo " (dry run: nothing is changed)" )"
 
 # ---- 1. this computer
 step 1 "This computer"
@@ -205,9 +219,10 @@ elif [ -d "$DATA/src/.git" ]; then
   ok "Source" "$SRC ($(git -C "$SRC" log -1 --format=%h 2>/dev/null))"
 else
   SRC="$DATA/src"
-  say "Getting Talus from $REPO ..."
+  REF=$(release_ref)
+  say "Getting Talus $REF from $REPO ..."
   run mkdir -p "$DATA"
-  run git clone --quiet --depth 1 -b "$BRANCH" "$REPO" "$SRC"
+  run git clone --quiet --depth 1 -b "$REF" "$REPO" "$SRC"
 fi
 TOOLCHAIN=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$SRC/rust/rust-toolchain.toml" 2>/dev/null || true)
 TOOLCHAIN=${TOOLCHAIN:-$RUST_FALLBACK}
@@ -313,6 +328,12 @@ if [ -n "$PREBUILT" ]; then
       mkdir -p "$DATA"
       tar -xzf "$t/b.tgz" -C "$DATA" --strip-components=1 || die "could not unpack the release"
       ok "Prebuilt" "$(basename "$PREBUILT" .tar.gz) unpacked into $DATA"
+      # the source next to it should be the commit the binaries were built from (data files, tools, update)
+      bin_commit=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("commit",""))' "$DATA/MANIFEST.json" 2>/dev/null || true)
+      src_commit=$(git -C "$SRC" rev-parse HEAD 2>/dev/null || true)
+      if [ -n "$bin_commit" ] && [ -n "$src_commit" ] && [ "$bin_commit" != "$src_commit" ]; then
+        wrn "Source" "$SRC is at ${src_commit%"${src_commit#????????????}"}, the binaries were built from ${bin_commit%"${bin_commit#????????????}"} (TALUS_BRANCH=<their tag> to match)"
+      fi
     fi
     rm -rf "$t"
   fi
@@ -325,6 +346,19 @@ if [ -z "$PREBUILT" ]; then
   build_kernels
   build_rust talus-cli talus-server talus-tui talus-setup
   run install -m 0755 "$SRC/build/libtalus_kernels.so" "$BIN/libtalus_kernels.so"
+fi
+# the hipBLASLt prefill tuning tables next to the kernel library ($BIN/hip, where it finds them without
+# STRATA_HIPBLASLT_TUNING; talus#50): a release tarball brings them, a source build (or an older tarball) copies them
+if [ -z "$PREBUILT" ] || ! ls "$BIN"/hip/*-hipblaslt-*.txt >/dev/null 2>&1; then
+  run mkdir -p "$BIN/hip"
+  run sh -c "install -m 0644 '$SRC'/tools/hip/*-hipblaslt-*.txt '$BIN/hip/'"
+fi
+# Flash-Next's data files and preparation tools at their source-tree paths under $DATA (talus setup takes them from
+# there; scripts/release/side-files.txt): a release tarball brings them, a source build copies them
+if [ -r "$SRC/scripts/release/side-files.txt" ]; then
+  for f in $(grep -v '^[[:space:]]*#' "$SRC/scripts/release/side-files.txt" | grep .); do
+    if [ -z "$PREBUILT" ] || [ ! -f "$DATA/$f" ]; then run install -D -m 0644 "$SRC/$f" "$DATA/$f"; fi
+  done
 fi
 # the programs find ROCm through this link (their RUNPATH is $ORIGIN/../rocm-sdk/lib): no LD_LIBRARY_PATH needed
 run ln -sfn "$ROCM_ROOT" "$DATA/rocm-sdk"

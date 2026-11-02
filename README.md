@@ -8,30 +8,54 @@ serves each model through an OpenAI-compatible HTTP API.
 
 ## How fast is it?
 
-Tokens per second on the Ryzen AI Max+ 395 laptop (70 W), end to end through the HTTP server, each model in its shipped
-configuration and after passing every quality gate. `code` is the coding-prompt mix, `pp32k` prompt processing and
-`tg32k` generation at 32K tokens of context.
+Tokens per second for Talus v0.1.2 on a Ryzen AI Max+ 395 desktop (GMKtec EVO-X2, 128 GB, about 120 W
+sustained), end to end through the HTTP server, each model in its shipped configuration. `code` is the coding-prompt
+mix, `pp32k` prompt processing and `tg32k` generation at about 32K tokens of context.
+
+| Model | code | pp32k | tg32k |
+|---|---|---|---|
+| Qwen3.8-27B | 67.8 | 545 | 36.2 |
+| Qwen3.8-Flash-Next | 73.8 | 1,486 | 65.6 |
+| GLM-5.3-Flash | 34.7 | 567 | 35.4 |
+| MiMo-V2.6-Flash | 49.1 | 661 | 42.3 |
+| Laguna-S-2.1 | 52.3 | 1,008 | 36.2 |
+
+The quality gates (long-context recall, an agentic smoke test on five coding tasks, KL divergence against a reference, a 45-minute soak
+test) ran mostly on our 70 W laptop (HP ZBook Ultra G1a); [docs/RESULTS.md](docs/RESULTS.md) says where each ran. The
+two machines have the same chip but different power limits, so their figures are not comparable with each other.
+
+How much the 27B's shipped 4-bit weights give up against the full BF16 weights, on the same desktop:
+
+| Weights | Size | KL code | top-1 code | code | pp32k | tg32k, no speculation |
+|---|---|---|---|---|---|---|
+| BF16 (reference, opt-in) | 54.7 GB | reference | reference | 19.4 | 506 | 4.0 |
+| `UD-Q4_K_XL` (option) | 17.6 GB | 0.0357 | 95.8 % | 57.4 | 487 | 11.3 |
+| `UD-IQ4_XS` (shipped default) | 14.3 GB (+2.2 GB W4A4 prompt sidecar) | 0.0815 | 93.5 % | 67.8 | 546 | 13.2 |
+
+Lower KL and higher top-1 = closer to BF16. `code` is served with speculative decoding as above; `tg32k` here is plain
+decode without it. Details, wiki text and all speed cells:
+[docs/RESULTS.md](docs/RESULTS.md#qwen38-27b-our-4-bit-weights-against-bf16).
+
+Against other engines, on the 70 W laptop with the v0.1.0 builds (not re-measured for v0.1.2):
 
 | Model | Engine | code | pp32k | tg32k |
 |---|---|---|---|---|
-| Qwen3.8-27B | **Talus** | 59.9 | 416 | 34.3 |
+| Qwen3.8-27B | **Talus v0.1.0** | 59.9 | 416 | 34.3 |
 | | llama.cpp (our patched build) | 46.8 | 270 | 30.6 |
 | | gufo | 41.9 | 452 | 24.0 |
-| Qwen3.8-Flash-Next | **Talus** | 69.9 | 1,262 | 66.1 |
+| Qwen3.8-Flash-Next | **Talus v0.1.0** | 69.9 | 1,262 | 66.1 |
 | | gufo | 63.1 | 1,387 | 55.6 |
-| GLM-5.3-Flash | **Talus** | 33.1 | 465 | 33.2 |
+| GLM-5.3-Flash | **Talus v0.1.0** | 33.1 | 465 | 33.2 |
 | | llama.cpp (our patched build) | 30.1 | 217 | 27.0 |
-| MiMo-V2.6-Flash | **Talus** | 43.0 | 526 | 32.8 |
+| MiMo-V2.6-Flash | **Talus v0.1.0** | 43.0 | 526 | 32.8 |
 | | llama.cpp (our patched build) | 39.9 | 287 | 30.1 |
-| Laguna-S-2.1 | **Talus** | 43.7 | 783 | 33.4 |
+| Laguna-S-2.1 | **Talus v0.1.0** | 43.7 | 783 | 33.4 |
 | | llama.cpp (our patched build) | 44.6 | 514 | 30.4 |
 
-Full tables (chat, edit, 2K cells, time to first token, memory, quality gates): [docs/RESULTS.md](docs/RESULTS.md).
-Every number there comes from each model's recorded freeze run, measured end to end
-through the HTTP server, with quality gates (long-context recall, an agentic coding suite, KL divergence against a
-reference, greedy byte-identity, a soak test) that each model must pass. A model whose release run has not passed
-shows "pending". The comparison rows are our own patched build of llama.cpp ("halo4"), not stock llama.cpp, and other
-engines measured on the same machine under stated conditions. How everything is measured:
+Full tables (chat, edit, 2K cells, time to first token, memory, the v0.1.1 figures on the same desktop, quality gates):
+[docs/RESULTS.md](docs/RESULTS.md). Every figure there names its machine and build. A model whose release run has not
+passed shows "pending". The comparison rows are our own patched build of llama.cpp ("halo4"), not stock llama.cpp, and
+other engines measured on the same laptop under stated conditions. How everything is measured:
 [docs/METHODOLOGY.md](docs/METHODOLOGY.md).
 
 Talus is a fork of [Strata](https://github.com/Niko1221/Strata) (MIT). Strata runs Qwen3.8-Flash-Next on consumer
@@ -48,8 +72,10 @@ In geology, talus is the slope of broken rock that collects at the foot of strat
 | Memory | 128 GB unified memory. Each model needs most of it, and GLM-5.3-Flash and MiMo-V2.6-Flash need the GPU memory pool raised with a kernel parameter: [System setup](docs/MODELS.md#system-setup). |
 | OS | Linux with a ROCm SDK (see [Build](#build)) |
 
-We develop and measure on one laptop, an HP ZBook Ultra G1a, whose firmware limits the APU to 70 W. Desktop and
-mini-PC Strix Halo machines usually allow more power; we have not measured them.
+We develop and measure on two machines with the same chip and 128 GB: an HP ZBook Ultra G1a laptop, whose firmware
+limits the APU to 70 W, and a GMKtec EVO-X2 desktop, which holds about 120 W. The v0.1.2 speed figures come from the
+desktop and the quality gates from the laptop; every figure in [docs/RESULTS.md](docs/RESULTS.md) names its machine.
+Other Strix Halo machines may allow other power limits; we have not measured them.
 
 The kernel library has per-architecture tables keyed by GPU target. Only gfx1151 is tuned. The code also knows
 gfx1201 (Radeon AI PRO R9700), so that card can be added by filling in its tables; it is not supported yet.
@@ -126,7 +152,9 @@ The release was built and measured with ROCm SDK 10.2.0a20261014.
 ### Get a model
 
 Download the GGUF files listed for the model in [docs/MODELS.md](docs/MODELS.md), with its drafter and draft
-vocabulary. The server reads the tokenizer and the chat template straight from the model's GGUF.
+vocabulary. The server reads the tokenizer and the chat template straight from the model's GGUF (the run config's
+`tokenizer` is the GGUF's path; no separate tokenizer files are needed). Qwen3.8-Flash-Next is the exception: its
+`tokenizer` is the `tokenizer` folder inside its pack. `talus setup` writes these paths for you.
 
 ### Serve
 
@@ -143,6 +171,7 @@ GGUF), stop tokens and default sampling. An example for Qwen3.8-27B:
   "tokenizer": "/models/Qwen3.8-27B-UD-IQ4_XS.gguf",
   "model_name": "qwen3.8-27b",
   "stop_tokens": ["<|im_end|>"],
+  "sampling": {"temperature": 0.8, "top_p": 0.95, "top_k": 40, "min_p": 0.05},
   "env": {},
   "lib_dirs": ["/path/to/rocm/lib", "/path/to/rocm/lib/llvm/lib", "/path/to/rocm/lib/rocm_sysdeps/lib"]
 }
@@ -152,8 +181,17 @@ GGUF), stop tokens and default sampling. An example for Qwen3.8-27B:
 TALUS_API_KEY=<choose-a-key> rust/target/release/talus-server --config qwen27b.json --host 0.0.0.0 --port 8000
 ```
 
-The other models' arguments are in [docs/MODELS.md](docs/MODELS.md). The engine loads the model (this takes a while
-the first time) and the server answers on `http://<host>:8000/v1`.
+Set `TALUS_API_KEY` (or pass `--api-key`) whenever the server listens beyond this machine; clients send it as
+`Authorization: Bearer <key>` or `x-api-key`.
+
+With the prebuilt programs of a release tarball instead of a source build, use the tarball's `bin/talus-cli` as
+`exe` and start `bin/talus-server`; the kernel library and the hipBLASLt tables are already next to them in `bin/`.
+ROCm is not bundled: make `rocm-sdk` in the tarball's top folder a link to your ROCm SDK root, install ROCm in `/opt/rocm`, or list its
+library folders in `lib_dirs` ([scripts/release/README.md](scripts/release/README.md)). The installer sets all of this up.
+
+The other models' arguments are in [docs/MODELS.md](docs/MODELS.md), and each model's default sampling (the
+`sampling` block) in [docs/MODELS.md, Default sampling](docs/MODELS.md#default-sampling). The engine loads the model
+(this takes a while the first time) and the server answers on `http://<host>:8000/v1`.
 
 ### Use it
 
@@ -164,30 +202,6 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer $TALUS_API_KEY" -H "Content-Type: application/json" \
   -d '{"model": "qwen3.8-27b", "messages": [{"role": "user", "content": "Write a haiku about rocks."}]}'
 ```
-
-## Known issues (v0.1.1)
-
-**Flash-Next prompt speed with a manual tarball install.** If you unpacked the release tarball yourself instead of
-using `install.sh`, Flash-Next can't find its prompt-processing tuning table and falls back to a slower path: prompt
-processing is about 22% slower at 2K tokens and 7% slower at 32K, and outputs can differ slightly at the rounding level.
-Decode speed and the other four models are not affected. Installs made with `install.sh` already have the table.
-
-Workaround: get the table from this repository (`tools/hip/gfx1151-hipblaslt-100401.txt`) and point Talus at it with an
-absolute path, e.g.
-
-    export STRATA_HIPBLASLT_TUNING=/path/to/talus/tools/hip/gfx1151-hipblaslt-100401.txt
-
-The same applies to the `data/...` files in the Flash-Next example in `docs/MODELS.md`: use absolute paths to a
-checkout of this repository. v0.1.2 will ship these files in the tarball and warn at startup when they are missing.
-
-**Our numbers were measured with the "performance" power profile.** On laptops (and some mini PCs) the default
-`balanced` ACPI platform profile can cut speed a lot; GLM chat dropped from about 24 to about 11 tok/s in our test.
-To match our numbers:
-
-    echo performance | sudo tee /sys/firmware/acpi/platform_profile
-
-(not persistent across reboots; check your distribution's power-profile tool to make it stick). v0.1.2's installer
-will offer to set this for you.
 
 ## The server
 

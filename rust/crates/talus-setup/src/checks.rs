@@ -10,6 +10,7 @@ use crate::download;
 use crate::manifest::{self, Prep};
 use crate::paths::Paths;
 use crate::plan::{self, Fit};
+use crate::power;
 use crate::probe::SysInfo;
 use crate::state::SetupState;
 use std::io::{Read, Write};
@@ -50,6 +51,8 @@ pub enum Fix {
     ChmodPrivate(PathBuf),
     /// Kernel parameters: the confirm-and-diff flow, never automatic.
     BootParams,
+    /// The ACPI platform profile `performance`, now and at every boot (sudo; asked, default yes).
+    PowerProfile,
     /// A command that needs sudo; shown and asked for.
     Sudo {
         argv: Vec<String>,
@@ -83,6 +86,9 @@ impl Fix {
             Fix::RestartService => "restart the talus service".into(),
             Fix::ChmodPrivate(p) => format!("make {} readable by you only", p.display()),
             Fix::BootParams => "set the kernel parameters".into(),
+            Fix::PowerProfile => {
+                "set the ACPI platform profile to performance (now and at every boot)".into()
+            }
             Fix::Sudo { argv, .. } => format!("sudo {}", boot::shell_join(argv)),
             Fix::Rebuild => "rebuild Talus (talus update --rebuild)".into(),
         }
@@ -377,6 +383,52 @@ pub fn check_boot(sys: &SysInfo, need_pool: bool) -> Vec<Check> {
     out
 }
 
+/// The ACPI platform profile (talus#54): Talus is measured in `performance`.
+pub fn check_power_profile(sys: &SysInfo) -> Check {
+    use crate::power::Status;
+    let t = "Platform profile";
+    match power::status(sys) {
+        Status::NotHalo => Check::new(
+            "power_profile",
+            t,
+            Verdict::Skip,
+            format!("{} (checked on Strix Halo only)", power::describe(sys)),
+        ),
+        Status::Absent => Check::new(
+            "power_profile",
+            t,
+            Verdict::Info,
+            "no ACPI platform profile: the power mode is a firmware (BIOS) setting here; pick its highest sustained mode",
+        ),
+        Status::Performance => {
+            Check::new("power_profile", t, Verdict::Pass, power::describe(sys))
+        }
+        Status::NoPerformance { current, .. } => Check::new(
+            "power_profile",
+            t,
+            Verdict::Info,
+            format!(
+                "{}: the firmware offers no \"performance\" profile",
+                power::describe(sys)
+            ),
+        )
+        .advice(format!("Talus is measured in performance; {current} may be slower.")),
+        Status::Other { current } => Check::new(
+            "power_profile",
+            t,
+            Verdict::Warn,
+            format!(
+                "{}: Talus is measured in performance (GLM-5.3-Flash 11.2 tok/s with balanced instead of about 24)",
+                power::describe(sys)
+            ),
+        )
+        .advice(format!(
+            "Set it to performance (talus doctor --fix asks, and keeps it across reboots); now {current}."
+        ))
+        .fix(Fix::PowerProfile),
+    }
+}
+
 pub fn hardware(sys: &SysInfo, need_pool: bool) -> Vec<Check> {
     let mut v = vec![
         check_os(sys),
@@ -385,6 +437,7 @@ pub fn hardware(sys: &SysInfo, need_pool: bool) -> Vec<Check> {
         check_ram(sys),
     ];
     v.extend(check_boot(sys, need_pool));
+    v.push(check_power_profile(sys));
     v
 }
 
@@ -410,6 +463,62 @@ pub fn rocm_version(root: &Path) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// The HIP version of an SDK root (`share/hip/version`: `HIP_VERSION_MAJOR/MINOR/PATCH`), as `major.minor.patch`.
+pub fn hip_version(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join("share/hip/version")).ok()?;
+    let field = |k: &str| {
+        text.lines()
+            .find_map(|l| l.trim().strip_prefix(k)?.strip_prefix('='))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    Some(format!(
+        "{}.{}.{}",
+        field("HIP_VERSION_MAJOR")?,
+        field("HIP_VERSION_MINOR")?,
+        field("HIP_VERSION_PATCH")?
+    ))
+}
+
+/// The ROCm verdict for an SDK reporting `v` (and HIP `hip`) against the pin `pin` (HIP `pin_hip`).
+/// An SDK copy given through ROCM_SDK has `.info/version` = the base release ("10.2.0") without the nightly date
+/// ("a20261014"), so a bare base version is the release's only when its HIP version matches the pin's; a different
+/// HIP version, another base or another nightly is still a warning.
+pub fn rocm_verdict(
+    v: &str,
+    hip: Option<&str>,
+    pin: &str,
+    pin_hip: Option<&str>,
+) -> (Verdict, String) {
+    if v == pin {
+        return (Verdict::Pass, format!("{v} (the release's)"));
+    }
+    let pin_base = pin
+        .split_once('a')
+        .map(|(b, _)| b)
+        .filter(|b| !b.is_empty());
+    if pin_base == Some(v) {
+        return match (hip, pin_hip) {
+            (Some(h), Some(ph)) if h == ph => (
+                Verdict::Pass,
+                format!("{v}, HIP {h}: the release's {pin} (this SDK's version file omits the nightly date)"),
+            ),
+            (Some(h), Some(ph)) => (
+                Verdict::Warn,
+                format!("{v}, HIP {h}: another nightly than the release's {pin} (HIP {ph})"),
+            ),
+            _ => (
+                Verdict::Warn,
+                format!("{v}; cannot confirm it is the release's nightly {pin} (no HIP version to compare)"),
+            ),
+        };
+    }
+    (
+        Verdict::Warn,
+        format!("{v}; the release was built and measured with {pin}"),
+    )
 }
 
 pub fn check_rocm(st: Option<&SetupState>, paths: &Paths) -> Check {
@@ -441,10 +550,20 @@ pub fn check_rocm(st: Option<&SetupState>, paths: &Paths) -> Check {
         .advice("The SDK is missing or incomplete: run the installer again.");
     }
     match rocm_version(&root) {
-        Some(v) if v == manifest::rocm_version() => Check::new("rocm", "ROCm SDK", Verdict::Pass, format!("{v} (the release's)")),
-        Some(v) => Check::new("rocm", "ROCm SDK", Verdict::Warn, format!("{v}; the release was built and measured with {}", manifest::rocm_version()))
-            .advice("Other ROCm versions should work but are untested; report problems with `talus doctor --report`."),
-        None => Check::new("rocm", "ROCm SDK", Verdict::Warn, format!("version unknown at {}", root.display())),
+        Some(v) => {
+            let hip = hip_version(&root);
+            match rocm_verdict(&v, hip.as_deref(), manifest::rocm_version(), manifest::rocm_hip_version()) {
+                (Verdict::Pass, d) => Check::new("rocm", "ROCm SDK", Verdict::Pass, d),
+                (verdict, d) => Check::new("rocm", "ROCm SDK", verdict, d)
+                    .advice("Other ROCm versions should work but are untested; report problems with `talus doctor --report`."),
+            }
+        }
+        None => Check::new(
+            "rocm",
+            "ROCm SDK",
+            Verdict::Warn,
+            format!("version unknown at {}", root.display()),
+        ),
     }
 }
 
@@ -478,6 +597,189 @@ pub fn check_binaries(paths: &Paths) -> Check {
         .advice("Build them again.")
         .fix(Fix::Rebuild)
     }
+}
+
+/// hipBLASLt's version number as `hipblasLtGetVersion` reports it (major * 100000 + minor * 100 + patch, e.g. 1.5.0
+/// -> 100500), read from the SDK's `include/hipblaslt/hipblaslt-version.h`, else from `lib/libhipblaslt.so.X.Y.Z`.
+pub fn hipblaslt_version(root: &Path) -> Option<u32> {
+    let num = |major: u32, minor: u32, patch: u32| major * 100_000 + minor * 100 + patch;
+    if let Ok(h) = std::fs::read_to_string(root.join("include/hipblaslt/hipblaslt-version.h")) {
+        let get = |k: &str| -> Option<u32> {
+            h.lines().find_map(|l| {
+                let mut w = l.split_whitespace();
+                (w.next() == Some("#define") && w.next() == Some(k))
+                    .then(|| w.next()?.parse().ok())
+                    .flatten()
+            })
+        };
+        if let (Some(a), Some(b), Some(c)) = (
+            get("HIPBLASLT_VERSION_MAJOR"),
+            get("HIPBLASLT_VERSION_MINOR"),
+            get("HIPBLASLT_VERSION_PATCH"),
+        ) {
+            return Some(num(a, b, c));
+        }
+    }
+    let rd = std::fs::read_dir(root.join("lib")).ok()?;
+    rd.flatten().find_map(|e| {
+        let n = e.file_name().to_string_lossy().into_owned();
+        let v: Vec<u32> = n
+            .strip_prefix("libhipblaslt.so.")?
+            .split('.')
+            .map(|x| x.parse().ok())
+            .collect::<Option<_>>()?;
+        (v.len() == 3).then(|| num(v[0], v[1], v[2]))
+    })
+}
+
+/// Architectures with calibrated tables in tools/hip (mirrors `arch_has_upstream_tables` in
+/// src/prefill/hipblaslt_tuning.hpp).
+pub const TUNED_ARCHES: [&str; 5] = ["gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201"];
+
+/// Where libtalus_kernels.so looks for its table when STRATA_HIPBLASLT_TUNING is unset, in order (mirrors
+/// `default_tuning_dirs` in src/prefill/hipblaslt_tuning.hpp): `<libdir>/hip`, `<libdir>/../share/talus/hip`,
+/// `<libdir>/../tools/hip`.
+pub fn tuning_dirs(libdir: &Path) -> Vec<PathBuf> {
+    vec![
+        libdir.join("hip"),
+        libdir.join("../share/talus/hip"),
+        libdir.join("../tools/hip"),
+    ]
+}
+
+/// The `STRATA_HIPBLASLT_TUNING_V1 <arch> <version>` header of a table file.
+fn table_header(p: &Path) -> Option<(String, u32)> {
+    let t = std::fs::read_to_string(p).ok()?;
+    let l = t
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))?;
+    let mut w = l.split_whitespace();
+    (w.next()? == "STRATA_HIPBLASLT_TUNING_V1").then_some(())?;
+    let arch = w.next()?.to_string();
+    let v = w.next()?.parse().ok()?;
+    Some((arch, v))
+}
+
+/// The table the kernel library would load for (`arch`, `version`) from `libdir` (the auto-discovery rule), and the
+/// hipBLASLt versions it has tables for (any directory).
+pub fn find_tuning_table(
+    libdir: &Path,
+    arch: &str,
+    version: Option<u32>,
+) -> (Option<PathBuf>, Vec<u32>) {
+    let mut have: Vec<u32> = Vec::new();
+    let mut found = None;
+    for d in tuning_dirs(libdir) {
+        if let (Some(v), None) = (version, &found) {
+            let f = d.join(format!("{arch}-hipblaslt-{v}.txt"));
+            if table_header(&f) == Some((arch.to_string(), v)) {
+                found = Some(f);
+            }
+        }
+        if let Ok(rd) = std::fs::read_dir(&d) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if let Some(v) = n
+                    .strip_prefix(&format!("{arch}-hipblaslt-"))
+                    .and_then(|r| r.strip_suffix(".txt"))
+                    .and_then(|r| r.parse().ok())
+                {
+                    if !have.contains(&v) {
+                        have.push(v);
+                    }
+                }
+            }
+        }
+    }
+    have.sort_unstable();
+    (found, have)
+}
+
+/// The hipBLASLt prefill tuning table libtalus_kernels.so would use on this GPU and ROCm (talus#50): without one the
+/// prompt runs untuned (hipBLASEx: slower prefill, different numerics).
+pub fn check_tuning(sys: &SysInfo, st: Option<&SetupState>, paths: &Paths) -> Check {
+    const T: &str = "Prefill tuning table";
+    let arch = if sys.has_gfx1151() {
+        "gfx1151".to_string()
+    } else if let Some(g) = sys.gpus.first() {
+        g.clone()
+    } else {
+        return Check::new("tuning", T, Verdict::Skip, "no GPU found");
+    };
+    let root = st
+        .and_then(|s| s.rocm_sdk.clone())
+        .or_else(|| std::fs::canonicalize(paths.rocm_link()).ok());
+    let version = root.as_deref().and_then(hipblaslt_version);
+    let libdir = paths.bin();
+    let (found, have) = find_tuning_table(&libdir, &arch, version);
+    let list = |h: &[u32]| {
+        h.iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let advice = "Reinstall the programs (`talus update --rebuild`; they bring the tables to bin/hip), or set \
+                  STRATA_HIPBLASLT_TUNING in the run config to a table file or its directory.";
+    match (version, found) {
+        (Some(v), Some(f)) => Check::new(
+            "tuning",
+            T,
+            Verdict::Pass,
+            format!("{arch} / hipBLASLt {v}: {}", paths.tilde(&normal(&f))),
+        ),
+        (Some(v), None) if TUNED_ARCHES.contains(&arch.as_str()) => Check::new(
+            "tuning",
+            T,
+            Verdict::Warn,
+            if have.is_empty() {
+                format!("no table for {arch} next to the kernel library ({}): the prompt runs untuned", paths.tilde(&libdir.join("hip")))
+            } else {
+                format!("no table for {arch} / hipBLASLt {v} (have {}): the prompt runs untuned", list(&have))
+            },
+        )
+        .advice(advice)
+        .fix(Fix::Rebuild),
+        (Some(v), None) => Check::new(
+            "tuning",
+            T,
+            Verdict::Info,
+            format!("no table for {arch} / hipBLASLt {v}: untuned prefill (tools/hip/tune_hipblaslt makes one)"),
+        ),
+        (None, _) if !have.is_empty() => Check::new(
+            "tuning",
+            T,
+            Verdict::Info,
+            format!(
+                "hipBLASLt version unknown; tables for {arch}: {} in {}",
+                list(&have),
+                paths.tilde(&libdir.join("hip"))
+            ),
+        ),
+        (None, _) if TUNED_ARCHES.contains(&arch.as_str()) => Check::new(
+            "tuning",
+            T,
+            Verdict::Warn,
+            format!("no table for {arch} next to the kernel library: the prompt runs untuned"),
+        )
+        .advice(advice)
+        .fix(Fix::Rebuild),
+        (None, _) => Check::new("tuning", T, Verdict::Info, format!("no tables for {arch}")),
+    }
+}
+
+/// `a/b/../c` -> `a/c` (display only; no file system access).
+fn normal(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir if out.file_name().is_some() => {
+                out.pop();
+            }
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Files of one installed model.
@@ -934,6 +1236,7 @@ pub fn run(ctx: &Ctx) -> Vec<Check> {
     let mut out = hardware(ctx.sys, need_pool);
     out.push(check_rocm(ctx.state, ctx.paths));
     out.push(check_binaries(ctx.paths));
+    out.push(check_tuning(ctx.sys, ctx.state, ctx.paths));
     let Some(st) = ctx.state else {
         out.push(
             Check::new(
@@ -1034,6 +1337,37 @@ mod tests {
     }
 
     #[test]
+    fn platform_profile_check() {
+        let mut s = halo_box();
+        let c = check_power_profile(&s);
+        assert_eq!(c.verdict, Verdict::Pass, "{c:?}");
+        assert!(c.detail.starts_with("performance"));
+        s.platform_profile = Some("balanced".into());
+        let c = check_power_profile(&s);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.starts_with("balanced"));
+        assert_eq!(c.fixes, vec![Fix::PowerProfile]);
+        assert!(!Fix::PowerProfile.safe(), "sudo: asked first");
+        s.platform_profile = None;
+        assert_eq!(check_power_profile(&s).verdict, Verdict::Info);
+        s.platform_profile = Some("quiet".into());
+        s.platform_profile_choices = vec!["quiet".into(), "balanced".into()];
+        let c = check_power_profile(&s);
+        assert_eq!(c.verdict, Verdict::Info);
+        assert!(c.fixes.is_empty());
+        s.gpus = vec!["gfx1100".into()];
+        assert_eq!(check_power_profile(&s).verdict, Verdict::Skip);
+        // a fresh (untuned) fake root reads balanced from its sysfs
+        let root = crate::testutil::fake_halo_root("pp", false);
+        let mut f = crate::probe::probe(&root);
+        std::fs::remove_dir_all(root).ok();
+        f.groups = vec!["video".into(), "render".into()];
+        let hw = hardware(&f, false);
+        let pp = hw.iter().find(|c| c.id == "power_profile").unwrap();
+        assert_eq!(pp.verdict, Verdict::Warn);
+    }
+
+    #[test]
     fn install_checks_find_missing_and_corrupt_files() {
         let home = crate::testutil::tempdir("doctor");
         let paths = Paths::under(&home);
@@ -1123,6 +1457,188 @@ mod tests {
         std::fs::write(t.join(".info/version"), "7.14.1\n").unwrap();
         assert_eq!(rocm_version(&t).as_deref(), Some("7.14.1"));
         std::fs::remove_dir_all(d).ok();
+    }
+
+    /// itest18: an SDK copy given through ROCM_SDK reports plain "10.2.0" (.info/version); with the pin's HIP version it
+    /// is the release's SDK, while another nightly, another HIP or another release still warns.
+    #[test]
+    fn rocm_check_accepts_release_sdk_copy() {
+        let pin = "10.2.0a20261014";
+        let ph = Some("7.17.26411");
+        assert_eq!(rocm_verdict(pin, ph, pin, ph).0, Verdict::Pass);
+        let (v, d) = rocm_verdict("10.2.0", Some("7.17.26411"), pin, ph);
+        assert_eq!(v, Verdict::Pass, "{d}");
+        assert!(d.contains("10.2.0a20261014"), "{d}");
+        // a 10.2.0 copy of another nightly (2026-09-30: HIP 7.17.26391)
+        assert_eq!(
+            rocm_verdict("10.2.0", Some("7.17.26391"), pin, ph).0,
+            Verdict::Warn
+        );
+        // no HIP version to compare: not hidden
+        let (v, d) = rocm_verdict("10.2.0", None, pin, ph);
+        assert_eq!(v, Verdict::Warn);
+        assert!(d.contains("cannot confirm"), "{d}");
+        assert_eq!(
+            rocm_verdict("10.2.0", Some("7.17.26411"), pin, None).0,
+            Verdict::Warn
+        );
+        assert_eq!(
+            rocm_verdict("10.2.0a20260930", Some("7.17.26391"), pin, ph).0,
+            Verdict::Warn
+        );
+        assert_eq!(
+            rocm_verdict("10.1.0", Some("7.16.26385"), pin, ph).0,
+            Verdict::Warn
+        );
+        assert_eq!(
+            rocm_verdict("10.2", Some("7.17.26411"), pin, ph).0,
+            Verdict::Warn
+        );
+        // the shipped pin names its HIP version
+        assert_eq!(manifest::rocm_hip_version(), Some("7.17.26411"));
+        assert_eq!(manifest::rocm_version(), pin);
+        // hip_version reads share/hip/version
+        let d = crate::testutil::tempdir("hipv");
+        std::fs::create_dir_all(d.join("share/hip")).unwrap();
+        std::fs::write(
+            d.join("share/hip/version"),
+            "# Auto-generated by cmake\nHIP_PACKAGING_VERSION_PATCH=26411-0000000\nHIP_VERSION_MAJOR=7\nHIP_VERSION_MINOR=17\nHIP_VERSION_PATCH=26411\nHIP_VERSION_GITHASH=0000000\n",
+        )
+        .unwrap();
+        assert_eq!(hip_version(&d).as_deref(), Some("7.17.26411"));
+        assert_eq!(hip_version(&d.join("nothing")), None);
+        std::fs::remove_dir_all(d).ok();
+    }
+
+    #[test]
+    fn hipblaslt_version_from_header_or_soname() {
+        let d = crate::testutil::tempdir("hipltv");
+        std::fs::create_dir_all(d.join("include/hipblaslt")).unwrap();
+        std::fs::write(
+            d.join("include/hipblaslt/hipblaslt-version.h"),
+            "#define _HIPBLASLT_VERSION_H_\n#define HIPBLASLT_VERSION_MAJOR     1\n#define HIPBLASLT_VERSION_MINOR     5\n#define HIPBLASLT_VERSION_PATCH     0\n#define HIPBLASLT_VERSION_TWEAK     24bdd073\n",
+        )
+        .unwrap();
+        assert_eq!(hipblaslt_version(&d), Some(100500));
+        let e = crate::testutil::tempdir("hipltv2");
+        std::fs::create_dir_all(e.join("lib")).unwrap();
+        for n in [
+            "libhipblaslt.so",
+            "libhipblaslt.so.1",
+            "libhipblaslt.so.1.4.1",
+        ] {
+            std::fs::write(e.join("lib").join(n), b"").unwrap();
+        }
+        assert_eq!(hipblaslt_version(&e), Some(100401));
+        assert_eq!(hipblaslt_version(&e.join("nothing")), None);
+        std::fs::remove_dir_all(d).ok();
+        std::fs::remove_dir_all(e).ok();
+    }
+
+    #[test]
+    fn tuning_table_check() {
+        let home = crate::testutil::tempdir("tuning");
+        let paths = Paths::under(&home);
+        let rocm = home.join("rocm");
+        std::fs::create_dir_all(rocm.join("include/hipblaslt")).unwrap();
+        std::fs::write(
+            rocm.join("include/hipblaslt/hipblaslt-version.h"),
+            "#define HIPBLASLT_VERSION_MAJOR 1\n#define HIPBLASLT_VERSION_MINOR 5\n#define HIPBLASLT_VERSION_PATCH 0\n",
+        )
+        .unwrap();
+        let st = SetupState::new(&paths, home.join("src"), Some(rocm.clone()));
+        let sys = halo_box();
+        // nothing installed: a warning with the rebuild fix
+        let c = check_tuning(&sys, Some(&st), &paths);
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert_eq!(c.fixes, vec![Fix::Rebuild]);
+        // another version's table only: still a warning, naming what is there
+        let table = |dir: &Path, v: u32| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join(format!("gfx1151-hipblaslt-{v}.txt")),
+                format!("# t\nSTRATA_HIPBLASLT_TUNING_V1 gfx1151 {v}\nbf16 1 2 1 4 5\n"),
+            )
+            .unwrap();
+        };
+        table(&paths.tuning_dir(), 100401);
+        let c = check_tuning(&sys, Some(&st), &paths);
+        assert_eq!(c.verdict, Verdict::Warn);
+        assert!(c.detail.contains("have 100401"), "{}", c.detail);
+        // a source-tree style ../tools/hip is found; bin/hip wins over it
+        table(&paths.data.join("tools/hip"), 100500);
+        let c = check_tuning(&sys, Some(&st), &paths);
+        assert_eq!(c.verdict, Verdict::Pass);
+        assert!(
+            c.detail.ends_with("tools/hip/gfx1151-hipblaslt-100500.txt"),
+            "{}",
+            c.detail
+        );
+        assert!(!c.detail.contains(".."), "{}", c.detail);
+        table(&paths.tuning_dir(), 100500);
+        let c = check_tuning(&sys, Some(&st), &paths);
+        assert_eq!(c.verdict, Verdict::Pass);
+        assert!(
+            c.detail.contains("gfx1151 / hipBLASLt 100500"),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail.ends_with("bin/hip/gfx1151-hipblaslt-100500.txt"),
+            "{}",
+            c.detail
+        );
+        // a file with the right name but another header does not count
+        std::fs::write(
+            paths.tuning_dir().join("gfx1151-hipblaslt-100500.txt"),
+            "STRATA_HIPBLASLT_TUNING_V1 gfx1151 100401\n",
+        )
+        .unwrap();
+        std::fs::remove_dir_all(paths.data.join("tools")).unwrap();
+        assert_eq!(check_tuning(&sys, Some(&st), &paths).verdict, Verdict::Warn);
+        // version unknown: report what is there
+        let st2 = SetupState::new(&paths, home.join("src"), Some(home.join("no-rocm")));
+        assert_eq!(
+            check_tuning(&sys, Some(&st2), &paths).verdict,
+            Verdict::Info
+        );
+        // no GPU: skip
+        let mut nogpu = halo_box();
+        nogpu.gpus.clear();
+        assert_eq!(
+            check_tuning(&nogpu, Some(&st), &paths).verdict,
+            Verdict::Skip
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn tuning_rules_match_the_shipped_tables() {
+        // the repository's tools/hip: every arch is in TUNED_ARCHES, and a directory in the source tree finds gfx1151 100500 in ../tools/hip
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let hip = src.join("tools/hip");
+        let mut arches = std::collections::BTreeSet::new();
+        for e in std::fs::read_dir(&hip).unwrap().flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if let Some((a, _)) = n.split_once("-hipblaslt-") {
+                if n.ends_with(".txt") {
+                    arches.insert(a.to_string());
+                }
+            }
+        }
+        assert!(!arches.is_empty());
+        for a in &arches {
+            assert!(
+                TUNED_ARCHES.contains(&a.as_str()),
+                "{a} missing from TUNED_ARCHES"
+            );
+        }
+        let (f, have) = find_tuning_table(&src.join("rust"), "gfx1151", Some(100500));
+        assert_eq!(
+            f.unwrap().file_name().unwrap(),
+            "gfx1151-hipblaslt-100500.txt"
+        );
+        assert!(have.contains(&100401) && have.contains(&100500));
     }
 
     #[test]

@@ -216,6 +216,10 @@ pub fn render(checks: &[Check], sys: &SysInfo, talus_version: &str, rocm: &str) 
             .unwrap_or_else(|| "?".into())
     ));
     s.push_str(&format!(
+        "- ACPI platform profile: {}\n",
+        crate::power::describe(sys)
+    ));
+    s.push_str(&format!(
         "- Desktop session: {}; default target: {}\n\n",
         if sys.desktop_active { "running" } else { "no" },
         sys.default_target.as_deref().unwrap_or("?")
@@ -289,6 +293,7 @@ mod tests {
         let r = render(&checks, &sys, "abc123", "10.2.0a20261014");
         assert!(r.contains("| Memory | FAIL |"));
         assert!(r.contains("Kernel parameters: ttm.pages_limit=31457280 kho=off"));
+        assert!(r.contains("- ACPI platform profile: none (no ACPI platform profile)"));
         assert!(
             !r.contains("root=/dev/mapper"),
             "only our parameters are reported"

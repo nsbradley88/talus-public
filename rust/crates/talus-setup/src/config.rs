@@ -16,8 +16,11 @@ pub struct Ctx {
     pub bin_dir: PathBuf,
     /// The ROCm SDK root.
     pub rocm: PathBuf,
-    /// The Talus source (data files: expert profile, draft vocabularies, hipBLASLt tables).
+    /// The Talus source: data files not found under `prefix` come from here.
     pub src: PathBuf,
+    /// The install prefix (TALUS_HOME): the release tarball / install.sh put the data files and tools there at their
+    /// source-tree paths (scripts/release/side-files.txt), so they match the binaries.
+    pub prefix: PathBuf,
     /// `<models_dir>/<model-id>`.
     pub model_dir: PathBuf,
     pub log: PathBuf,
@@ -40,12 +43,19 @@ impl Ctx {
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("/opt/rocm")),
             src: st.src.clone(),
+            prefix: paths.data.clone(),
             model_dir: st.model_dir(model_id),
             log: paths.engine_log(model_id),
             host: st.host.clone(),
             port: st.port,
             api_key,
         }
+    }
+
+    /// A shipped data file or tool (`data/...`, `tools/...`): under the install prefix when it is there, else in
+    /// the source clone.
+    pub fn side_file(&self, rel: &str) -> PathBuf {
+        side_file(&self.prefix, &self.src, rel)
     }
 
     pub fn lib_dirs(&self) -> Vec<String> {
@@ -58,6 +68,16 @@ impl Ctx {
         .iter()
         .map(|p| p.display().to_string())
         .collect()
+    }
+}
+
+/// `prefix/rel` when it exists (release tarball / install.sh, talus#50), else `src/rel`.
+pub fn side_file(prefix: &Path, src: &Path, rel: &str) -> PathBuf {
+    let p = prefix.join(rel);
+    if p.exists() {
+        p
+    } else {
+        src.join(rel)
     }
 }
 
@@ -104,7 +124,8 @@ pub fn run_config(m: &ModelInstall, ch: &Choices, c: &Ctx) -> Value {
             }
             (
                 vec!["<|im_end|>"],
-                Some(json!({"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0})),
+                // the sampling every published 27B number was measured with (talus#52)
+                Some(json!({"temperature": 0.8, "top_p": 0.95, "top_k": 40, "min_p": 0.05})),
                 main.clone(),
             )
         }
@@ -113,7 +134,7 @@ pub fn run_config(m: &ModelInstall, ch: &Choices, c: &Ctx) -> Value {
             a(&["--pack", &pack, "--native", &main]);
             a(&[
                 "--expert-profile",
-                &p(c.src.join("data/expert-profile.bin")),
+                &p(c.side_file("data/expert-profile.bin")),
             ]);
             a(&[
                 "--expert-cache",
@@ -133,16 +154,15 @@ pub fn run_config(m: &ModelInstall, ch: &Choices, c: &Ctx) -> Value {
                 ]);
                 a(&[
                     "--mtp-draft-vocab",
-                    &p(c.src.join("data/draft_vocab_en.bin")),
+                    &p(c.side_file("data/draft_vocab_en.bin")),
                 ]);
             } else {
                 a(&["--suffix-draft", "0"]);
             }
             a(&["--max-context", "262144", "--kv", "int8"]);
-            env.insert(
-                "STRATA_HIPBLASLT_TUNING".into(),
-                json!(p(c.src.join("tools/hip/gfx1151-hipblaslt-100401.txt"))),
-            );
+            // no STRATA_HIPBLASLT_TUNING (talus#50): the kernel library finds the hipBLASLt table for the running
+            // hipBLASLt next to itself (bin/hip, installed by install.sh / the release tarball); `talus doctor`
+            // reports which one
             for k in [
                 "STRATA_PF_FUSED",
                 "STRATA_PF_GEMM",
@@ -156,7 +176,13 @@ pub fn run_config(m: &ModelInstall, ch: &Choices, c: &Ctx) -> Value {
             }
             env.insert("STRATA_PF_SWITCH_MIN_T".into(), json!("0"));
             env.insert("STRATA_PREFILL_STREAM_MIN".into(), json!("128"));
-            (vec!["<|im_end|>"], None, format!("{pack}/tokenizer"))
+            // measured with no sampling block: the chat cell sent temperature 1.0 / top_p 0.95 and the engine filled
+            // top_k 20 / min_p 0 (its own GEN defaults); stated here so talus-server's built-in 0.7 never applies
+            (
+                vec!["<|im_end|>"],
+                Some(json!({"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0})),
+                format!("{pack}/tokenizer"),
+            )
         }
         "glm-5.3-flash" => {
             a(&["--model", &main, "--ctx", "65536"]);
@@ -207,9 +233,9 @@ pub fn run_config(m: &ModelInstall, ch: &Choices, c: &Ctx) -> Value {
                 "--sparse",
                 "1024,16384,128,1024,16",
             ]);
-            // the DFlash drafter is an opt-in download (license unclear); prompt lookup drafts either way
-            if drafters && ch.opt_drafter {
-                a(&["--dflash-gguf", &f(Role::DrafterOptIn, 0)]);
+            // the DFlash drafter is on with the drafters (talus#53, v0.1.2); prompt lookup drafts either way
+            if drafters {
+                a(&["--dflash-gguf", &f(Role::Drafter, 0)]);
             }
             (
                 vec!["\u{3008}|EOS|\u{3009}", "</assistant>"],
@@ -329,16 +355,13 @@ mod tests {
         drafters: false,
         ..ON
     };
-    const ALL: Choices = Choices {
-        opt_drafter: true,
-        ..ON
-    };
 
     fn ctx() -> Ctx {
         Ctx {
             bin_dir: "/t/bin".into(),
             rocm: "/t/rocm".into(),
             src: "/t/src".into(),
+            prefix: "/t/share".into(),
             model_dir: "/m/x".into(),
             log: "/t/log".into(),
             host: "127.0.0.1".into(),
@@ -396,15 +419,15 @@ mod tests {
             "--model /m/x/MiMo-V2.6-Flash-a4-x-00001-of-00003.gguf --max-context 196608 --ubatch 2048 \
              --dflash-gguf /m/x/dflash-MiMo-V2.6-Flash-MOPD-Q8_0.gguf --spec 4 --spec-draft-vocab /m/x/mimo-dv-65536.bin"
         );
-        let la = run_config(manifest::get("laguna-s-2.1").unwrap(), &ALL, &c);
+        let la = run_config(manifest::get("laguna-s-2.1").unwrap(), &ON, &c);
         assert_eq!(
             args(&la).join(" "),
             "--model /m/x/Laguna-S-2.1-Q4-lean-00001-of-00003.gguf --max-context 262144 --ubatch 2048 \
              --eos-ids 2,24 --spec 7 --sparse 1024,16384,128,1024,16 --dflash-gguf /m/x/laguna-s-2.1-dflash-Q8_0.gguf"
         );
         assert_eq!(la["stop_tokens"], json!(["〈|EOS|〉", "</assistant>"]));
-        // default: no DFlash drafter (opt-in), prompt lookup only
-        let la0 = run_config(manifest::get("laguna-s-2.1").unwrap(), &ON, &c);
+        // drafters off: no DFlash drafter, prompt lookup only
+        let la0 = run_config(manifest::get("laguna-s-2.1").unwrap(), &OFF, &c);
         assert!(!args(&la0).iter().any(|a| a == "--dflash-gguf"));
         let fx = run_config(manifest::get("qwen3.8-flash-next").unwrap(), &ON, &c);
         let fa = args(&fx).join(" ");
@@ -416,7 +439,41 @@ mod tests {
         ));
         assert!(fa.ends_with("--max-context 262144 --kv int8"));
         assert_eq!(fx["env"]["STRATA_PF_FUSED"], json!("1"));
+        // talus#50: the library finds the hipBLASLt table itself; no source-tree path in the config
+        assert!(fx["env"].get("STRATA_HIPBLASLT_TUNING").is_none());
         assert_eq!(fx["tokenizer"], json!("/m/x/pack/tokenizer"));
+    }
+
+    #[test]
+    fn side_files_come_from_the_install_prefix_when_there() {
+        let d = crate::testutil::tempdir("sidef");
+        let mut c = ctx();
+        c.prefix = d.join("share");
+        c.src = d.join("src");
+        assert_eq!(
+            c.side_file("data/expert-profile.bin"),
+            d.join("src/data/expert-profile.bin")
+        );
+        std::fs::create_dir_all(d.join("share/data")).unwrap();
+        std::fs::write(d.join("share/data/expert-profile.bin"), b"x").unwrap();
+        assert_eq!(
+            c.side_file("data/expert-profile.bin"),
+            d.join("share/data/expert-profile.bin")
+        );
+        let fx = run_config(manifest::get("qwen3.8-flash-next").unwrap(), &ON, &c);
+        let fa = args(&fx).join(" ");
+        assert!(
+            fa.contains(&format!(
+                "--expert-profile {}",
+                d.join("share/data/expert-profile.bin").display()
+            )),
+            "{fa}"
+        );
+        assert!(fa.contains(&format!(
+            "--mtp-draft-vocab {}",
+            d.join("src/data/draft_vocab_en.bin").display()
+        )));
+        std::fs::remove_dir_all(d).ok();
     }
 
     #[test]
@@ -440,6 +497,57 @@ mod tests {
                 .iter()
                 .all(|e| e.contains("missing")));
         }
+    }
+
+    /// Each model's default sampling is the one its published numbers were measured with (talus#52).
+    const MEASURED_SAMPLING: [(&str, f64, f64, i64, f64); 5] = [
+        ("qwen3.8-27b", 0.8, 0.95, 40, 0.05),
+        ("qwen3.8-flash-next", 1.0, 0.95, 20, 0.0),
+        ("glm-5.3-flash", 0.8, 0.95, 40, 0.05),
+        ("mimo-v2.6-flash", 1.0, 1.0, 20, 0.0),
+        ("laguna-s-2.1", 1.0, 1.0, 20, 0.0),
+    ];
+
+    #[test]
+    fn sampling_is_the_measured_one() {
+        assert_eq!(MEASURED_SAMPLING.len(), manifest::MODELS.len());
+        for (id, t, tp, tk, mp) in MEASURED_SAMPLING {
+            let v = run_config(manifest::get(id).unwrap(), &ON, &ctx());
+            assert_eq!(
+                v["sampling"],
+                json!({"temperature": t, "top_p": tp, "top_k": tk, "min_p": mp}),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_example_configs_agree_with_setup() {
+        // every configs/*.json of a model carries the same sampling block as the config talus setup writes
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../configs");
+        let mut seen = 0;
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            let text = std::fs::read_to_string(e.path()).unwrap();
+            let v: Value = serde_json::from_str(&text).unwrap();
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(&(_, t, tp, tk, mp)) = MEASURED_SAMPLING
+                .iter()
+                .find(|(id, ..)| name.starts_with(&format!("{id}.")))
+            else {
+                continue;
+            };
+            assert_eq!(
+                v["sampling"],
+                json!({"temperature": t, "top_p": tp, "top_k": tk, "min_p": mp}),
+                "{name}"
+            );
+            seen += 1;
+        }
+        assert!(
+            seen >= 5,
+            "found only {seen} shipped configs in {}",
+            dir.display()
+        );
     }
 
     #[test]

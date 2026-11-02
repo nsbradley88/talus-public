@@ -3589,6 +3589,32 @@ impl GlmEngine {
         self.graphs.len()
     }
 
+    /// Memory pressure (#40): destroy every captured graph (they are re-captured on next use; the launches are the
+    /// same, so outputs do not change). Returns the graphs destroyed.
+    pub fn drop_graphs(&mut self) -> Result<usize> {
+        if self.graphs.is_empty() {
+            return Ok(0);
+        }
+        ffi::sync(self.stream)?; // no launch of them may still be in flight
+        let n = self.graphs.len();
+        for (_, g) in self.graphs.drain() {
+            ffi::graph_destroy(g);
+        }
+        self.graph_used.clear();
+        Ok(n)
+    }
+
+    /// Memory-pressure safe point inside a request (prompt chunk / decode round): a relaxed atomic load unless the
+    /// pressure guard latched a low reading; then the engine's mid-request classes are shed, and the request fails
+    /// (`insufficient_memory`) if the host is still under the floor.
+    #[inline]
+    pub fn pressure_point(&mut self) -> Result<()> {
+        if !talus_mem::pressure::pending() {
+            return Ok(());
+        }
+        talus_mem::pressure::check_mid_request(self).map_err(CoreError::from)
+    }
+
     // ------------------------------------------------------------------------------------------------------------
     // recurrent-state snapshots (prompt cache)
 
@@ -3608,6 +3634,16 @@ impl GlmEngine {
         let p = dev_alloc(n)?;
         self.allocs.push(p);
         Ok(Buf { p, bytes: n })
+    }
+
+    /// Free a snapshot buffer from [`Self::snap_alloc`] (memory pressure: the caller forgets the snapshot).
+    pub fn snap_free(&mut self, b: &Buf) -> Result<()> {
+        ffi::sync(self.stream)?;
+        if let Some(i) = self.allocs.iter().position(|&p| p == b.p) {
+            self.allocs.swap_remove(i);
+            ffi::dev_free(b.p);
+        }
+        Ok(())
     }
 
     /// Copy one KDA layer's current recurrent state (KDA + conv, slot cur) into its place in a snapshot buffer.
@@ -3653,5 +3689,31 @@ impl GlmEngine {
         }
         self.st.cur_slot = 0;
         ffi::sync(self.stream)
+    }
+}
+
+/// Raw `/proc/meminfo` MemAvailable delta around `f` (bytes released, 0 if none or unreadable).
+fn freed_by(f: impl FnOnce() -> bool) -> u64 {
+    let a = super::weights::mem_available_bytes();
+    if !f() {
+        return 0;
+    }
+    let b = super::weights::mem_available_bytes();
+    b.saturating_sub(a).max(1)
+}
+
+impl talus_mem::pressure::Shed for GlmEngine {
+    fn shed(&mut self, class: talus_mem::pressure::ShedClass) -> u64 {
+        use talus_mem::pressure::ShedClass;
+        match class {
+            ShedClass::DecodeGraphs => {
+                freed_by(|| self.drop_graphs().map(|n| n > 0).unwrap_or(false))
+            }
+            ShedClass::TransientArenas => {
+                freed_by(|| prefill::trim_arenas(self)) + talus_mem::pressure::trim_host_heap()
+            }
+            // prompt snapshots belong to the serve backend; GLM keeps no RAM-tier prompt cache
+            ShedClass::PromptSnapshots | ShedClass::PromptCacheRam => 0,
+        }
     }
 }

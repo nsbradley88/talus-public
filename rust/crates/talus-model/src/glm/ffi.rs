@@ -716,6 +716,9 @@ pub struct Tkg {
 pub struct GlmLib {
     /// `tk_register_mmq_q8_buf` (marks an activation buffer as MMQ layout for tk_prefill_moe_mmq)
     pub register_mmq: Option<unsafe extern "C" fn(*const c_void)>,
+    /// `tk_prefill_trim` (#40 memory pressure: frees the shared prefill engine's grown scratch / allocator caches;
+    /// rebuilt by the next prompt chunk). None with older libraries.
+    pub prefill_trim: Option<unsafe extern "C" fn(*mut tk_ctx) -> tk_status>,
     pub tk: LibTalusKernels,
     pub g: Tkg,
     pub ctx: *mut tk_ctx,
@@ -903,8 +906,24 @@ impl GlmLib {
                 })
             }
         };
+        let prefill_trim = {
+            let cn = CString::new("tk_prefill_trim").unwrap();
+            // SAFETY: handle valid.
+            let f = unsafe { dlsym(h, cn.as_ptr()) };
+            if f.is_null() {
+                None
+            } else {
+                // SAFETY: extern "C" tk_status tk_prefill_trim(tk_ctx*).
+                Some(unsafe {
+                    std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut tk_ctx) -> tk_status>(
+                        f,
+                    )
+                })
+            }
+        };
         Ok(Self {
             register_mmq: reg,
+            prefill_trim,
             tk,
             g,
             ctx,

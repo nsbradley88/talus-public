@@ -215,8 +215,10 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream, const void* x_q8_1_ready, int lfuse) {
     const bool gate_deferred = (lfuse & 1) != 0, pair = (lfuse & 2) != 0;
-    if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
-        throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
+    // 1..16 rows (a Flash-Next copy window); the projections are native_mmvq's columns (bitwise across column
+    // counts), the gate's BF16 rows run as calls of <= 8 rows (bf16_gemv_fp32_mmvf_multi's limit)
+    if (n_tok < 1 || n_tok > 16 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
+        throw std::invalid_argument("shared_expert_multi: needs 1..16 tokens, native weights, scratch and a stream");
     cudaStream_t cs = (cudaStream_t) stream;
     // the activation's q8_1: the caller's (STRATA_VERIFY_QDEDUP, x_q8_1_ready) or the descriptor's, else quantized here
     const void* x_q8_1 = x_q8_1_ready ? x_q8_1_ready : nw.x_q8_1;
@@ -245,7 +247,12 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     }
     static const bool batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     if (native_bf16 && batch && n_tok > 1) {   // one gemv for all rows (outputs identical), fused sigmoid+scale
-        bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
+        if (n_tok <= 8) bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
+        else {   // two calls of ceil(n/2), floor(n/2) rows (as verify_wide.hpp)
+            const int a = (n_tok + 1) / 2;
+            bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, a, stream);
+            bf16_gemv_fp32_mmvf_multi(x + (size_t) a * n_embd, n_embd, gate_inp_bf16, g + a, 1, n_embd, 1, n_tok - a, stream);
+        }
         launch_sigmoid_scale_rows(out, g, (int) n_embd, n_tok, cs);
     } else if (native_bf16 && n_tok == 1) {
         bf16_gemv_fp32_mmvf(x, gate_inp_bf16, g, n_embd, 1, stream);

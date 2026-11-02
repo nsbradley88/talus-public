@@ -28,7 +28,7 @@ pub use ffi::{
 pub use kld_flags::{
     classify_niche_flag, compute_sparse_topk_kld, NicheFlagDisposition, Piece6KldFlags,
 };
-pub use prefill::{equal_chunk, Piece2Prefill};
+pub use prefill::{equal_chunk, equal_chunks_enabled, Piece2Prefill};
 pub use skeleton::{
     fnv1a64_bytes, BlockDeviceBuffers, GdnDeviceBuffers, GdnLayerState, LayerDumpComparison,
     LayerDumpEntry, LayerDumpHarness, LayerDumpHeader, MoeDeviceBuffers, PleStateLayout,
@@ -37,6 +37,8 @@ pub use skeleton::{
     TensorDiffReport, LAYER_DUMP_MAGIC,
 };
 pub use spec::{parse_logit_bias, DraftPick, DraftPolicy, SuffixDrafter};
-pub use state::{compute_prompt_cuts, message_checkpoint_boundary, PromptCutPlan};
+pub use state::{
+    compute_prompt_cuts, message_checkpoint_boundary, prompt_end_checkpoint, PromptCutPlan,
+};
 pub use verify_mtp::Piece4VerifyMtp;
 pub use weights::{ExpertCacheLayout, Piece1Weights};

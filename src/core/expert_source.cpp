@@ -13,6 +13,7 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/cpu/kq_avx1.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
 
@@ -3759,10 +3760,10 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 
 namespace {
 // the verify window's per-entry tables in `expert_pool_dispatch_multi` (`kind`, `distinct`, `first_of`)
-// are fixed arrays of this many entries: MAXT tokens of the model's 10 routed experts must fit, and a larger k is
-// refused at run time rather than written past them.
-constexpr int64_t kMaxWindowEntries = 128;
-static_assert(strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
+// are fixed arrays of this many entries: kVerifyMaxT tokens of the model's 10 routed experts must fit, and a larger k
+// is refused at run time rather than written past them.  (256 for the 16-token copy windows; was 128.)
+constexpr int64_t kMaxWindowEntries = 256;
+static_assert(strata::kernels::kVerifyMaxT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
 }  // namespace
 
 namespace {
@@ -3786,7 +3787,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                                 float* out) {
     using namespace strata::kernels::cpu;
     if (d.failed) return;
-    if (n_tok < 1 || n_tok > MAXT) {
+    // a window of up to kVerifyMaxT tokens; an expert's CPU job takes at most MAXT of them (a wider window's
+    // expert gets one job per MAXT tokens, each token's rows bitwise the one-token kernel's either way).  The peer GPU
+    // and the remote helpers take at most MAXT tokens per window.
+    if (n_tok < 1 || n_tok > strata::kernels::kVerifyMaxT ||
+        (n_tok > MAXT && (d.peer != nullptr || d.remote_count > 0))) {
         d.failed = true;
         d.fail = "a verify window has more tokens than the multi-token expert kernel takes";
         d.fail_layer = d.layers;
@@ -3805,12 +3810,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.fail_layer = d.layers;
         return;
     }
-    if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) MAXT);
+    const int64_t win_cap = std::max<int64_t>(MAXT, n_tok);   // the window's tokens (was MAXT)
+    if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) win_cap);
     const ExpertLayout& lay = expert_layout();
     const bool native = lay.native;
-    if (native && d.nact_multi.size() < (size_t) MAXT * kNativeActBytes) d.nact_multi.resize((size_t) MAXT * kNativeActBytes);
+    if (native && d.nact_multi.size() < (size_t) win_cap * kNativeActBytes) d.nact_multi.resize((size_t) win_cap * kNativeActBytes);
     if (d.job_of.size() != (size_t) d.n_expert) d.job_of.assign((size_t) d.n_expert, (int16_t) -1);
-    if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (MAXT * k));
+    if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (win_cap * k));
     static const bool ptrace = std::getenv("STRATA_POOL_TRACE") != nullptr;
     auto pt = [&](const char* what, long long a = -1) {
         if (ptrace) { std::fprintf(stderr, "pool trace: layer %lld %s %lld\n", (long long) d.layers, what, a); std::fflush(stderr); }
@@ -4046,6 +4052,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             ++d.cache_refused;
             int16_t& jo = d.job_of[(size_t) e];
+            // a full job (MAXT tokens: a window wider than MAXT) hands the expert's next tokens to a new job
+            if (jo >= 0 && d.jobs_multi[(size_t) jo].nt >= MAXT) jo = -1;
             if (jo < 0) {
                 const uint8_t* b = d.src->blob(d.layers, e);
                 if (b == nullptr) {

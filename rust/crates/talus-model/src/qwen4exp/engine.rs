@@ -29,8 +29,9 @@ use crate::qwen4exp::ffi::{
 use crate::qwen4exp::kld_flags::{split_rust_only_flags, KldCliOpts}; // qwen4exp-p5
 use crate::qwen4exp::skeleton::{LayerDumpHarness, Qwen4ExpModelConfig, Qwen4ExpRustEngine};
 use crate::qwen4exp::spec::{parse_logit_bias, DraftPolicy, SuffixDrafter};
-use crate::qwen4exp::state::compute_prompt_cuts;
-use talus_spec::{copy_cfg_from_env, copy_enabled, copy_env_f64, CopyMatch, CopyProposer};
+use crate::qwen4exp::state::{compute_prompt_cuts, prompt_end_checkpoint};
+use crate::qwen4exp::verify_mtp::K_VERIFY_MAX_T;
+use talus_spec::{copy_cfg_from_env, copy_enabled, copy_env_f64, CopyMatch, CopyProposer}; // the widest verify window (16)
 
 struct StdinShared {
     queue: Mutex<(VecDeque<String>, bool)>,
@@ -182,10 +183,15 @@ struct FnCopy {
     /// this window's copy: (match, rows, chained after the MTP's drafts)
     cur: Option<(CopyMatch, usize, bool)>,
     out: Vec<i32>,
+    /// a copy window wider than `base_rows` (the release width, kVerifyMaxTBase = 8 rows) only where the
+    /// copy's estimated per-token acceptance is at least `wide_q` (`TALUS_COPY_WIDE_Q`, default 0.95; faster edits, long-context decode unchanged): long verbatim
+    /// stretches verify up to `TALUS_COPY_VERIFY` (16) rows at once, everything else keeps windows of <= 8 rows
+    base_rows: usize,
+    wide_q: f64,
     /// `TALUS_COPY_LOG=1`: round time sums / counts by window size and kind (0 MTP, 1 copy, 2 MTP + copy)
     log: bool,
-    tsum: [[f64; 9]; 3],
-    tn: [[u32; 9]; 3],
+    tsum: [[f64; K_VERIFY_MAX_T + 1]; 3],
+    tn: [[u32; K_VERIFY_MAX_T + 1]; 3],
 }
 
 impl FnCopy {
@@ -204,16 +210,28 @@ impl FnCopy {
             next_toks: Vec::new(),
             cur: None,
             out: Vec::new(),
+            base_rows: COPY_BASE_ROWS,
+            wide_q: copy_env_f64("WIDE_Q").unwrap_or(0.95),
             log: copy_env_f64("LOG").is_some_and(|v| v != 0.0),
-            tsum: [[0.0; 9]; 3],
-            tn: [[0; 9]; 3],
+            tsum: [[0.0; K_VERIFY_MAX_T + 1]; 3],
+            tn: [[0; K_VERIFY_MAX_T + 1]; 3],
         })
     }
 
     fn time_round(&mut self, kind: usize, t: i32, ms: f64) {
-        if self.log && (1..=8).contains(&t) {
+        if self.log && (1..=K_VERIFY_MAX_T as i32).contains(&t) {
             self.tsum[kind][t as usize] += ms;
             self.tn[kind][t as usize] += 1;
+        }
+    }
+
+    /// how many copied tokens a window that already holds `rows` rows may take - all `avail` (up to the
+    /// verify window) when copies like `m` are accepted at >= `wide_q`, else only up to the release width.
+    fn wide_cap(&self, m: &CopyMatch, avail: usize, rows: usize) -> usize {
+        if rows + avail <= self.base_rows || self.cp.accept_rate(m) >= self.wide_q {
+            avail
+        } else {
+            avail.min(self.base_rows.saturating_sub(rows))
         }
     }
 
@@ -241,9 +259,12 @@ impl FnCopy {
             &mut self.out,
         );
         if let Some(m) = m {
-            let k = self
-                .cp
-                .choose_len(&m, self.out.len(), self.row_cost, self.min_gain);
+            let k = self.cp.choose_len(
+                &m,
+                self.wide_cap(&m, self.out.len(), 1),
+                self.row_cost,
+                self.min_gain,
+            );
             if k > 0 {
                 self.next_toks.clear();
                 self.next_toks.extend_from_slice(&self.out[..k]);
@@ -281,9 +302,12 @@ impl FnCopy {
             return 0;
         };
         // the MTP rows come first: their drafts are paid for already, so only the copy's own rows are priced
-        let k = self
-            .cp
-            .choose_len(&m, self.out.len(), self.row_cost, self.min_gain);
+        let k = self.cp.choose_len(
+            &m,
+            self.wide_cap(&m, self.out.len(), 1 + drafts.len()),
+            self.row_cost,
+            self.min_gain,
+        );
         if k == 0 {
             return 0;
         }
@@ -309,7 +333,7 @@ impl FnCopy {
     fn report(&mut self) {
         if self.log {
             for (kind, name) in ["mtp", "copy", "mtp+copy"].iter().enumerate() {
-                let cells: Vec<String> = (1..=8)
+                let cells: Vec<String> = (1..=K_VERIFY_MAX_T)
                     .filter(|&t| self.tn[kind][t] > 0)
                     .map(|t| {
                         format!(
@@ -323,8 +347,8 @@ impl FnCopy {
                     eprintln!("talus copy: rounds {name}: {}", cells.join(", "));
                 }
             }
-            self.tsum = [[0.0; 9]; 3];
-            self.tn = [[0; 9]; 3];
+            self.tsum = [[0.0; K_VERIFY_MAX_T + 1]; 3];
+            self.tn = [[0; K_VERIFY_MAX_T + 1]; 3];
         }
         let s = self.cp.take_stats();
         if s.windows + s.chain_windows > 0 {
@@ -336,17 +360,22 @@ impl FnCopy {
     }
 }
 
-/// copies fill verify windows of up to `TALUS_COPY_VERIFY` (default 8, the verify kernels' kVerifyMaxT)
-/// tokens.  The C++ option parser widens `--spec S` to S + 2 for prompt lookup; with the copy proposer on and no
-/// `--mtp-max-t`, the window becomes `--spec 8 --mtp-max-t S` instead (the MTP keeps its S-token windows).
+/// The release verify width (kVerifyMaxTBase, 8 rows): MTP / lookup windows and every copy window below the
+/// high-confidence bar stay within it.
+const COPY_BASE_ROWS: usize = 8;
+
+/// copies fill verify windows of up to `TALUS_COPY_VERIFY` (default 16, the verify kernels'
+/// kVerifyMaxT; 8 = the rc-copy release) tokens.  The C++ option parser widens `--spec S` to S + 2 for prompt lookup;
+/// with the copy proposer on and no `--mtp-max-t`, the window becomes `--spec W --mtp-max-t S` instead (the MTP keeps
+/// its S-token windows, the suffix drafter / draft policy their release width; only copies use rows past S + 2).
 fn widen_verify_for_copy(argv: Vec<String>) -> Vec<String> {
     if !copy_enabled() || argv.iter().any(|a| a == "--mtp-max-t") {
         return argv;
     }
     let w = copy_env_f64("VERIFY")
         .map(|v| v as i64)
-        .unwrap_or(8)
-        .clamp(2, 8);
+        .unwrap_or(K_VERIFY_MAX_T as i64)
+        .clamp(2, K_VERIFY_MAX_T as i64);
     let Some(i) = argv.iter().rposition(|a| a == "--spec") else {
         return argv;
     };
@@ -941,7 +970,7 @@ unsafe extern "C" fn cb_run_serve_loop(
         }
     }
 
-    // with copies on, the verify window is 8 (widen_verify_for_copy) but the suffix drafter / draft policy keep
+    // with copies on, the verify window is 16 (rd-draft; widen_verify_for_copy) but the suffix drafter / draft policy keep
     // their release width (the MTP's windows + 2): only copies fill the extra rows
     let copy_on_here = copy_enabled();
     let sfx_spec = if copy_on_here && info.lookup_chain == 0 && info.mtp_max_t >= 2 {
@@ -1140,6 +1169,23 @@ unsafe extern "C" fn cb_run_serve_loop(
                 if (k.serve_checkpoint_at)(ctx, to, as_tail, is_pin, cut_plan.turn_at) < 0 {
                     return 1;
                 }
+            }
+        }
+
+        // talus#60: the prompt end, when no checkpoint of this request is near it (a raw prompt)
+        if !cancelled {
+            let end_at = prompt_end_checkpoint(
+                parsed.ids.len() as i64,
+                cut_plan.turn_at,
+                cut_plan.root_at,
+                cut_plan.message_at,
+                pin_at,
+                info.prompt_cache,
+                parsed.req_ckpt != 0,
+                info.short_read,
+            );
+            if end_at > 0 && (k.serve_checkpoint_at)(ctx, end_at, 0, 0, cut_plan.turn_at) < 0 {
+                return 1;
             }
         }
 
@@ -1911,4 +1957,55 @@ pub fn run_qwen4exp_cli<S: AsRef<str>>(argv: &[S]) -> i32 {
     let c_driver = driver_state.build_c_driver();
 
     unsafe { (kernels.run_with_rust_driver)(argc, c_ptrs.as_ptr(), &c_driver) }
+}
+
+#[cfg(test)]
+mod rd_draft_tests {
+    use super::*;
+
+    #[test]
+    fn widen_verify_for_copy_takes_the_widest_window() {
+        if !copy_enabled() || copy_env_f64("VERIFY").is_some() {
+            return; // the environment chose otherwise
+        }
+        let a: Vec<String> = ["talus", "--spec", "5"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let w = widen_verify_for_copy(a);
+        assert_eq!(w, vec!["talus", "--spec", "16", "--mtp-max-t", "5"]);
+        // an explicit --mtp-max-t, or a window already that wide: unchanged
+        let b: Vec<String> = ["talus", "--spec", "16"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(widen_verify_for_copy(b.clone()), b);
+    }
+
+    #[test]
+    fn wide_copy_windows_need_high_confidence() {
+        let Some(mut fc) = FnCopy::from_env() else {
+            return;
+        };
+        fc.wide_q = 0.9;
+        fc.base_rows = 8;
+        // a long fresh match: prior acceptance 0.97 -> the whole copy (15 drafts) may fill a 16-row window
+        let long = CopyMatch {
+            start: 0,
+            len: 60,
+            resumed: false,
+        };
+        assert_eq!(fc.wide_cap(&long, 15, 1), 15);
+        // a resumed match: prior 0.85 < 0.9 -> at most the release width (8 rows: 7 drafts after row 0)
+        let resumed = CopyMatch {
+            start: 0,
+            len: 5,
+            resumed: true,
+        };
+        assert_eq!(fc.wide_cap(&resumed, 15, 1), 7);
+        // chained after 4 MTP rows: 4 more rows at most
+        assert_eq!(fc.wide_cap(&resumed, 11, 4), 4);
+        // a copy that fits the release width is never cut
+        assert_eq!(fc.wide_cap(&resumed, 5, 1), 5);
+    }
 }

@@ -16,5 +16,6 @@ talus-mem = { workspace = true }
 talus-spec = { workspace = true }
 talus-text = { workspace = true }
 talus-state = { workspace = true }
+talus-cluster = { workspace = true }
 
 

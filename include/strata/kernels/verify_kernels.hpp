@@ -18,7 +18,15 @@
 
 namespace strata::kernels {
 
-inline constexpr int kVerifyMaxT = 8;
+/// The widest verify window.  16 - Flash-Next's long-span copy windows (talus-spec CopyProposer, the Rust
+/// serve loop) verify up to 15 copied tokens at once; every other window (MTP, prompt lookup, batch, split, PCIe/CPU
+/// share) stays at or below kVerifyMaxTBase.  Every kernel keeps its pre-rd-draft instantiation for T <= kVerifyMaxTBase
+/// (the same code for those widths); T in (kVerifyMaxTBase, kVerifyMaxT] takes an instantiation of the same per-token
+/// arithmetic, or two calls of <= kVerifyMaxTBase rows where a kernel is row-wise, so every row stays bitwise verify(1).
+inline constexpr int kVerifyMaxT = 16;
+/// The verify window's width before rd-draft (8): the kernels' old instantiations and the paths that never take wider
+/// windows (the CPU expert pool's tokens per job, the batch/split windows, the MTP's draft chain).
+inline constexpr int kVerifyMaxTBase = 8;
 
 /// For token t of T: conv over [history(3) | qkv_0 .. qkv_t] -> SiLU -> L2 norm of the q/k heads -> h[t].
 /// `history` is NOT written, but with `commit` (one token): it then keeps the token, as gdn_conv_commit.  Bitwise

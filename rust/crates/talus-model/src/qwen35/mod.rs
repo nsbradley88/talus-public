@@ -5,9 +5,12 @@
 //! - `src/model/qwen35.cpp`
 //! - `src/qwen35/q36_engine.cu`
 
+pub mod cluster;
 pub mod engine;
 pub mod ffi;
 pub mod graphs;
+pub mod kv8;
+pub mod w16;
 pub mod w4i;
 pub mod weights;
 

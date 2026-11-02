@@ -44,7 +44,7 @@ pub fn request_chunk(tokens: i64, max_chunk: i64) -> i64 {
     max_chunk.min(rounded)
 }
 
-/// generate.cpp `equal_chunk` (STRATA_PREFILL_EQUAL=1: equal chunks; otherwise `request_chunk`). `stream_all_min` is
+/// generate.cpp `equal_chunk` (STRATA_PREFILL_EQUAL: off by default, `request_chunk`; `=1`: equal chunks, talus#49/#55). `stream_all_min` is
 /// `Prefill::stream_all_min_tokens()`.
 pub fn serve_equal_chunk(
     tokens: i64,

@@ -35,6 +35,41 @@ pub fn message_checkpoint_boundary(
     -1
 }
 
+/// talus#60: a checkpoint at the prompt's end (`n - 1`, the state the reply starts from) for a request whose cuts
+/// leave none near it (1:1 with `strata::program::prompt_end_checkpoint`, `message_boundary.hpp`).
+///
+/// Flash-Next is hybrid-recurrent (GDN layers): a request resumes only from the live state when it is a strict prefix
+/// of the new prompt, or from a checkpoint. Checkpoints were taken only at turn tokens (and every
+/// `--prompt-cache-every` tokens), so a raw `/completion` prompt without a turn token kept none: the same prompt again,
+/// a longer one, or a `/slots` restore of it reused 0 tokens. Returns `n - 1`, or -1 when one of this request's
+/// checkpoints is within `short_read` tokens of the end already (a chat prompt: its turn checkpoint) or there is no
+/// conversation cache.
+#[allow(clippy::too_many_arguments)]
+pub fn prompt_end_checkpoint(
+    n: i64,
+    turn_at: i64,
+    root_at: i64,
+    message_at: i64,
+    pin_at: i64,
+    prompt_cache: i32,
+    req_ckpt: bool,
+    short_read: i64,
+) -> i64 {
+    let end = n - 1;
+    if prompt_cache <= 0 || !req_ckpt || end < 1 {
+        return -1;
+    }
+    let nearest = [turn_at, root_at, message_at, pin_at]
+        .into_iter()
+        .filter(|&c| c <= end)
+        .fold(0, i64::max);
+    if end - nearest > short_read.max(0) {
+        end
+    } else {
+        -1
+    }
+}
+
 /// Output of `compute_prompt_cuts` for a `--serve` `GEN` request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptCutPlan {
@@ -188,5 +223,78 @@ mod tests {
         assert_eq!(plan.root_at, 2500);
         assert_eq!(plan.message_at, 9000);
         assert_eq!(plan.cuts, vec![2500, 9000, 9500, 9999]);
+    }
+
+    #[test]
+    fn prompt_end_checkpoint_for_a_raw_prompt() {
+        // talus#60: plain text, no turn token: the cuts take no checkpoint, so the prompt end gets one
+        let im_start = 248045i64;
+        let ids = vec![42i64; 2763];
+        let plan = compute_prompt_cuts(
+            &ids, 0, 0, false, -1, 6, im_start, -1, 0, true, false, false, -1,
+        );
+        assert_eq!(plan.turn_at, -1);
+        assert_eq!(plan.cuts, vec![2762]);
+        let end = prompt_end_checkpoint(
+            2763,
+            plan.turn_at,
+            plan.root_at,
+            plan.message_at,
+            -1,
+            6,
+            true,
+            64,
+        );
+        assert_eq!(end, 2762);
+        // resumed from the live state at 2762 (nothing left to read): still the end, so a re-send finds it
+        let plan = compute_prompt_cuts(
+            &ids, 2762, 2762, false, -1, 6, im_start, -1, 0, true, false, false, -1,
+        );
+        assert!(plan.cuts.is_empty());
+        assert_eq!(
+            prompt_end_checkpoint(
+                2763,
+                plan.turn_at,
+                plan.root_at,
+                plan.message_at,
+                -1,
+                6,
+                true,
+                64
+            ),
+            2762
+        );
+    }
+
+    #[test]
+    fn prompt_end_checkpoint_skips_when_a_checkpoint_is_near_the_end() {
+        // a chat prompt: the turn checkpoint is 3 tokens before the end (<|im_start|>assistant\n)
+        assert_eq!(
+            prompt_end_checkpoint(10000, 9996, -1, -1, -1, 6, true, 64),
+            -1
+        );
+        // the turn is far from the end (a raw continuation after a chat): the end gets one too
+        assert_eq!(
+            prompt_end_checkpoint(10000, 5000, -1, -1, -1, 6, true, 64),
+            9999
+        );
+        // a pin near the end counts like any checkpoint of the request
+        assert_eq!(
+            prompt_end_checkpoint(10000, -1, -1, -1, 9990, 6, true, 64),
+            -1
+        );
+        // short prompts are cheaper to read again
+        assert_eq!(prompt_end_checkpoint(60, -1, -1, -1, -1, 6, true, 64), -1);
+        assert_eq!(prompt_end_checkpoint(66, -1, -1, -1, -1, 6, true, 64), 65);
+        // no conversation cache, or ckpt=0: none
+        assert_eq!(
+            prompt_end_checkpoint(10000, -1, -1, -1, -1, 0, true, 64),
+            -1
+        );
+        assert_eq!(
+            prompt_end_checkpoint(10000, -1, -1, -1, -1, 6, false, 64),
+            -1
+        );
+        assert_eq!(prompt_end_checkpoint(1, -1, -1, -1, -1, 6, true, 0), -1);
     }
 }

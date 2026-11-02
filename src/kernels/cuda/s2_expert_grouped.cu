@@ -790,7 +790,8 @@ constexpr int GU_CHUNKS = (H / 32 + 31) / 32;   // 3: chunks of a gate/up row pe
 constexpr int GMAX = 8;                          // entries per group (tokens routed to one expert in a window)
 // a group holds one entry per token of the window routed to its expert, and the kernels below keep at
 // most GMAX of them (`min(..., GMAX)`): a longer window would drop entries without a word.
-static_assert(GMAX >= kVerifyMaxT, "a verify window's group can exceed GMAX entries");
+// (the S-form layout keeps windows of <= kVerifyMaxTBase; Verifier::record_window refuses wider ones there)
+static_assert(GMAX >= kVerifyMaxTBase, "a verify window's group can exceed GMAX entries");
 constexpr int GU_ROWS = 32;                      // gate/up rows per block: 4 per warp
 constexpr int D_ROWS = 64;                       // down rows per block: 8 per warp
 

@@ -2,7 +2,8 @@
 //!
 //! Safe fixes (download a bad file again, rewrite a run config, restart the service, tighten a key file's mode) are
 //! applied after a yes (or straight away with `--yes`). Anything that needs sudo is shown and asked for; boot
-//! settings go through the same show-the-diff, type-yes flow as setup, and never happen with `--yes` alone.
+//! settings go through the same show-the-diff, type-yes flow as setup, and never happen with `--yes` alone. The
+//! platform profile is asked like in setup (default yes; `--no-power-profile` leaves it alone).
 
 use crate::checks::{self, Check, Fix, Verdict};
 use crate::exec::Exec;
@@ -26,6 +27,8 @@ pub struct Args {
     pub allow_system_changes: bool,
     /// Only the hardware checks (what `talus setup` shows first).
     pub hw_only: bool,
+    /// `--fix` leaves the ACPI platform profile alone.
+    pub no_power_profile: bool,
 }
 
 pub fn print(cs: &[Check]) {
@@ -140,6 +143,10 @@ fn apply(
                 st.models.keys().filter_map(|k| manifest::get(k)).collect();
             wizard::system_settings(x, p, sys, &models, a.allow_system_changes, (&date, &stamp))
                 .map(|_| ())
+        }
+        Fix::PowerProfile => {
+            wizard::power_profile(x, p, sys, a.no_power_profile, &date);
+            Ok(())
         }
         Fix::Sudo { argv, after } => {
             ui::say(&format!(

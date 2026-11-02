@@ -331,6 +331,18 @@ class EngineNonFinite(ValueError):
     ends one that had started (as "length").  A ValueError, so a stream that has started reports it as an error event."""
 
 
+class EngineMemory(ValueError):
+    """#40: the engine refused or stopped a request because the host stayed under its MemAvailable floor after it shed
+    its rebuildable caches (`ERR insufficient_memory: ...`).  The engine keeps running and its next request starts
+    cold; the client gets a 503 (code insufficient_memory) and may retry.  A ValueError, so a stream that has started
+    reports it as an error event."""
+
+
+def engine_error(msg: str) -> ValueError:
+    """The exception for an engine's ERR text: EngineMemory for a memory refusal (#40), else a ValueError."""
+    return EngineMemory(msg) if msg.startswith("insufficient_memory") else ValueError(msg)
+
+
 class SessionRefused(ValueError):
     """Disk sessions: the engine refused or failed a SAVE / RESTORE and is still in step (`SERR <kind> <published>
     <reason>`).  `kind` is the engine's category - invalid (400), storage (507), memory (503), io (500); `published`:
@@ -1955,7 +1967,7 @@ class StrataEngine:
                     return
                 elif line.startswith("ERR"):
                     done = True
-                    raise ValueError(line[4:].strip())
+                    raise engine_error(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
                 if self.can_stop:
@@ -4062,7 +4074,7 @@ class Service:
         el = now - s.get("started", now)
         if s.get("first_token") is None:
             pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
-            done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
+            done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read
             print(f"[talus] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
         else:
             rate = s["generated"] / max(1e-6, now - s["first_token"])
@@ -5539,6 +5551,11 @@ def make_handler(svc: Service):
                     self._llama_compat(path, req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
+            except EngineMemory as e:                       # #40: the host is short of memory; the engine lives on
+                print(f"[talus] 503: {e}", flush=True)
+                self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
+                           else {"error": {"type": "server_error", "code": "insufficient_memory", "message": str(e)}},
+                           headers={"Retry-After": 5})
             except EngineNonFinite as e:                    # #879, twice: not the request's fault
                 print(f"[talus] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"

@@ -28,6 +28,7 @@
 #include "strata/kernels/router_top10.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/shared_expert.hpp"
+#include "strata/kernels/verify_wide.hpp"
 #include "strata/core/spec_prob.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/weights.hpp"
@@ -361,7 +362,7 @@ struct Qwen4expP4Access {
         const char* pre = mode == 0 ? "attn_hyper_connection" : mode == 1 ? "mlp_hyper_connection" : "hyper_connection_mixer";
         const std::string wn = std::string(pre) + ".hc_norm.weight", wd = std::string(pre) + ".input_mix_weight_down.weight",
                           wu = std::string(pre) + ".input_mix_weight_up.weight", wi = std::string(pre) + ".block_inject_weight.weight";
-        FusedGrArgs fa[kFusedGrMaxT];
+        FusedGrArgs fa[kVerifyMaxT];   // rd-draft: a copy window's catch-up of up to 16 rows
         for (int t = 0; t < T; ++t) {
             fa[t].R = m.R_ + (size_t) t * HC * N; fa[t].R_out = m.R_ + (size_t) t * HC * N;
             fa[t].apply = mode == 1 || mode == 2;
@@ -378,7 +379,7 @@ struct Qwen4expP4Access {
             else if (mode == 2) { fa[t].inject_out = m.dummy_inj_; fa[t].mixed = m.sample_ + t * N; }
             else { fa[t].mixed = m.sample_ + t * N; }
         }
-        fused_gr_read_multi(fa, T, m.xn_, cs);
+        fused_gr_read_multi_wide(fa, T, m.xn_, HC * N, cs);
         return 0;
     }
     // the final mixer per row with the drafter's own gr workspace (gr_read)

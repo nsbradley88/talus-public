@@ -599,6 +599,28 @@ mod tests {
             assert_eq!(view.architecture, "qwen4exp");
             assert_eq!(view.tensor_count, 4);
             assert_eq!(view.metadata_u64.get("qwen4exp.block_count"), Some(&48));
+
+            // the same family as ONE flat GgufFile (shards mapped back to back), from any shard
+            #[cfg(target_os = "linux")]
+            for from in [&paths[0], &paths[1]] {
+                let flat = GgufFile::open_any(from).expect("open_any split");
+                assert_eq!(flat.tensors().len(), 4);
+                assert_eq!(flat.get_u64("qwen4exp.block_count"), Some(48));
+                assert!(flat.get_u64("split.count").is_none());
+                for (name, seed) in [
+                    ("token_embd.weight", 1u8),
+                    ("blk.0.attn_qkv.weight", 2u8),
+                    ("blk.11.ffn_gate_exps.weight", 3u8),
+                    ("blk.12.attn_q.weight", 4u8),
+                ] {
+                    let t = flat.find_tensor(name).expect("flat tensor");
+                    let data = flat.tensor_data(t).expect("flat tensor_data");
+                    assert_eq!(data, model.tensor_bytes(name).unwrap());
+                    for (idx, &b) in data.iter().enumerate() {
+                        assert_eq!(b, pattern_byte(seed, idx));
+                    }
+                }
+            }
         }
 
         // 2. Missing shard 2 of 3 is rejected naming the missing shard

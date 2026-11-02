@@ -601,13 +601,13 @@ typedef struct tk_qwen4exp_p4_ver_view {
     void* sink;                // strata::core::GpuPlanSink*
     uint8_t* staging; int64_t staging_blobs; int64_t max_blob;
     uint32_t* cur_layer;
-    int32_t* groups;           // [9]
+    int32_t* groups;           // [kVerifyMaxT + 1]
     int32_t nonfinite_blocks, verify_max_t;
     // device
     float* head_logits; float* R;
     void* stream; void* copy_stream; void* commit_done; void** commit_exec;   // commit_exec: the member (made by prepare)
     // scalar members (read and written in place)
-    int32_t* last_t; int64_t* last_pos0; int32_t* last_tokens;   // last_tokens: [8]
+    int32_t* last_t; int64_t* last_pos0; int32_t* last_tokens;   // last_tokens: [kVerifyMaxT]
     uint8_t* staged; uint8_t* last_batch; uint8_t* copy_used; uint8_t* commit_pending; uint8_t* always_publish; uint8_t* head_sampling;
     int32_t* nf_row; int64_t* nf_pos; uint32_t* nf_mask;
     double* ms_wait; double* ms_pool; double* ms_host; double* ms_commit; double* ms_gate;
@@ -707,8 +707,8 @@ void tk_qwen4exp_p4_progress(const char* where, int64_t detail, int kind);   // 
 int tk_qwen4exp_p4_env_flags(void);   // bit 0: HIP build, bit 1: STRATA_ONE_TOKEN_COMMIT on, bit 2: commit async
 // ---- phase 2a: the window / commit graph capture in Rust (verify_mtp.rs RustVerifier::prepare) ----
 typedef struct tk_qwen4exp_p4_capture_view {
-    void** exec;               // Verifier::exec_[9]
-    void** exec_nr;            // Verifier::exec_nr_[9] (#871: the doorbell variant)
+    void** exec;               // Verifier::exec_[kVerifyMaxT + 1]
+    void** exec_nr;            // Verifier::exec_nr_[kVerifyMaxT + 1] (#871: the doorbell variant)
     uint8_t* all_resident; uint8_t* ar_off;
     const int32_t* h_res;      // host residency table [n_layers * n_expert] (null: none)
     int64_t n_expert;
@@ -801,7 +801,7 @@ typedef struct tk_qwen4exp_p4_mtp_rec_view {
     int32_t hnorm_stream, force_on, kv_rot, coupled_ok, spec_q;
     float *cos_tab, *sin_tab;
     void* stream;
-    void **round_exec, **round_exec_c, **step_exec, **step_exec_c, **prefill_exec, **prefill_dev_exec;   // [9] each
+    void **round_exec, **round_exec_c, **step_exec, **step_exec_c, **prefill_exec, **prefill_dev_exec;   // [kVerifyMaxT + 1] each (step_exec*: [9], chain steps < kVerifyMaxTBase)
     int32_t native_rope, norm_rope_usable;
     int32_t head_type, sub_head, dhead_type;
 } tk_qwen4exp_p4_mtp_rec_view_t;

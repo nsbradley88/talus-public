@@ -33,6 +33,97 @@ fn git(src: &std::path::Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// The newest `vX.Y.Z` tag in `git ls-remote --tags --refs` output (release candidates and other tags left out).
+pub fn newest_release_tag(ls_remote: &str) -> Option<String> {
+    ls_remote
+        .lines()
+        .filter_map(|l| l.split("refs/tags/").nth(1))
+        .filter_map(|t| {
+            let v: Vec<u32> = t
+                .strip_prefix('v')?
+                .split('.')
+                .map(|x| x.parse().ok())
+                .collect::<Option<_>>()?;
+            (v.len() == 3).then(|| ((v[0], v[1], v[2]), t.to_string()))
+        })
+        .max()
+        .map(|(_, t)| t)
+}
+
+/// A source installed from a release tag (install.sh clones the tag of the binaries, talus#50 A3): move it to the
+/// newest release tag. Returns Ok(false) when it is already there.
+fn update_tag_checkout(
+    x: &Exec,
+    p: &mut Prompter,
+    src: &std::path::Path,
+    check: bool,
+) -> Result<bool, String> {
+    let current = git(src, &["describe", "--tags", "--exact-match", "HEAD"]).unwrap_or_default();
+    let tags = git(src, &["ls-remote", "--tags", "--refs", "origin", "v*"])?;
+    let Some(latest) = newest_release_tag(&tags) else {
+        ui::say("No release tag found upstream; Talus stays as it is.");
+        return Ok(false);
+    };
+    if latest == current {
+        ui::say(&format!("Talus is up to date ({current})."));
+        return Ok(false);
+    }
+    ui::say(&format!(
+        "New release: {} -> {latest}",
+        if current.is_empty() {
+            "this checkout"
+        } else {
+            &current
+        }
+    ));
+    if check {
+        ui::say("Update with `talus update`.");
+        return Ok(false);
+    }
+    if !p.confirm(
+        "Update now (fetch the release, rebuild, migrate configs)?",
+        true,
+    ) {
+        return Ok(false);
+    }
+    let dirty = git(src, &["status", "--porcelain", "--untracked-files=no"]).unwrap_or_default();
+    if !dirty.is_empty() {
+        return Err(format!(
+            "{} has local changes; nothing was updated. Commit or stash them (git -C {} stash), then run again.",
+            src.display(),
+            src.display()
+        ));
+    }
+    let s = src.display().to_string();
+    x.run(
+        &[
+            "git".into(),
+            "-C".into(),
+            s.clone(),
+            "fetch".into(),
+            "--quiet".into(),
+            "--depth".into(),
+            "1".into(),
+            "origin".into(),
+            "tag".into(),
+            latest.clone(),
+        ],
+        "get the new release",
+    )?;
+    x.run(
+        &[
+            "git".into(),
+            "-C".into(),
+            s,
+            "checkout".into(),
+            "--quiet".into(),
+            latest.clone(),
+        ],
+        "switch the source to it",
+    )?;
+    Ok(true)
+}
+
 /// Build and install the binaries from `st.src` with install.sh.
 pub fn rebuild(x: &Exec, paths: &Paths, st: &SetupState) -> Result<(), String> {
     let script = st.src.join("install.sh");
@@ -110,6 +201,24 @@ pub fn run(a: Args) -> i32 {
         }
     };
     ui::say("Checking for a new release ...");
+    // a release-tag checkout (detached HEAD, install.sh's default): follow the release tags, not a branch
+    if git(&src, &["symbolic-ref", "-q", "HEAD"]).is_err() {
+        match update_tag_checkout(&x, &mut p, &src, a.check) {
+            Ok(true) => {}
+            Ok(false) if !a.rebuild || a.check => return 0,
+            Ok(false) => {}
+            Err(e) => {
+                ui::error(&e);
+                return 1;
+            }
+        }
+        ui::say(&ui::bold("Building"));
+        if let Err(e) = rebuild(&x, &paths, &st) {
+            ui::error(&e);
+            return 1;
+        }
+        return finish_update(&x, &mut p, &paths, &mut st, &a);
+    }
     if let Err(e) = git(&src, &["fetch", "--quiet", "origin"]) {
         ui::error(&format!("git fetch failed: {e}"));
         return 1;
@@ -175,10 +284,14 @@ pub fn run(a: Args) -> i32 {
         ui::error(&e);
         return 1;
     }
-    // From here on the NEW version does the work: migrating configs and checking the result are its business.
+    finish_update(&x, &mut p, &paths, &mut st, &a)
+}
+
+/// After the build: the NEW version does the rest (migrating configs and checking the result are its business).
+fn finish_update(x: &Exec, p: &mut Prompter, paths: &Paths, st: &mut SetupState, a: &Args) -> i32 {
     let new = paths.bin().join("talus-setup");
     if a.dry_run || !new.exists() {
-        return post_update(&x, &mut p, &paths, &mut st, a.dry_run);
+        return post_update(x, p, paths, st, a.dry_run);
     }
     let mut cmd = Command::new(&new);
     cmd.arg("migrate");
@@ -270,6 +383,14 @@ pub fn run_migrate(yes: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn newest_release_tag_skips_candidates() {
+        let out = "a1\trefs/tags/v0.1.0\nb2\trefs/tags/v0.1.10\nc3\trefs/tags/v0.1.2\nd4\trefs/tags/v0.2.0-rc1\ne5\trefs/tags/talus-x\n";
+        assert_eq!(newest_release_tag(out).as_deref(), Some("v0.1.10"));
+        assert_eq!(newest_release_tag("x\trefs/tags/v1.0-rc\n"), None);
+        assert_eq!(newest_release_tag(""), None);
+    }
 
     #[test]
     fn rebuild_goes_through_install_sh() {

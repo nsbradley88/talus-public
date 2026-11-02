@@ -36,6 +36,7 @@
 
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
 #include "hipblaslt_tuning.hpp"
+#include <atomic>
 #include <hip/hip_runtime_api.h>
 #include <hipblaslt/hipblaslt.h>
 #include <hipblaslt/hipblaslt-ext.hpp>
@@ -184,8 +185,19 @@ struct HipLtDescriptors {
 };
 
 std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t workspace_bytes) {
-    const char* path = std::getenv("STRATA_HIPBLASLT_TUNING");
-    if (!path || !*path) return nullptr;
+    namespace lt = strata::prefill::hipblaslt;
+    // talus#50: the table is found without STRATA_HIPBLASLT_TUNING too (next to libtalus_kernels.so: hip/, then
+    // ../share/talus/hip, ../tools/hip; hipblaslt_tuning.hpp has the rules).  Set to a file it behaves exactly as
+    // before (that file, else the runtime's sibling next to it); set to a directory it takes the runtime's table
+    // there; set empty / off / none / 0 it disables the table (hipBLASEx).
+    const char* env = std::getenv("STRATA_HIPBLASLT_TUNING");
+    if (env != nullptr && lt::tuning_env_disables(env)) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true))
+            std::fprintf(stderr, "prefill gemm: hipBLASLt tuning disabled (STRATA_HIPBLASLT_TUNING='%s'); using hipBLASEx\n",
+                         env);
+        return nullptr;
+    }
 
     auto state = std::make_unique<HipLtState>();
     state->workspace = workspace;
@@ -210,30 +222,29 @@ std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t works
     const auto suffix = arch.find(':');
     if (suffix != std::string::npos) arch.resize(suffix);
 
-    std::string error;
-    std::string used = path;
-    if (!state->table.load(path, arch, version, error)) {
-        // Talus: a table is tied to one hipBLASLt version, and the same run config serves builds on different ROCm
-        // runtimes (7.14.1: 100401, the 10.2 nightlies: 100500).  The calibrations sit side by side as
-        // <arch>-hipblaslt-<version>.txt (tools/hip), so the runtime's own table next to the named one is used
-        // instead of falling back to the untuned hipBLASEx path.
-        std::string dir(path);
-        const auto slash = dir.find_last_of('/');
-        dir = slash == std::string::npos ? std::string() : dir.substr(0, slash + 1);
-        const std::string sibling = dir + arch + "-hipblaslt-" + std::to_string(version) + ".txt";
-        std::string error2;
-        state->table = {};
-        if (sibling != path && state->table.load(sibling, arch, version, error2)) {
-            std::fprintf(stderr, "prefill gemm: %s (%s); using %s, the table for this runtime\n", error.c_str(), path,
-                         sibling.c_str());
-            used = sibling;
-        } else {
-            std::fprintf(stderr, "prefill gemm: %s; using hipBLASEx\n", error.c_str());
-            return nullptr;
+    // Talus: a table is tied to one hipBLASLt version, and the same run config serves builds on different ROCm
+    // runtimes (7.14.1: 100401, the 10.2 nightlies: 100500).  The calibrations sit side by side as
+    // <arch>-hipblaslt-<version>.txt (tools/hip), so the runtime's own table next to the named one is used
+    // instead of falling back to the untuned hipBLASEx path (resolve_tuning_table, env_sibling).
+    const std::string libdir = lt::module_dir_of(reinterpret_cast<const void*>(&create_hipblaslt_state));
+    const lt::TuningResolution res = lt::resolve_tuning_table(state->table, env, /*auto_search=*/true, libdir, arch,
+                                                              version);
+    if (!res.loaded) {
+        static std::atomic<bool> warned{false};
+        if (lt::arch_has_upstream_tables(arch)) {
+            if (!warned.exchange(true)) std::fprintf(stderr, "%s\n", lt::untuned_warning(arch, version, res).c_str());
+        } else if (env != nullptr) {
+            std::fprintf(stderr, "prefill gemm: %s; using hipBLASEx\n", res.error.c_str());
         }
+        return nullptr;
     }
-    std::fprintf(stderr, "prefill gemm: hipBLASLt tuning enabled (%zu rows, %s, version %d, %s)\n",
-                 state->table.rows().size(), arch.c_str(), version, used.c_str());
+    if (res.source == lt::TuningResolution::Source::env_sibling) {
+        std::fprintf(stderr, "prefill gemm: %s (%s); using %s, the table for this runtime\n", res.first_error.c_str(),
+                     env, res.path.c_str());
+    }
+    std::fprintf(stderr, "prefill gemm: hipBLASLt tuning enabled (%zu rows, %s, version %d, %s%s)\n",
+                 state->table.rows().size(), arch.c_str(), version, res.path.c_str(),
+                 res.source == lt::TuningResolution::Source::auto_dir ? ", found next to libtalus_kernels.so" : "");
     return state;
 }
 
@@ -628,7 +639,7 @@ bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, flo
         if (T >= 4096 && !told.exchange(true))   // (a short chunk may legitimately get another solution: not worth a line)
             std::fprintf(stderr, "talus: STRATA_HCD_EXACT: the tuning table gives the hyper-connection down projection (N 320, K 10240) "
                                  "solution %d at T %lld, not 1176 / 1177 / 1253: hipBLASLt runs it (a changed table or library; "
-                                 "tools/hip/gfx1151-hipblaslt-100401.txt is the one measured)\n",
+                                 "the measured tables are gfx1151-hipblaslt-100401.txt and -100500.txt)\n",
                          id, (long long) T);
         return false;
     }

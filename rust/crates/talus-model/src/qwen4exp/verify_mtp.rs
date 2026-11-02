@@ -57,8 +57,8 @@ use crate::qwen4exp::skeleton::Qwen4ExpModelConfig;
 // Constants shared with the C++ side
 // ============================================================================
 
-/// `strata::kernels::kVerifyMaxT`: the widest window (verify_kernels.hpp).
-pub const K_VERIFY_MAX_T: usize = 8;
+/// `strata::kernels::kVerifyMaxT`: the widest window (verify_kernels.hpp; 16, copy windows).
+pub const K_VERIFY_MAX_T: usize = 16;
 /// `strata::core::kSpecQStride`: one q row = 64 ids then 64 probabilities as float bits (spec_prob.hpp).
 pub const K_SPEC_Q_STRIDE: usize = 128;
 /// `strata::core::kCoupledHistCap`: the coupled drafter's penalty window cap (coupled_draft.hpp).

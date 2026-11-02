@@ -662,7 +662,8 @@ mod tests {
         );
         assert_eq!(args.join(" "), "--mtp rt --kv int8");
         assert!(!model("glm-5.3-flash").unwrap().has_fast());
-        // 27B: 4-bit prompt math is opt-in (off by default since 2026-10-28); Fast = the all-layer profile
+        // 27B: 4-bit prompt math is the engine default with a v3 sidecar (On = no edit); Fast = the
+        // all-layer profile; Reference turns it off (TALUS_Q27_W4I=0) for bit-for-bit output
         let q = model("qwen3.8-27b").unwrap();
         let f = q.edits(&q.level_selection(Level::Fast)).unwrap();
         assert_eq!(f, vec![Edit::Env("TALUS_Q27_W4I", "fast")]);
@@ -670,7 +671,7 @@ mod tests {
         assert!(!b.iter().any(|e| matches!(e, Edit::Env("TALUS_Q27_W4I", _))));
         let r = q.edits(&q.level_selection(Level::Reference)).unwrap();
         assert!(r.contains(&Edit::Env("TALUS_PF_FA", "0")));
-        assert!(!r.iter().any(|e| matches!(e, Edit::Env("TALUS_Q27_W4I", _))));
+        assert!(r.contains(&Edit::Env("TALUS_Q27_W4I", "0")));
     }
 
     #[test]

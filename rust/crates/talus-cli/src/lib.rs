@@ -190,6 +190,12 @@ pub struct CliConfig {
     pub n_layers_explicit: bool,
     /// Whether `--n` / `--max-new` was explicitly passed on the command line.
     pub n_explicit: bool,
+    /// talus#47 clustering (27B): `--cluster-role head|worker` (or `TALUS_CLUSTER_ROLE`); None = one process.
+    pub cluster_role: Option<String>,
+    /// `--cluster-addr HOST:PORT`: where the worker listens / the head connects (default 127.0.0.1:7701).
+    pub cluster_addr: Option<String>,
+    /// `--cluster-split N`: the worker owns layers N.. (default: the middle, on a 4-layer boundary).
+    pub cluster_split: Option<u32>,
 }
 
 impl Default for CliConfig {
@@ -271,6 +277,9 @@ impl Default for CliConfig {
             ctx_explicit: false,
             n_layers_explicit: false,
             n_explicit: false,
+            cluster_role: None,
+            cluster_addr: None,
+            cluster_split: None,
         }
     }
 }
@@ -529,6 +538,16 @@ where
                 let v = next_val(&mut i, a)?;
                 cfg.cache_live = parse_i32_arg(a, &v)?;
             }
+            "--cluster-role" => {
+                cfg.cluster_role = Some(next_val(&mut i, a)?);
+            }
+            "--cluster-addr" => {
+                cfg.cluster_addr = Some(next_val(&mut i, a)?);
+            }
+            "--cluster-split" => {
+                let v = next_val(&mut i, a)?;
+                cfg.cluster_split = Some(parse_i32_arg(a, &v)?.max(0) as u32);
+            }
             "--livecold-test" => {
                 let v = next_val(&mut i, a)?;
                 cfg.livecold_test = parse_i32_arg(a, &v)?;
@@ -755,7 +774,10 @@ Every model's shipped arguments: docs/MODELS.md. Environment switches: TALUS_X a
   --sample-test              CPU self-test of make_dist vs sample() and speculative draw
   --exact-test N             verify T=4 batch step equals four T=1 steps at pos N
   --attn-test                WMMA decode/verify attention vs scalar reference
-  --attn-bench               WMMA attention microbenchmark"
+  --attn-bench               WMMA attention microbenchmark
+  --cluster-role head|worker 27B pipeline split across two processes (talus#47; off by default)
+  --cluster-addr HOST:PORT   worker listen / head connect address (default 127.0.0.1:7701)
+  --cluster-split N          the worker owns layers N.. (default: the middle, on a 4-layer boundary)"
     );
 }
 
@@ -813,6 +835,9 @@ fn sync_layer_state_view_back(eng: &mut Q36Engine, view: &Q36LayerStateView) {
     eng.gdn_pending = view.gdn_pending;
     eng.gdn_valid = true;
     eng.dctx.set_bounds(view.dctx_lo, view.dctx_hi);
+    // a restore copies f16 cells only; rebuild their int8 copy (no-op unless TALUS_Q27_KV8=1)
+    let n = eng.n_past;
+    eng.kv8_rebuild(0, n);
 }
 
 /// Real `Q36Engine` stdio protocol backend matching `serve(Engine& E)` in `q36_engine.cu:2617-3120`.
@@ -875,6 +900,20 @@ impl Q36StdioBackend {
     }
 }
 
+/// #40 memory pressure: the 27B's rebuildable memory is its prompt cache (recurrent snapshots, then the KV stashes
+/// of the RAM tier). Restores are grid-aligned and cold-exact, so dropping them only costs prompt time.
+impl talus_mem::pressure::Shed for Q36StdioBackend {
+    fn shed(&mut self, class: talus_mem::pressure::ShedClass) -> u64 {
+        use talus_mem::pressure::ShedClass;
+        match class {
+            ShedClass::PromptSnapshots => self.pc.shed_snaps(),
+            ShedClass::PromptCacheRam => self.pc.shed_stashes(),
+            ShedClass::TransientArenas => talus_mem::pressure::trim_host_heap(),
+            ShedClass::DecodeGraphs => 0,
+        }
+    }
+}
+
 impl EngineProtocolBackend for Q36StdioBackend {
     fn max_context(&self) -> i32 {
         self.eng.max_seq()
@@ -909,6 +948,12 @@ impl EngineProtocolBackend for Q36StdioBackend {
                 fresh: 0,
             };
             return write_done_line(out, &done);
+        }
+
+        // #40: admission near the MemAvailable floor (sheds the prompt cache first; still short -> this request fails)
+        if let Err(e) = talus_mem::pressure::admit(self) {
+            writeln!(out, "{}", talus_mem::pressure::err_line(&e.to_string()))?;
+            return out.flush();
         }
 
         let cache_enabled = self.pc.max_snaps > 0 || self.pc.max_msg > 0;
@@ -1272,6 +1317,16 @@ impl EngineProtocolBackend for Q36StdioBackend {
             fresh,
             prompt_ms
         );
+        if let Some((hops, hop_s)) = self.eng.cluster_stats() {
+            eprintln!(
+                "talus-cluster: {hops} hops so far, mean {:.3} ms host time per hop",
+                if hops > 0 {
+                    1000.0 * hop_s / hops as f64
+                } else {
+                    0.0
+                }
+            );
+        }
         if self.eng.use_dflash && self.eng.dp.mode() == DrafterPick::K_AUTO {
             eprintln!(
                 "talus-serve: drafter windows DFlash2 {}, MTP {} (fallback {})",
@@ -1673,6 +1728,13 @@ pub fn run_mimo_cli(cfg: &CliConfig, model_path: &Path) -> i32 {
     };
 
     if cfg.serve {
+        // Run-time guard at the common 8 GiB floor. MIMO_FLOOR_BYTES (11 GiB) is the load-time budget: it leaves room
+        // for run-time growth (served MiMo reaches ~11 GiB MemAvailable at 81K), so refusing requests below 11 GiB
+        // would fail requests that complete today.
+        talus_mem::pressure::install(
+            talus_mem::pressure::PressureConfig::strix_default(),
+            "talus-mimo",
+        );
         return match talus_model::mimo::serve_main(&mut eng) {
             Ok(()) => 0,
             Err(e) => {
@@ -2068,6 +2130,10 @@ pub fn run_laguna_cli(cfg: &CliConfig, model_path: &Path) -> i32 {
     };
 
     if cfg.serve {
+        talus_mem::pressure::install(
+            talus_mem::pressure::PressureConfig::strix_default(),
+            "talus-laguna",
+        );
         let disk =
             disk_tier::open_laguna(cfg, model_path, df_path.as_deref(), eng.ring(), eng.ctx16());
         return match talus_model::laguna::serve_main(
@@ -2212,6 +2278,61 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
     opts.no_v16 = cfg.no_v16;
     opts.dflash_path = cfg.dflash_gguf.clone().unwrap_or_default();
 
+    // talus#47: a cluster stage loads only its layers. Off unless --cluster-role / TALUS_CLUSTER_ROLE.
+    let cl_spec = match talus_cluster::Spec::from_parts(
+        cfg.cluster_role.as_deref(),
+        cfg.cluster_addr.as_deref(),
+        cfg.cluster_split,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("talus-cli: {e}");
+            return 2;
+        }
+    };
+    let mut draft_vocab_vec = draft_vocab_vec;
+    if let Some(sp) = &cl_spec {
+        // the handshake's environment identity: snapshot it before the kernel library adds its own defaults
+        let _ = talus_cluster::ident::env_pairs();
+        let n_layer = match talus_gguf::GgufFile::open(Path::new(model_path))
+            .map_err(|e| e.to_string())
+            .and_then(|f| talus_model::qwen35::describe_gguf(&f).map_err(|e| e.to_string()))
+        {
+            Ok(g) => g.n_layer as usize,
+            Err(e) => {
+                eprintln!("talus-cli: cluster: cannot read {model_path}: {e}");
+                return 1;
+            }
+        };
+        let split = if sp.split > 0 {
+            sp.split as usize
+        } else {
+            talus_model::qwen35::cluster::default_split(n_layer)
+        };
+        if split == 0 || split >= n_layer {
+            eprintln!("talus-cli: cluster split {split} outside 1..{n_layer}");
+            return 2;
+        }
+        if cfg.mmvq_bench.is_some() || cfg.attn_test || cfg.attn_bench || cfg.livecold_test > 0 {
+            eprintln!("talus-cli: --mmvq-bench / --attn-test / --attn-bench / --livecold-test run on one process only");
+            return 2;
+        }
+        match sp.role {
+            talus_cluster::Role::Head => {
+                opts.stage_lo = 0;
+                opts.stage_hi = split;
+            }
+            talus_cluster::Role::Worker => {
+                opts.stage_lo = split;
+                opts.stage_hi = 0;
+                opts.mtp_gguf = None;
+                opts.no_mtp = true;
+                opts.dflash_path.clear();
+                draft_vocab_vec = None;
+            }
+        }
+    }
+
     let mut model = match Q36Model::load(
         Path::new(model_path),
         opts.mtp_gguf.as_deref(),
@@ -2224,10 +2345,52 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
             return 1;
         }
     };
+    if let Some(sp) = cl_spec
+        .as_ref()
+        .filter(|s| s.role == talus_cluster::Role::Worker)
+    {
+        return talus_model::qwen35::cluster::worker_main(&mut model, &sp.addr);
+    }
+    // talus#47 head: connect to the worker, agree on the context (per-stage auto context when none is given), and
+    // have the worker build its engine first, so each stage's memory plan sees the other's allocations.
+    let mut cl_link = None;
+    let mut cl_cfg;
+    let cfg = if let Some(sp) = cl_spec.as_ref() {
+        let max_batch = if cfg.chunk > 0 { cfg.chunk } else { 512 };
+        let explicit = cfg.ctx_explicit.then_some(cfg.max_context);
+        let (link, ctx) = match talus_model::qwen35::cluster::cluster_connect_head(
+            &model,
+            &sp.addr,
+            explicit,
+            max_batch,
+            cfg.use_graph,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("talus-cli: cluster: {e}");
+                return 1;
+            }
+        };
+        cl_link = Some(link);
+        model.cfg.max_seq = ctx;
+        model.opts.max_seq = ctx;
+        cl_cfg = cfg.clone();
+        cl_cfg.max_context = ctx;
+        if cl_cfg.serve && (cl_cfg.prompt_cache > 0 || cl_cfg.snap_msg > 0) {
+            // Phase 1: the prompt cache's snapshots are not sharded across stages yet (DESIGN.md 2.2)
+            eprintln!("talus-cli: cluster: prompt cache off (RAM and disk; sharded snapshots are Phase 2)");
+        }
+        cl_cfg.prompt_cache = 0;
+        cl_cfg.snap_msg = 0;
+        cl_cfg.prompt_cache_disk = Some("off".to_string());
+        &cl_cfg
+    } else {
+        cfg
+    };
     // without --max-context the 27B takes the largest of 256K / 128K / 64K that fits in memory beside
     // the weights and the int8 prompt expansion. An explicit --max-context is always honoured.
     let mut auto_cfg;
-    let cfg = if model.dense && !cfg.ctx_explicit {
+    let cfg = if model.dense && !cfg.ctx_explicit && cl_link.is_none() {
         let (ctx, why) = talus_model::qwen35::engine::q27_auto_context(&model);
         eprintln!("talus-cli: {why}");
         model.cfg.max_seq = ctx;
@@ -2277,6 +2440,12 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
         },
     );
     eng.dfl_sample = eng.use_dflash && eng.dl.dfl_sample();
+    if let Some(link) = cl_link.take() {
+        if let Err(e) = eng.cluster_attach_head(link) {
+            eprintln!("talus-cli: cluster: {e}");
+            return 1;
+        }
+    }
 
     if cfg.mmvq_bench.is_some() {
         eng.mmvq_bench();
@@ -2325,6 +2494,7 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
             fz.truncate(n as usize);
         }
         let ok = eng.exact_test(&pr, &fz);
+        talus_model::qwen35::cluster::cluster_bye(&mut eng);
         return if ok { 0 } else { 1 };
     }
 
@@ -2362,6 +2532,10 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
             server.run_blocking();
             return 0;
         }
+        talus_mem::pressure::install(
+            talus_mem::pressure::PressureConfig::strix_default(),
+            "talus-serve",
+        );
         return serve_stdio(&mut backend);
     }
 
@@ -2681,6 +2855,7 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
             100.0 * (accepted as f64) / (offered as f64)
         );
     }
+    talus_model::qwen35::cluster::cluster_bye(&mut eng);
 
     0
 }
@@ -2916,7 +3091,10 @@ where
     let argv: Vec<String> = args.into_iter().map(|a| a.as_ref().to_string()).collect();
     for arg in argv.iter().skip(1).take(2) {
         if arg == "--version" || arg == "-V" {
-            println!("talus 0.1.1 (based on strata 0.1.44.1)");
+            println!(
+                "talus {} (based on strata 0.1.44.1)",
+                env!("CARGO_PKG_VERSION")
+            );
             return 0;
         }
         if arg == "--families" {

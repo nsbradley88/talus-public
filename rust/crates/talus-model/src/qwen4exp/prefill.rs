@@ -38,14 +38,18 @@ use crate::qwen4exp::skeleton::Qwen4ExpModelConfig;
 // qwen4exp-r2: the prompt path's buffer setup (Prefill's sizing statics, carve, relayout, init's device half)
 mod setup;
 
+/// `STRATA_PREFILL_EQUAL`: off by default, `=1` opts in (same rule as generate.cpp). talus#49 shipped it on in
+/// v0.1.2-rc1, but it failed the release KLD gate on prompts over 16K, so v0.1.2 ships it off (talus#55).
+#[inline]
+pub fn equal_chunks_enabled(env: Option<&str>) -> bool {
+    env.is_some_and(|v| v.starts_with('1'))
+}
+
 /// Equal-chunk divider matching `equal_chunk(n, max_c)` in `src/program/generate.cpp`
 /// (delegates to `weights::serve_equal_chunk` / `weights::request_chunk`).
 #[inline]
 pub fn equal_chunk(tokens: i64, max_chunk: i64) -> i64 {
-    let equal_chunks = std::env::var("STRATA_PREFILL_EQUAL")
-        .ok()
-        .map(|v| v.starts_with('1'))
-        .unwrap_or(false);
+    let equal_chunks = equal_chunks_enabled(std::env::var("STRATA_PREFILL_EQUAL").ok().as_deref());
     let stream_all_min = std::env::var("STRATA_PREFILL_STREAM_ALL")
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
@@ -309,7 +313,7 @@ fn env_first_is(name: &str, c: u8) -> bool {
         .unwrap_or(false)
 }
 /// `v == nullptr || atoi(v) != 0`
-fn env_default_on(name: &str) -> bool {
+fn env_default_flag(name: &str) -> bool {
     env_str(name).map(|v| c_atoi(&v) != 0).unwrap_or(true)
 }
 
@@ -400,13 +404,13 @@ fn env() -> &'static Env {
             bf16x2_env: env_str("STRATA_PREFILL_BF16X2")
                 .map(|v| c_atoi(&v))
                 .unwrap_or(0),
-            stream_ahead: env_default_on("STRATA_PREFILL_STREAM_AHEAD"),
-            issuer_on: env_default_on("STRATA_PREFILL_ISSUER"),
-            ple_batch_env: env_default_on("STRATA_PLE_BATCH"),
+            stream_ahead: env_default_flag("STRATA_PREFILL_STREAM_AHEAD"),
+            issuer_on: env_default_flag("STRATA_PREFILL_ISSUER"),
+            ple_batch_env: env_default_flag("STRATA_PLE_BATCH"),
             ple_threads: env_str("STRATA_PLE_GATHER_THREADS")
                 .map(|v| (c_atoi(&v) as i64).clamp(1, 32))
                 .unwrap_or(8),
-            group_gather_env: env_default_on("STRATA_PREFILL_GROUP_GATHER"),
+            group_gather_env: env_default_flag("STRATA_PREFILL_GROUP_GATHER"),
             step_sync: env_first_is("STRATA_PF_STEP_SYNC", b'1'),
             kv_host_dma: env_first_is("STRATA_KV_HOST_DMA", b'1'),
             indexer_per_token: env_str("STRATA_INDEXER_PER_TOKEN").is_some(),
@@ -3713,6 +3717,41 @@ mod tests {
             crate::qwen4exp::weights::serve_equal_chunk(5000, 4096, true, 900),
             2560
         );
+    }
+
+    /// talus#55: the default (no STRATA_PREFILL_EQUAL) chunks exactly as v0.1.2-rc1 did with STRATA_PREFILL_EQUAL=0,
+    /// i.e. plain `request_chunk`; only `=1` opts into equal chunks.
+    #[test]
+    fn prefill_equal_default_off_matches_rc1_kill_switch() {
+        use crate::qwen4exp::weights::{request_chunk, serve_equal_chunk};
+        assert!(!equal_chunks_enabled(None));
+        assert!(!equal_chunks_enabled(Some("0")));
+        assert!(!equal_chunks_enabled(Some("")));
+        assert!(equal_chunks_enabled(Some("1")));
+        // rc1's rule: on unless the value starts with '0'
+        let rc1_rule = |v: Option<&str>| v.map(|v| !v.starts_with('0')).unwrap_or(true);
+        let rc1_off = rc1_rule(Some("0"));
+        assert!(!rc1_off);
+        let default_flag = equal_chunks_enabled(None);
+        for &max_chunk in &[4096i64, 8192, 16384] {
+            for &stream_min in &[128i64, 1024] {
+                for tokens in (1..=140_000i64)
+                    .step_by(97)
+                    .chain([16384, 16385, 19000, 24000, 33000, 65536])
+                {
+                    let def = serve_equal_chunk(tokens, max_chunk, default_flag, stream_min);
+                    assert_eq!(
+                        def,
+                        serve_equal_chunk(tokens, max_chunk, rc1_off, stream_min)
+                    );
+                    assert_eq!(def, request_chunk(tokens, max_chunk));
+                }
+            }
+        }
+        // the served geometry at 19K/24K/33K (--prefill auto:16384, stream min 128) is the plain 16384 chunk again
+        for &t in &[19000i64, 24000, 33000] {
+            assert_eq!(serve_equal_chunk(t, 16384, default_flag, 128), 16384);
+        }
     }
 
     #[test]

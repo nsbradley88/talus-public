@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use talus_core_api::{CoreError, Result};
 use talus_gguf::GgufModel;
-use talus_mem::{Budget, BudgetCategory, HostMemProbe, GIB};
+use talus_mem::{Budget, BudgetCategory, HostMemProbe, LinuxProcMemProbe, GIB};
 
 use super::engine::{self, Dump, GlmConfig, GlmEngine};
 use super::ffi::GlmLib;
@@ -67,7 +67,7 @@ pub fn parse(args: &[String]) -> std::result::Result<GlmCli, String> {
         temp: 0.0,
         seed: 0,
         draft_vocab: None,
-        minavail_gib: 8.0,
+        minavail_gib: weights::floor_bytes() as f64 / GIB as f64,
         extra: vec![],
     };
     let mut i = 1;
@@ -121,7 +121,7 @@ fn mem_available_gib() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Load the model once, refusing configurations that would leave MemAvailable below the 8 GiB floor.
+/// Load the model once, refusing configurations that would leave MemAvailable below the floor (8 GiB; TALUS_MEM_FLOOR_GIB).
 pub fn load_engine(c: &GlmCli) -> Result<GlmEngine> {
     let avail = mem_available_gib();
     if avail < c.minstart_gib {
@@ -153,7 +153,7 @@ pub fn load_engine(c: &GlmCli) -> Result<GlmEngine> {
     // activations (phase-aliased, measured 406 MiB at GLM_PCH=512) and 2 prompt-cache snapshots
     let acts: u64 = 640 << 20; // 512-token chunks with phase-aliased buffers: 406 MiB + MMQ scratch
     let snaps: u64 = (34 * (4 << 20) + 34 * 3 * 8192 * 3 * 4) as u64; // 1 by default (GLM_PROMPT_SNAPS)
-    let budget = Budget::strix_default();
+    let budget = Budget::with_floor(LinuxProcMemProbe::new(), weights::floor_bytes() as usize);
     let ids = weights::reserve(
         &budget,
         &[
@@ -170,11 +170,12 @@ pub fn load_engine(c: &GlmCli) -> Result<GlmEngine> {
     )?;
     if c.verbose {
         eprintln!(
-            "glm: MemAvailable {avail:.1} GiB; reserved weights {:.2} + kv {:.2} + kda {:.2} + acts {:.2} GiB (floor 8 GiB)",
+            "glm: MemAvailable {avail:.1} GiB; reserved weights {:.2} + kv {:.2} + kda {:.2} + acts {:.2} GiB (floor {:.1} GiB)",
             wbytes as f64 / GIB as f64,
             kv as f64 / GIB as f64,
             rec as f64 / GIB as f64,
-            acts as f64 / GIB as f64
+            acts as f64 / GIB as f64,
+            weights::floor_bytes() as f64 / GIB as f64
         );
     }
     let w = GlmWeights::load(&g, &hp, c.mtp, c.verbose)?;

@@ -27,6 +27,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"   // kVerifyMaxT sizes the per-width tables below
 
 #include <cuda_runtime.h>
 
@@ -446,7 +447,7 @@ private:
     float* ple_val_ = nullptr;
     int last_t_ = 0;
     int64_t last_pos0_ = 0;
-    int32_t last_tokens_[8] = {};
+    int32_t last_tokens_[strata::kernels::kVerifyMaxT] = {};
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
@@ -457,8 +458,8 @@ private:
     cudaStream_t df_side_[2] = {};
     cudaEvent_t df_fork_ = nullptr;
     cudaEvent_t df_join_[2] = {};
-    cudaGraphExec_t exec_[9] = {};
-    cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
+    cudaGraphExec_t exec_[strata::kernels::kVerifyMaxT + 1] = {};
+    cudaGraphExec_t exec_nr_[strata::kernels::kVerifyMaxT + 1] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
     cudaGraphExec_t commit_exec_ = nullptr;
 
     // mapped staging (host pointer, device alias)
@@ -494,7 +495,7 @@ private:
     static void publish_plan(void* ctx);
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
-    int groups_[9] = {};
+    int groups_[strata::kernels::kVerifyMaxT + 1] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 
     // device

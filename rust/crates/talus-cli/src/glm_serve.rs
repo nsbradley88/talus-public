@@ -20,6 +20,18 @@ use talus_sched::{
 /// Snapshot grid (tokens): a multiple of the prefill window and the k-pool size.
 pub const GRID: usize = 512;
 
+/// Snapshot grid at run time: GLM_SNAP_GRID (a multiple of GRID), default GRID.
+pub(crate) fn snap_grid() -> usize {
+    static G: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("GLM_SNAP_GRID")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&g| g >= GRID && g % GRID == 0)
+            .unwrap_or(GRID)
+    })
+}
+
 struct Snap {
     pos: usize,
     hash: u64,
@@ -37,6 +49,8 @@ pub struct GlmBackend {
     max_snaps: usize,
     clock: u64,
     log: bool,
+    /// TALUS_MEM_SHED_EVERY: 1 = every class, or a comma list of graphs,snapshots,pcache,arenas
+    shed_every: Option<String>,
 }
 
 fn hash_prefix(t: &[u32]) -> u64 {
@@ -65,6 +79,9 @@ impl GlmBackend {
             max_snaps,
             clock: 0,
             log: std::env::var("GLM_SERVE_LOG").is_ok(),
+            shed_every: std::env::var("TALUS_MEM_SHED_EVERY")
+                .ok()
+                .filter(|v| !v.is_empty() && v != "0"),
         }
     }
 
@@ -117,8 +134,9 @@ impl GlmBackend {
         write_resume_line(out, reuse).ok();
         // grid snapshots of this prompt: the last grid point before its end (and the one before it with 2+ slots)
         let end = prompt.len();
-        let last_grid = (end.saturating_sub(1) / GRID) * GRID;
-        let points: Vec<usize> = [last_grid, last_grid.saturating_sub(GRID)]
+        let grid = snap_grid();
+        let last_grid = (end.saturating_sub(1) / grid) * grid;
+        let points: Vec<usize> = [last_grid, last_grid.saturating_sub(grid)]
             .into_iter()
             .take(self.max_snaps.max(1))
             .filter(|&g| g > reuse && g > 0)
@@ -184,6 +202,20 @@ impl GlmBackend {
                 &mut cb2,
             )?
         };
+        if std::env::var("GLM_LOGITS_HASH").as_deref() == Ok("1") {
+            // diagnostics (rd-mempr warm vs cold): FNV-1a over the bits of the last prompt token's logits
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for v in first.iter() {
+                for b in v.to_bits().to_le_bytes() {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+            eprintln!(
+                "glm-serve: logits-hash {h:016x} prompt {} reuse {reuse}",
+                prompt.len()
+            );
+        }
         let prompt_ms = t0.elapsed().as_secs_f64() * 1e3;
         let fresh = (prompt.len() - reuse) as i64;
         write_pp_line(out, prompt.len() as i64, fresh, prompt_ms).ok();
@@ -228,7 +260,7 @@ impl GlmBackend {
         };
         if self.log {
             eprintln!(
-                "glm-serve: prompt {} (reuse {reuse}) {:.0} ms | gen {} {:.0} ms ({:.1} tok/s) accept {}/{} | avail {:.2} GiB",
+                "glm-serve: prompt {} (reuse {reuse}) {:.0} ms | gen {} {:.0} ms ({:.1} tok/s) accept {}/{} | avail {:.2} GiB{}",
                 prompt.len(),
                 prompt_ms,
                 gen.len(),
@@ -236,7 +268,10 @@ impl GlmBackend {
                 gen.len() as f64 / st.decode_ms.max(1e-3) * 1e3,
                 st.accepted,
                 st.drafted,
-                talus_model::glm::weights::mem_available_bytes() as f64 / (1u64 << 30) as f64
+                talus_model::glm::weights::mem_available_bytes() as f64 / (1u64 << 30) as f64,
+                talus_mem::pressure::global()
+                    .map(|p| format!(" | pressure: {}", p.summary()))
+                    .unwrap_or_default()
             );
         }
         write_done_line(
@@ -258,6 +293,70 @@ impl GlmBackend {
     }
 }
 
+/// #40 memory pressure: the backend's rebuildable memory is the engine's (graphs, prefill arenas) plus the prompt
+/// snapshots. Dropping a snapshot costs the next turn a re-read of its prompt, and (warm != cold on GLM) may change its
+/// text, so snapshots are an inexact class, shed last.
+impl talus_mem::pressure::Shed for GlmBackend {
+    fn shed(&mut self, class: talus_mem::pressure::ShedClass) -> u64 {
+        use talus_mem::pressure::ShedClass;
+        match class {
+            ShedClass::PromptSnapshots => {
+                let mut n = 0u64;
+                for s in std::mem::take(&mut self.snaps) {
+                    if self.eng.snap_free(&s.buf).is_ok() {
+                        n += s.buf.bytes as u64;
+                    }
+                }
+                n
+            }
+            _ => self.eng.shed(class),
+        }
+    }
+
+    /// GLM's warm resume is not bitwise the cold read (rd-mempr wc, 2026-10-31): a resumed window below 1152 rows
+    /// (288 experts x pf_w16_moe_min_rows 32) runs the MMQ expert path where the cold run's 4096-row window runs the
+    /// fp16 (w16) experts. So a dropped snapshot can change the next turn's text (it completes as a cold run); shed
+    /// last (operator option A). Exact when every window takes w16 (STRATA_PF_W16_MOE_MIN=0) or the snapshot grid is
+    /// the chunk (GLM_SNAP_GRID=4096).
+    fn inexact(&self, class: talus_mem::pressure::ShedClass) -> bool {
+        class == talus_mem::pressure::ShedClass::PromptSnapshots
+            && std::env::var("STRATA_PF_W16_MOE_MIN").as_deref() != Ok("0")
+            && super::glm_serve::snap_grid() % talus_model::glm::engine::pch() != 0
+    }
+}
+
+impl GlmBackend {
+    /// TALUS_MEM_SHED_EVERY=1 (test knob): after every request shed every class and log what each released, so a
+    /// run can show that shedding changes no output (and measure the classes).
+    fn shed_probe(&mut self) {
+        use talus_mem::pressure::{Shed, SHED_ORDER};
+        let mut parts = vec![];
+        let want = self.shed_every.clone().unwrap_or_default();
+        for c in SHED_ORDER {
+            let key = match c {
+                talus_mem::pressure::ShedClass::DecodeGraphs => "graphs",
+                talus_mem::pressure::ShedClass::PromptSnapshots => "snapshots",
+                talus_mem::pressure::ShedClass::PromptCacheRam => "pcache",
+                talus_mem::pressure::ShedClass::TransientArenas => "arenas",
+            };
+            if want != "1" && !want.split(',').any(|w| w == key) {
+                continue;
+            }
+            let a = talus_model::glm::weights::mem_available_bytes();
+            let n = self.shed(c);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let b = talus_model::glm::weights::mem_available_bytes();
+            parts.push(format!(
+                "{} {} (MemAvailable {:+.1} MiB)",
+                c.name(),
+                if n > 0 { "shed" } else { "none" },
+                (b as f64 - a as f64) / (1u64 << 20) as f64
+            ));
+        }
+        eprintln!("glm-serve: shed probe: {}", parts.join(", "));
+    }
+}
+
 impl EngineProtocolBackend for GlmBackend {
     fn max_context(&self) -> i32 {
         self.eng.cfg.ctx as i32
@@ -271,11 +370,24 @@ impl EngineProtocolBackend for GlmBackend {
         stop: &CancelToken,
         out: &mut dyn Write,
     ) -> std::io::Result<()> {
-        if let Err(e) = self.run(cmd, stop, out) {
-            writeln!(out, "ERR {e}")?;
+        // #40: admission at request start: shed in the fixed order when the host is near the floor; still under it
+        // -> this request fails (ERR insufficient_memory), the server keeps serving
+        let r = match talus_mem::pressure::admit(self) {
+            Ok(()) => self.run(cmd, stop, out),
+            Err(e) => Err(e.into()),
+        };
+        if let Err(e) = r {
+            writeln!(out, "{}", talus_mem::pressure::err_line(&e.to_string()))?;
             out.flush()?;
             // state is unknown after an error: drop the history so the next request starts cold
             self.hist.clear();
+            if talus_mem::pressure::is_insufficient_memory(&e.to_string()) {
+                // what the failed request may have left behind: the snapshot slot it was filling is invalid anyway
+                self.snaps.retain(|s| s.pos != usize::MAX);
+            }
+        }
+        if self.shed_every.is_some() {
+            self.shed_probe();
         }
         Ok(())
     }

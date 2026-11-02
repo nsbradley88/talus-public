@@ -22,6 +22,9 @@ use crate::laguna::ffi::{
     TK_ROPE_SCALING_NONE, TK_ROPE_SCALING_YARN,
 };
 use crate::laguna::session::{compute_ctx16_and_ring, session_payload_bytes, SessionHeader};
+use crate::tail_prune::{
+    chunk_tail_offset, first_prunable_layer, plan_on_grid, Grid, LayerAttn, LayerRows, TailRequest,
+};
 
 /// Laguna DFlash drafter (a child module: it drives the engine's stream, kernels and taps).
 #[path = "dflash.rs"]
@@ -50,6 +53,21 @@ const K_SPLIT: i32 = 16;
 /// Padding past `U * K_TOP_K` on `ident` so MMQ's widest column tile never reads past the buffer
 /// (`laguna_engine.cpp:kIdentPad`).
 const K_IDENT_PAD: usize = 512;
+
+/// rd-swa-laguna: a pruned layer keeps a suffix of each chunk that starts on a multiple of this many rows from the
+/// chunk start (the prompt-attention kernels group queries from the chunk's first row).
+const TAIL_ALIGN: usize = 256;
+/// rd-swa-laguna: never run a pruned layer on fewer rows than this (small batches take other kernels).
+const TAIL_MIN_ROWS: usize = 128;
+/// rd-swa-laguna: chunks of this many rows or fewer are never split.
+const TAIL_SMALL_NB: usize = 8;
+/// rd-swa-laguna: positions below a query that a sliding-window layer may read: the window, the 64 tile positions
+/// `swa_keep_from` keeps, and the 16-alignment.
+const TAIL_REACH: usize = K_SWA + 64 + 16;
+/// rd-swa-laguna: resume spans (`tail_span`) of sliding-window rows kept below a prompt's end: a resume the ring guard
+/// allows reads only written rows after up to `TAIL_SPANS - 1` shorter requests in a row (3; each span
+/// costs about 0.4 points of the 32K prompt gain).
+const TAIL_SPANS: usize = 3;
 
 /// Engine configuration options (`src/laguna/laguna_engine.hpp:EngineOptions`).
 #[derive(Debug, Clone, Copy)]
@@ -273,6 +291,13 @@ pub struct Engine {
     vgemm_clear: bool,
     // columns per dense tk_mmvq call in step_n (TALUS_LAGUNA_DENSE_COLS, 1..=64; 16 = the earlier chunking)
     dense_cols: usize,
+    // rd-swa-laguna: exact tail-row pruning of the layers after the last full-attention layer in prefill
+    // (default on; TALUS_LAGUNA_TAIL_PRUNE=0 turns it off)
+    tail_on: bool,
+    // rd-swa-laguna: the prompt end the following prefill calls belong to (serve sets it around its chunk loop)
+    tail_hint: Option<usize>,
+    // rd-swa-laguna: per layer, positions whose sliding-window K / V a pruned prefill did not write (sorted, disjoint)
+    tail_stale: Vec<Vec<(usize, usize)>>,
 }
 
 // SAFETY: Engine owns its HIP stream, graphs, and device allocations.
@@ -805,6 +830,11 @@ impl Engine {
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(K_MAX_VERIFY)
                     .clamp(1, K_MAX_VERIFY),
+                tail_on: std::env::var("TALUS_LAGUNA_TAIL_PRUNE")
+                    .map(|v| !v.starts_with('0'))
+                    .unwrap_or(true),
+                tail_hint: None,
+                tail_stale: Vec::new(),
             })
         })();
 
@@ -1019,6 +1049,129 @@ impl Engine {
     /// a request reads past its context never hold an earlier request's keys / values.
     pub fn clear_full_kv_from(&mut self, from: usize) -> Result<()> {
         self.clear_kv_from(from, false)
+    }
+
+    /// rd-swa-laguna: how far below the cached end a request may resume while the sliding-window rings still hold the
+    /// positions it reads (the serve ring guard: `cached + K_MAX_VERIFY - swa_keep_from(lcp) <= ring`).
+    fn tail_span(&self) -> usize {
+        self.ring.saturating_sub(K_MAX_VERIFY + TAIL_REACH)
+    }
+
+    /// rd-swa-laguna: the exact pruning plan of a prefill of `n_tok` tokens at `pos0` (`None`: nothing to skip).
+    /// Kept rows: the last row's logits, the DFlash drafter's injected window (+64), the taps of the earlier layers,
+    /// and every sliding-window K / V row that a later query can read, including the queries of any resume the ring
+    /// guard allows after up to two shorter requests in a row (`min_query` = end - TAIL_SPANS * span - 64), so a resume
+    /// never meets a skipped row in practice (0 of 8,573 replayed agentic requests); `tail_resume_floor` catches the rest.
+    fn tail_plan(&self, pos0: usize, n_tok: usize) -> Option<Vec<LayerRows>> {
+        if self.ring >= self.ctx16 {
+            return None; // no ring guard: a resume can reach any position
+        }
+        let end = self.tail_hint.map_or(pos0 + n_tok, |e| e.max(pos0 + n_tok));
+        let out_rows = 1 + if self.taps.is_null() {
+            0
+        } else {
+            dflash::DF_WINDOW + 64
+        };
+        let nl = self.m.layers.len();
+        let layers: Vec<LayerAttn> = (0..nl)
+            .map(|il| {
+                if is_full(il) {
+                    LayerAttn::Full
+                } else {
+                    LayerAttn::Window(TAIL_REACH + 1)
+                }
+            })
+            .collect();
+        let req = TailRequest {
+            final_end: end,
+            out_rows,
+            min_query: end.saturating_sub(TAIL_SPANS * self.tail_span() + 64),
+            taps: TAP_LAYERS
+                .iter()
+                .filter(|&&t| t > 0 && t < nl)
+                .map(|&t| (t - 1, out_rows))
+                .collect(),
+        };
+        let grid = Grid {
+            start: pos0,
+            ubatch: self.U,
+            align: TAIL_ALIGN,
+            min_rows: TAIL_MIN_ROWS,
+            small_nb: TAIL_SMALL_NB,
+        };
+        let rows = plan_on_grid(&layers, &req, Some(&grid));
+        first_prunable_layer(&rows).map(|_| rows)
+    }
+
+    /// rd-swa-laguna: declare the prompt end for the prefill calls that follow (`None` clears it): each chunk call of
+    /// a served prompt then knows which rows nothing reads.
+    pub fn set_prefill_hint(&mut self, end: Option<usize>) {
+        self.tail_hint = end;
+    }
+
+    /// rd-swa-laguna: record layer `il`'s sliding-window rows `a .. b` as skipped (`stale`) or written.
+    fn tail_mark(&mut self, il: usize, a: usize, b: usize, stale: bool) {
+        if a >= b || (!stale && self.tail_stale.get(il).is_none_or(|v| v.is_empty())) {
+            return;
+        }
+        if self.tail_stale.len() <= il {
+            self.tail_stale.resize(il + 1, Vec::new());
+        }
+        let v = &mut self.tail_stale[il];
+        let mut out: Vec<(usize, usize)> = Vec::with_capacity(v.len() + 2);
+        for &(x, y) in v.iter() {
+            if y <= a || x >= b {
+                out.push((x, y));
+            } else {
+                if x < a {
+                    out.push((x, a));
+                }
+                if y > b {
+                    out.push((b, y));
+                }
+            }
+        }
+        if stale {
+            out.push((a, b));
+            out.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(out.len());
+            for (x, y) in out {
+                match merged.last_mut() {
+                    Some(last) if last.1 >= x => last.1 = last.1.max(y),
+                    _ => merged.push((x, y)),
+                }
+            }
+            out = merged;
+        }
+        *v = out;
+    }
+
+    /// rd-swa-laguna: true when no sliding-window layer has a skipped row in positions `a .. b`.
+    fn tail_clean(&self, a: usize, b: usize) -> bool {
+        self.tail_stale
+            .iter()
+            .all(|v| v.iter().all(|&(x, y)| y <= a || x >= b))
+    }
+
+    /// rd-swa-laguna: `lcp` when every sliding-window row a query at `lcp ..` can read was written, else 0 (a fresh
+    /// prefill). The plan keeps those rows for every resume the ring guard allows, so this only fires after a chain of
+    /// shorter requests.
+    pub fn tail_resume_floor(&self, lcp: usize) -> usize {
+        if lcp == 0 || self.tail_clean(lcp.saturating_sub(TAIL_REACH), lcp) {
+            lcp
+        } else {
+            0
+        }
+    }
+
+    /// rd-swa-laguna: positions `from ..` are about to be prefilled again: forget their skipped-row records.
+    pub fn tail_discard_from(&mut self, from: usize) {
+        for v in self.tail_stale.iter_mut() {
+            v.retain(|&(a, _)| a < from);
+            for r in v.iter_mut() {
+                r.1 = r.1.min(from);
+            }
+        }
     }
 
     /// The first position a sliding-window layer keeps when a request resumes at `from` (16-aligned; 0 at `from` 0).
@@ -1453,6 +1606,7 @@ impl Engine {
         nb: usize,
         p0: usize,
         mut dump: Option<DumpFn<'_>>,
+        tail: Option<&[LayerRows]>,
     ) -> Result<()> {
         assert!(nb >= 1 && nb <= self.U && p0 + nb <= self.ctx);
 
@@ -1552,6 +1706,42 @@ impl Engine {
             let cos = if full { self.cos_full } else { self.cos_swa };
             let sin = if full { self.sin_full } else { self.sin_swa };
 
+            // rd-swa-laguna: rows `ka ..` of this chunk write this layer's K / V, rows `ob ..` also run its attention
+            // output and FFN (both 0 without pruning; `ka == nb`: the layer is skipped for this chunk)
+            let (ka, ob) = match tail {
+                Some(rows) => (
+                    chunk_tail_offset(
+                        p0,
+                        nb,
+                        rows[il].in_from(),
+                        TAIL_ALIGN,
+                        TAIL_MIN_ROWS,
+                        TAIL_SMALL_NB,
+                    ),
+                    chunk_tail_offset(
+                        p0,
+                        nb,
+                        rows[il].out_from,
+                        TAIL_ALIGN,
+                        TAIL_MIN_ROWS,
+                        TAIL_SMALL_NB,
+                    ),
+                ),
+                None => (0, 0),
+            };
+            debug_assert!(ka <= ob && (ka == 0 || !full));
+            if !full {
+                self.tail_mark(il, p0, p0 + ka, true);
+                self.tail_mark(il, p0 + ka, p0 + nb, false);
+            }
+            if ka == nb {
+                continue;
+            }
+            let na = nb - ka;
+            let nbo = nb - ob;
+            let x_a = unsafe { self.x.add(ka * K_EMBD) };
+            let x_b = unsafe { self.x.add(ob * K_EMBD) };
+
             if pos_q_heads != H as i32 {
                 check_tk(
                     ctx_ptr,
@@ -1572,9 +1762,9 @@ impl Engine {
                     (self.tk.tk_rms_norm_to)(
                         ctx_ptr,
                         self.h,
-                        self.x,
+                        x_a,
                         L.attn_norm.as_f32(),
-                        nb as i32,
+                        na as i32,
                         K_EMBD as i32,
                         K_EPS,
                         stream,
@@ -1583,10 +1773,10 @@ impl Engine {
                 "tk_rms_norm_to(attn_norm)",
             )?;
             let mut h_attn_q8_layout = None;
-            self.dense_ex(&L.wq, self.h, self.q, nb, &mut h_attn_q8_layout)?;
-            self.dense_ex(&L.wk, self.h, self.kc, nb, &mut h_attn_q8_layout)?;
-            self.dense_ex(&L.wv, self.h, self.vc, nb, &mut h_attn_q8_layout)?;
-            self.dense_ex(&L.attn_gate, self.h, self.g, nb, &mut h_attn_q8_layout)?;
+            self.dense_ex(&L.wq, self.h, self.q, na, &mut h_attn_q8_layout)?;
+            self.dense_ex(&L.wk, self.h, self.kc, na, &mut h_attn_q8_layout)?;
+            self.dense_ex(&L.wv, self.h, self.vc, na, &mut h_attn_q8_layout)?;
+            self.dense_ex(&L.attn_gate, self.h, self.g, na, &mut h_attn_q8_layout)?;
 
             check_tk(
                 ctx_ptr,
@@ -1595,12 +1785,12 @@ impl Engine {
                         ctx_ptr,
                         self.q,
                         L.q_norm.as_f32(),
-                        (nb * H) as i32,
+                        (na * H) as i32,
                         K_EPS,
                         n_rot,
                         cos,
                         sin,
-                        self.pos_q,
+                        self.pos_q.add(ka * H),
                         1,
                         stream,
                     )
@@ -1614,12 +1804,12 @@ impl Engine {
                         ctx_ptr,
                         self.kc,
                         L.k_norm.as_f32(),
-                        (nb * K_HEAD_KV) as i32,
+                        (na * K_HEAD_KV) as i32,
                         K_EPS,
                         n_rot,
                         cos,
                         sin,
-                        self.pos_k,
+                        self.pos_k.add(ka * K_HEAD_KV),
                         1,
                         stream,
                     )
@@ -1639,9 +1829,9 @@ impl Engine {
                             self.vpool[il] as *mut c_void,
                             self.kscale[il],
                             self.vscale[il],
-                            nb as i32,
+                            na as i32,
                             K_HEAD_KV as i32,
-                            p0 as i32,
+                            (p0 + ka) as i32,
                             self.vtl[il] as i32,
                             stream,
                         )
@@ -1674,7 +1864,7 @@ impl Engine {
                     )?;
                 }
             } else {
-                let kp_dst = unsafe { self.kpool[il].add(p0 * self.cell) as *mut c_void };
+                let kp_dst = unsafe { self.kpool[il].add((p0 + ka) * self.cell) as *mut c_void };
                 check_tk(
                     ctx_ptr,
                     unsafe {
@@ -1683,7 +1873,7 @@ impl Engine {
                             ctx_ptr,
                             self.kc,
                             kp_dst,
-                            (nb * self.cell) as i64,
+                            (na * self.cell) as i64,
                             stream,
                         )
                     },
@@ -1696,9 +1886,9 @@ impl Engine {
                             ctx_ptr,
                             self.vc,
                             self.vpool[il],
-                            nb as i32,
+                            na as i32,
                             K_HEAD_KV as i32,
-                            p0 as i32,
+                            (p0 + ka) as i32,
                             self.vtl[il] as i32,
                             stream,
                         )
@@ -1706,6 +1896,12 @@ impl Engine {
                     "tk_v_store_t",
                 )?;
             }
+            if ob == nb {
+                // K / V only: no later row of this chunk reads this layer's output
+                continue;
+            }
+            let q_b = unsafe { self.q.add((ob - ka) * H * K_HEAD_DIM) };
+            let g_b = unsafe { self.g.add((ob - ka) * H) };
 
             if self.use_wmma {
                 check_tk(
@@ -1713,12 +1909,12 @@ impl Engine {
                     unsafe {
                         (self.tk.tk_laguna_prompt_attn_wmma)(
                             ctx_ptr,
-                            self.q,
+                            q_b,
                             self.kpool[il],
                             self.vpool[il],
                             self.att,
-                            nb as i32,
-                            p0 as i32,
+                            nbo as i32,
+                            (p0 + ob) as i32,
                             H as i32,
                             K_HEAD_KV as i32,
                             if full { 0 } else { K_SWA as i32 },
@@ -1748,12 +1944,12 @@ impl Engine {
                     unsafe {
                         (self.tk.tk_laguna_prompt_attn)(
                             ctx_ptr,
-                            self.q,
+                            q_b,
                             self.kpool[il],
                             self.vpool[il],
                             self.att,
-                            nb as i32,
-                            p0 as i32,
+                            nbo as i32,
+                            (p0 + ob) as i32,
                             H as i32,
                             K_HEAD_KV as i32,
                             if full { 0 } else { K_SWA as i32 },
@@ -1786,24 +1982,24 @@ impl Engine {
                     (self.tk.tk_softplus_head_gate)(
                         ctx_ptr,
                         self.att,
-                        self.g,
-                        (nb * H) as i32,
+                        g_b,
+                        (nbo * H) as i32,
                         K_HEAD_DIM as i32,
                         stream,
                     )
                 },
                 "tk_softplus_head_gate",
             )?;
-            self.dense(&L.wo, self.att, self.a, nb)?;
+            self.dense(&L.wo, self.att, self.a, nbo)?;
             check_tk(
                 ctx_ptr,
                 unsafe {
                     tk_add_inplace(
                         &self.tk,
                         ctx_ptr,
-                        self.x,
+                        x_b,
                         self.a,
-                        (nb * K_EMBD) as i64,
+                        (nbo * K_EMBD) as i64,
                         stream,
                     )
                 },
@@ -1829,9 +2025,9 @@ impl Engine {
                     (self.tk.tk_rms_norm_to)(
                         ctx_ptr,
                         self.h,
-                        self.x,
+                        x_b,
                         L.ffn_norm.as_f32(),
-                        nb as i32,
+                        nbo as i32,
                         K_EMBD as i32,
                         K_EPS,
                         stream,
@@ -1842,8 +2038,8 @@ impl Engine {
 
             if il == 0 {
                 let mut h_ffn_q8_layout = None;
-                self.dense_ex(&L.d_gate, self.h, self.f1, nb, &mut h_ffn_q8_layout)?;
-                self.dense_ex(&L.d_up, self.h, self.f2, nb, &mut h_ffn_q8_layout)?;
+                self.dense_ex(&L.d_gate, self.h, self.f1, nbo, &mut h_ffn_q8_layout)?;
+                self.dense_ex(&L.d_up, self.h, self.f2, nbo, &mut h_ffn_q8_layout)?;
                 check_tk(
                     ctx_ptr,
                     unsafe {
@@ -1851,22 +2047,22 @@ impl Engine {
                             ctx_ptr,
                             self.f1,
                             self.f2,
-                            (nb * K_FF_DENSE) as i64,
+                            (nbo * K_FF_DENSE) as i64,
                             stream,
                         )
                     },
                     "tk_silu_mul(layer0)",
                 )?;
-                self.dense(&L.d_down, self.f1, self.a, nb)?;
+                self.dense(&L.d_down, self.f1, self.a, nbo)?;
                 check_tk(
                     ctx_ptr,
                     unsafe {
                         tk_add_inplace(
                             &self.tk,
                             ctx_ptr,
-                            self.x,
+                            x_b,
                             self.a,
-                            (nb * K_EMBD) as i64,
+                            (nbo * K_EMBD) as i64,
                             stream,
                         )
                     },
@@ -1883,7 +2079,7 @@ impl Engine {
                             self.rl,
                             K_EMBD as i32,
                             K_EXPERTS as i32,
-                            nb as i32,
+                            nbo as i32,
                             stream,
                         )
                     },
@@ -1896,7 +2092,7 @@ impl Engine {
                             ctx_ptr,
                             self.rl,
                             L.router_bias.as_f32(),
-                            nb as i32,
+                            nbo as i32,
                             K_TOP_K as i32,
                             K_EXP_SCALE as f32,
                             self.sel_e,
@@ -1913,8 +2109,8 @@ impl Engine {
 
                 // Shared expert
                 let mut h_sh_q8_layout = None;
-                self.dense_ex(&L.sh_gate, self.h, self.f1, nb, &mut h_sh_q8_layout)?;
-                self.dense_ex(&L.sh_up, self.h, self.f2, nb, &mut h_sh_q8_layout)?;
+                self.dense_ex(&L.sh_gate, self.h, self.f1, nbo, &mut h_sh_q8_layout)?;
+                self.dense_ex(&L.sh_up, self.h, self.f2, nbo, &mut h_sh_q8_layout)?;
                 check_tk(
                     ctx_ptr,
                     unsafe {
@@ -1922,17 +2118,17 @@ impl Engine {
                             ctx_ptr,
                             self.f1,
                             self.f2,
-                            (nb * K_FF_EXP) as i64,
+                            (nbo * K_FF_EXP) as i64,
                             stream,
                         )
                     },
                     "tk_silu_mul(shared)",
                 )?;
-                self.dense(&L.sh_down, self.f1, self.ysh, nb)?;
+                self.dense(&L.sh_down, self.f1, self.ysh, nbo)?;
 
-                // Routed experts: grouped by expert (`max_rows = nb`: an expert appears at most once per token)
-                let S = nb * K_TOP_K;
-                let max_rows = nb;
+                // Routed experts: grouped by expert (`max_rows = nbo`: an expert appears at most once per token)
+                let S = nbo * K_TOP_K;
+                let max_rows = nbo;
                 check_tk(
                     ctx_ptr,
                     unsafe {
@@ -2007,12 +2203,12 @@ impl Engine {
                     unsafe {
                         (self.tk.tk_moe_add_slots)(
                             ctx_ptr,
-                            self.x,
+                            x_b,
                             self.ysh,
                             self.yexp,
                             self.smap,
                             self.sel_w,
-                            nb as i32,
+                            nbo as i32,
                             K_EMBD as i32,
                             K_TOP_K as i32,
                             stream,
@@ -2027,8 +2223,8 @@ impl Engine {
                     &self.hip,
                     self.s,
                     &format!("l_out-{il}"),
-                    self.x,
-                    nb,
+                    x_b,
+                    nbo,
                     K_EMBD,
                     *cb,
                 )?;
@@ -2087,6 +2283,12 @@ impl Engine {
                 "hipMemcpyAsync(ptok_dev)",
             )?;
         }
+        // rd-swa-laguna: rows of the last layers that nothing reads (not with an all-rows logits file or a layer dump)
+        let tail = if self.tail_on && logits_file.is_none() && dump.is_none() {
+            self.tail_plan(pos0, n_tok)
+        } else {
+            None
+        };
         let mut p = 0usize;
         while p < n_tok {
             let nb = (n_tok - p).min(self.U);
@@ -2099,7 +2301,14 @@ impl Engine {
             } else {
                 None
             };
-            self.prefill_ubatch(&tokens[p..p + nb], p, nb, pos0 + p, chunk_dump)?;
+            self.prefill_ubatch(
+                &tokens[p..p + nb],
+                p,
+                nb,
+                pos0 + p,
+                chunk_dump,
+                tail.as_deref(),
+            )?;
 
             if logits_file.is_some() {
                 check_tk(
@@ -3492,7 +3701,7 @@ impl Engine {
             },
             "hipMemcpyAsync(verify_gemm tokens)",
         )?;
-        self.prefill_ubatch(tokens, 0, n, p0, None)?;
+        self.prefill_ubatch(tokens, 0, n, p0, None, None)?;
         check_tk(
             ctx_ptr,
             unsafe {
@@ -3853,6 +4062,14 @@ impl Engine {
         if n == 0 || n > self.ctx {
             return Err("invalid bad token count".to_string());
         }
+        // rd-swa-laguna: a loaded session is resumed anywhere the ring guard allows, so its rings must hold every row
+        // those queries read (the file has no record of skipped rows)
+        if !self.tail_clean(n.saturating_sub(self.tail_span() + TAIL_REACH), n) {
+            return Err(
+                "invalid tail-pruned rows inside the resume window (TALUS_LAGUNA_TAIL_PRUNE)"
+                    .to_string(),
+            );
+        }
         let nl = self.m.layers.len();
         let esz = if self.kv_q8 { 1usize } else { 2usize };
         let hdr = SessionHeader::new(
@@ -4042,6 +4259,16 @@ impl Engine {
         self.bnd_valid = 0;
         self.kv_hw = self.kv_hw.max(toks.len());
         self.swa_dirty = true;
+        // rd-swa-laguna: only the resume window was checked when the file was saved; treat older rows as skipped
+        self.tail_stale.clear();
+        if self.tail_on {
+            let keep = toks.len().saturating_sub(self.tail_span() + TAIL_REACH);
+            for il in 0..nl {
+                if !is_full(il) {
+                    self.tail_mark(il, 0, keep, true);
+                }
+            }
+        }
         Ok((toks, total))
     }
 }

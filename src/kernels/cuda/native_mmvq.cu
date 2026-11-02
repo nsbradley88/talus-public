@@ -2531,6 +2531,21 @@ void q8_0_pair_launch(const Q80Block* w1, const Q80Block* w2, const Q81Block* x,
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                       int n_in, int n_out, int ncols, void* stream) {
     using F = SmallTraits<Q80Block, 8>;
+    // rd-fnrec (#22): where native_mmvq takes the wave32 kernels (gfx11: native_mmvq_w32 for every column count), the
+    // two calls this pair stands for sum in w32_body's order, not native_mmvq_multi_kernel's.  The multi kernel's
+    // sums differ from them in the last bits (~70% of the shared expert's gate / up outputs, CPU emulation
+    // rd/rd-fnrec/emu); the SwiGLU's q8_1 hides most of that, but ~0.6% of (token, layer) steps flip a byte, so a
+    // 2..8-row verify window (the only user, STRATA_LFUSE) drifted from verify(1) after a few tokens.  There the pair
+    // is native_mmvq_w32_multi (each matrix exactly its own native_mmvq_w32 launch), or nothing.
+    if (native_mmvq_w32_active() && native_mmvq_w32_supported(ggml_type)) {
+        if (ggml_type != 8 || ncols < 2 || ncols > 8 || n_out <= 0 || n_in <= 0 || !w1 || !w2 || !x_q8_1 || !y1 || !y2 ||
+            !stream)
+            return false;
+        const void* const w[2] = {w1, w2};
+        float* const y[2] = {y1, y2};
+        const int no[2] = {n_out, n_out};
+        return native_mmvq_w32_multi(ggml_type, 2, w, y, no, x_q8_1, n_in, ncols, stream);
+    }
     // only where both calls would run native_mmvq_multi_kernel<F, ncols, WARPS, 1> (exact layout, not packed)
     if (ggml_type != 8 || !g_multi_exact || ncols < 2 || ncols > 8 || n_out <= 0 || n_in <= 0 || n_in % 32 != 0 ||
         n_in / F::DIV < F::BPI || !w1 || !w2 || !x_q8_1 || !y1 || !y2 || !stream)

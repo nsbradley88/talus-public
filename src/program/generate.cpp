@@ -4686,7 +4686,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
     }
     std::vector<std::vector<std::unique_ptr<strata::core::SessionState>>> bslot_ss;
     if (o.batch != 0) {
-        const int cap = strata::kernels::kVerifyMaxT;
+        const int cap = strata::kernels::kVerifyMaxTBase;
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
                         : split_same ? "it needs each stage of a layer split on its own GPU" : nullptr;
         if (off != nullptr) {
@@ -4796,7 +4796,8 @@ static int qwen4exp_engine_main(int argc, char** argv) {
         const strata::core::OnDevice on_mtp(last_st && !mtp_first ? last_st->dev : -1);
         // --pipeline-windows 2: 8 rows (the chain runs on past the window in flight: its drafts, its bonus token and
         // the next window's drafts), and the round/step graphs carry the forcing kernel
-        const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
+        // (kVerifyMaxTBase, the pipelined chain's width before kVerifyMaxT grew to 16 for copy windows)
+        const int mtp_t = o.pipeline_windows >= 2 ? std::max(o.spec, strata::kernels::kVerifyMaxTBase) : o.spec;
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "talus generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
@@ -6875,13 +6876,16 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                                     : ((tokens + 255) / 256) * 256;
         return std::min(max_chunk, rounded);
     };
-    // STRATA_PREFILL_EQUAL=1 (opt-in, PR #693): a segment of `tokens` reads in n = ceil(tokens / max_chunk) chunks of EQUAL
+    // STRATA_PREFILL_EQUAL=1 (upstream PR #693; opt-in, off by default in Talus): a
+    // segment of `tokens` reads in n = ceil(tokens / max_chunk) chunks of EQUAL
     // size (ceil(tokens / n) rounded up to 256) instead of full chunks and a short last one.  A chunk of
     // stream_all_min_tokens() or more streams every expert the GPU does not hold, whatever its length, so a prompt's cost
     // is its number of such chunks and equal chunks borrow no more slots than that count needs.  A last chunk below
     // stream_all_min_tokens() stays as it is (it moves only the experts its own tokens route to).  Used ONLY where a
     // segment's chunk is chosen (the serve lend, generate's prompt); `request_chunk` is unchanged because
-    // STRATA_SPLIT_SMALL_OWN uses it too.  The chunk geometry changes the rounding, so it is off by default.
+    // STRATA_SPLIT_SMALL_OWN uses it too.  The chunk geometry changes the rounding.  talus#49 shipped it on in
+    // v0.1.2-rc1 (faster prompts at 19K-33K), but it failed the release KLD gate on prompts over 16K (Flash-Next,
+    // see the v0.1.2 release notes), so v0.1.2 ships it off.
     static const bool equal_chunks = [] { const char* e = std::getenv("STRATA_PREFILL_EQUAL"); return e != nullptr && e[0] == '1'; }();
     auto equal_chunk = [&](int64_t tokens, int64_t max_chunk) -> int64_t {
         const int64_t plain = request_chunk(tokens, max_chunk);
@@ -8175,11 +8179,11 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                     vs.slot_off = gs.cache.slot_offsets();
                     vs.n_slots = gs.cache.slots();
                     gs.ver.set_remote_expert_opt(remote_opt.get());
-                    // --batch-mtp: every stage runs the same 2-rows-per-slot windows as the first (up to kVerifyMaxT
+                    // --batch-mtp: every stage runs the same 2-rows-per-slot windows as the first (up to kVerifyMaxTBase
                     // rows, the hand-off's size) and bounds its captured batch layouts like the first (below)
                     if (batch_mtp) gs.ver.set_batch_graph_limit(64);
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
-                                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err);
+                                       batch_mtp ? strata::kernels::kVerifyMaxTBase : std::max(o.spec, o.batch), err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
                     split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
@@ -8257,7 +8261,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
+                      batch_mtp ? strata::kernels::kVerifyMaxTBase : std::max(o.spec, o.batch), err) ||
             (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "talus serve: %s\n", err.c_str());
@@ -10175,7 +10179,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
         struct BSlot {
             bool active = false, stop = false;
             int32_t x = 0;                 ///< the token the next window feeds (not yet in the slot's state)
-            std::array<int32_t, strata::kernels::kVerifyMaxT> draft{}; ///< the slot's next MTP proposal
+            std::array<int32_t, strata::kernels::kVerifyMaxTBase> draft{}; ///< the slot's next MTP proposal
             bool draft_ready = false;
             int64_t p = 0;                 ///< its position
             int64_t produced = 0, max_new = 0;
@@ -10322,14 +10326,14 @@ static int qwen4exp_engine_main(int argc, char** argv) {
         // so it keeps the conversation it holds
         auto batch_step = [&]() -> bool {
             int S = 0;
-            int rows[strata::kernels::kVerifyMaxT] = {};
-            int32_t tok[strata::kernels::kVerifyMaxT] = {}, outb[strata::kernels::kVerifyMaxT] = {};
-            int64_t pos[strata::kernels::kVerifyMaxT] = {};
-            int first[strata::kernels::kVerifyMaxT] = {}, active[strata::kernels::kVerifyMaxT] = {};
+            int rows[strata::kernels::kVerifyMaxTBase] = {};
+            int32_t tok[strata::kernels::kVerifyMaxTBase] = {}, outb[strata::kernels::kVerifyMaxTBase] = {};
+            int64_t pos[strata::kernels::kVerifyMaxTBase] = {};
+            int first[strata::kernels::kVerifyMaxTBase] = {}, active[strata::kernels::kVerifyMaxTBase] = {};
             static size_t next_slot = 0;
             // Each MTP slot uses two rows; rotate slots when more than four are active.
             int A = 0;
-            for (size_t offset = 0; offset < bs.size() && S + (batch_mtp ? 2 : 1) <= strata::kernels::kVerifyMaxT; ++offset) {
+            for (size_t offset = 0; offset < bs.size() && S + (batch_mtp ? 2 : 1) <= strata::kernels::kVerifyMaxTBase; ++offset) {
                 const int b = (int) ((next_slot + offset) % bs.size());
                 if (bs[(size_t) b].active) {
                     first[A] = S;
@@ -10551,8 +10555,8 @@ static int qwen4exp_engine_main(int argc, char** argv) {
         struct PGroup {
             bool inflight = false;
             int stage = 0;                  ///< the stage it runs on or waits for
-            int32_t tok[strata::kernels::kVerifyMaxT] = {};
-            int64_t pos[strata::kernels::kVerifyMaxT] = {};
+            int32_t tok[strata::kernels::kVerifyMaxTBase] = {};
+            int64_t pos[strata::kernels::kVerifyMaxTBase] = {};
             int64_t since = 0;              ///< tick it started waiting (fairness)
             int S = 0;                      ///< slots in its window: up to its last active one (idle ones cost rows)
         };
@@ -13792,6 +13796,15 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                     std::fprintf(stderr, "talus serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
             }
+            // talus#60: the prompt end, when no checkpoint of this request is near it (a raw prompt)
+            if (!cancelled) {
+                const int64_t end_at = strata::program::prompt_end_checkpoint(
+                    n, turn_at, root_at, message_at, pin_at, o.prompt_cache, req_ckpt, req_short_read);
+                if (end_at > 0 && !checkpoint_at(end_at, nullptr, false)) {
+                    std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
+                    return 1;
+                }
+            }
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
@@ -14407,7 +14420,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                         ++pl_on;
                         // the chain over A, forced through B's drafts: B's bonus guess and the next window's drafts
                         mtp.set_source_R(V1(A).final_R(0));
-                        chain_n = std::min(strata::kernels::kVerifyMaxT - 1, B.T + S_mtp - 1);
+                        chain_n = std::min(strata::kernels::kVerifyMaxTBase - 1, B.T + S_mtp - 1);
                         if (!mtp.chain_launch(A.T, outp.data(), A.p, a, B.tok + 1, B.T - 1, chain_n, chain_n, err))
                             return die(err);
                         chain_kind = 1;
@@ -14436,7 +14449,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                         B = PW{};
                         if (!last) {
                             mtp.set_source_R(V1(A).final_R(0));
-                            chain_n = strata::kernels::kVerifyMaxT - 1;
+                            chain_n = strata::kernels::kVerifyMaxTBase - 1;
                             if (!mtp.chain_launch(A.T, outp.data(), A.p, a, nullptr, 0, chain_n, chain_n, err))
                                 return die(err);
                             chain_kind = 2;
@@ -16731,6 +16744,17 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                 T = std::min(T, room);
                 T_mtp = T;
             }
+            // test hook (bitwise verify-test): STRATA_VERIFY_FORCE_T=n with --spec-oracle and no --mtp makes every
+            // window after the first n rows wide (the oracle's tokens as its drafts), so a window of n rows verifies
+            // positions that the n = 1 run verified one at a time; with STRATA_WINDOW_HASH_ROWS=1 --window-hashes then
+            // writes one line per accepted row (position, its final-residual hash, its logits hash, its argmax)
+            static const int force_t = [] { const char* e = std::getenv("STRATA_VERIFY_FORCE_T"); return e ? std::atoi(e) : 0; }();
+            if (force_t > 0 && !use_mtp && (force_t == 1 || !oracle.empty()) && !first_window && follow.empty()) {
+                T = std::max(1, std::min(force_t, room));
+                T_mtp = T;
+                from_sfx = false;
+                chain_n = 0;
+            }
             const bool timed_round = !first_window;
             ++window_hist[(size_t) T];
             if (p + T > o.max_context) {
@@ -16785,6 +16809,24 @@ static int qwen4exp_engine_main(int argc, char** argv) {
             }
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+            static const bool hash_rows_mode = [] { const char* e = std::getenv("STRATA_WINDOW_HASH_ROWS"); return e && e[0] == '1'; }();
+            if (hashes != nullptr && hash_rows_mode) {   // per accepted row (the verify-test's comparison unit)
+                const size_t rf = (size_t) (g.hc * g.n_embd);
+                std::vector<float> lrow((size_t) ver.vocab());
+                auto fnv = [](const void* p, size_t n) {
+                    uint64_t h = 1469598103934665603ull;
+                    const auto* b = (const uint8_t*) p;
+                    for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+                    return h;
+                };
+                if (first_window) std::fprintf(hashes, "first %lld %d\n", (long long) p, (int) window[0]);   // the oracle's head
+                for (int i = 0; i <= a; ++i) {
+                    const uint64_t hr = fnv(hash_rows.data() + (size_t) i * rf, rf * sizeof(float));
+                    const uint64_t hl = ver.copy_logits(i, lrow.data()) ? fnv(lrow.data(), lrow.size() * sizeof(float)) : 0ull;
+                    std::fprintf(hashes, "row %lld T %d r %d %016llx %016llx %d\n", (long long) (p + i), T, i,
+                                 (unsigned long long) hr, (unsigned long long) hl, (int) outv[(size_t) i]);
+                }
+            }
             if (const char* fn_dump = std::getenv("TALUS_FN_DUMP"); fn_dump != nullptr && fn_dump[0] != '\0') {
                 char tag[96];
                 std::snprintf(tag, sizeof(tag), "verify_p%lld_T%d_final_R", (long long) p, T);

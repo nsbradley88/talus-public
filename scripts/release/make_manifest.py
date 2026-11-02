@@ -42,8 +42,13 @@ def main():
     hdr = open("/src/include/talus_kernels.h").read()
     abi = re.search(r"#define\s+TALUS_KERNELS_ABI_VERSION\s+(\d+)", hdr)
     files, glibc_floor, rocm_needed = {}, (0, 0), set()
+    tables = {}
     for name in sorted(os.listdir(os.path.join(st, "bin"))):
         p = os.path.join(st, "bin", name)
+        if os.path.isdir(p):  # bin/hip: the hipBLASLt prefill tuning tables (talus#50), data not ELF
+            for t in sorted(os.listdir(p)):
+                tables[f"bin/{name}/{t}"] = {"sha256": sha256(os.path.join(p, t)), "size": os.path.getsize(os.path.join(p, t))}
+            continue
         needed, rpath, glibc = elf_info(p)
         files[f"bin/{name}"] = {"sha256": sha256(p), "size": os.path.getsize(p), "needed": needed, "runpath": rpath}
         if glibc and glibc > glibc_floor:
@@ -72,8 +77,15 @@ def main():
                             "/opt/rocm/lib", "ROCM_SDK / ROCM_PATH (+ /lib) for libamdhip64 (hip-sys)"],
             "glibc_min": "%d.%d" % glibc_floor,
             "kernels_lookup": "libtalus_kernels.so next to the executables (bin/); TALUS_KERNELS_LIB overrides",
+            "hipblaslt_tuning_lookup": "STRATA_HIPBLASLT_TUNING (file or directory) overrides; else "
+                                       "<dir of libtalus_kernels.so>/hip/<arch>-hipblaslt-<hipBLASLt version>.txt "
+                                       "(then ../share/talus/hip, ../tools/hip)",
         },
         "files": files,
+        "tuning_tables": tables,
+        "side_files": {f"{d}/{n}": {"sha256": sha256(os.path.join(st, d, n)), "size": os.path.getsize(os.path.join(st, d, n))}
+                       for d in ("data", "tools") if os.path.isdir(os.path.join(st, d))
+                       for n in sorted(os.listdir(os.path.join(st, d)))},
     }
     json.dump(m, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")

@@ -1091,9 +1091,21 @@ extern "C" tk_status tk_prefill_ctx_init(tk_ctx* ctx) TK_NOEXCEPT {
             }
         }
 
+        // talus#50: without STRATA_HIPBLASLT_TUNING the Flash-Next GEMM (prefill/gemm.cu) finds the table next to
+        // libtalus_kernels.so (hipblaslt_tuning.hpp, resolve_tuning_table).  This loader (the Rust engines: 27B, GLM,
+        // MiMo, Laguna) keeps the env-only rule until measured: none of them ran with a table in a published config,
+        // and a table changes the GEMM algorithms (numerics).  Enabling the same discovery here is this constant.
+        constexpr bool kAutoDiscoverTuning = false;
         const char* env_tuning = std::getenv("STRATA_HIPBLASLT_TUNING");
         if (env_tuning != nullptr && env_tuning[0] != '\0' && state->hipblaslt_version > 0) {
             (void) state->load_tuning_host(env_tuning);
+        } else if (kAutoDiscoverTuning && env_tuning == nullptr && state->hipblaslt_version > 0) {
+            strata::prefill::hipblaslt::TuningTable found;
+            const auto res = strata::prefill::hipblaslt::resolve_tuning_table(
+                found, nullptr, /*auto_search=*/true,
+                strata::prefill::hipblaslt::module_dir_of(reinterpret_cast<const void*>(&tk_prefill_ctx_init)),
+                strata::prefill::tk::strip_gcn_arch_suffix(state->gcn_arch_name), state->hipblaslt_version);
+            if (res.loaded) (void) state->load_tuning_host(res.path.c_str());
         }
 
         {
@@ -1128,6 +1140,39 @@ extern "C" void tk_prefill_ctx_destroy(tk_ctx* ctx) TK_NOEXCEPT {
             }
         }
     } catch (...) {
+    }
+}
+
+// #40 memory pressure: free the prompt path's grown caches - the dense MMQ activation buffer (grown to the largest
+// chunk's rows) and the MMQ launch context with its stream-k scratch pool.  Both are rebuilt by the next call that
+// needs them (same kernels, same results; the buffer layout follows its new capacity).  The dequant scratch is kept:
+// its size follows the first GEMM's shape and sets later slicing.  Synchronizes the device first.  TK_OK also when
+// there was nothing to free.
+extern "C" tk_status tk_prefill_trim(tk_ctx* ctx) TK_NOEXCEPT {
+    if (ctx == nullptr) {
+        return TK_ERR_INVALID_ARG;
+    }
+    try {
+        std::lock_guard<std::mutex> lock(g_registry_mu);
+        auto& reg = state_registry();
+        auto it = reg.find(ctx);
+        if (it == reg.end() || !it->second) {
+            return TK_OK;
+        }
+        tk_prefill_state& state = *it->second;
+        (void) cudaDeviceSynchronize();
+        if (state.mmq_ctx) {
+            delete static_cast<strata::prefill::mmq::Context*>(state.mmq_ctx);
+            state.mmq_ctx = nullptr;
+        }
+        if (state.mmq_dense_buf) {
+            (void) cudaFree(state.mmq_dense_buf);
+            state.mmq_dense_buf = nullptr;
+            state.mmq_dense_cap_rows = 0;
+        }
+        return TK_OK;
+    } catch (...) {
+        return translate_current_exception(ctx, "tk_prefill_trim");
     }
 }
 

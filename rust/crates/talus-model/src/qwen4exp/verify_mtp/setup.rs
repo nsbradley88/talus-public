@@ -513,7 +513,8 @@ unsafe fn ver_init(f: &R2vFfi, ver: *mut c_void) -> Result<bool, String> {
         return Ok(false);
     }
     let max_t = fa.max_t;
-    if max_t < 2 || max_t > fa.verify_max_t || max_t > fa.cpu_maxt {
+    // (the CPU expert pool takes a wider window's tokens per expert in jobs of <= cpu_maxt)
+    if max_t < 2 || max_t > fa.verify_max_t {
         return Err(format!(
             "verify: the window must hold 2..{} tokens",
             fa.verify_max_t

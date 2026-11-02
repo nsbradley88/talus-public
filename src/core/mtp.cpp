@@ -29,6 +29,7 @@
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/verify_wide.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 
@@ -915,7 +916,7 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
         g_mp.stamp(2, cs);
         // ---- the attention hyper-connection
         {
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kVerifyMaxT];
             for (int t = 0; t < T; ++t) {
                 fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = false;
                 fa[t].w_norm = f32("attn_hyper_connection.hc_norm.weight");
@@ -925,7 +926,7 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
                 fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC;
                 fa[t].inject_out = inj_ + t * HC; fa[t].mixed = mixed_ + t * N;
             }
-            fused_gr_read_multi(fa, T, xn_, cs);
+            fused_gr_read_multi_wide(fa, T, xn_, HC * N, cs);   // a copy window's catch-up of up to 16 rows
         }
         g_mp.stamp(3, cs);
         // ---- attention: K/V into the layer's own cache
@@ -1034,7 +1035,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         g_mp.stamp(7, cs);
         // ---- the MLP hyper-connection (the attention write folded in)
         {
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kVerifyMaxT];
             for (int t = 0; t < T; ++t) {
                 fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = true;
                 fa[t].bo_prev = bo_ + t * N; fa[t].inj_prev = inj_ + t * HC;
@@ -1153,7 +1154,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         g_mp.stamp(12, cs);
         // ---- the final mixer and the main model's head
         if (fuse_head_gr) {
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kVerifyMaxT];
             for (int t = 0; t < T; ++t) {
                 fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = true;
                 fa[t].bo_prev = y_ + t * N; fa[t].inj_prev = inj2_ + t * HC;
@@ -1167,7 +1168,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
             fused_gr_read_multi(fa, T, xn_, cs);
         } else if (head_mix_multi_on) {
             // the window's rows in one read (CUDA; HIP keeps gr_read per row): bitwise the same sums
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kVerifyMaxT];
             for (int t = 0; t < T; ++t) {
                 fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = false;
                 fa[t].w_norm = f32("hyper_connection_mixer.hc_norm.weight");
@@ -1737,7 +1738,7 @@ bool MtpDrafter::prepare_chain(std::string& err) {
     if (!force_on_ || h_force_ == nullptr) { err = "mtp: chains need set_force_capture before load"; return false; }
     for (int T = 1; T <= max_t_; ++T)
         if (!capture_round(T, false, err)) return false;
-    for (int j = 1; j <= max_t_ - 2; ++j)
+    for (int j = 1; j <= std::min(max_t_ - 2, strata::kernels::kVerifyMaxTBase - 1); ++j)   // the chain's tables
         if (!capture_step(j, false, err)) return false;
     if (ev_chain_ == nullptr && cudaEventCreateWithFlags(&ev_chain_, cudaEventDisableTiming) != cudaSuccess) {
         err = "mtp: event creation failed";
@@ -1756,7 +1757,8 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
     const OnDevice on_device(device_);
     if (chain_live_) { err = "mtp: a chain is already in flight"; return false; }
     if (!force_on_ || ev_chain_ == nullptr) { err = "mtp: chains need prepare_chain"; return false; }
-    if (T < 1 || T > max_t_ || a < 0 || a >= T || n_out < 1 || n_out > max_t_ - 1 || n_force < 0 || n_force > n_out ||
+    if (T < 1 || T > max_t_ || a < 0 || a >= T || n_out < 1 || n_out > max_t_ - 1 || n_out > strata::kernels::kVerifyMaxTBase ||
+        n_force < 0 || n_force > n_out ||
         n_force > 16) {
         err = "mtp: chain arguments out of range";
         return false;

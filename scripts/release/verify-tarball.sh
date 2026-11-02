@@ -23,6 +23,14 @@ P=$(ls -d "$T"/talus-*/ | head -1); P=${P%/}; echo "  prefix $P"
 (cd "$P" && sha256sum --quiet -c SHA256SUMS) && ok "SHA256SUMS ($(wc -l < "$P/SHA256SUMS") files)" || bad "SHA256SUMS"
 for f in MANIFEST.json LICENSE THIRD_PARTY_NOTICES.md bin/libtalus_kernels.so bin/talus-cli bin/talus-server bin/talus-tui; do
   [ -e "$P/$f" ] || bad "missing $f"; done
+# hipBLASLt prefill tuning tables next to the kernel library (talus#50): without them the prompt runs untuned
+nt=$(ls "$P"/bin/hip/*-hipblaslt-*.txt 2>/dev/null | wc -l)
+[ -f "$P/bin/hip/gfx1151-hipblaslt-100500.txt" ] && ok "bin/hip: $nt hipBLASLt tuning tables (gfx1151 100500 present)" \
+  || bad "missing bin/hip/gfx1151-hipblaslt-100500.txt (hipBLASLt tuning table)"
+# Flash-Next's data files and preparation tools (scripts/release/side-files.txt)
+SF=$(dirname "$0")/side-files.txt; miss=""
+for f in $(grep -v '^[[:space:]]*#' "$SF" | grep .); do [ -f "$P/$f" ] || miss="$miss $f"; done
+[ -z "$miss" ] && ok "side files: $(grep -v '^[[:space:]]*#' "$SF" | grep -c .) (data/, tools/)" || bad "missing side files:$miss"
 
 # programs run (no model, no GPU: --help paths do not load HIP)
 for b in talus-cli talus-server talus-setup; do
@@ -40,6 +48,7 @@ else bad "talus-tui --once rc=$rc: $out"; fi
 SYS="libc.so.6 libm.so.6 libgcc_s.so.1 ld-linux-x86-64.so.2 libstdc++.so.6 libdl.so.2 libpthread.so.0 librt.so.1"
 ROCM=$(python3 -c "import json,sys; print(' '.join(json.load(open(sys.argv[1]))['runtime']['rocm_sonames']))" "$P/MANIFEST.json")
 for f in "$P"/bin/*; do
+  [ -f "$f" ] || continue
   n=$(readelf -d "$f" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | tr '\n' ' ')
   for l in $n; do
     case " $SYS " in *" $l "*) continue;; esac

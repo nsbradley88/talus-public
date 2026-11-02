@@ -154,11 +154,12 @@ impl ServiceState {
                     args.insert(0, config.model_path.clone());
                     args.insert(0, "--model".to_string());
                 }
-                let sub = StdioSubprocessEngine::spawn_with_cwd(
+                let sub = StdioSubprocessEngine::spawn_with_log(
                     exe,
                     &args,
                     &config.engine_env,
                     config.cwd.as_deref(),
+                    config.log_path.as_deref(),
                     config.max_context,
                 )
                 .map_err(|e| format!("failed to start engine {}: {e}", exe.display()))?;
@@ -1506,6 +1507,13 @@ fn handle_post(
     }
 }
 
+/// #40: an engine's memory refusal (`ERR insufficient_memory: ...`: the host stayed under its MemAvailable floor
+/// after the engine shed its caches; the engine keeps serving) -> the OpenAI error code; None for other errors.
+pub fn engine_err_code(msg: &str) -> Option<&'static str> {
+    msg.contains("insufficient_memory")
+        .then_some("insufficient_memory")
+}
+
 fn send_post_error(
     stream: &mut TcpStream,
     path: &str,
@@ -1530,10 +1538,15 @@ fn send_post_error(
         ]);
         write_json(stream, code, &body, &[])
     } else {
+        let kind = if err_code == Some("insufficient_memory") {
+            "server_error"
+        } else {
+            "invalid_request_error"
+        };
         let body = JsonValue::obj(vec![(
             "error",
             JsonValue::obj(vec![
-                ("type", JsonValue::from("invalid_request_error")),
+                ("type", JsonValue::from(kind)),
                 ("message", JsonValue::from(message)),
                 ("param", JsonValue::from(param)),
                 ("code", JsonValue::from(err_code)),
@@ -2049,7 +2062,10 @@ fn handle_llama_completion(
         let mut timings = match res {
             Ok(t) => t,
             Err(e) => {
-                return send_post_error(stream, "/completion", 500, &e.to_string(), None, None);
+                let msg = e.to_string();
+                let code = engine_err_code(&msg);
+                let status = if code.is_some() { 503 } else { 500 };
+                return send_post_error(stream, "/completion", status, &msg, None, code);
             }
         };
         let tail = detok.flush();
@@ -2793,13 +2809,14 @@ fn handle_openai_chat(
         let out = match run_chat_generation(&prep, state, cancel, |_ev| true) {
             Ok(o) => o,
             Err(e) => {
+                let msg = e.to_string();
                 return send_post_error(
                     stream,
                     "/v1/chat/completions",
                     503,
-                    &e.to_string(),
+                    &msg,
                     None,
-                    None,
+                    engine_err_code(&msg),
                 );
             }
         };
@@ -3129,11 +3146,12 @@ fn handle_responses(
         }) {
             Ok(o) => o,
             Err(e) => {
+                let msg = e.to_string();
                 let body = responses_error_body(
-                    &e.to_string(),
+                    &msg,
                     "server_error",
                     None,
-                    Some("server_error"),
+                    Some(engine_err_code(&msg).unwrap_or("server_error")),
                 );
                 return write_json(stream, 503, &body, &[]);
             }
@@ -3617,4 +3635,20 @@ fn anthropic_collect(events: &[(String, JsonValue)]) -> JsonValue {
     }
     msg.insert("content", JsonValue::Array(blocks));
     msg
+}
+
+#[cfg(test)]
+mod mempr_tests {
+    use super::engine_err_code;
+
+    #[test]
+    fn engine_memory_refusal_has_its_code() {
+        assert_eq!(
+            engine_err_code(
+                "insufficient_memory: host MemAvailable 7900 MiB is below the 8192 MiB floor"
+            ),
+            Some("insufficient_memory")
+        );
+        assert_eq!(engine_err_code("bad prompt ids"), None);
+    }
 }

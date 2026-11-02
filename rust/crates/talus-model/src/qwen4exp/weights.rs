@@ -485,6 +485,20 @@ t2 0 0 {q_off} 10 128 14 8 0 2 0 4 0 1 4 8 2 1 0\n"
         // the last chunk (904) is below stream_all_min: plain
         assert_eq!(serve_equal_chunk(5000, 4096, true, 1024), 4096);
         assert_eq!(serve_equal_chunk(9000, 4096, true, 128), 3072);
+        // talus#49 geometry with STRATA_PREFILL_EQUAL=1 (opt-in since v0.1.2-rc2; --prefill auto:16384,
+        // STRATA_PREFILL_STREAM_MIN=128), checked with STRATA_TRACE
+        assert_eq!(serve_equal_chunk(19000, 16384, true, 128), 9728);
+        assert_eq!(serve_equal_chunk(24000, 16384, true, 128), 12032);
+        assert_eq!(serve_equal_chunk(33000, 16384, true, 128), 11008);
+        assert_eq!(serve_equal_chunk(8192, 16384, true, 128), 8192);
+        assert_eq!(serve_equal_chunk(65536, 16384, true, 128), 16384);
+        // a short last chunk under stream_all_min keeps the plain split (the reference path's 1024 default)
+        assert_eq!(serve_equal_chunk(33000, 16384, true, 1024), 16384);
+        // the default (off, talus#55) serves the plain split: full 16384 chunks and a short last one
+        assert_eq!(serve_equal_chunk(19000, 16384, false, 128), 16384);
+        assert_eq!(serve_equal_chunk(24000, 16384, false, 128), 16384);
+        assert_eq!(serve_equal_chunk(33000, 16384, false, 128), 16384);
+        assert_eq!(serve_equal_chunk(8192, 16384, false, 128), 8192);
     }
 
     #[test]

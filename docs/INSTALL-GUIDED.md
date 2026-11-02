@@ -62,17 +62,18 @@ Run the same command again at any time: finished steps are skipped and a stopped
   3  GLM-5.3-Flash          118 GB  64K     headless only  .. / ... tok/s   MIT
   4  MiMo-V2.6-Flash         98 GB  192K    tight          .. / ... tok/s   MIT
   5  Laguna-S-2.1            73 GB  256K    yes            .. / ... tok/s   OpenMDW-1.1
-  Speeds: tokens per second in chat (answer) and reading a 2K prompt, from the release run.
+  Speeds: tokens per second in chat (answer) and reading a 2K prompt, v0.1.2 on a GMKtec EVO-X2 desktop (Ryzen AI Max+ 395, 128 GB, about 120 W); a 70 W laptop is slower.
   Models to install (numbers like 1,5 or all): [1]
 ```
 
-(The real table shows the speeds of the release run; [RESULTS.md](RESULTS.md) has them all.)
+(The real table shows rounded chat and 2K-prompt speeds of v0.1.2 measured on that desktop during release testing;
+[RESULTS.md](RESULTS.md) has the release run's figures, within about 1 % of them, and the machine each figure comes
+from.)
 
-- **Download** is the size with the drafters (speculative decoding), which are on by default. One drafter is not
-  downloaded by default: Laguna-S-2.1's DFlash drafter, a community conversion whose license is unclear (check its
-  repository, [wimmmm/poolside-Laguna-S-2.1-DFlash-GGUF](https://huggingface.co/wimmmm/poolside-Laguna-S-2.1-DFlash-GGUF),
-  before use). Without it Laguna drafts with prompt lookup; `--advanced` shows the source and asks, and
-  `--opt-in-drafters` takes it.
+- **Download** is the size with the drafters (speculative decoding), which are on by default. Since v0.1.2 that
+  includes Laguna-S-2.1's DFlash drafter, our Q8_0 of poolside's drafter
+  ([j2ipper/Laguna-S-2.1-DFlash-GGUF](https://huggingface.co/j2ipper/Laguna-S-2.1-DFlash-GGUF), OpenMDW-1.1).
+  `--advanced` can turn the drafters off; Laguna then drafts with prompt lookup.
 - **With desktop** says whether the model fits while a desktop session runs: Qwen3.8-27B, Qwen3.8-Flash-Next and
   Laguna-S-2.1 do; MiMo-V2.6-Flash is tight; GLM-5.3-Flash needs the machine without a desktop session. Under the
   table, setup also says what stops a model from fitting on your machine right now.
@@ -84,8 +85,7 @@ listed in [MODELS.md](MODELS.md), resume where they stopped, and are checked aga
 publish. If you have an `HF_TOKEN` for Hugging Face rate limits, it is used, never printed and never stored.
 
 `talus setup --advanced` asks more: the folder for the model files, the drafters on or off, Qwen3.8-27B's 4-bit
-prompt weights (an opt-in with a trade-off: faster prompt reading, slower answers after it; setup shows the
-details), its Fast-tier file (which did not pass our quality gate; setup warns), and whether the server should be
+prompt weights (v3, 2.2 GB, downloaded by default; Talus uses them by default for faster prompt reading), its Fast-tier file (which did not pass our quality gate; setup warns), and whether the server should be
 reachable from your network (it then makes an API key).
 
 ## System settings

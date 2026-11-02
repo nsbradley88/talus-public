@@ -230,6 +230,8 @@ tk_status tk_prefill_ctx_init(tk_ctx* ctx) TK_NOEXCEPT;
 
 /** Destroy and release all prefill state associated with `ctx` (no-op if `ctx == NULL`). */
 void tk_prefill_ctx_destroy(tk_ctx* ctx) TK_NOEXCEPT;
+/// #40: free the prompt path's grown caches (dense MMQ buffer, MMQ launch context); rebuilt on next use.
+tk_status tk_prefill_trim(tk_ctx* ctx) TK_NOEXCEPT;
 
 /**
  * Load a per-architecture hipBLASLt tuning table into `ctx`'s prefill state from `dir_or_file`.

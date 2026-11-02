@@ -38,6 +38,12 @@ pub struct SysInfo {
     pub desktop_active: bool,
     /// `systemctl --user` works (a user service can be installed).
     pub user_systemd: bool,
+    /// `/sys/firmware/acpi/platform_profile` (None: the firmware has no ACPI platform profile).
+    pub platform_profile: Option<String>,
+    /// `/sys/firmware/acpi/platform_profile_choices`.
+    pub platform_profile_choices: Vec<String>,
+    /// `powerprofilesctl get`: power-profiles-daemon (or tuned-ppd) manages the profile.
+    pub ppd_profile: Option<String>,
 }
 
 impl SysInfo {
@@ -219,6 +225,12 @@ pub fn probe(root: &Path) -> SysInfo {
             );
         }
     }
+    s.platform_profile = read(root, crate::power::SYSFS)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    s.platform_profile_choices = read(root, crate::power::SYSFS_CHOICES)
+        .map(|v| v.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default();
     let etc_group = read(root, "/etc/group").unwrap_or_default();
     s.kfd_group = file_gid(&root.join("dev/kfd")).and_then(|g| group_name(&etc_group, g));
     s.render_group = std::fs::read_dir(root.join("dev/dri"))
@@ -253,6 +265,7 @@ pub fn probe(root: &Path) -> SysInfo {
             .status()
             .map(|st| st.success())
             .unwrap_or(false);
+        s.ppd_profile = run("powerprofilesctl", &["get"]).filter(|v| !v.is_empty());
     }
     s
 }
@@ -311,6 +324,15 @@ mod tests {
         assert_eq!(s.gtt_total, Some(128849018880));
         assert_eq!(s.kho_default_on, Some(true));
         assert!(s.mem_total_gib() > 124.0);
+        assert_eq!(s.platform_profile.as_deref(), Some("performance"));
+        assert_eq!(
+            s.platform_profile_choices,
+            vec!["low-power", "balanced", "performance"]
+        );
+        assert_eq!(s.ppd_profile, None, "no commands run on a fake root");
+        std::fs::remove_dir_all(root).ok();
+        let root = crate::testutil::fake_halo_root("probe-fresh", false);
+        assert_eq!(probe(&root).platform_profile.as_deref(), Some("balanced"));
         std::fs::remove_dir_all(root).ok();
     }
 

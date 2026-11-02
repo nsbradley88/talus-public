@@ -426,6 +426,11 @@ pub fn serve_main(engine: &mut MimoEngine) -> Result<()> {
             ));
             continue;
         }
+        // #40: refuse just this request when the host is under the MemAvailable floor (no rebuildable caches here)
+        if let Err(e) = talus_mem::pressure::admit(&mut talus_mem::pressure::NoShed) {
+            emit(&talus_mem::pressure::err_line(&e.to_string()));
+            continue;
+        }
         if sp.seed >= 0 {
             rng.seed(sp.seed as u64);
         }

@@ -3,8 +3,8 @@
 //! Names, licenses, memory floors and the trade-off text of each option come from `talus_presets::MODELS` (the
 //! catalog the TUI and the server use). This file adds only what the catalog does not have: the files to download
 //! (Hugging Face repository, path, size, SHA-256, exactly as docs/MODELS.md lists them), how well each model fits
-//! next to a desktop session (docs/MODELS.md "System setup") and a one-line speed headline from the release run
-//! (docs/RESULTS.md, release `RELEASE`).
+//! next to a desktop session (docs/MODELS.md "System setup") and a one-line speed headline (`SPEED_SOURCE`: the v0.1.2 run;
+//! memory figures: docs/RESULTS.md, release `RELEASE`).
 //!
 //! The SHA-256 values are the ones Hugging Face publishes for each file (the LFS object id), and for our own
 //! repositories (j2ipper/*) also the repositories' SHA256SUMS files; `download::published_sha256` checks them again
@@ -12,8 +12,11 @@
 
 use talus_presets::ModelSpec;
 
-/// The release the speed headlines and memory figures come from.
+/// The release the memory figures come from.
 pub const RELEASE: &str = "43c94474";
+/// Where the speed headlines (`chat_tps`, `prompt_tps`) come from: v0.1.2 measured on rc1 through the shipped talus-server.
+pub const SPEED_SOURCE: &str =
+    "v0.1.2 on a GMKtec EVO-X2 desktop (Ryzen AI Max+ 395, 128 GB, about 120 W)";
 /// The ROCm SDK the release was built and measured with: the repository's `rocm.version` file, which install.sh
 /// reads too (one place to re-pin).
 pub const ROCM_VERSION_FILE: &str = include_str!("../../../../rocm.version");
@@ -27,6 +30,19 @@ pub fn parse_rocm_version(text: &str) -> Option<&str> {
     text.lines()
         .map(str::trim)
         .find(|l| !l.is_empty() && !l.starts_with('#'))
+}
+
+/// The pinned SDK's HIP version (`# hip: <major.minor.patch>` in `rocm.version`), if the file names one.
+pub fn rocm_hip_version() -> Option<&'static str> {
+    parse_rocm_hip_version(ROCM_VERSION_FILE)
+}
+
+pub fn parse_rocm_hip_version(text: &str) -> Option<&str> {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix('#'))
+        .filter_map(|l| l.trim().strip_prefix("hip:"))
+        .map(str::trim)
+        .find(|v| !v.is_empty())
 }
 /// The model a first install recommends: the smallest, and it fits next to a desktop.
 pub const DEFAULT_MODEL: &str = "qwen3.8-27b";
@@ -42,7 +58,8 @@ pub enum Role {
     DraftVocab,
     /// A drafter we do not download by default (its license is unclear). Opt-in, needs the drafters on.
     DrafterOptIn,
-    /// Qwen3.8-27B's 4-bit prompt weights (`TALUS_Q27_W4I=auto`). Opt-in.
+    /// Qwen3.8-27B's 4-bit prompt weights (format v3, used by default when present; `TALUS_Q27_W4I=0` off).
+    /// Offered opt-in until the j2ipper/Qwen3.8-27B-W4A4-prompt-v3 upload is live (then `Choices::default().w4i`).
     W4i,
     /// Qwen3.8-27B's Fast-tier prompt weights (`TALUS_Q27_W4I=fast`). Opt-in; failed the quality gate.
     W4iFast,
@@ -118,7 +135,7 @@ pub struct ModelInstall {
     /// GiB of optional speed copies the engine places only when they fit (the 27B's wide verify tile-plane copies,
     /// 13 GiB: dropped first, before the context shrinks, when memory is short or other programs use it); 0: none.
     pub auto_pack_gib: u32,
-    /// Release run: answer speed in chat (tok/s) and prompt speed at 2K (tok/s).
+    /// `SPEED_SOURCE` run: answer speed in chat (tok/s) and prompt speed at 2K (tok/s).
     pub chat_tps: f32,
     pub prompt_tps: f32,
     /// Shipped context, for the table.
@@ -171,13 +188,14 @@ impl ModelInstall {
 pub struct Choices {
     /// Drafters and draft vocabularies (speculative decoding). On by default.
     pub drafters: bool,
-    /// Qwen3.8-27B's 4-bit prompt weights (`.w4i`, 2 GiB). Opt-in.
+    /// Qwen3.8-27B's 4-bit prompt weights (`.w4i` v3, 2.2 GB). On by default (the v3 upload is live).
     #[serde(default)]
     pub w4i: bool,
     /// Qwen3.8-27B's Fast-tier prompt weights (`.fast.w4i`, 8 GiB). Opt-in, failed the quality gate.
     #[serde(default)]
     pub w4i_fast: bool,
-    /// Opt-in drafters (Laguna-S-2.1's DFlash drafter: license unclear). Off by default.
+    /// Opt-in drafters (`Role::DrafterOptIn`; no model has one since Laguna's DFlash drafter became a default
+    /// drafter in v0.1.2). Off by default.
     #[serde(default)]
     pub opt_drafter: bool,
 }
@@ -186,7 +204,7 @@ impl Default for Choices {
     fn default() -> Self {
         Choices {
             drafters: true,
-            w4i: false,
+            w4i: true,
             w4i_fast: false,
             opt_drafter: false,
         }
@@ -241,11 +259,13 @@ pub const MODELS: &[ModelInstall] = &[
                 sha256: "a1a7c29a4262fa8658c91f2855c99d2feef443dd01f04a56aca6d8b484167457",
                 role: Role::DraftVocab,
             },
+            // rd-q4quant v3 (c48): the default-on 4-bit prompt sidecar (layers 48-63, format v3). The v2 file of
+            // j2ipper/Qwen3.8-27B-W4A4-prompt stays published for older Talus versions.
             FileSpec {
-                repo: "j2ipper/Qwen3.8-27B-W4A4-prompt",
+                repo: "j2ipper/Qwen3.8-27B-W4A4-prompt-v3",
                 path: "Qwen3.8-27B-UD-IQ4_XS.w4i",
-                size: 2_142_248_960,
-                sha256: "b4f8d947e0a2d48382d331c9a4eb3e72032801e80c48cb2c1172bfe15bb4a105",
+                size: 2_208_309_248,
+                sha256: "2a4f69c3918218d3f1b6fbdf3a3278c65077ee042c4cee51e5b99e455862935d",
                 role: Role::W4i,
             },
             FileSpec {
@@ -267,8 +287,8 @@ pub const MODELS: &[ModelInstall] = &[
         release_free_gib: 41,
         auto_context_gib: 12,
         auto_pack_gib: 13,
-        chat_tps: 46.7,
-        prompt_tps: 443.0,
+        chat_tps: 51.3,
+        prompt_tps: 599.0,
         context: "256K",
     },
     ModelInstall {
@@ -305,8 +325,8 @@ pub const MODELS: &[ModelInstall] = &[
         release_free_gib: 51,
         auto_context_gib: 0,
         auto_pack_gib: 0,
-        chat_tps: 58.9,
-        prompt_tps: 970.0,
+        chat_tps: 62.2,
+        prompt_tps: 1093.0,
         context: "256K",
     },
     ModelInstall {
@@ -356,8 +376,8 @@ pub const MODELS: &[ModelInstall] = &[
         release_free_gib: 9,
         auto_context_gib: 0,
         auto_pack_gib: 0,
-        chat_tps: 32.4,
-        prompt_tps: 452.0,
+        chat_tps: 34.1,
+        prompt_tps: 564.0,
         context: "64K",
     },
     ModelInstall {
@@ -407,8 +427,8 @@ pub const MODELS: &[ModelInstall] = &[
         release_free_gib: 14,
         auto_context_gib: 0,
         auto_pack_gib: 0,
-        chat_tps: 35.8,
-        prompt_tps: 597.0,
+        chat_tps: 38.1,
+        prompt_tps: 739.0,
         context: "192K",
     },
     ModelInstall {
@@ -436,12 +456,18 @@ pub const MODELS: &[ModelInstall] = &[
                 role: Role::Weights,
             },
             FileSpec {
-                // the DFlash drafter of the release runs (byte-identical); opt-in: its license is unclear
-                repo: "wimmmm/poolside-Laguna-S-2.1-DFlash-GGUF",
+                // the DFlash drafter, on by default since v0.1.2 (talus#53): our Q8_0 of poolside's BF16 GGUF
+                // (poolside/Laguna-S-2.1-GGUF laguna-s-2.1-DFlash-BF16.gguf, sha256 2ee8aa30..., OpenMDW-1.1),
+                // llama-quantize b12032 Q8_0. All 76 tensors byte-identical to the release runs' file (below); the
+                // GGUF adds 4 metadata keys of poolside's newer conversion that Talus does not read.
+                // Fallback until j2ipper/Laguna-S-2.1-DFlash-GGUF is live: the community file of the release runs,
+                //   repo: "wimmmm/poolside-Laguna-S-2.1-DFlash-GGUF", size: 1_188_531_360,
+                //   sha256: "d4e698ad542a66a961a7194f858193708db32546c5786de2bc5ed6addabc9075",
+                repo: "j2ipper/Laguna-S-2.1-DFlash-GGUF",
                 path: "laguna-s-2.1-dflash-Q8_0.gguf",
-                size: 1_188_531_360,
-                sha256: "d4e698ad542a66a961a7194f858193708db32546c5786de2bc5ed6addabc9075",
-                role: Role::DrafterOptIn,
+                size: 1_188_531_584,
+                sha256: "b8dd55dddf48a32442c100493b4bdd7e2b2ec25bafcef46d1c977405abdcebf7",
+                role: Role::Drafter,
             },
         ],
         prep: Prep::None,
@@ -452,16 +478,15 @@ pub const MODELS: &[ModelInstall] = &[
         release_free_gib: 38,
         auto_context_gib: 0,
         auto_pack_gib: 0,
-        chat_tps: 34.6,
-        prompt_tps: 965.0,
+        chat_tps: 37.4,
+        prompt_tps: 1164.0,
         context: "256K",
     },
 ];
 
 /// What setup says about an opt-in drafter before offering it.
-pub const OPT_DRAFTER_NOTE: &str = "Laguna-S-2.1's DFlash drafter (laguna-s-2.1-dflash-Q8_0.gguf, 1.2 GB) comes from \
-wimmmm/poolside-Laguna-S-2.1-DFlash-GGUF, a community conversion of poolside/Laguna-S-2.1-DFlash. Its license is \
-unclear: check the repository before you use it. Without it Laguna drafts with prompt lookup.";
+pub const OPT_DRAFTER_NOTE: &str =
+    "This drafter is not downloaded by default: check its license first.";
 
 pub fn get(id: &str) -> Option<&'static ModelInstall> {
     MODELS.iter().find(|m| m.id == id)
@@ -561,47 +586,45 @@ mod tests {
             .map(|f| f.local_name())
             .collect();
         assert!(names.contains(&"mtp-Qwen3.8-27B-Q4_0.gguf"));
-        assert!(!names.iter().any(|n| n.ends_with(".w4i")));
+        // v0.1.2: the v3 4-bit prompt sidecar is a default download; the Fast tier stays opt-in
+        assert!(names.contains(&"Qwen3.8-27B-UD-IQ4_XS.w4i"));
+        assert!(!names.iter().any(|n| n.ends_with(".fast.w4i")));
+        let no_w4 = Choices { w4i: false, ..d };
+        assert!(!q
+            .selected_files(&no_w4)
+            .iter()
+            .any(|f| f.local_name().ends_with(".w4i")));
         let no_draft = Choices {
             drafters: false,
+            w4i: false,
             ..d
         };
         assert_eq!(q.selected_files(&no_draft).len(), 1);
-        let w4 = Choices { w4i: true, ..d };
-        assert!(q
-            .selected_files(&w4)
-            .iter()
-            .any(|f| f.local_name() == "Qwen3.8-27B-UD-IQ4_XS.w4i"));
-        // about 17 GB with drafters, as the docs say
-        let gb = q.download_bytes(&d) as f64 / 1e9;
+        // about 17 GB with drafters plus the 2.2 GB sidecar
+        let gb = q.download_bytes(&no_w4) as f64 / 1e9;
         assert!((16.0..18.0).contains(&gb), "{gb}");
+        let gb = q.download_bytes(&d) as f64 / 1e9;
+        assert!((18.0..20.5).contains(&gb), "{gb}");
     }
 
     #[test]
-    fn laguna_dflash_is_opt_in() {
+    fn laguna_dflash_is_default() {
+        // talus#53 (v0.1.2): the DFlash drafter comes with the drafters (on by default); drafters off leaves it out
         let l = get("laguna-s-2.1").unwrap();
         let d = Choices::default();
-        assert!(!l
+        assert!(l
             .selected_files(&d)
             .iter()
-            .any(|f| f.role == Role::DrafterOptIn));
-        let on = Choices {
-            opt_drafter: true,
-            ..d
-        };
-        assert!(l
-            .selected_files(&on)
-            .iter()
             .any(|f| f.local_name() == "laguna-s-2.1-dflash-Q8_0.gguf"));
+        assert!(!MODELS.iter().any(|m| m.has_role(Role::DrafterOptIn)));
         let off = Choices {
-            opt_drafter: true,
             drafters: false,
             ..d
         };
         assert_eq!(
             l.selected_files(&off).len(),
             3,
-            "the opt-in needs the drafters on"
+            "drafters off: the weights only"
         );
         assert_eq!(rocm_version(), "10.2.0a20261014");
         assert_eq!(

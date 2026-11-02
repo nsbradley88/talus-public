@@ -5,6 +5,7 @@
 //!     src/                       the Talus source (git clone), unless install.sh ran from a checkout
 //!     rocm/                      the ROCm SDK (TheRock wheels in a Python venv), unless ROCM_SDK was given
 //!     bin/                       talus-cli, talus-server, talus-tui, talus-setup, libtalus_kernels.so
+//!         hip/                   hipBLASLt prefill tuning tables <arch>-hipblaslt-<version>.txt (found by the library)
 //!     models/<model-id>/         downloaded model files (or --models-dir)
 //!     pyenv/                     Python tools for the Flash-Next pack (numpy, regex, llama.cpp's gguf-py)
 //! ~/.config/talus/               $XDG_CONFIG_HOME/talus
@@ -70,6 +71,10 @@ impl Paths {
     }
     pub fn bin(&self) -> PathBuf {
         self.data.join("bin")
+    }
+    /// The hipBLASLt prefill tuning tables, next to libtalus_kernels.so (where the library looks first).
+    pub fn tuning_dir(&self) -> PathBuf {
+        self.bin().join("hip")
     }
     pub fn rocm_venv(&self) -> PathBuf {
         self.data.join("rocm")

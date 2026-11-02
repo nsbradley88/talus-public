@@ -44,6 +44,16 @@ export CARGO_PROFILE_RELEASE_STRIP=debuginfo CARGO_INCREMENTAL=0
 ST=/tmp/stage/$PKG; rm -rf /tmp/stage; mkdir -p $ST/bin $ST/licenses
 for b in $BINS; do install -m 0755 /src/rust/target/release/$b $ST/bin/$b; done
 install -m 0755 "$SO" $ST/bin/libtalus_kernels.so
+# hipBLASLt prefill tuning tables (talus#50): next to the kernel library, where it finds them without
+# STRATA_HIPBLASLT_TUNING (bin/hip/<arch>-hipblaslt-<hipBLASLt version>.txt; src/prefill/hipblaslt_tuning.hpp)
+mkdir -p $ST/bin/hip
+for t in /src/tools/hip/*-hipblaslt-*.txt; do install -m 0644 "$t" $ST/bin/hip/; done
+[ -f $ST/bin/hip/gfx1151-hipblaslt-100500.txt ] || { echo "no gfx1151 hipBLASLt table staged" >&2; exit 1; }
+# Flash-Next's data files and preparation tools at their source-tree paths under the prefix (talus setup takes them
+# from there; scripts/release/side-files.txt is the list)
+grep -v '^[[:space:]]*#' /src/scripts/release/side-files.txt | grep . | while read -r f; do
+  install -D -m 0644 "/src/$f" "$ST/$f"
+done
 cp -r /src/configs $ST/configs
 mkdir -p $ST/docs; cp /src/docs/*.md $ST/docs/
 for f in README.md LICENSE THIRD_PARTY_NOTICES.md SECURITY.md; do [ -f /src/$f ] && cp /src/$f $ST/$f; done

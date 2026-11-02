@@ -23,7 +23,7 @@ fn put(root: &Path, p: &str, s: &str) {
 }
 
 /// The release machine as files: Ubuntu 26.04, kernel 7.0, gfx1151, 125 GiB. `tuned`: the documented kernel
-/// parameters are set.
+/// parameters are set and the ACPI platform profile is `performance` (else `balanced`).
 pub fn fake_halo_root(tag: &str, tuned: bool) -> PathBuf {
     let r = tempdir(tag);
     put(&r, "etc/os-release", "NAME=\"Ubuntu\"\nID=ubuntu\nID_LIKE=debian\nVERSION_ID=\"26.04\"\nPRETTY_NAME=\"Ubuntu 26.04.1 LTS\"\n");
@@ -81,6 +81,16 @@ pub fn fake_halo_root(tag: &str, tuned: bool) -> PathBuf {
         &r,
         "sys/class/drm/card1/device/mem_info_gtt_total",
         "128849018880\n",
+    );
+    put(
+        &r,
+        "sys/firmware/acpi/platform_profile",
+        if tuned { "performance\n" } else { "balanced\n" },
+    );
+    put(
+        &r,
+        "sys/firmware/acpi/platform_profile_choices",
+        "low-power balanced performance\n",
     );
     put(
         &r,

@@ -12,7 +12,7 @@ cmake_minimum_required(VERSION 3.24)
 # release the fork is based on; TALUS_VERSION is the fork's own.  Internal names (strata:: namespaces, CMake targets)
 # stay Strata's so upstream merges stay cheap; the binaries are renamed at the end of this file.
 project(strata VERSION 0.1.44.1 LANGUAGES CXX)
-set(TALUS_VERSION 0.1.1)
+set(TALUS_VERSION 0.1.2)
 # EXPERIMENTAL: the Intel Arc engine, the SYCL port in sycl/ (PR #423; icpx + oneMKL, docs/INTEL_ARC.md). It is its
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
 option(STRATA_ENABLE_SYCL "EXPERIMENTAL: build the Intel Arc (SYCL) engine from sycl/ - docs/INTEL_ARC.md" OFF)
@@ -279,6 +279,13 @@ if(STRATA_BUILD_TESTS)
   add_executable(tuning_header_arch_family_test tests/prefill/tuning_header_arch_family_test.cpp)
   target_include_directories(tuning_header_arch_family_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill")
   add_test(NAME tuning_header_arch_family_test COMMAND tuning_header_arch_family_test)
+  # talus#50: where the table comes from (STRATA_HIPBLASLT_TUNING file / dir / off, auto-discovery next to
+  # libtalus_kernels.so) and that auto-discovery loads the same gfx1151 rows the old 100401-named config did
+  add_executable(tuning_resolve_test tests/prefill/tuning_resolve_test.cpp)
+  target_include_directories(tuning_resolve_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill")
+  target_compile_definitions(tuning_resolve_test PRIVATE TALUS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+  target_link_libraries(tuning_resolve_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME tuning_resolve_test COMMAND tuning_resolve_test)
   # the model description and the arch registry: GGUF metadata -> description, capability refusals, the per-layer
   # tensor check (synthetic; `model_desc_test --real SHARD [PACK]` checks a real model and pack, no GPU)
   add_executable(model_desc_test tests/core/model_desc_test.cpp)
@@ -617,11 +624,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_sources(strata_prefill PRIVATE src/prefill/wmma_gemm.cu)
     # Talus: the prompt kernels of the Talus prefill levers (gfx11 WMMA), in strata_prefill so that
     # libtalus_kernels (which links strata_prefill whole) carries them
-    target_sources(strata_prefill PRIVATE src/prefill/tp_fa.cu src/prefill/tp_i8gemm.cu src/prefill/tp_w4a4.cu src/prefill/tp_w4i.cu)
-    set_source_files_properties(src/prefill/tp_fa.cu src/prefill/tp_i8gemm.cu src/prefill/tp_w4a4.cu src/prefill/tp_w4i.cu PROPERTIES LANGUAGE HIP)
+    target_sources(strata_prefill PRIVATE src/prefill/tp_fa.cu src/prefill/tp_i8gemm.cu src/prefill/tp_w4a4.cu src/prefill/tp_w4i.cu src/prefill/tp_w16.cu)
+    set_source_files_properties(src/prefill/tp_fa.cu src/prefill/tp_i8gemm.cu src/prefill/tp_w4a4.cu src/prefill/tp_w4i.cu src/prefill/tp_w16.cu PROPERTIES LANGUAGE HIP)
   endif()
   target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
-  target_link_libraries(strata_prefill PUBLIC strata_engine ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  target_link_libraries(strata_prefill PUBLIC strata_engine ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target} ${CMAKE_DL_LIBS})
   if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)
     target_compile_definitions(strata_prefill PRIVATE STRATA_HIPBLASLT_AVAILABLE=1)
     target_link_libraries(strata_prefill PRIVATE roc::hipblaslt)
@@ -1699,6 +1706,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/laguna/laguna_kernels.cu
     src/laguna/talus_kernels_laguna.cpp
     src/qwen35/q36_kernels.cu
+    src/qwen35/q36_kv8.cu
     src/qwen35/q36_adraft.cu
     src/qwen35/q36_dflash.cu
   )
@@ -1733,6 +1741,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_source_files_properties(
       src/laguna/laguna_kernels.cu
       src/qwen35/q36_kernels.cu
+      src/qwen35/q36_kv8.cu
       src/qwen35/q36_adraft.cu
       src/qwen35/q36_dflash.cu
       PROPERTIES LANGUAGE HIP

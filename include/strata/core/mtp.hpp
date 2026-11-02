@@ -23,6 +23,7 @@
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"   // kVerifyMaxT sizes the per-width graph tables
 
 #include <cuda_runtime.h>
 
@@ -54,7 +55,9 @@ public:
         rr_res_ = res_row; rr_margin_ = margin; rr_lo_ = lo; rr_hi_ = hi;
     }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
-    void set_max_drafts(int k) { max_drafts_ = k; }
+    /// never more than kVerifyMaxTBase (the chain's step tables); a window wider than that (an FN copy window
+    /// of up to kVerifyMaxT rows) only has the drafter catch up on its rows.
+    void set_max_drafts(int k) { max_drafts_ = k < strata::kernels::kVerifyMaxTBase ? k : strata::kernels::kVerifyMaxTBase; }
     /// --mtp-hnorm stream (opt-in; before the first draft or prefill): pre_fc_norm_hidden normalizes each
     /// hyper-connection stream on its own, as llama.cpp's qwen4exp MTP graph does, instead of one RMS over all four.
     void set_hnorm_per_stream(bool on) { hnorm_stream_ = on; }
@@ -180,7 +183,7 @@ private:
     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
     // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
     bool setup_coupled(std::string& err);
-    cudaGraphExec_t round_exec_c_[9] = {};
+    cudaGraphExec_t round_exec_c_[strata::kernels::kVerifyMaxT + 1] = {};
     cudaGraphExec_t step_exec_c_[9] = {};
     bool coupled_ok_ = false, coupled_active_ = false;
     bool coupled_rec_ = false;   ///< record_forward: the full layer ends in the coupled sampler (draft coupled_j_)
@@ -201,7 +204,7 @@ private:
     const float* window_R_ = nullptr;
     int max_t_ = 0;
     int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
-    int max_drafts_ = 1 << 30;
+    int max_drafts_ = strata::kernels::kVerifyMaxTBase;   ///< was 1 << 30 (max_t - 1 <= 7 bounded it)
     bool hnorm_stream_ = false;
     bool q4_ = false, q4_head_ = false;
     uint8_t* dense4_ = nullptr;              ///< --mtp-q4: Q4_0 copies of the Q8_0 tensors
@@ -228,14 +231,14 @@ private:
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;
-    cudaGraphExec_t prefill_exec_[9] = {};
-    cudaGraphExec_t prefill_dev_exec_[9] = {};
+    cudaGraphExec_t prefill_exec_[strata::kernels::kVerifyMaxT + 1] = {};
+    cudaGraphExec_t prefill_dev_exec_[strata::kernels::kVerifyMaxT + 1] = {};
     PinnedRing pf_ring_;          ///< #1996: the records above go up from a pinned slot, not from the pageable vector they are built in
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
     int64_t pf_cap_ = 0;          ///< its capacity in ints
     cudaStream_t side_ = nullptr;                    // the shared expert's branch of the draft graphs (CUDA)
     cudaEvent_t sh_fork_ = nullptr, sh_join_ = nullptr;
-    cudaGraphExec_t round_exec_[9] = {};
+    cudaGraphExec_t round_exec_[strata::kernels::kVerifyMaxT + 1] = {};
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
     std::vector<Tensor> tensors_;

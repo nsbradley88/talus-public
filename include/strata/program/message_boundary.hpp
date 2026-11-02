@@ -17,4 +17,20 @@ inline int64_t message_checkpoint_boundary(const std::vector<int64_t>& ids, int6
     return -1;
 }
 
+// talus#60: a checkpoint at the prompt's end (n - 1, the state the reply starts from) for a request whose cuts leave
+// none near it.  A hybrid-recurrent model (Flash-Next: GDN layers) resumes only from the live state when it is a strict
+// prefix of the next prompt, or from a checkpoint; checkpoints were taken only at turn tokens (and every
+// --prompt-cache-every tokens), so a raw /completion prompt without a turn token kept none: the same prompt again, a
+// longer one, or a /slots restore of it reused 0 tokens.  Returns n - 1, or -1 when a checkpoint of this request is
+// within --short-read tokens of the end already (a chat prompt: its turn checkpoint) or there is no conversation cache.
+inline int64_t prompt_end_checkpoint(int64_t n, int64_t turn_at, int64_t root_at, int64_t message_at, int64_t pin_at,
+        int prompt_cache, bool req_ckpt, int64_t short_read) {
+    const int64_t end = n - 1;
+    if (prompt_cache <= 0 || !req_ckpt || end < 1) return -1;
+    int64_t nearest = 0;
+    for (const int64_t c : {turn_at, root_at, message_at, pin_at})
+        if (c <= end && c > nearest) nearest = c;
+    return end - nearest > (short_read > 0 ? short_read : 0) ? end : -1;
+}
+
 } // namespace strata::program

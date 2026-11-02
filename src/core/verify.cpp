@@ -51,6 +51,7 @@
 #include "strata/core/progress.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/verify_wide.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -594,7 +595,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                                              err);
 #endif
     if (const int rc = qwen4exp_r2v_ver_init(*this, r2v_check, err); rc != 0) return rc > 0;   // ---- qwen4exp-r2v
-    if (max_t < 2 || max_t > strata::kernels::kVerifyMaxT || max_t > strata::kernels::cpu::MAXT) {
+    // (the CPU expert pool takes a wider window's tokens per expert in jobs of <= cpu::MAXT)
+    if (max_t < 2 || max_t > strata::kernels::kVerifyMaxT) {
         err = "verify: the window must hold 2.." + std::to_string(strata::kernels::kVerifyMaxT) + " tokens";
         return false;
     }
@@ -883,6 +885,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int64_t IQ = g.idx_q_heads, ID = g.idx_key_dim, NE = g.n_expert, MT = max_t_;
     const QsaShapes s = shapes_of(g);
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
+    // a window wider than kVerifyMaxTBase needs the native expert layout (the S-form grouped kernels hold at
+    // most kVerifyMaxTBase entries per group) and is not a batch window
+    if (T > kVerifyMaxTBase && (batch_rec_ || !strata::kernels::cpu::expert_layout().native)) {
+        err = "verify: a window of more than " + std::to_string(kVerifyMaxTBase) + " tokens needs the native expert layout";
+        return false;
+    }
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
@@ -1024,10 +1032,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             const bool batched = !ple_batch_kv && ple_batch && n > 1 && (pw.key_bf16 != nullptr || nkey) && ple_native_bf16_enabled();
             if (ple_batch_kv) {
                 try {
-                    bf16_gemv_fp32_mmvf_multi(ple_ + (size_t) tb * N, N, ss.ple.w.key_bf16,
-                                              xn_ + (size_t) tb * HC * N, HC * N, N, HC * N, n, cs);
-                    bf16_gemv_fp32_mmvf_multi(ple_ + (size_t) tb * N, N, ss.ple.w.value_bf16,
-                                              z_ + (size_t) tb * N, N, N, N, n, cs);
+                    bf16_gemv_fp32_mmvf_multi_wide(ple_ + (size_t) tb * N, N, ss.ple.w.key_bf16,
+                                 xn_ + (size_t) tb * HC * N, HC * N, N, HC * N, n, cs);
+                    bf16_gemv_fp32_mmvf_multi_wide(ple_ + (size_t) tb * N, N, ss.ple.w.value_bf16,
+                                 z_ + (size_t) tb * N, N, N, N, n, cs);
                 } catch (const std::exception& e) {
                     err = std::string("verify PLE multi: ") + e.what();
                     return false;
@@ -1035,14 +1043,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             } else if (batched) {
                 try {
                     if (pw.key_bf16 != nullptr)
-                        bf16_gemv_fp32_mmvf_multi(ple_ + tb * N, N, pw.key_bf16, ple_key_ + (size_t) tb * NG_HC_DIM,
+                        bf16_gemv_fp32_mmvf_multi_wide(ple_ + tb * N, N, pw.key_bf16, ple_key_ + (size_t) tb * NG_HC_DIM,
                                                   NG_HC_DIM, N, NG_HC_DIM, n, cs);
                     else {
                         native_quantize_q8_1(ple_ + tb * N, xq_, (int) N, n, cs);
                         native_mmvq(pw.key_native_type, pw.key_native_data, xq_, ple_key_ + (size_t) tb * NG_HC_DIM,
                                     (int) N, NG_HC_DIM, n, cs);
                     }
-                    bf16_gemv_fp32_mmvf_multi(ple_ + tb * N, N, pw.value_bf16, ple_val_ + tb * N, N, N, N, n, cs);
+                    bf16_gemv_fp32_mmvf_multi_wide(ple_ + tb * N, N, pw.value_bf16, ple_val_ + tb * N, N, N, N, n, cs);
                 } catch (const std::exception& e) {
                     err = std::string("verify PLE batch: ") + e.what();
                     return false;
@@ -1101,7 +1109,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             pending = false;
         }
         auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out) {
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kVerifyMaxT];
             for (int t = tb; t < te; ++t) {
                 FusedGrArgs& a = fa[t - tb];
                 a.R = Rt(t); a.R_out = Rt(t); a.apply = apply;
@@ -1118,8 +1126,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     else if (strata::kernels::cpu::expert_layout().native) a.q8_mixed = nat_xq_ + (size_t) t * (N / 32) * 36;
                 }
             }
-            return fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
-                                (int) (l * kProfPer + (half == 0 ? 27 : 30)));
+            return fused_gr_read_multi_wide(fa, n, xn_ + (size_t) tb * HC * N, HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
+                                   (int) (l * kProfPer + (half == 0 ? 27 : 30)));
         };
         const bool q8_attn = gr_read_group(0, pending, inj2_, inj_);   // true: xq_ holds mixed's q8_1 (STRATA_QFUSE)
         {   // measurement only: STRATA_DUMMY_NODES=k adds k empty kernel nodes per layer (what one node costs in a window)
@@ -1284,11 +1292,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     norm_rope_on(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH, df_side_[0]);
                     if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, df_side_[0]);   // <Hq, Hk> = <q, k>
                     fork(1);
-                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID,
-                                              IQ * ID, N, IQ * ID, n, df_side_[1]);
+                    bf16_gemv_fp32_mmvf_multi_wide(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID,
+                                 IQ * ID, N, IQ * ID, n, df_side_[1]);
                     norm_rope_on(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ, df_side_[1]);
                 }
-                if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
+                if (qb) bf16_gemv_fp32_mmvf_multi_wide(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
                 else for (int t = tb; t < te; ++t)
                     bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
                 stamp(l, 7, grp);
@@ -1387,8 +1395,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     norm_rope(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH);
                     }
                     if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
-                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
-                                              N, IQ * ID, n, cs);
+                    bf16_gemv_fp32_mmvf_multi_wide(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
+                                 N, IQ * ID, n, cs);
                     norm_rope(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ);
                 } else {
                 for (int t = tb; t < te; ++t) {
@@ -1428,8 +1436,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                               attn_ + t * NH * HD, 1, cs);
                     }
                 } else {
-                qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
-                                 s, scores_ + (size_t) tb * max_blocks_, cs);
+                // a wide group's queries in two calls of <= 8, so each keeps the one-pass multi-query kernel
+                // (per (block, query) the arithmetic of the per-query kernel either way)
+                verify_row_chunks(n, [&](int c0, int c) {
+                    qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + (tb + c0) * IQ * ID, step_ + (tb + c0) * kStepCount, c,
+                                     max_blocks_, s, scores_ + (size_t) (tb + c0) * max_blocks_, cs);
+                });
                 qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
                                sel_ + (size_t) tb * cap_, cs);
                 stamp(l, 11, grp);
@@ -1492,8 +1504,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                              logits_ + tb * NE, NE, N, NE, n,
                                                              (const uint16_t*) w_sgi->data, sh_g_ + tb, 1, cs);
                 if (!sg_ready)
-                bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
-                                          NE, n, cs);
+                bf16_gemv_fp32_mmvf_multi_wide(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
+                             NE, n, cs);
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
 #if defined(STRATA_HIP_GFX906)
@@ -1579,6 +1591,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, sh_stream);
             }
             try {
+                // (up to 16 rows in one call; a wide group has no LFUSE, so no flags)
                 shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
                                     sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, sh_stream,
                                     qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36) : nullptr,
@@ -1760,7 +1773,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // (no pending write, no inject)
         const bool mix_q8 = hd->hc_q8 != nullptr && hu->hc_q8 != nullptr && head_ != nullptr && head_->loaded();
         if (mix_q8) {
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kVerifyMaxT];
             for (int t = 0; t < T; ++t) {
                 FusedGrArgs& a = fa[t];
                 a.R = Rt(t); a.R_out = Rt(t); a.apply = false;
@@ -1770,10 +1783,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
                 a.mixed = head_mixed_ + t * N;
             }
-            fused_gr_read_multi(fa, T, xn_, cs);
+            fused_gr_read_multi_wide(fa, T, xn_, HC * N, cs);
         }
         else if (fuse_head_gr) {
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kVerifyMaxT];
             for (int t = 0; t < T; ++t) {
                 FusedGrArgs& a = fa[t];
                 a.R = Rt(t); a.R_out = Rt(t); a.apply = true;
@@ -1788,7 +1801,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.inject_out = head_inj_;
                 a.mixed = head_mixed_ + t * N;
             }
-            fused_gr_read_multi(fa, T, xn_, cs);
+            fused_gr_read_multi_wide(fa, T, xn_, HC * N, cs);
         } else if (head_mix_multi_enabled() && head_ != nullptr && head_->loaded()) {
             // the final mixer, the window's tokens in one read (fused_gr_read_multi without the pending write: the
             // last layer's write was done above; its sums are gr_read's)
@@ -1796,14 +1809,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 err = "verify: the output_hc_* weights have the wrong engine forms";
                 return false;
             }
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kVerifyMaxT];
             for (int t = 0; t < T; ++t) {
                 fa[t].R = Rt(t); fa[t].R_out = Rt(t); fa[t].apply = false;
                 fa[t].w_norm = (const float*) hn->data; fa[t].w_down = (const uint16_t*) hd->data;
                 fa[t].w_up = (const uint16_t*) hu->data; fa[t].eps = EPS;
                 fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC; fa[t].mixed = head_mixed_ + t * N;
             }
-            fused_gr_read_multi(fa, T, xn_, cs);
+            fused_gr_read_multi_wide(fa, T, xn_, HC * N, cs);
         } else {
             for (int t = 0; t < T; ++t) {
                 BlockBuffers bb = ss.block;

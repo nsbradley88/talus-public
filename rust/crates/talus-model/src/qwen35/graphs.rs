@@ -1626,6 +1626,18 @@ impl DFlash {
         }
     }
 
+    /// talus#47: whether target layer `next` (`1..=n_layer`) feeds one of the taps (the match `tap` uses).
+    pub fn wants_tap(&self, next: i32) -> bool {
+        self.ready
+            && (0..K_DFLASH_TAPS).any(|j| {
+                if self.mdl.is_gguf {
+                    self.mdl.tap_layers[j] == next
+                } else {
+                    self.mdl.tap_layers[j] == next || (self.mdl.tap_layers[j] + 1) == next
+                }
+            })
+    }
+
     pub fn capture_tap(&mut self, li: i32, x_layer: *const f32, n_tok: i32) {
         let next = if self.mdl.is_gguf { li + 1 } else { li };
         self.tap(next, x_layer, n_tok, ptr::null_mut());
@@ -3456,6 +3468,9 @@ impl PromptCache {
 impl Q36Engine {
     /// Destroy all captured `hipGraphExec_t` handles (`Q36Engine::destroy_graphs`).
     pub fn destroy_graphs(&mut self) {
+        if self.cl.is_some() {
+            self.cl_destroy_graphs();
+        }
         unsafe {
             if !self.g1.is_null() {
                 let _ = hipGraphExecDestroy(self.g1);
@@ -3531,6 +3546,9 @@ impl Q36Engine {
             unsafe { hipStreamBeginCapture(self.s_main, HIP_STREAM_CAPTURE_MODE_RELAXED) },
             "hipStreamBeginCapture",
         )?;
+        if self.cl.is_some() {
+            self.cl_capture_begin();
+        }
         body(self);
         let mut gr: hipGraph_t = ptr::null_mut();
         hip_check(
@@ -3543,6 +3561,9 @@ impl Q36Engine {
             "hipGraphInstantiate",
         )?;
         let _ = unsafe { hipGraphDestroy(gr) };
+        if self.cl.is_some() {
+            return Ok(self.cl_capture_end(exec));
+        }
         Ok(exec)
     }
 
@@ -3661,7 +3682,7 @@ impl Q36Engine {
             let idx = n as usize;
             if idx < self.gS.len() && !self.gS[idx].is_null() {
                 unsafe {
-                    let _ = hipGraphLaunch(self.gS[idx], self.s_main);
+                    let _ = self.launch_graph(self.gS[idx]);
                 }
             } else {
                 self.chain_step(n);
@@ -3980,7 +4001,7 @@ impl Q36Engine {
         self.dfl_samp_prep();
         if self.opts.use_graph && !self.gDs.is_null() {
             unsafe {
-                let _ = hipGraphLaunch(self.gDs, self.s_main);
+                let _ = self.launch_graph(self.gDs);
             }
         } else {
             let out_d = unsafe { self.tok_d.add(1) };
@@ -4083,7 +4104,7 @@ impl Q36Engine {
             }
             if self.opts.use_graph && !self.gC[idx].is_null() {
                 unsafe {
-                    let _ = hipGraphLaunch(self.gC[idx], self.s_main);
+                    let _ = self.launch_graph(self.gC[idx]);
                 }
             } else {
                 self.draft_chain(D);
@@ -4124,7 +4145,7 @@ impl Q36Engine {
         }
         if self.opts.use_graph && !self.gA[idx].is_null() {
             unsafe {
-                let _ = hipGraphLaunch(self.gA[idx], self.s_main);
+                let _ = self.launch_graph(self.gA[idx]);
             }
         } else {
             self.forward_full(self.tok_d, T, self.pos0_d, T, true);
@@ -4235,7 +4256,7 @@ impl Q36Engine {
             };
             if self.opts.use_graph && !gx.is_null() {
                 unsafe {
-                    let _ = hipGraphLaunch(gx, self.s_main);
+                    let _ = self.launch_graph(gx);
                 }
             } else {
                 let stream = self.s_main.cast::<c_void>();
@@ -4334,7 +4355,7 @@ impl Q36Engine {
             };
             if self.opts.use_graph && !gx.is_null() {
                 unsafe {
-                    let _ = hipGraphLaunch(gx, self.s_main);
+                    let _ = self.launch_graph(gx);
                 }
             } else {
                 let stream = self.s_main.cast::<c_void>();
@@ -4495,7 +4516,7 @@ impl Q36Engine {
             };
             if self.opts.use_graph && !gx.is_null() {
                 unsafe {
-                    let _ = hipGraphLaunch(gx, self.s_main);
+                    let _ = self.launch_graph(gx);
                 }
             } else {
                 let stream = self.s_main.cast::<c_void>();
@@ -4618,7 +4639,7 @@ impl Q36Engine {
         };
         if self.opts.use_graph && !gx.is_null() {
             unsafe {
-                let _ = hipGraphLaunch(gx, self.s_main);
+                let _ = self.launch_graph(gx);
             }
         } else {
             let stream = self.s_main.cast::<c_void>();

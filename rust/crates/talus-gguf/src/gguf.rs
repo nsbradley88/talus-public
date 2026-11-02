@@ -453,6 +453,66 @@ impl GgufFile {
         )
     }
 
+    /// Opens a GGUF model that may be split into `llama-gguf-split` shards (`*-00001-of-0000N.gguf`, any shard's
+    /// path) as ONE flat file view: the shards are mapped back to back ([`Mmap::open_concat`]), every tensor's offset
+    /// is rebased onto the first shard's data section and the metadata is merged (the split.* keys of shard 1).
+    /// A path that is not a split shard opens as [`GgufFile::open`]. (the qwen35 loader takes one
+    /// `GgufFile`; the BF16 27B ships as two shards.)
+    #[cfg(target_os = "linux")]
+    pub fn open_any(path: impl AsRef<Path>) -> Result<Self> {
+        let paths = crate::split::gguf_split_paths(path.as_ref())?;
+        if paths.len() <= 1 {
+            return Self::open(path);
+        }
+        // validates the family (split.count / split.no / tensor counts, duplicate names, conflicting metadata)
+        let model = crate::split::GgufModel::open_paths(paths.iter())?;
+        let (map, bases) = Mmap::open_concat(&paths)?;
+        let shards = model.shards();
+        let first = &shards[0];
+        let mut tensors = Vec::new();
+        let mut tensor_index = BTreeMap::new();
+        for (i, sh) in shards.iter().enumerate() {
+            let shift = (bases[i] as u64 + sh.data_start)
+                .checked_sub(first.data_start)
+                .ok_or_else(|| GgufError::InvalidSplit {
+                    message: format!("shard {} data section precedes shard 1's", i + 1),
+                })?;
+            for t in sh.tensors() {
+                let mut e = t.clone();
+                e.offset = t.offset + shift;
+                tensor_index.insert(e.name.clone(), tensors.len());
+                tensors.push(e);
+            }
+        }
+        let mut metadata = model.metadata().clone();
+        for k in ["split.no", "split.count", "split.tensors.count"] {
+            metadata.remove(k);
+        }
+        let backing = Backing::Mmap(map);
+        let flat = Self {
+            path: first.path.clone(),
+            logical_file_size: backing.len() as u64,
+            backing,
+            version: first.version,
+            tensor_count: tensors.len() as u64,
+            metadata_kv_count: metadata.len() as u64,
+            alignment: first.alignment,
+            header_bytes: first.header_bytes,
+            data_start: first.data_start,
+            metadata,
+            tensors,
+            tensor_index,
+        };
+        for t in &flat.tensors {
+            if !flat.in_bounds(t) {
+                return Err(GgufError::InvalidSplit {
+                    message: format!("tensor {} lies outside the concatenated shards", t.name),
+                });
+            }
+        }
+        Ok(flat)
+    }
+
     /// Opens a header-only GGUF dump (such as `*.gguf.hdr`) with an optional explicit `logical_file_size`.
     ///
     /// If `logical_file_size` is `None`, checks for a companion `.size` file on disk.

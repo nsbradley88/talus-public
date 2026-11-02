@@ -190,6 +190,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
                  int n_in, int n_out, int ncols, void* stream);
 /// S26 STRATA_LFUSE: native_mmvq(w1 -> y1) and native_mmvq(w2 -> y2), same type / shape / input, in ONE launch,
 /// bitwise the two calls. Returns false (nothing launched) where that is not the case (Q8_0, 2-8 columns only).
+/// Where native_mmvq takes the wave32 kernels (native_mmvq_w32_active) it is native_mmvq_w32_multi (rd-fnrec, #22).
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                       int n_in, int n_out, int ncols, void* stream);
 

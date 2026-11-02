@@ -11,8 +11,10 @@ USAGE
   talus setup   [--advanced] [--yes] [--dry-run] [--allow-system-changes]
                 [--models LIST | --add LIST | --remove LIST] [--models-dir DIR]
                 [--port N] [--lan] [--no-start] [--no-service] [--force]
-                [--opt-in-drafters]  (Laguna-S-2.1's DFlash drafter: license unclear, off by default)
+                [--opt-in-drafters]  (opt-in drafters; none today: Laguna's DFlash drafter is a default since 0.1.2)
+                [--no-power-profile] (leave the ACPI platform profile alone)
   talus doctor  [--fix] [--yes] [--report] [--deep] [--offline] [--dry-run] [--allow-system-changes]
+                [--no-power-profile]
   talus hw      the hardware report only (read-only)
   talus update  [--check] [--rebuild] [--yes] [--dry-run]
   talus serve   run the server on the installed models (what the service runs)
@@ -24,6 +26,8 @@ LIST is model numbers, ids or short names, comma-separated: 1,5  or  27b,laguna 
 
 --yes takes every default without asking. Boot settings (kernel parameters) change only after you type
 \"yes\", or with --yes --allow-system-changes. Nothing ever reboots by itself.
+On Strix Halo, setup offers the \"performance\" ACPI platform profile Talus is measured with (default yes, so
+--yes takes it; it needs sudo and is kept across reboots). --no-power-profile skips it.
 --dry-run prints every action instead of doing it.
 HF_TOKEN (optional) raises Hugging Face rate limits; it is never printed or stored.
 ";
@@ -59,6 +63,7 @@ fn parse_setup(args: Vec<String>) -> Result<wizard::Args, String> {
             "--no-service" => a.no_service = true,
             "--no-download" => a.no_download = true,
             "--opt-in-drafters" => a.opt_in_drafters = true,
+            "--no-power-profile" => a.no_power_profile = true,
             "--force" => a.force = true,
             other => return Err(format!("unknown option for setup: {other}")),
         }
@@ -78,6 +83,7 @@ fn parse_doctor(args: Vec<String>) -> Result<doctor::Args, String> {
             "--dry-run" | "-n" => a.dry_run = true,
             "--allow-system-changes" => a.allow_system_changes = true,
             "--hw" => a.hw_only = true,
+            "--no-power-profile" => a.no_power_profile = true,
             other => return Err(format!("unknown option for doctor: {other}")),
         }
     }

@@ -38,6 +38,16 @@ pub struct GenStats {
     pub finish: String,
 }
 
+/// GLM_MEM_TRACE=1: MemAvailable after every prompt chunk (stream synchronized; diagnostics only).
+fn mem_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GLM_MEM_TRACE").as_deref() == Ok("1"))
+}
+
+fn ffi_sync(eng: &GlmEngine) -> Result<()> {
+    super::ffi::sync(eng.stream)
+}
+
 /// Sequence state between calls (single sequence).
 #[derive(Debug, Clone, Default)]
 pub struct SeqPos {
@@ -80,6 +90,8 @@ pub fn prefill_with(
     let mut i = 0;
     let mut last = vec![];
     while i < toks.len() {
+        // #40: memory-pressure safe point (one atomic load unless the guard latched a low reading)
+        eng.pressure_point()?;
         // prefill chunks aligned to absolute multiples of PCH (the MMQ path above TMAX tokens)
         let mut t = (toks.len() - i).min(pch() - (seq.n_past + i) % pch());
         // a snapshot point inside the window: captured mid-window when the window is sliced and the point sits on
@@ -103,6 +115,13 @@ pub fn prefill_with(
         let pos0 = seq.n_past + i;
         let cur = eng.st.cur_slot as i32;
         let r = eng.trunk(&toks[i..i + t], pos0, &[cur], 1);
+        if mem_trace() {
+            let _ = ffi_sync(eng);
+            eprintln!(
+                "glm-mem: chunk pos {pos0} rows {t} MemAvailable {} MiB",
+                super::weights::mem_available_bytes() >> 20
+            );
+        }
         let mid_done = eng.snap_mid.take().is_some();
         r?;
         if mid_done {
@@ -204,6 +223,7 @@ pub fn generate(
     let mut copy_buf: Vec<i32> = Vec::new();
     let mut indexed = 0usize; // tokens of `out` in the copy index
     while !stop && out.len() < p.max_new && seq.n_past + 4 < ctx {
+        eng.pressure_point()?;
         stats.rounds += 1;
         if let Some(cp) = copy.as_mut() {
             let o: Vec<i32> = out[indexed..].iter().map(|&t| t as i32).collect();

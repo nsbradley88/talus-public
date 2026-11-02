@@ -1064,6 +1064,41 @@ pub(crate) fn d2h(host: &mut [u8], src: *const u8, st: hipStream_t) -> bool {
     }
 }
 
+impl Q36PromptCache {
+    /// #40 memory pressure: free every recurrent snapshot (the grid-aligned restore is cold-exact, so a later turn
+    /// only re-reads more of its prompt). Returns the bytes freed.
+    pub fn shed_snaps(&mut self) -> u64 {
+        let mut n = 0u64;
+        for mut s in self.snaps.drain(..) {
+            if !s.buf.is_null() {
+                unsafe {
+                    let _ = hipFree(s.buf.cast::<c_void>());
+                }
+                s.buf = ptr::null_mut();
+                n += self.snap_bytes as u64;
+            }
+        }
+        n
+    }
+
+    /// #40 memory pressure: free every KV stash (the RAM tier; disk-tier entries stay on disk). Returns the bytes
+    /// freed.
+    pub fn shed_stashes(&mut self) -> u64 {
+        let mut n = 0u64;
+        for mut s in self.stashes.drain(..) {
+            if !s.buf.is_null() {
+                unsafe {
+                    let _ = hipFree(s.buf.cast::<c_void>());
+                }
+                s.buf = ptr::null_mut();
+                n += s.bytes as u64;
+            }
+        }
+        self.stash_used = 0;
+        n
+    }
+}
+
 impl Drop for Q36PromptCache {
     fn drop(&mut self) {
         for s in &mut self.snaps {

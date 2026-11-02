@@ -567,6 +567,12 @@ pub struct Q36Options {
     pub dflash_path: String,
     pub max_seq: i32,
     pub vram_reserve_mb: usize,
+    /// talus#47 clustering: load only layers `stage_lo..stage_hi` (`stage_hi == 0`: to the end). The head stage
+    /// (`stage_lo == 0`, `stage_hi < n_layer`) also loads the embedding, head, MTP and draft vocab plus layer
+    /// `stage_hi`'s `attn_norm` (its fused epilogue at the cut needs it); a worker stage (`stage_lo > 0`) loads its
+    /// layers and `output_norm` only. Default 0 / 0: the whole model, unchanged.
+    pub stage_lo: usize,
+    pub stage_hi: usize,
 }
 
 impl Default for Q36Options {
@@ -604,6 +610,8 @@ impl Default for Q36Options {
             dflash_path: String::new(),
             max_seq: 65536,
             vram_reserve_mb: 1536,
+            stage_lo: 0,
+            stage_hi: 0,
         }
     }
 }
@@ -1851,6 +1859,9 @@ pub struct Q36Model {
     pub allocs: Vec<*mut c_void>,
     pub packed: Vec<(*const c_void, *mut c_void, usize)>,
     model_desc: ModelDesc,
+    /// talus#47: the layers this process owns (`0..n_layer` unless a cluster stage).
+    pub stage_lo: usize,
+    pub stage_hi: usize,
 }
 
 unsafe impl Send for Q36Model {}
@@ -1904,6 +1915,18 @@ impl Drop for Q36Model {
 }
 
 impl Q36Model {
+    /// talus#47: whether this process owns trunk layer `li` (always true outside a cluster).
+    #[inline]
+    pub fn owns(&self, li: usize) -> bool {
+        li >= self.stage_lo && li < self.stage_hi
+    }
+
+    /// talus#47: this process is a cluster stage (owns a strict sub-range of the trunk).
+    #[inline]
+    pub fn is_staged(&self) -> bool {
+        self.stage_lo > 0 || self.stage_hi < self.layers.len()
+    }
+
     /// Load Qwen3.5 / Qwen3.6 model weights from `gguf_path` and optional `mtp_gguf_path` sidecar.
     pub fn load(
         gguf_path: &Path,
@@ -1911,15 +1934,19 @@ impl Q36Model {
         draft_vocab_ids: Option<&[i32]>,
         opts: &Q36Options,
     ) -> Result<Self> {
-        let f = GgufFile::open(gguf_path)?;
+        // a split GGUF (the BF16 27B ships as two shards) opens as one flat view; one file opens as before
+        let f = GgufFile::open_any(gguf_path)?;
         let effective_mtp_path = mtp_gguf_path.or(opts.mtp_gguf.as_deref());
         let side = match effective_mtp_path {
             Some(p) => Some(GgufFile::open(p)?),
             None => None,
         };
+        super::w16::check_gguf_memory(&f, side.as_ref(), opts)?;
         let mut model = Self::load_from_gguf(&f, side.as_ref(), draft_vocab_ids, opts)?;
         model.file_path = Some(gguf_path.to_path_buf());
         model.mtp_file_path = effective_mtp_path.map(|p| p.to_path_buf());
+        // every matrix must have a decode-width kernel (before, a BF16 / F16 one was silently skipped)
+        super::w16::check_model_decode_types(&model)?;
         Ok(model)
     }
 
@@ -1933,6 +1960,34 @@ impl Q36Model {
         let g = describe_gguf(f)?;
         let cfg = Q36Config::from_geometry(&g, opts.max_seq);
         let dense = !g.is_moe();
+        // talus#47: a cluster stage loads only its layers (+ the head stage's globals); 0..n_layer by default.
+        let n_layer_all = g.n_layer as usize;
+        let stage_lo = opts.stage_lo.min(n_layer_all);
+        let stage_hi = if opts.stage_hi == 0 {
+            n_layer_all
+        } else {
+            opts.stage_hi.min(n_layer_all)
+        };
+        let staged = stage_lo > 0 || stage_hi < n_layer_all;
+        let head_stage = stage_lo == 0;
+        ensure!(
+            !staged || (dense && stage_lo < stage_hi),
+            "cluster stage layers {stage_lo}..{stage_hi}: only the dense 27B splits, with a non-empty range"
+        );
+        // A tensor's shape and type without its bytes (a worker stage still reads the head's qtype to pick the same
+        // fused epilogue kernel as one process).
+        let meta_tens = |src_f: &GgufFile, name: &str| -> Result<Tens> {
+            let t = find_tensor(src_f, name)?;
+            Ok(Tens::new(
+                ptr::null(),
+                t.ggml_type_u32(),
+                tensor_ne(t, 0),
+                tensor_ne(t, 1),
+                tensor_ne(t, 2),
+                t.n_bytes() as usize,
+                tensor_w_scale(src_f, name),
+            ))
+        };
         let top_k = if dense {
             0
         } else {
@@ -2212,21 +2267,31 @@ impl Q36Model {
         };
 
         // Global tensors
-        let token_embd = upload_mat_tens(
-            f,
-            "token_embd.weight",
-            false,
-            &mut arena,
-            &mut allocs,
-            &mut packed,
-        )?;
+        let token_embd = if head_stage {
+            upload_mat_tens(
+                f,
+                "token_embd.weight",
+                false,
+                &mut arena,
+                &mut allocs,
+                &mut packed,
+            )?
+        } else {
+            meta_tens(f, "token_embd.weight")?
+        };
         let embd_t = find_tensor(f, "token_embd.weight")?;
         let embd_type = embd_t.ggml_type_u32() as i32;
         let embd_row = (embd_t.n_bytes() as usize) / (g.n_vocab as usize);
         let embd = token_embd.as_u8();
 
         let output_norm = upload_f32_tens(f, "output_norm.weight", &mut arena, &mut allocs)?;
-        let output = if f.tensor("output.weight").is_some() {
+        let output = if !head_stage {
+            if f.tensor("output.weight").is_some() {
+                meta_tens(f, "output.weight")?
+            } else {
+                token_embd
+            }
+        } else if f.tensor("output.weight").is_some() {
             upload_mat_tens(
                 f,
                 "output.weight",
@@ -2278,6 +2343,19 @@ impl Q36Model {
             let p = format!("blk.{li}.");
             L.is_attn = g.layer_kinds[li] == LayerKind::Attn;
             L.attn = L.is_attn;
+            if li < stage_lo || li >= stage_hi {
+                // not owned: structure only; the head stage keeps the next stage's first attn_norm (extra_next)
+                if head_stage && li == stage_hi {
+                    L.attn_norm = upload_f32_tens(
+                        f,
+                        &format!("{p}attn_norm.weight"),
+                        &mut arena,
+                        &mut allocs,
+                    )?;
+                }
+                L.sync_views();
+                continue;
+            }
             L.attn_norm =
                 upload_f32_tens(f, &format!("{p}attn_norm.weight"), &mut arena, &mut allocs)?;
             L.post_norm = upload_f32_tens(
@@ -2628,9 +2706,11 @@ impl Q36Model {
             allocs,
             packed,
             model_desc,
+            stage_lo,
+            stage_hi,
         };
 
-        if !opts.no_mtp {
+        if !opts.no_mtp && head_stage {
             if let Some(side) = mtp_f {
                 let _ = model.try_load_mtp_from(side, true, opts.mtp_main_head, opts.mtp_f16)?;
             }
@@ -2639,7 +2719,9 @@ impl Q36Model {
             }
         }
 
-        if let Some(ids) = draft_vocab_ids {
+        if !head_stage {
+            // a worker stage: no drafter vocab
+        } else if let Some(ids) = draft_vocab_ids {
             if !ids.is_empty() {
                 model.init_draft_vocab_head(ids)?;
             }

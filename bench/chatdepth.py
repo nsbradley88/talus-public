@@ -5,11 +5,12 @@ The same corpus as bench.py, cut to ~N tokens by characters (ratio calibrated wi
 Streamed (bench.post_ttft): each run carries ttft_ms / ttft_srv_ms / cache_n; then one warm follow-up (the last depth's
 conversation + its answer + ~300 new tokens) goes into the record's "warm" field (TTFT_WARM=0: none).
 Env DEPTH_OFFSETS (as in bench.py): after the legacy sequence and the warm follow-up, one more sample per depth at each
-non-zero corpus offset (token offset x the calibrated chars/token ratio); "mp_runs" / "mp" as in bench.py."""
+non-zero corpus offset (token offset x the calibrated chars/token ratio); "mp_runs" / "mp" as in bench.py (per-depth
+offset lists "LIST;MIN:LIST", legacy-offsets-first order, median / IQR / MAD / 4-prompt subset)."""
 import json, os, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.argv, args = sys.argv[:1], sys.argv[1:]
-from bench import post, post_ttft, corpus, memavail, depth_offsets, mp_aggregate
+from bench import post, post_ttft, corpus, memavail, depth_offsets, mp_aggregate, mp_order
 label, depths = args[0], [int(x) for x in args[1].split(",")]
 text = corpus()
 def run(nchars, ntok=128, msgs=None, cold=True, start=0):
@@ -39,19 +40,20 @@ if os.environ.get("TTFT_WARM", "1") != "0" and depths:
         print(json.dumps({"warm": res["warm"]}), flush=True)
     except Exception as e:
         res["warm"] = {"error": str(e)[:200]}
-offs = depth_offsets()
-if offs and depths:   # multi-prompt cells after the legacy sequence and the warm follow-up
+plan = mp_order(depths)
+if plan:   # multi-prompt cells after the legacy sequence and the warm follow-up
     mp = [dict(x, offset=0, depth_nominal=d) for d, x in zip(depths, res["runs"])]
     try:
-        for d in depths:
-            for o in offs:
-                st = int(o * ratio)
-                if st + int(d * ratio) > len(text):
-                    print(json.dumps({"mp_skip": {"depth": d, "offset": o, "corpus_chars": len(text)}}), flush=True); continue
-                r = dict(rec(run(int(d * ratio), start=st)), offset=o, depth_nominal=d)
-                print(json.dumps(r), flush=True); mp.append(r)
+        for d, o in plan:
+            st = int(o * ratio)
+            if st + int(d * ratio) > len(text):
+                print(json.dumps({"mp_skip": {"depth": d, "offset": o, "corpus_chars": len(text)}}), flush=True); continue
+            r = dict(rec(run(int(d * ratio), start=st)), offset=o, depth_nominal=d)
+            print(json.dumps(r), flush=True); mp.append(r)
     except Exception as e:
         res["mp_error"] = str(e)[:200]
-    res["mp_runs"] = mp; res["mp"] = {"offsets": [0] + offs, "agg": mp_aggregate(mp)}
+    res["mp_runs"] = mp
+    res["mp"] = {"offsets": [0] + depth_offsets(), "spec": os.environ.get("DEPTH_OFFSETS", "0"),
+                 "offsets_by_depth": {str(d): [0] + depth_offsets(d) for d in depths}, "agg": mp_aggregate(mp)}
     print(json.dumps({"mp": res["mp"]}), flush=True)
 open(os.environ.get("TALUS_RESULTS_JSONL", "results.jsonl"), "a").write(json.dumps(res) + "\n")

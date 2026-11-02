@@ -12,7 +12,7 @@ use super::ffi::*;
 use super::graphs::{DFlash, DfCtx, DraftLen, DrafterPick};
 use super::weights::{
     hip_check, hip_malloc_bytes, to_tk_qtype, LayerW, Mat, Q36Model, Q36Options, GGML_TYPE_BF16,
-    GGML_TYPE_F32,
+    GGML_TYPE_F16, GGML_TYPE_F32,
 };
 
 /// Expanded INT8 trunk matrix (`talus::prefill::I8Mat` in `tp_i8gemm.hpp`).
@@ -139,8 +139,9 @@ pub fn q27_bytes_per_token(model: &Q36Model) -> usize {
     let n_state = model
         .layers
         .iter()
+        .enumerate()
         .take(g.n_layer as usize)
-        .filter(|l| l.is_attn)
+        .filter(|(i, l)| l.is_attn && model.owns(*i))
         .count()
         + usize::from(model.has_mtp);
     let tp_fa = model.opts.use_fattn
@@ -266,6 +267,13 @@ pub struct Q36Engine {
     pub kc: Vec<*mut u16>,
     pub vc: Vec<*mut u16>,
     pub vtc: Vec<*mut u16>,
+    /// rd-kv27 (TALUS_Q27_KV8=1): the int8 copy read by decode / verify attention (`kv8.rs` layouts); empty when off
+    pub kv8: bool,
+    pub kv8_variant: i32,
+    pub kq8: Vec<*mut u8>,
+    pub ks8: Vec<*mut u16>,
+    pub vq8: Vec<*mut u8>,
+    pub vs8: Vec<*mut u16>,
     pub k_cache: Vec<*mut c_void>,
     pub v_cache: Vec<*mut c_void>,
     pub conv: Vec<*mut f32>,
@@ -491,6 +499,9 @@ pub struct Q36Engine {
 
     pub(crate) allocs: Vec<*mut c_void>,
     pub(crate) hallocs: Vec<*mut c_void>,
+
+    /// talus#47: cluster stage state (None: one process, every path unchanged).
+    pub cl: Option<Box<super::cluster::ClState>>,
 }
 
 unsafe impl Send for Q36Engine {}
@@ -572,6 +583,12 @@ impl Q36Engine {
             kc: Vec::new(),
             vc: Vec::new(),
             vtc: Vec::new(),
+            kv8: false,
+            kv8_variant: 0,
+            kq8: Vec::new(),
+            ks8: Vec::new(),
+            vq8: Vec::new(),
+            vs8: Vec::new(),
             k_cache: Vec::new(),
             v_cache: Vec::new(),
             conv: Vec::new(),
@@ -767,6 +784,7 @@ impl Q36Engine {
             gDs: ptr::null_mut(),
             allocs: Vec::new(),
             hallocs: Vec::new(),
+            cl: None,
         };
         eng.init(model, ctx_len)?;
         Ok(eng)
@@ -867,6 +885,9 @@ impl Q36Engine {
         self.n_attn = 0;
         self.n_gdn = 0;
         for i in 0..(g.n_layer as usize) {
+            if !model.owns(i) {
+                continue; // talus#47: another stage holds this layer's state
+            }
             if model.layers[i].is_attn {
                 self.attn_slot[i] = self.n_attn;
                 self.n_attn += 1;
@@ -943,6 +964,42 @@ impl Q36Engine {
             self.vtc[i] = hip_alloc_zeroed::<u16>(vt_elems, &mut self.allocs)?;
             self.k_cache[i] = self.kc[i].cast::<c_void>();
             self.v_cache[i] = self.vc[i].cast::<c_void>();
+        }
+        // the int8 copy for decode / verify attention (head dim 256, the WMMA attention's shapes only)
+        self.kv8 = false;
+        self.kq8.clear();
+        self.ks8.clear();
+        self.vq8.clear();
+        self.vs8.clear();
+        if super::kv8::kv8_requested() {
+            let ver = talus_q36_kv8_version();
+            if g.head_dim as usize != super::kv8::KV8_HD || ver != super::kv8::KV8_VERSION {
+                eprintln!(
+                    "talus: TALUS_Q27_KV8=1 ignored (head dim {}, kernel library int8 KV version {} != {})",
+                    g.head_dim,
+                    ver,
+                    super::kv8::KV8_VERSION
+                );
+            } else {
+                let (a, b, c, d) = super::kv8::kv8_layer_elems(
+                    g.n_head_kv as usize,
+                    ctx_len as usize,
+                    self.vt_ctx as usize,
+                );
+                for _ in 0..(self.n_attn_state as usize) {
+                    self.kq8.push(hip_alloc_zeroed::<u8>(a, &mut self.allocs)?);
+                    self.ks8.push(hip_alloc_zeroed::<u16>(b, &mut self.allocs)?);
+                    self.vq8.push(hip_alloc_zeroed::<u8>(c, &mut self.allocs)?);
+                    self.vs8.push(hip_alloc_zeroed::<u16>(d, &mut self.allocs)?);
+                }
+                self.kv8 = true;
+                self.kv8_variant = super::kv8::kv8_variant();
+                eprintln!(
+                    "talus: int8 KV for decode/verify attention ON (TALUS_Q27_KV8=1): +{:.2} GiB",
+                    ((a + 2 * b + c + 2 * d) * self.n_attn_state as usize) as f64
+                        / (1u64 << 30) as f64
+                );
+            }
         }
 
         let C = g.ssm_qkv_dim() as usize;
@@ -1103,6 +1160,7 @@ impl Q36Engine {
                 );
                 self.tp_levers_init(model)?;
                 self.w4i_init(model);
+                self.w4i_pair_gu(model);
             }
             self.wide_pack_init();
         } else {
@@ -1380,6 +1438,9 @@ impl Q36Engine {
             self.dctx
                 .init(self.df.window(), self.df.ring(), self.df.block());
         }
+        if self.cl.is_some() {
+            self.cl_mirror_reset();
+        }
     }
 
     /// Flush any pending GDN state updates (`Engine::flush_gdn` in `q36_engine.cu:1305-1318`).
@@ -1391,6 +1452,9 @@ impl Q36Engine {
             if self.gdn_pending <= 0 {
                 return;
             }
+            if self.cl.is_some() {
+                self.cl_mirror_flush();
+            }
             let m = self.model();
             let g = &m.g;
             let C = g.ssm_qkv_dim() as i32;
@@ -1400,7 +1464,7 @@ impl Q36Engine {
             let stream = self.s_main.cast::<c_void>();
             for li in 0..(g.n_layer as usize) {
                 let L = &m.layers[li];
-                if L.is_attn {
+                if L.is_attn || !m.owns(li) {
                     continue;
                 }
                 let s = self.gdn_slot[li] as usize;
@@ -1462,6 +1526,9 @@ impl Q36Engine {
         if n <= 0 {
             return;
         }
+        if self.cl.is_some() {
+            self.cl_mirror_commit(n);
+        }
         let m = self.model();
         let g = &m.g;
         let C = g.ssm_qkv_dim() as i32;
@@ -1471,7 +1538,7 @@ impl Q36Engine {
         let stream = self.s_main.cast::<c_void>();
         for li in 0..(g.n_layer as usize) {
             let L = &m.layers[li];
-            if L.is_attn {
+            if L.is_attn || !m.owns(li) {
                 continue;
             }
             let s = self.gdn_slot[li] as usize;
@@ -1635,7 +1702,7 @@ impl Q36Engine {
 type I8Candidate = (usize, *const u8, i32, i32, i32, i32, usize, usize);
 
 /// The dense trunk matrices tp_i8x expands and their total bytes (0 when TALUS_PF_I8=0).
-fn i8x_candidates(model: &Q36Model) -> (Vec<I8Candidate>, usize) {
+pub(crate) fn i8x_candidates(model: &Q36Model) -> (Vec<I8Candidate>, usize) {
     let mut candidates: Vec<I8Candidate> = Vec::new();
     if !std::env::var("TALUS_PF_I8")
         .map(|v| v != "0")
@@ -1767,6 +1834,14 @@ impl Q36Engine {
             return;
         }
 
+        // BF16 weights (any width) and F16 weights at decode width (F16 prompts keep the hipBLAS path below)
+        if (raw_qt == GGML_TYPE_BF16 as i32
+            || (raw_qt == GGML_TYPE_F16 as i32 && n_tok <= self.gemm_t))
+            && self.w16_mm(w, x, y, n_tok, ldy)
+        {
+            return;
+        }
+
         if n_tok > self.gemm_t
             && (ldy <= 0 || ldy == w.n_out)
             && !self.dq_x.is_null()
@@ -1864,6 +1939,13 @@ impl Q36Engine {
                 };
                 t0 += chunk;
             }
+        } else {
+            // before, a weight type without a decode mat-vec fell through here leaving y unwritten. The load
+            // check (w16::check_model_decode_types) rejects such models, so reaching this is a bug: stop loudly.
+            panic!(
+                "qwen35: no kernel multiplies GGML type {} ({} x {}) at {} rows",
+                raw_qt, w.n_out, w.n_in, n_tok
+            );
         }
     }
 
@@ -2078,6 +2160,9 @@ impl Q36Engine {
         };
         let path = path.to_string_lossy().into_owned();
         if !std::path::Path::new(&path).exists() {
+            if mode == "default" {
+                return; // (no sidecar installed: the exact int8 prompt path, silently)
+            }
             eprintln!(
                 "talus-cli: W4A4 sidecar {path} not found ({mode}): prompts stay on the exact int8 path \
                  (place the matching .w4i next to the GGUF, or TALUS_Q27_W4I=0 to silence this)"
@@ -2104,6 +2189,13 @@ impl Q36Engine {
                 return;
             }
         };
+        if mode == "default" && src.as_ref().map(|s| s.version).unwrap_or(1) < 3 {
+            eprintln!(
+                "talus-cli: W4A4 sidecar {path} is format v{} (pre-rd-q4quant): off by default, TALUS_Q27_W4I=auto to use it",
+                src.as_ref().map(|s| s.version).unwrap_or(1)
+            );
+            return;
+        }
         if let (Some(src), Some(g)) = (&src, model.file_path.as_deref()) {
             let gsize = std::fs::metadata(g).map(|m| m.len()).unwrap_or(0);
             if src.size != 0 && src.size != gsize {
@@ -2123,7 +2215,7 @@ impl Q36Engine {
         for (li, L) in model.layers.iter().enumerate() {
             for (plane, nm, w) in [
                 (0usize, "ffn_gate", &L.ffn_gate_mat),
-                (0, "ffn_up", &L.ffn_up_mat),
+                (2, "ffn_up", &L.ffn_up_mat),
                 (1, "ffn_down", &L.ffn_down_mat),
             ] {
                 if w.is_null() || !super::w4i::plane_selected(&planes, li, plane) {
@@ -2138,12 +2230,27 @@ impl Q36Engine {
                     eprintln!("talus-cli: TALUS_Q27_W4I: {name} shape mismatch, skipped");
                     continue;
                 }
+                // rd-q4quant v3: smoothing / best-of-4 scales / 128-col groups need the pack2 kernel
+                if (e.off_ismooth != 0
+                    || e.flags & 1 != 0
+                    || e.wg == 128
+                    || std::env::var("TALUS_Q27_W4I_KMODE").is_ok_and(|v| v == "1"))
+                    && !talus_pf_w4i_pack2_available()
+                {
+                    eprintln!("talus-cli: TALUS_Q27_W4I: {name} needs talus_pf_w4i_pack2 (old libtalus_kernels), skipped");
+                    continue;
+                }
                 let wsb = if e.wg == 0 {
                     e.n as usize * 4
                 } else {
                     e.n as usize * (e.k / e.wg) as usize * 4
                 };
-                total += e.n as usize * e.k as usize / 2 + wsb + e.k as usize;
+                let smb = if e.off_ismooth != 0 {
+                    e.k as usize * 4
+                } else {
+                    0
+                };
+                total += e.n as usize * e.k as usize / 2 + wsb + e.k as usize + smb;
                 want.push((w.d as usize, *e, e.wg as i32, wsb as i32));
             }
         }
@@ -2153,9 +2260,10 @@ impl Q36Engine {
         }
         let rows = self.max_batch.max(1);
         let kmax = want.iter().map(|w| w.1.k as i32).max().unwrap_or(0);
-        let act = rows as usize * kmax as usize / 2
-            + rows as usize * (kmax as usize / 32)
-            + rows as usize * 4;
+        let act = 2
+            * (rows as usize * kmax as usize / 2
+                + rows as usize * (kmax as usize / 32)
+                + rows as usize * 4);
         let guard = match self.budget.try_reserve_guard(
             talus_mem::BudgetCategory::Weights,
             "tp_w4i_sidecar",
@@ -2171,14 +2279,24 @@ impl Q36Engine {
         };
         let mut host = Vec::new();
         let mut ok = true;
+        let mut seen: HashMap<Vec<u8>, usize> = HashMap::new();
+        // TALUS_Q27_W4I_KMODE=0|1 overrides the sidecar's activation group-scale rule (A/B on one file)
+        let kmode_env = std::env::var("TALUS_Q27_W4I_KMODE")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok());
         for (key, e, wg, wsb) in &want {
             let n = e.n as usize;
             let k = e.k as usize;
             let wq = super::w4i::upload(&mut f, e.off_wq, n * k / 2, &mut host);
             let ws = super::w4i::upload(&mut f, e.off_ws, *wsb as usize, &mut host);
-            let sg = super::w4i::upload(&mut f, e.off_signs, k, &mut host);
-            match (wq, ws, sg) {
-                (Ok(wq), Ok(ws), Ok(sg)) => {
+            let sg = super::w4i::upload_shared(&mut f, e.off_signs, k, &mut host, &mut seen);
+            let sm = if e.off_ismooth != 0 {
+                super::w4i::upload_shared(&mut f, e.off_ismooth, k * 4, &mut host, &mut seen)
+            } else {
+                Ok(ptr::null_mut())
+            };
+            match (wq, ws, sg, sm) {
+                (Ok(wq), Ok(ws), Ok(sg), Ok(sm)) => {
                     self.w4i.mats.insert(
                         *key,
                         super::w4i::W4iMat {
@@ -2188,12 +2306,28 @@ impl Q36Engine {
                             n: e.n as i32,
                             k: e.k as i32,
                             wg: *wg,
+                            inv_s: sm.cast::<f32>(),
+                            kmode: kmode_env.unwrap_or((e.flags & 1) as i32).clamp(0, 1),
                         },
                     );
-                    self.w4i.bytes += n * k / 2 + *wsb as usize + k;
+                    self.w4i.bytes +=
+                        n * k / 2 + *wsb as usize + k + if sm.is_null() { 0 } else { k * 4 };
                 }
-                (a, b, c) => {
-                    for p in [a.ok(), b.ok(), c.ok()].into_iter().flatten() {
+                (a, b, _c, _d) => {
+                    // (signs / smoothing buffers may be shared with loaded matrices: left to a later clear();
+                    // a failed load clears the whole cache below anyway)
+                    let used: std::collections::HashSet<usize> = self
+                        .w4i
+                        .mats
+                        .values()
+                        .flat_map(|m| [m.signs as usize, m.inv_s as usize])
+                        .collect();
+                    for &p in seen.values().filter(|p| !used.contains(p)) {
+                        unsafe {
+                            let _ = hipFree(p as *mut c_void);
+                        }
+                    }
+                    for p in [a.ok(), b.ok()].into_iter().flatten() {
                         unsafe {
                             let _ = hipFree(p.cast::<c_void>());
                         }
@@ -2206,14 +2340,24 @@ impl Q36Engine {
         let xq = hip_malloc_bytes(rows as usize * kmax as usize / 2);
         let xk = hip_malloc_bytes(rows as usize * (kmax as usize / 32));
         let xs = hip_malloc_bytes(rows as usize * 4);
-        match (ok, xq, xk, xs) {
-            (true, Ok(a), Ok(b), Ok(c)) => {
+        // rd-q4quant-B: the second set (the fused norm packs gate and up, whose seeded signs differ)
+        let xq2 = hip_malloc_bytes(rows as usize * kmax as usize / 2);
+        let xk2 = hip_malloc_bytes(rows as usize * (kmax as usize / 32));
+        let xs2 = hip_malloc_bytes(rows as usize * 4);
+        match (ok, xq, xk, xs, xq2, xk2, xs2) {
+            (true, Ok(a), Ok(b), Ok(c), Ok(a2), Ok(b2), Ok(c2)) => {
                 self.w4i.xq = a;
                 self.w4i.xk = b;
                 self.w4i.xs = c.cast::<f32>();
+                self.w4i.xq2 = a2;
+                self.w4i.xk2 = b2;
+                self.w4i.xs2 = c2.cast::<f32>();
             }
-            (_, a, b, c) => {
-                for p in [a.ok(), b.ok(), c.ok()].into_iter().flatten() {
+            (_, a, b, c, a2, b2, c2) => {
+                for p in [a.ok(), b.ok(), c.ok(), a2.ok(), b2.ok(), c2.ok()]
+                    .into_iter()
+                    .flatten()
+                {
                     unsafe {
                         let _ = hipFree(p.cast::<c_void>());
                     }
@@ -2227,6 +2371,8 @@ impl Q36Engine {
         }
         self.w4i.cap_rows = rows;
         self.w4i.cap_k = kmax;
+        self.w4i.fuse = talus_pf_w4i_fused_available()
+            && std::env::var("TALUS_PF_W4I_FUSE").map_or(true, |v| v != "0");
         self.w4i.min_rows = std::env::var("TALUS_Q27_W4I_MIN")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
@@ -2241,6 +2387,195 @@ impl Q36Engine {
             (self.w4i.bytes as f64) / ((1usize << 30) as f64),
             self.w4i.min_rows
         );
+    }
+
+    /// rd-q4quant-B: per layer whose W4 gate and up share the packed activations (equal signs by content, weight
+    /// groups, smoothing vector and group-scale rule) and whose down projection is W4 too, move the pair into one
+    /// interleaved matrix for `talus_pf_w4i_gemm_gu` (gate + up + SwiGLU in one GEMM; the separate copies are freed,
+    /// so no extra memory).  TALUS_PF_W4I_GU=0: off.
+    pub fn w4i_pair_gu(&mut self, model: &Q36Model) {
+        if self.w4i.mats.is_empty()
+            || !talus_pf_w4i_gu_available()
+            || std::env::var("TALUS_PF_W4I_GU").is_ok_and(|v| v == "0")
+        {
+            return;
+        }
+        let stream = self.s_main.cast::<c_void>();
+        let signs_of = |p: *const i8, k: usize| -> Option<Vec<u8>> {
+            let mut v = vec![0u8; k];
+            let rc = unsafe {
+                hipMemcpy(
+                    v.as_mut_ptr().cast::<c_void>(),
+                    p.cast::<c_void>(),
+                    k,
+                    HIP_MEMCPY_DEVICE_TO_HOST,
+                )
+            };
+            (rc == hipSuccess).then_some(v)
+        };
+        let mut pairs = 0;
+        for L in model.layers.iter() {
+            let (gk, uk) = (L.ffn_gate_mat.d as usize, L.ffn_up_mat.d as usize);
+            let (Some(g), Some(u)) = (
+                self.w4i.mats.get(&gk).copied(),
+                self.w4i.mats.get(&uk).copied(),
+            ) else {
+                continue;
+            };
+            if !self.w4i.mats.contains_key(&(L.ffn_down_mat.d as usize)) {
+                continue; // (the GU path packs its output for a W4 down projection)
+            }
+            if g.wq.is_null()
+                || u.wq.is_null()
+                || g.wg != u.wg
+                || g.inv_s != u.inv_s
+                || g.kmode != u.kmode
+                || g.n != u.n
+                || g.k != u.k
+                || g.n % 128 != 0
+            {
+                continue;
+            }
+            let k = g.k as usize;
+            if g.signs != u.signs {
+                match (signs_of(g.signs, k), signs_of(u.signs, k)) {
+                    (Some(a), Some(b)) if a == b => {}
+                    _ => continue,
+                }
+            }
+            let n = g.n as usize;
+            let per_row = if g.wg == 0 { 1 } else { k / g.wg as usize };
+            let (Ok(oq), Ok(os)) = (
+                hip_malloc_bytes(n * k),
+                hip_malloc_bytes(2 * n * per_row * 4),
+            ) else {
+                eprintln!("talus-cli: W4A4 gate+up pairing: allocation failed, stays separate");
+                break;
+            };
+            let os = os.cast::<f32>();
+            let ok =
+                talus_pf_w4i_interleave_gu(g.wq, u.wq, g.ws, u.ws, g.wg, g.n, g.k, oq, os, stream)
+                    && unsafe { hipStreamSynchronize(self.s_main) } == hipSuccess;
+            if !ok {
+                unsafe {
+                    let _ = hipFree(oq.cast::<c_void>());
+                    let _ = hipFree(os.cast::<c_void>());
+                }
+                continue;
+            }
+            unsafe {
+                let _ = hipFree(g.wq.cast::<c_void>());
+                let _ = hipFree(g.ws.cast::<c_void>());
+                let _ = hipFree(u.wq.cast::<c_void>());
+                let _ = hipFree(u.ws.cast::<c_void>());
+            }
+            for key in [gk, uk] {
+                if let Some(m) = self.w4i.mats.get_mut(&key) {
+                    m.wq = ptr::null_mut();
+                    m.ws = ptr::null_mut();
+                }
+            }
+            self.w4i.gu.insert(
+                gk,
+                super::w4i::W4iMat {
+                    wq: oq,
+                    ws: os,
+                    n: 2 * g.n,
+                    ..g
+                },
+            );
+            pairs += 1;
+        }
+        if pairs > 0 {
+            eprintln!(
+                "talus-cli: W4A4 gate + up in one GEMM with the SwiGLU epilogue on {pairs} layers (TALUS_PF_W4I_GU=0: off)"
+            );
+        }
+    }
+
+    /// rd-q4quant-B: the FFN's residual add + RMSNorm (`tk_q36_add_rms`, bit for bit) with the W4 packs of h for the
+    /// layer's W4 gate / up matrices in the same launch (`talus_pf_w4i_add_rms_pack`).  None: not taken (nothing ran,
+    /// the caller runs `tk_q36_add_rms`); Some(true): h was not written (both gate and up are W4).  `ffn_w4i` picks
+    /// the packs up from `w4i.pre`.  A second set needs the first's options (smoothing yes / no, group-scale rule);
+    /// otherwise ffn_w4i packs it.
+    pub fn w4i_add_rms(
+        &mut self,
+        gate: &Mat,
+        up: &Mat,
+        wn: *const f32,
+        n_tok: i32,
+        e: i32,
+        eps: f32,
+    ) -> Option<bool> {
+        self.w4i.pre = [None, None];
+        if !self.w4i.fuse
+            || self.w4i.mats.is_empty()
+            || n_tok < self.w4i.min_rows
+            || n_tok > self.w4i.cap_rows
+        {
+            return None;
+        }
+        let paired = self.w4i.gu.get(&(gate.d as usize)).copied();
+        let g4 = paired.or_else(|| self.w4i.find(gate.d));
+        // (a gate + up pair reads one packed set: the pair's)
+        let u4 = if paired.is_some() {
+            None
+        } else {
+            self.w4i.find(up.d)
+        };
+        let mut sets: Vec<super::w4i::PackKey> = Vec::with_capacity(2);
+        for m in [g4, u4].into_iter().flatten() {
+            if m.k != e {
+                return None;
+            }
+            let key = m.pack_key();
+            if sets.is_empty()
+                || (!sets.contains(&key)
+                    && key.2.is_null() == sets[0].2.is_null()
+                    && key.3 == sets[0].3)
+            {
+                sets.push(key);
+            }
+        }
+        if sets.is_empty() {
+            return None;
+        }
+        let skip_h = g4.is_some() && (u4.is_some() || paired.is_some());
+        let set = |k: super::w4i::PackKey, xq, xk, xs| W4iPackSet {
+            signs: k.0,
+            wg: k.1,
+            inv_s: k.2,
+            xq,
+            xk,
+            xs,
+        };
+        let a = set(sets[0], self.w4i.xq, self.w4i.xk, self.w4i.xs);
+        let b = match sets.get(1) {
+            Some(&k) => set(k, self.w4i.xq2, self.w4i.xk2, self.w4i.xs2),
+            None => set(
+                (ptr::null(), 0, ptr::null(), 0),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ),
+        };
+        if !talus_pf_w4i_add_rms_pack(
+            self.x,
+            self.y,
+            wn,
+            if skip_h { ptr::null_mut() } else { self.h },
+            n_tok,
+            e,
+            eps,
+            a,
+            b,
+            sets[0].3,
+            self.s_main.cast::<c_void>(),
+        ) {
+            return None;
+        }
+        self.w4i.pre = [Some(sets[0]), sets.get(1).copied()];
+        Some(skip_h)
     }
 
     /// the dense FFN of one prompt chunk with W4A4 on the planes the sidecar selects (the rest exact).
@@ -2267,27 +2602,67 @@ impl Q36Engine {
         }
         let stream = self.s_main.cast::<c_void>();
         let (xq, xk, xs) = (self.w4i.xq, self.w4i.xk, self.w4i.xs);
-        let mut packed: Option<(*const i8, i32)> = None;
+        // the rc-a4 pack when the matrix has no smoothing / best-of-4 scales (bitwise the old path)
+        let pack = |m: &super::w4i::W4iMat, x: *const f32, g: *const f32, k: i32| -> bool {
+            if m.inv_s.is_null() && m.kmode == 0 && m.wg != 128 {
+                talus_pf_w4i_pack(x, g, n_tok, k, k as i64, m.signs, m.wg, xq, xk, xs, stream)
+            } else {
+                talus_pf_w4i_pack2(
+                    x, g, n_tok, k, k as i64, m.signs, m.wg, m.inv_s, m.kmode, xq, xk, xs, stream,
+                )
+            }
+        };
+        let pre = std::mem::take(&mut self.w4i.pre);
+        if let (Some(gu), Some(m)) = (self.w4i.gu.get(&(gate.d as usize)).copied(), d4) {
+            // rd-q4quant-B: gate + up + SwiGLU in one GEMM (sh_g = the down input), then the down pack (with the
+            // down matrix's own options) and GEMM
+            if pre[0] != Some(gu.pack_key()) && !pack(&gu, self.h, ptr::null(), e) {
+                return false;
+            }
+            let fh = gu.n / 2;
+            if !talus_pf_w4i_gemm_gu(
+                gu.wq, gu.ws, gu.wg, fh, gu.k, xq, xk, xs, n_tok, self.sh_g, fh as i64, stream,
+            ) {
+                return false;
+            }
+            self.invalidate_pf();
+            return pack(&m, self.sh_g, ptr::null(), f)
+                && talus_pf_w4i_gemm(
+                    m.wq, m.ws, m.wg, m.n, m.k, xq, xk, xs, n_tok, out, m.n as i64, stream,
+                );
+        }
+        let mut packed: Option<super::w4i::PackKey> = None;
         for (w, w4, y) in [(gate, g4, self.sh_g), (up, u4, self.sh_u)] {
             match w4 {
+                Some(m) if pre[1].is_some() && pre[1] == Some(m.pack_key()) => {
+                    // rd-q4quant-B: packed by the fused norm into the second set
+                    if !talus_pf_w4i_gemm(
+                        m.wq,
+                        m.ws,
+                        m.wg,
+                        m.n,
+                        m.k,
+                        self.w4i.xq2,
+                        self.w4i.xk2,
+                        self.w4i.xs2,
+                        n_tok,
+                        y,
+                        m.n as i64,
+                        stream,
+                    ) {
+                        return false;
+                    }
+                }
                 Some(m) => {
-                    if packed != Some((m.signs as *const i8, m.wg)) {
-                        if !talus_pf_w4i_pack(
-                            self.h,
-                            ptr::null(),
-                            n_tok,
-                            e,
-                            e as i64,
-                            m.signs,
-                            m.wg,
-                            xq,
-                            xk,
-                            xs,
-                            stream,
-                        ) {
+                    if packed.is_none() && pre[0].is_some() {
+                        packed = pre[0]; // rd-q4quant-B: packed by the fused norm into the first set
+                    }
+                    let key = m.pack_key();
+                    if packed != Some(key) {
+                        if !pack(&m, self.h, ptr::null(), e) {
                             return false;
                         }
-                        packed = Some((m.signs as *const i8, m.wg));
+                        packed = Some(key);
                     }
                     if !talus_pf_w4i_gemm(
                         m.wq, m.ws, m.wg, m.n, m.k, xq, xk, xs, n_tok, y, m.n as i64, stream,
@@ -2301,11 +2676,11 @@ impl Q36Engine {
         self.invalidate_pf();
         match d4 {
             Some(m) => {
-                if !talus_pf_w4i_pack(
-                    self.sh_u, self.sh_g, n_tok, f, f as i64, m.signs, m.wg, xq, xk, xs, stream,
-                ) || !talus_pf_w4i_gemm(
-                    m.wq, m.ws, m.wg, m.n, m.k, xq, xk, xs, n_tok, out, m.n as i64, stream,
-                ) {
+                if !pack(&m, self.sh_u, self.sh_g, f)
+                    || !talus_pf_w4i_gemm(
+                        m.wq, m.ws, m.wg, m.n, m.k, xq, xk, xs, n_tok, out, m.n as i64, stream,
+                    )
+                {
                     return false;
                 }
             }
@@ -2608,6 +2983,10 @@ impl Q36Engine {
                 self.vt_ctx,
                 stream,
             );
+            if self.kv8 {
+                // the rows just written, into the int8 copy (prompt rows too: decode reads every cell)
+                self.kv8_put(s, pos0, 0, T, self.s_main);
+            }
             if self.kv_only_pass {
                 // (also for T <= gemm_t: the projections above ran in full, the rest is skipped)
                 self.invalidate_pf();
@@ -2706,6 +3085,46 @@ impl Q36Engine {
                         stream,
                     );
                 }
+            } else if self.kv8 {
+                // rd-kv27 (TALUS_Q27_KV8=1): decode / verify attention over the int8 copy
+                let _ = talus_q36_attn_wmma_kv8(
+                    self.n_chunk_w,
+                    HKV,
+                    self.q,
+                    self.kq8[s].cast_const().cast::<c_void>(),
+                    self.ks8[s].cast_const().cast::<c_void>(),
+                    self.vq8[s].cast_const().cast::<c_void>(),
+                    self.vs8[s].cast_const().cast::<c_void>(),
+                    pos0,
+                    T,
+                    H,
+                    self.ctx_len,
+                    self.vt_ctx,
+                    sc,
+                    self.att_ck,
+                    self.pacc,
+                    self.pm,
+                    self.pl,
+                    stream.cast::<c_void>(),
+                    self.kv8_variant,
+                );
+                let _ = tk_q36_attn_merge(
+                    self.tk.as_ptr(),
+                    T * H,
+                    HD,
+                    self.pacc,
+                    self.pm,
+                    self.pl,
+                    self.gate,
+                    pos0,
+                    0,
+                    H,
+                    self.n_chunk_w,
+                    self.att,
+                    self.att_ck,
+                    q8_out,
+                    stream,
+                );
             } else {
                 let _ = tk_q36_attn_wmma(
                     self.tk.as_ptr(),
@@ -3054,21 +3473,44 @@ impl Q36Engine {
                     self.apply(ffn_down, self.sh_g, self.sh_y, T);
                 }
             } else {
-                let _ = tk_q36_add_rms(
-                    self.tk.as_ptr(),
-                    T,
-                    self.x,
-                    self.y,
-                    L.post_norm_ptr,
-                    self.h,
-                    E,
-                    eps,
-                    stream,
-                );
+                // rd-q4quant-B: with W4 gate / up, the residual add + norm also packs h for them (h is then
+                // written only if a plane of the layer still reads it)
+                let h_skipped = match self.w4i_add_rms(ffn_gate, ffn_up, L.post_norm_ptr, T, E, eps)
+                {
+                    Some(skipped) => skipped,
+                    None => {
+                        let _ = tk_q36_add_rms(
+                            self.tk.as_ptr(),
+                            T,
+                            self.x,
+                            self.y,
+                            L.post_norm_ptr,
+                            self.h,
+                            E,
+                            eps,
+                            stream,
+                        );
+                        false
+                    }
+                };
                 self.invalidate_pf();
                 if self.ffn_w4i(ffn_gate, ffn_up, ffn_down, self.sh_y, T, E, F) {
                     // opt-in W4A4 FFN (TALUS_Q27_W4I)
                 } else {
+                    if h_skipped {
+                        // (the exact path reads h: the norm of the updated x, bit for bit tk_q36_add_rms's h)
+                        let _ = tk_q36_rms(
+                            self.tk.as_ptr(),
+                            T,
+                            self.x,
+                            L.post_norm_ptr,
+                            self.h,
+                            E,
+                            eps,
+                            stream,
+                        );
+                        self.invalidate_pf();
+                    }
                     self.apply(ffn_gate, self.h, self.sh_g, T);
                     if self.tp_gu_down(ffn_up, ffn_down, self.sh_g, self.sh_y, T, F) {
                         // fused up + SwiGLU + q8_1, then down (rb-q27)
@@ -3684,7 +4126,9 @@ impl Q36Engine {
             self.mark_q8(ptr::null(), 0, 0);
         }
         let n_layer = m.layers.len();
-        for li in 0..n_layer {
+        // talus#47: a head stage runs layers 0..cut (its last epilogue reads layer cut's attn_norm), then hops
+        let l_end = m.stage_hi.min(n_layer);
+        for li in 0..l_end {
             let last = (li + 1) == n_layer;
             let wn = if last {
                 m.out_norm
@@ -3712,6 +4156,9 @@ impl Q36Engine {
                     )
                 };
             }
+        }
+        if self.cl.is_some() {
+            self.cl_cut(pos0, n_tok, verify);
         }
         if self.fused && n_tok <= self.gemm_t {
             let _ = tk_q36_ctl_end(self.tk.as_ptr(), self.gctl, verify, stream);
@@ -3955,7 +4402,7 @@ impl Q36Engine {
             }
             if !self.model().hybrid && self.opts.use_graph {
                 if let Ok(exec) = self.ensure_single_decode_graph() {
-                    let _ = unsafe { hipGraphLaunch(exec, self.s_main) };
+                    let _ = unsafe { self.launch_graph(exec) };
                 } else {
                     self.forward_full(self.tok_d, 1, self.pos0_d, 1, false);
                 }
@@ -4460,6 +4907,45 @@ impl Q36Engine {
     }
 
     /// Run attention WMMA vs scalar reference self-test (`Engine::attn_selftest`).
+    /// quantize cells `[base, base + n)` of attention state slot `s` into its int8 copy (base = `*pos0 + c0`
+    /// with a device `pos0`, else `c0`).
+    pub fn kv8_put(&self, s: usize, pos0: *const i32, c0: i32, n: i32, stream: hipStream_t) {
+        if !self.kv8 || s >= self.kq8.len() || n <= 0 {
+            return;
+        }
+        let g = &self.model().g;
+        let ok = talus_q36_kv8_quant(
+            self.kc[s].cast_const().cast::<c_void>(),
+            self.vtc[s].cast_const().cast::<c_void>(),
+            self.ctx_len,
+            self.vt_ctx,
+            g.n_head_kv as i32,
+            g.head_dim as i32,
+            self.kq8[s].cast::<c_void>(),
+            self.ks8[s].cast::<c_void>(),
+            self.vq8[s].cast::<c_void>(),
+            self.vs8[s].cast::<c_void>(),
+            pos0,
+            c0,
+            n,
+            stream.cast::<c_void>(),
+        );
+        debug_assert!(ok, "talus_q36_kv8_quant failed");
+    }
+
+    /// rebuild the int8 copy of cells `[c0, c0 + n)` from the f16 cache in every attention slot, after
+    /// anything wrote f16 cells directly (prompt-cache restore, session load).  Bitwise what the decode path wrote.
+    pub fn kv8_rebuild(&mut self, c0: i32, n: i32) {
+        if !self.kv8 {
+            return;
+        }
+        let n = n.min(self.ctx_len - c0.max(0));
+        for s in 0..self.kq8.len() {
+            self.kv8_put(s, ptr::null(), c0.max(0), n, self.s_main);
+        }
+        let _ = unsafe { hipStreamSynchronize(self.s_main) };
+    }
+
     pub fn attn_selftest(&mut self) -> bool {
         // the scalar reference (tk_q36_attn_part) reads the std-layout V copy, which is not allocated by default
         if self.vc.first().is_some_and(|p| p.is_null()) {
@@ -4638,57 +5124,343 @@ impl Q36Engine {
                 }
             }
         }
+        if self.kv8 {
+            return self.kv8_selftest(fill_max);
+        }
         true
     }
 
-    /// Run attention microbenchmark (`Engine::attn_bench`).
+    fn d2h<T: Copy + Default>(src: *const T, n: usize) -> Vec<T> {
+        let mut v = vec![T::default(); n];
+        unsafe {
+            let _ = hipMemcpy(
+                v.as_mut_ptr().cast::<c_void>(),
+                src.cast::<c_void>(),
+                n * std::mem::size_of::<T>(),
+                HIP_MEMCPY_DEVICE_TO_HOST,
+            );
+        }
+        v
+    }
+
+    /// One attention call of `T` rows at `*pos0 = p0` over slot 0 (f16 WMMA or the int8 copy), merged and gated.
+    fn attn_rows(&mut self, p0: i32, T: i32, use_kv8: bool) -> Vec<f32> {
+        let var = self.kv8_variant;
+        self.attn_rows_v(p0, T, use_kv8, var)
+    }
+
+    fn attn_rows_v(&mut self, p0: i32, T: i32, use_kv8: bool, variant: i32) -> Vec<f32> {
+        let g = &self.model().g;
+        let (H, HKV, HD) = (g.n_head as i32, g.n_head_kv as i32, g.head_dim as i32);
+        let sc = 1.0f32 / (HD as f32).sqrt();
+        unsafe {
+            let _ = hipMemcpy(
+                self.pos0_d.cast::<c_void>(),
+                (&p0 as *const i32).cast::<c_void>(),
+                4,
+                HIP_MEMCPY_HOST_TO_DEVICE,
+            );
+        }
+        if use_kv8 {
+            let _ = talus_q36_attn_wmma_kv8(
+                self.n_chunk_w,
+                HKV,
+                self.q,
+                self.kq8[0].cast_const().cast::<c_void>(),
+                self.ks8[0].cast_const().cast::<c_void>(),
+                self.vq8[0].cast_const().cast::<c_void>(),
+                self.vs8[0].cast_const().cast::<c_void>(),
+                self.pos0_d,
+                T,
+                H,
+                self.ctx_len,
+                self.vt_ctx,
+                sc,
+                self.att_ck,
+                self.pacc,
+                self.pm,
+                self.pl,
+                ptr::null_mut(),
+                variant,
+            );
+        } else {
+            let _ = tk_q36_attn_wmma(
+                self.tk.as_ptr(),
+                self.attn_w8,
+                self.n_chunk_w,
+                HKV,
+                self.q,
+                self.kc[0].cast::<c_void>(),
+                self.vtc[0].cast::<c_void>(),
+                self.pos0_d,
+                T,
+                H,
+                HKV,
+                self.ctx_len,
+                self.vt_ctx,
+                sc,
+                self.att_ck,
+                self.n_chunk_w,
+                self.pacc,
+                self.pm,
+                self.pl,
+                ptr::null_mut(),
+            );
+        }
+        let _ = tk_q36_attn_merge(
+            self.tk.as_ptr(),
+            T * H,
+            HD,
+            self.pacc,
+            self.pm,
+            self.pl,
+            self.gate,
+            self.pos0_d,
+            0,
+            H,
+            self.n_chunk_w,
+            self.att,
+            self.att_ck,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
+        let _ = unsafe { hipDeviceSynchronize() };
+        Self::d2h(self.att.cast_const(), (T * H * HD) as usize)
+    }
+
+    /// rd-kv27 `--attn-test` with TALUS_Q27_KV8=1: (1) the GPU int8 copy is byte-identical to the CPU reference
+    /// quantizer (`kv8.rs`) over the f16 cells; (2) the int8 WMMA attention matches a CPU reference over the decoded
+    /// values; (3) a verify window's rows are bitwise the T = 1 rows at the same positions.
+    fn kv8_selftest(&mut self, fill_max: usize) -> bool {
+        use super::kv8::*;
+        let g = &self.model().g;
+        let (H, HKV, HD) = (g.n_head as usize, g.n_head_kv as usize, g.head_dim as usize);
+        let (ctx, vt_ctx) = (self.ctx_len as usize, self.vt_ctx as usize);
+        let fill = fill_max.min(ctx);
+        self.kv8_rebuild(0, fill as i32);
+        let _ = unsafe { hipDeviceSynchronize() };
+        let kc: Vec<u16> = Self::d2h(self.kc[0].cast_const(), HKV * ctx * HD);
+        let vt: Vec<u16> = Self::d2h(self.vtc[0].cast_const(), HKV * vt_ctx * HD);
+        let (a, b, c, d) = kv8_layer_elems(HKV, ctx, vt_ctx);
+        let gpu = Kv8Layer {
+            kq: Self::d2h(self.kq8[0].cast_const(), a),
+            ks: Self::d2h(self.ks8[0].cast_const(), b),
+            vq: Self::d2h(self.vq8[0].cast_const(), c),
+            vs: Self::d2h(self.vs8[0].cast_const(), d),
+        };
+        let mut cpu = Kv8Layer::zeroed(HKV, ctx, vt_ctx);
+        kv8_quant_cells(&kc, &vt, HKV, ctx, vt_ctx, 0, fill, &mut cpu);
+        let mut bad = 0usize;
+        for kvh in 0..HKV {
+            for cell in 0..fill {
+                for dd in 0..HD {
+                    bad += (gpu.kq[kv8_kq_index(kvh, cell, dd, ctx)]
+                        != cpu.kq[kv8_kq_index(kvh, cell, dd, ctx)])
+                        as usize;
+                    bad += (gpu.vq[kv8_vt_index(kvh, cell, dd, vt_ctx)]
+                        != cpu.vq[kv8_vt_index(kvh, cell, dd, vt_ctx)])
+                        as usize;
+                }
+                for gi in 0..KV8_GROUPS {
+                    bad += (gpu.ks[kv8_ks_index(kvh, cell, gi, ctx)]
+                        != cpu.ks[kv8_ks_index(kvh, cell, gi, ctx)])
+                        as usize;
+                    bad += (gpu.vs[kv8_vs_index(kvh, cell, gi, vt_ctx)]
+                        != cpu.vs[kv8_vs_index(kvh, cell, gi, vt_ctx)])
+                        as usize;
+                }
+            }
+        }
+        eprintln!("kv8-test: int8 copy vs CPU quantizer over {fill} cells: {bad} mismatches");
+        let mut ok = bad == 0;
+        let krow: Vec<Vec<Vec<f32>>> = (0..HKV)
+            .map(|h| (0..fill).map(|cl| kv8_k_row(&gpu, h, cl, ctx)).collect())
+            .collect();
+        let vrow: Vec<Vec<Vec<f32>>> = (0..HKV)
+            .map(|h| (0..fill).map(|cl| kv8_v_row(&gpu, h, cl, vt_ctx)).collect())
+            .collect();
+        let sc = 1.0f32 / (HD as f32).sqrt();
+        let (mut worst, mut q_err, mut q_ref) = ([0.0f32; 2], 0.0f64, 0.0f64);
+        for var in [0i32, 1] {
+            for &f in &[1usize, 17, 63, 64, 65, 257, 512, 1024] {
+                for &t in &[1usize, 2, 4, 6, 8, 16] {
+                    if f + t > fill {
+                        continue;
+                    }
+                    let p0 = (f - 1) as i32;
+                    let hq: Vec<f32> = Self::d2h(self.q.cast_const(), t * H * HD);
+                    let hg: Vec<f32> = Self::d2h(self.gate.cast_const(), t * H * HD);
+                    let got = self.attn_rows_v(p0, t as i32, true, var);
+                    let kf = |h: usize, cl: usize| krow[h][cl].clone();
+                    let vf = |h: usize, cl: usize| vrow[h][cl].clone();
+                    let r = ref_attention(&hq, &hg, t, H, HKV, p0 as usize, sc, &kf, &vf);
+                    for (x, y) in got.iter().zip(&r) {
+                        worst[var as usize] = worst[var as usize].max((x - y).abs());
+                    }
+                    // the quantization effect: int8 vs the f16 kernel on the same rows (information only)
+                    if var == 0 {
+                        let f16 = self.attn_rows(p0, t as i32, false);
+                        for (x, y) in got.iter().zip(&f16) {
+                            q_err += ((x - y) as f64).powi(2);
+                            q_ref += (*y as f64).powi(2);
+                        }
+                    }
+                    // verify rows == decode rows, bitwise
+                    if t > 1 {
+                        for tt in 0..t {
+                            // row tt of the window sees cells [0, p0 + tt]: a T = 1 call at p0 + tt with q row tt
+                            unsafe {
+                                let _ = hipMemcpy(
+                                    self.q.cast::<c_void>(),
+                                    hq.as_ptr().add(tt * H * HD).cast::<c_void>(),
+                                    H * HD * 4,
+                                    HIP_MEMCPY_HOST_TO_DEVICE,
+                                );
+                                let _ = hipMemcpy(
+                                    self.gate.cast::<c_void>(),
+                                    hg.as_ptr().add(tt * H * HD).cast::<c_void>(),
+                                    H * HD * 4,
+                                    HIP_MEMCPY_HOST_TO_DEVICE,
+                                );
+                            }
+                            let one = self.attn_rows_v(p0 + tt as i32, 1, true, var);
+                            if one[..] != got[tt * H * HD..(tt + 1) * H * HD] {
+                                eprintln!(
+                                "kv8-test: variant {var} fill {f} T {t}: row {tt} differs from its T=1 row"
+                            );
+                                ok = false;
+                            }
+                        }
+                        unsafe {
+                            let _ = hipMemcpy(
+                                self.q.cast::<c_void>(),
+                                hq.as_ptr().cast::<c_void>(),
+                                t * H * HD * 4,
+                                HIP_MEMCPY_HOST_TO_DEVICE,
+                            );
+                            let _ = hipMemcpy(
+                                self.gate.cast::<c_void>(),
+                                hg.as_ptr().cast::<c_void>(),
+                                t * H * HD * 4,
+                                HIP_MEMCPY_HOST_TO_DEVICE,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "kv8-test: int8 kernel vs CPU reference max |diff| variant 0 {:.2e}, variant 1 (ofs) {:.2e} (tol 3e-3); \
+             int8 vs f16 kernel rel rms {:.3e}",
+            worst[0],
+            worst[1],
+            (q_err / q_ref.max(1e-30)).sqrt()
+        );
+        ok && worst[0] <= 3e-3 && worst[1] <= 3e-3
+    }
+
+    /// Run attention microbenchmark (`Engine::attn_bench`): one layer's decode / verify attention (WMMA kernel +
+    /// merge excluded) at 2K / 32K / 64K cells (those below the context) for T = 1 / 6 / 8 / 16 rows; f16 always,
+    /// the int8 copy too with TALUS_Q27_KV8=1.  Prints us per call and the K + V bytes read per us.
     pub fn attn_bench(&mut self) {
         let g = &self.model().g;
-        let H = g.n_head as i32;
-        let HKV = g.n_head_kv as i32;
-        let HD = g.head_dim as i32;
-        let sc = 1.0f32 / (HD as f32).sqrt();
-        let iters = 200;
-        for &fill in &[64i32, 256, 512, 1024, 2048, 4096] {
-            if fill >= self.ctx_len {
+        let HKV = g.n_head_kv as usize;
+        for &fill in &[2048i32, 32768, 65536] {
+            if fill + 16 >= self.ctx_len {
+                eprintln!(
+                    "attn-bench: skip {fill} cells (--max-context {} too small)",
+                    self.ctx_len
+                );
                 continue;
             }
-            unsafe {
-                let _ = hipMemcpy(
-                    self.pos0_d.cast::<c_void>(),
-                    (&fill as *const i32).cast::<c_void>(),
-                    4,
-                    HIP_MEMCPY_HOST_TO_DEVICE,
-                );
-            }
-            for &T in &[1i32, 4, 8] {
-                let _ = unsafe { hipDeviceSynchronize() };
-                for _ in 0..iters {
-                    let _ = tk_q36_attn_wmma(
-                        self.tk.as_ptr(),
-                        self.attn_w8,
-                        self.n_chunk_w,
-                        HKV,
-                        self.q,
-                        self.kc[0].cast::<c_void>(),
-                        self.vtc[0].cast::<c_void>(),
-                        self.pos0_d,
+            for &T in &[1i32, 6, 8, 16] {
+                for (kv8, var) in [(false, 0), (true, 0), (true, 1)] {
+                    if kv8 && !self.kv8 {
+                        continue;
+                    }
+                    let iters = if fill > 16384 { 50 } else { 200 };
+                    let _ = self.attn_rows_v(fill - 1, T, kv8, var); // warm
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        self.attn_call(T, kv8, var);
+                    }
+                    let _ = unsafe { hipDeviceSynchronize() };
+                    let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                    let per_cell = if kv8 {
+                        super::kv8::KV8_CELL_BYTES
+                    } else {
+                        2 * 512
+                    };
+                    let bytes = (HKV * (fill as usize + T as usize) * per_cell) as f64;
+                    println!(
+                        "attn-bench kv={} cells={} T={} us={:.1} GB/s={:.1}",
+                        if !kv8 {
+                            "f16"
+                        } else if var == 0 {
+                            "int8"
+                        } else {
+                            "int8-ofs"
+                        },
+                        fill,
                         T,
-                        H,
-                        HKV,
-                        self.ctx_len,
-                        self.vt_ctx,
-                        sc,
-                        self.att_ck,
-                        self.n_chunk_w,
-                        self.pacc,
-                        self.pm,
-                        self.pl,
-                        ptr::null_mut(),
+                        us,
+                        bytes / us / 1e3
                     );
                 }
-                let _ = unsafe { hipDeviceSynchronize() };
             }
+        }
+    }
+
+    /// The attention kernel alone (no merge, no sync), `*pos0` already set by [`Self::attn_rows`].
+    fn attn_call(&mut self, T: i32, use_kv8: bool, variant: i32) {
+        let g = &self.model().g;
+        let (H, HKV, HD) = (g.n_head as i32, g.n_head_kv as i32, g.head_dim as i32);
+        let sc = 1.0f32 / (HD as f32).sqrt();
+        if use_kv8 {
+            let _ = talus_q36_attn_wmma_kv8(
+                self.n_chunk_w,
+                HKV,
+                self.q,
+                self.kq8[0].cast_const().cast::<c_void>(),
+                self.ks8[0].cast_const().cast::<c_void>(),
+                self.vq8[0].cast_const().cast::<c_void>(),
+                self.vs8[0].cast_const().cast::<c_void>(),
+                self.pos0_d,
+                T,
+                H,
+                self.ctx_len,
+                self.vt_ctx,
+                sc,
+                self.att_ck,
+                self.pacc,
+                self.pm,
+                self.pl,
+                ptr::null_mut(),
+                variant,
+            );
+        } else {
+            let _ = tk_q36_attn_wmma(
+                self.tk.as_ptr(),
+                self.attn_w8,
+                self.n_chunk_w,
+                HKV,
+                self.q,
+                self.kc[0].cast::<c_void>(),
+                self.vtc[0].cast::<c_void>(),
+                self.pos0_d,
+                T,
+                H,
+                HKV,
+                self.ctx_len,
+                self.vt_ctx,
+                sc,
+                self.att_ck,
+                self.n_chunk_w,
+                self.pacc,
+                self.pm,
+                self.pl,
+                ptr::null_mut(),
+            );
         }
     }
 

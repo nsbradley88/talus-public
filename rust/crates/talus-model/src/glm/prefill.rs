@@ -198,3 +198,18 @@ impl GlmEngine {
         Ok(())
     }
 }
+
+/// Memory pressure (#40): free the shared prefill engine's grown scratch and allocator caches (`tk_prefill_trim`;
+/// the next prompt chunk allocates them again, same sizes, same results). False when nothing was trimmed or the
+/// library has no trim entry.
+pub(super) fn trim_arenas(eng: &mut GlmEngine) -> bool {
+    let Some(f) = eng.lib.prefill_trim else {
+        return false;
+    };
+    if ffi::sync(eng.stream).is_err() {
+        return false;
+    }
+    // SAFETY: ctx valid; the stream is idle (synchronized above).
+    let st = unsafe { f(eng.lib.ctx) };
+    st == 0
+}

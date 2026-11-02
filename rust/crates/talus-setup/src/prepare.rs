@@ -136,7 +136,11 @@ pub fn prepare_flash_next(
         return Ok(());
     }
     let (py, gguf_py, shim) = python_env(x, paths)?;
-    let tools = st.src.join("tools");
+    // the tools shipped with the binaries (install prefix) when present, else the source clone's
+    let tools = crate::config::side_file(&paths.data, &st.src, "tools/iq_pack.py")
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| st.src.join("tools"));
     // tools/_paths.py first if the tree has it, our shim otherwise
     let pythonpath = format!("{}:{}", s(&tools), s(&shim));
     let env = format!("STRATA_GGUF_PY={}", s(&gguf_py));
@@ -203,7 +207,7 @@ pub fn prepare_flash_next(
                 "the MTP runtime files",
             )?;
         }
-        let dv = st.src.join("data/draft_vocab.bin");
+        let dv = crate::config::side_file(&paths.data, &st.src, "data/draft_vocab.bin");
         x.run(
             &["cp".into(), s(&dv), s(&rt.join("draft_vocab.bin"))],
             "the draft layer's token subset",
@@ -237,6 +241,39 @@ mod tests {
             assert!(a.contains(needle), "missing {needle} in:\n{a}");
         }
         assert!(!home.join(".local").exists(), "a dry run writes nothing");
+        assert!(
+            a.contains(&format!("{}/tools/iq_pack.py", home.join("src").display())),
+            "{a}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn tools_and_draft_vocab_from_the_install_prefix() {
+        let home = crate::testutil::tempdir("prep2");
+        let paths = Paths::under(&home);
+        let st = SetupState::new(&paths, home.join("src"), None);
+        for f in ["tools/iq_pack.py", "data/draft_vocab.bin"] {
+            let p = paths.data.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"").unwrap();
+        }
+        let m = crate::manifest::get("qwen3.8-flash-next").unwrap();
+        let x = Exec::new(true);
+        prepare_flash_next(&x, &paths, &st, m, &Choices::default()).unwrap();
+        let a = x.actions().join("\n");
+        let pre = paths.data.display().to_string();
+        for needle in [
+            "tools/iq_pack.py",
+            "tools/mtp_fetch.py",
+            "tools/mtp_rt.py",
+            "data/draft_vocab.bin",
+        ] {
+            assert!(
+                a.contains(&format!("{pre}/{needle}")),
+                "{needle} not from the prefix:\n{a}"
+            );
+        }
         std::fs::remove_dir_all(home).ok();
     }
 }

@@ -931,7 +931,31 @@ impl StdioSubprocessEngine {
         cwd: Option<&Path>,
         default_ctx: usize,
     ) -> Result<Self, EngineError> {
+        Self::spawn_with_log(exe, args, env, cwd, None, default_ctx)
+    }
+
+    /// As [`Self::spawn_with_cwd`], and with `log` set the engine's stderr is also appended to that file (the run
+    /// config's `"log"`, talus#58). The file is opened for append (created if missing) before the engine starts; the
+    /// stderr passthrough to talus-server's own stderr stays. A log that cannot be opened is a warning, not an error.
+    pub fn spawn_with_log(
+        exe: impl AsRef<Path>,
+        args: &[String],
+        env: &[(String, String)],
+        cwd: Option<&Path>,
+        log: Option<&Path>,
+        default_ctx: usize,
+    ) -> Result<Self, EngineError> {
         let exe_path = exe.as_ref().to_path_buf();
+        let log_file = log.and_then(|p| match open_engine_log(p) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!(
+                    "[talus-server] warning: cannot open engine log {}: {e}; engine stderr goes to stderr only",
+                    p.display()
+                );
+                None
+            }
+        });
         let mut cmd = Command::new(&exe_path);
         cmd.args(args);
         if !args
@@ -948,7 +972,11 @@ impl StdioSubprocessEngine {
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(if log_file.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::inherit()
+            });
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::process::CommandExt;
@@ -976,6 +1004,9 @@ impl StdioSubprocessEngine {
             .stdout
             .take()
             .ok_or_else(|| EngineError::EngineDied("missing child stdout".to_string()))?;
+        if let (Some(file), Some(stderr)) = (log_file, child.stderr.take()) {
+            tee_engine_stderr(stderr, file);
+        }
         let mut reader = BufReader::new(stdout);
 
         let mut max_context = default_ctx.max(1);
@@ -1358,6 +1389,44 @@ impl StdioSubprocessEngine {
             let _ = handle.child.kill();
             let _ = handle.child.wait();
         }
+    }
+}
+
+/// Open the engine log for append, creating it (and its parent directory) if missing.
+fn open_engine_log(path: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+/// Copy the engine's stderr to talus-server's stderr and to `log` until the engine closes it (exits). Write errors
+/// on either side are ignored so the engine never blocks on a full stderr pipe.
+fn tee_engine_stderr(mut src: std::process::ChildStderr, mut log: std::fs::File) {
+    let spawned = thread::Builder::new()
+        .name("engine-stderr".to_string())
+        .spawn(move || {
+            use std::io::Read;
+            let mut buf = [0u8; 8192];
+            loop {
+                match src.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let _ = log.write_all(&buf[..n]);
+                        let mut err = std::io::stderr().lock();
+                        let _ = err.write_all(&buf[..n]);
+                        let _ = err.flush();
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        eprintln!("[talus-server] warning: cannot start the engine log thread: {e}");
     }
 }
 

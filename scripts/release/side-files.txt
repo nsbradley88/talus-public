@@ -1,0 +1,16 @@
+# Data and tools the programs and `talus setup` need outside bin/, shipped at the same relative path under the install
+# prefix (the release tarball's top folder; ~/.local/share/talus for install.sh), talus#50. One path per line, relative
+# to the source tree. install.sh (source builds) and scripts/release/build-in-container.sh (the tarball) read this list.
+# Qwen3.8-Flash-Next run config: --expert-profile, --mtp-draft-vocab
+data/expert-profile.bin
+data/draft_vocab_en.bin
+# Flash-Next preparation (talus setup / prepare.rs): the draft layer's token subset and the pack / MTP tools with
+# everything they import or run
+data/draft_vocab.bin
+tools/iq_pack.py
+tools/strata_tokenizer.py
+tools/gguf_reader.py
+tools/_paths.py
+tools/mtp_fetch.py
+tools/mtp_pack.py
+tools/mtp_rt.py

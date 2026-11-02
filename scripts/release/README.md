@@ -12,6 +12,8 @@ One tarball per release, for Linux x86_64 + gfx1151 (Strix Halo):
 talus-<TAG>-linux-x86_64-gfx1151.tar.gz
 └── talus-<TAG>-linux-x86_64-gfx1151/
     ├── bin/  talus-cli  talus-server  talus-tui  [talus-setup]  libtalus_kernels.so
+    │   └── hip/  <arch>-hipblaslt-<version>.txt   (hipBLASLt prefill tuning tables, from tools/hip)
+    ├── data/  tools/   Flash-Next's expert profile, draft vocabularies and pack / MTP tools (side-files.txt)
     ├── configs/   docs/*.md   README.md  LICENSE  THIRD_PARTY_NOTICES.md  SECURITY.md
     ├── licenses/  rust-crates/<crate>-<ver>/ + INDEX.tsv, rust-std/, ggml/, rocm/
     ├── MANIFEST.json   (commit, tag, ROCm version + SDK fingerprint, rustc/gcc/cmake, base image, apt snapshot,
@@ -29,6 +31,11 @@ URL pattern: `https://github.com/nsbradley88/talus-public/releases/download/<TAG
 ### How the programs find their libraries
 
 - `libtalus_kernels.so` is found next to the executable (`bin/`); `TALUS_KERNELS_LIB` overrides.
+- The hipBLASLt prefill tuning table is found next to the kernel library: `bin/hip/<arch>-hipblaslt-<hipBLASLt
+  version>.txt` (the running hipBLASLt's version, e.g. `gfx1151-hipblaslt-100500.txt` on the ROCm 10.2 pin), then
+  `../share/talus/hip/`, then `../tools/hip/` (a source-tree build). `STRATA_HIPBLASLT_TUNING` overrides (a file, or a
+  directory holding the tables; empty / `off` disables the table). With no table on gfx1151 the engine log shows a
+  `talus: WARN: no hipBLASLt tuning table` line and the prompt runs untuned (hipBLASEx: slower, different numerics).
 - ROCm is **not bundled**. Every ELF in `bin/` carries `RUNPATH=$ORIGIN/../rocm-sdk/lib:/opt/rocm/lib`: link
   `PREFIX/rocm-sdk` to the ROCm SDK root (the installer does this), or install ROCm in `/opt/rocm`, or set
   `LD_LIBRARY_PATH` (searched first). `ROCM_SDK` / `ROCM_PATH` also work for `libamdhip64` (hip-sys).

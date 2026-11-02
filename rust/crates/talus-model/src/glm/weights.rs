@@ -430,7 +430,7 @@ impl<'a> Uploader<'a> {
             bytes: 0,
             names: vec![],
             total: total_weight_bytes(g),
-            floor: 8 << 30,
+            floor: floor_bytes(),
             t_read: 0.0,
             t_alloc: 0.0,
             t_sync: 0.0,
@@ -487,9 +487,10 @@ impl<'a> Uploader<'a> {
         if avail < remaining + self.floor {
             return Err(CoreError::InvalidArgument {
                 reason: format!(
-                    "load aborted at {name}: MemAvailable {:.1} GiB < {:.1} GiB still to load + 8 GiB floor",
+                    "load aborted at {name}: MemAvailable {:.1} GiB < {:.1} GiB still to load + {:.1} GiB floor",
                     avail as f64 / (1u64 << 30) as f64,
-                    remaining as f64 / (1u64 << 30) as f64
+                    remaining as f64 / (1u64 << 30) as f64,
+                    self.floor as f64 / (1u64 << 30) as f64
                 ),
             });
         }
@@ -742,33 +743,52 @@ pub fn mem_available_bytes() -> u64 {
     0
 }
 
-/// Background MemAvailable watchdog: exits the process (freeing its GPU memory) when MemAvailable stays below
-/// `floor` for two consecutive samples (200 ms apart).
-pub fn spawn_watchdog(floor: u64) {
-    unsafe extern "C" {
-        fn _exit(code: i32) -> !;
+/// GLM's MemAvailable floor when nothing overrides it (8 GiB, the Strix Halo rule).
+pub const DEFAULT_FLOOR_BYTES: u64 = 8 << 30;
+
+/// Parse a `TALUS_MEM_FLOOR_GIB` value: a number of GiB in [2, 64]. Anything else (unset, empty, out of range,
+/// not a number) yields `None`, i.e. the 8 GiB default.
+pub fn parse_floor_gib(v: Option<&str>) -> Option<u64> {
+    let g: f64 = v?.trim().parse().ok()?;
+    if !(2.0..=64.0).contains(&g) {
+        return None;
     }
-    std::thread::spawn(move || {
-        let mut low = 0;
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            let a = mem_available_bytes();
-            if a != 0 && a < floor {
-                low += 1;
-                if low >= 2 {
+    Some((g * (1u64 << 30) as f64) as u64)
+}
+
+/// The GLM MemAvailable floor in bytes: `TALUS_MEM_FLOOR_GIB` (an operator override for a host with less headroom,
+/// e.g. 6 on the desktop EVO-X2) or 8 GiB. Used by the load-time reservation, the loader's live check and the
+/// watchdog's default (`--minavail` still overrides the watchdog). Logged once at startup.
+pub fn floor_bytes() -> u64 {
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        let raw = std::env::var("TALUS_MEM_FLOOR_GIB").ok();
+        match parse_floor_gib(raw.as_deref()) {
+            Some(b) => {
+                eprintln!(
+                    "glm: MemAvailable floor {:.2} GiB (TALUS_MEM_FLOOR_GIB; default 8)",
+                    b as f64 / (1u64 << 30) as f64
+                );
+                b
+            }
+            None => {
+                if let Some(r) = raw.filter(|r| !r.trim().is_empty()) {
                     eprintln!(
-                        "glm: WATCHDOG MemAvailable {:.2} GiB < floor {:.2} GiB: exiting",
-                        a as f64 / (1u64 << 30) as f64,
-                        floor as f64 / (1u64 << 30) as f64
+                        "glm: ignoring TALUS_MEM_FLOOR_GIB={r:?} (want 2..64 GiB); floor 8 GiB"
                     );
-                    // SAFETY: immediate process exit; the driver releases GPU memory.
-                    unsafe { _exit(3) };
                 }
-            } else {
-                low = 0;
+                DEFAULT_FLOOR_BYTES
             }
         }
-    });
+    })
+}
+
+/// Memory-pressure guard (#40), replacing the old watchdog that exited the process at the floor: installs the shared
+/// `talus_mem::pressure` sampler with `floor` (bytes). The engine then sheds rebuildable memory at its safe points and
+/// fails only the current request when the host stays under the floor; the process exits only below the last-resort
+/// limit (`TALUS_MEM_HARD_EXIT_MIB`, default floor - 2 GiB).
+pub fn spawn_watchdog(floor: u64) {
+    talus_mem::pressure::install(talus_mem::pressure::PressureConfig::from_env(floor), "glm");
 }
 
 fn scale_f32_tensor(t: &Tensor, s: f32) -> Result<()> {
@@ -800,4 +820,24 @@ pub fn reserve(
         ids.push(r.id);
     }
     Ok(ids)
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::parse_floor_gib;
+
+    #[test]
+    fn floor_override_parsing() {
+        assert_eq!(parse_floor_gib(None), None);
+        assert_eq!(parse_floor_gib(Some("")), None);
+        assert_eq!(parse_floor_gib(Some("six")), None);
+        assert_eq!(parse_floor_gib(Some("1")), None);
+        assert_eq!(parse_floor_gib(Some("65")), None);
+        assert_eq!(parse_floor_gib(Some("6")), Some(6 << 30));
+        assert_eq!(parse_floor_gib(Some(" 8 ")), Some(8 << 30));
+        assert_eq!(
+            parse_floor_gib(Some("6.5")),
+            Some(6 * (1 << 30) + (1 << 29))
+        );
+    }
 }

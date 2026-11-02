@@ -1032,6 +1032,8 @@ pub fn serve_main(
             }
             let np = ids.len() - nf;
             eng.clear_kv_from(0, swa_clear)?;
+            eng.tail_discard_from(0);
+            eng.set_prefill_hint(Some(np));
             let mut done = 0usize;
             while done < np {
                 let n = eng.ubatch().min(np - done);
@@ -1050,6 +1052,7 @@ pub fn serve_main(
                 }
                 done += n;
             }
+            eng.set_prefill_hint(None);
             let mut rows: Vec<u8> = Vec::with_capacity((nf + 1) * v_len * 4);
             let push = |rows: &mut Vec<u8>, l: &[f32]| {
                 for v in l {
@@ -1188,6 +1191,11 @@ pub fn serve_main(
             ));
             continue;
         }
+        // #40: refuse just this request when the host is under the MemAvailable floor (no rebuildable caches here)
+        if let Err(e) = talus_mem::pressure::admit(&mut talus_mem::pressure::NoShed) {
+            emit(&talus_mem::pressure::err_line(&e.to_string()));
+            continue;
+        }
         if sp.seed >= 0 {
             rng.seed(sp.seed as u64);
         }
@@ -1260,6 +1268,12 @@ pub fn serve_main(
         } else {
             cached.clear();
         }
+        // rd-swa-laguna: never resume where a sliding-window query would read a row a pruned prefill skipped
+        if lcp > 0 && eng.tail_resume_floor(lcp) != lcp {
+            lcp = 0;
+            cached.clear();
+        }
+        eng.tail_discard_from(lcp);
         // cells past the reused prefix look as on a fresh engine (TALUS_LAGUNA_KV_CLEAR=0: off)
         if kv_clear {
             eng.clear_kv_from(lcp, swa_clear)?;
@@ -1270,6 +1284,8 @@ pub fn serve_main(
         let n_read = ids.len() - lcp;
         let ubatch = eng.ubatch();
         let mut done = 0usize;
+        // rd-swa-laguna: the chunk calls below are one prompt ending at ids.len()
+        eng.set_prefill_hint(Some(ids.len()));
         while done < n_read {
             let n = ubatch.min(n_read - done);
             let is_last = done + n == n_read;
@@ -1296,6 +1312,7 @@ pub fn serve_main(
             };
             emit(&format!("PP {done} {n_read} {:.0} {:.1}", ms, tps));
         }
+        eng.set_prefill_hint(None);
         cached.clear();
         cached.extend_from_slice(&ids);
         let prompt_ms = ms_since(tp);

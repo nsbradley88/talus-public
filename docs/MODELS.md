@@ -19,13 +19,17 @@ How to read the switch tables:
 figures for every model are on [RESULTS.md](RESULTS.md).
 
 All five models run with a minimum of free memory (`MemAvailable`) in mind: the engine's memory accountant refuses any allocation
-that would leave less than 8 GiB free (GLM-5.3-Flash runs closest to it, at about 9 GiB). One model runs per machine.
+that would leave less than 8 GiB free (GLM-5.3-Flash runs closest to it, at about 9 GiB). While serving, a shared memory
+guard frees caches it can rebuild when `MemAvailable` comes within 512 MiB of that floor, and if memory stays below the
+floor only the current request fails (`insufficient_memory`, HTTP 503) and the server keeps serving (GLM-5.3-Flash and
+Qwen3.8-27B free caches first; MiMo-V2.6-Flash and Laguna-S-2.1 refuse the request; Flash-Next keeps its own admission
+control). One model runs per machine.
 
 ## System setup
 
 On a default install, the GPU can use only part of the 128 GB, and GLM-5.3-Flash and MiMo-V2.6-Flash do not fit.
 Our measurements use these kernel parameters (Ubuntu: a file in `/etc/default/grub.d/`, then `sudo update-grub` and a
-reboot):
+reboot; `talus setup` writes it for you after asking):
 
 ```
 ttm.pages_limit=31457280 ttm.page_pool_size=31457280   # GPU memory pool 120 GiB
@@ -37,6 +41,41 @@ We also run headless (`sudo systemctl set-default multi-user.target`). This is a
 not a separate measurement): with a desktop session running, Qwen3.8-27B, Qwen3.8-Flash-Next and Laguna-S-2.1 still
 have tens of GiB to spare, MiMo-V2.6-Flash is tight, and GLM-5.3-Flash needs headless. These are boot settings: check
 them against your distribution's documentation before you apply them.
+
+Two more host settings were on for every measurement:
+
+- **ACPI platform profile `performance`** (laptops and some mini-PCs). Most Strix Halo machines boot in `balanced`,
+  which holds the chip's sustained power back: GLM-5.3-Flash decoded at 11.2 tok/s with balanced
+  instead of about 24 tok/s on our laptop. Check it with
+  `cat /sys/firmware/acpi/platform_profile` (the choices are in `platform_profile_choices` next to it).
+  `talus setup` offers to set it (default yes; `--no-power-profile` skips) and keeps it across reboots: with
+  `powerprofilesctl set performance` when power-profiles-daemon runs, otherwise with one systemd-tmpfiles line in
+  `/etc/tmpfiles.d/90-talus-platform-profile.conf`. `talus doctor` warns when it is not `performance`. It is not a
+  boot setting and needs no reboot. Performance draws more power and runs the fans harder (on a laptop: warmer,
+  louder, shorter on battery). Machines without the file (our desktop, and many others) set the power mode in the
+  BIOS: pick the highest sustained mode.
+- **`amd_iommu=off`** on the kernel command line, next to the parameters above. We have not measured what it is
+  worth, Talus runs with the IOMMU on, and `talus setup` does not set it. With it, the NPU is unavailable.
+
+## Default sampling
+
+Each run config carries a `sampling` block: the values a request gets for the sampling fields it leaves out. A
+request's own `temperature`, `top_p`, `top_k` and `min_p` always win. The blocks are the server settings every
+published figure of the model was measured under (the `chat` cell itself sends temperature 1.0 / top-p 0.95; the
+other fields come from the block):
+
+| Model | temperature | top_p | top_k | min_p |
+|---|---|---|---|---|
+| Qwen3.8-27B | 0.8 | 0.95 | 40 | 0.05 |
+| Qwen3.8-Flash-Next | 1.0 | 0.95 | 20 | 0 |
+| GLM-5.3-Flash | 0.8 | 0.95 | 40 | 0.05 |
+| MiMo-V2.6-Flash | 1.0 | 1.0 | 20 | 0 |
+| Laguna-S-2.1 | 1.0 | 1.0 | 20 | 0 |
+
+Qwen3.8-27B's block changed in v0.1.2: v0.1.1 shipped top_k 20 / min_p 0, which differed from what its figures were
+measured with. A run config without a `sampling` block gets talus-server's built-in defaults for the missing fields:
+temperature 0.7, top_p 0.95, top_k 20, min_p 0. The engines keep at most 64 candidates, so a `top_k` of 0 (off) or above
+64 means 64.
 
 Our own files (the GLM, MiMo and Laguna quants and the 64K draft vocabularies) are published on Hugging Face with
 model cards that give the recipe, the tensor types and the licenses.
@@ -51,7 +90,7 @@ Dense model with gated delta net and attention layers. Engine `qwen35`.
 | MTP head | `MTP/mtp-Qwen3.8-27B-Q4_0.gguf` from the same repository (about 1.3 GB) |
 | DFlash2 drafter | `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` from [z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF), z-lab's block-diffusion drafter (about 1.1 GB) |
 | Draft vocabulary | `qwen-dv-65536.bin` ([j2ipper/draft-vocab](https://huggingface.co/j2ipper/draft-vocab)): 64K token ids in llama.cpp's int32 format |
-| 4-bit prompt weights | `Qwen3.8-27B-UD-IQ4_XS.w4i` ([j2ipper/Qwen3.8-27B-W4A4-prompt](https://huggingface.co/j2ipper/Qwen3.8-27B-W4A4-prompt), about 2.0 GiB), placed next to the GGUF. Optional (opt-in `TALUS_Q27_W4I=auto`): by default prompts run on the exact int8 path. `Qwen3.8-27B-UD-IQ4_XS.fast.w4i` (about 8.0 GiB) only for the opt-in fast profile. Built for `UD-IQ4_XS` only. |
+| 4-bit prompt weights | `Qwen3.8-27B-UD-IQ4_XS.w4i` format v3 ([j2ipper/Qwen3.8-27B-W4A4-prompt-v3](https://huggingface.co/j2ipper/Qwen3.8-27B-W4A4-prompt-v3), about 2.06 GiB, sha256 `2a4f69c3918218d3f1b6fbdf3a3278c65077ee042c4cee51e5b99e455862935d`), placed next to the GGUF; `talus setup` downloads it by default (`--advanced` can skip it). Used by default when present (see **4-bit prompt math** below); `TALUS_Q27_W4I=0` (or the TUI's Reference level) turns it off, and without the file prompts run on the exact int8 path. The v2 file of [j2ipper/Qwen3.8-27B-W4A4-prompt](https://huggingface.co/j2ipper/Qwen3.8-27B-W4A4-prompt) is for v0.1.1 and older (opt-in there); v0.1.2 ignores a v2 file unless `TALUS_Q27_W4I=auto`. `Qwen3.8-27B-UD-IQ4_XS.fast.w4i` (about 8.0 GiB, v2 repository) is only for the opt-in fast profile. Built for `UD-IQ4_XS` only. |
 | Context / KV | Sized to the machine when `--max-context` is not given: the largest of 256K (the model's native context, no RoPE scaling), 128K and 64K that fits in memory beside the weights and the int8 prompt weights (see **Context by machine** below). f16 KV: 68 KiB per token (K and a transposed V copy for the 16 attention layers plus the MTP layer; 17 GiB at 256K) |
 | Stop token | `<|im_end|>` |
 | License | Apache-2.0 (model, MTP head, DFlash2 drafter) |
@@ -65,8 +104,8 @@ Shipped arguments:
 --dflash-gguf Qwen3.8-27B-DFlash2-Q4_K_M.gguf
 ```
 
-No environment variables are needed. 4-bit prompt math is an opt-in (`TALUS_Q27_W4I=auto`, see **4-bit prompt
-math** below). Without `--max-context` (or with `--max-context auto`) the engine picks the context by memory and logs
+No environment variables are needed. 4-bit prompt math is on when the v3 prompt-weight file is installed
+(`TALUS_Q27_W4I=0` turns it off, see **4-bit prompt math** below). Without `--max-context` (or with `--max-context auto`) the engine picks the context by memory and logs
 the choice and the reason in one line; an explicit `--max-context` is always honoured. Without the drafter flags, no
 speculative decoding runs.
 
@@ -109,18 +148,23 @@ the sampled text differs; we keep it off by default.
 | Split decode attention | `STRATA_ATTN_SPLIT=0` |
 | HIP graphs | `--no-graph` |
 
-**4-bit prompt math (opt-in, `TALUS_Q27_W4I=auto`).** It passed our quality gate (see [METHODOLOGY.md](METHODOLOGY.md),
-needle and agentic suites) and makes prompts about seven percent faster, but it is off by default: the changed prompt
-numerics lower draft acceptance afterwards, so generation after a 2K prompt is about eleven percent slower (about three
-percent after 32K). It pays off only when each request brings a very long new prompt and a short answer; for multi-turn
-chat and coding, leave it off. When on, the prompt (prefill) GEMMs of the feed-forward in layers 48-63 run on the `iu4`
+**4-bit prompt math (default with the v3 file).** It is used when the installed `.w4i` file is format v3
+(header `W4I3`). Measured against the exact int8 path on the laptop (tier 1, two control runs): prompts
+6.5-7.2 % faster at 2K and 6.5-6.7 % at 32K; decode after a 2K prompt
++1.6 to +1.7 %, after 32K -0.5 %; draft acceptance unchanged. Quality against the
+BF16 weights (teacher-forced, 12 wiki and 6 code chunks): the added KL over the exact path is
++0.00018 on wiki and +0.00099 on code, below the `Q8_0` floor of
+0.00084 / 0.00148; needle 60K 15/15, agentic smoke
+test 5/5. The v3 file comes from a new recipe for the same layers (SmoothQuant, best-of-4 integer
+group scales, GPTQ with 256-column groups, per-row bias correction) and replaces v0.1.1's v2 file, which lowered draft
+acceptance after the prompt and therefore stayed opt-in. When on, the prompt (prefill) GEMMs of the feed-forward in layers 48-63 run on the `iu4`
 matrix instruction, twice the int8 rate. Activations are rotated per 256 values (seeded Hadamard) and quantized to int4
 per 32 values; the 32-value scales are small integers times a per-token scale, so the kernel rescales with one integer
 multiply-add. The int4 weights are a separate GPTQ quantization of the GGUF's weights in the same rotated basis (`.w4i`
 file; build it with `tools/w4i/build_sidecar.sh`, recipe in `tools/w4i/README.md`). Decode, verification and drafting
 never use it. Only the last 16 layers: earlier layers cost several times more accuracy per layer (layer sweep in
-[METHODOLOGY.md](METHODOLOGY.md)). The file records the GGUF's name and size; a different GGUF, a missing file or an
-unset or `0` value keeps the exact int8 prompt path (a missing file logs one line). `TALUS_Q27_W4I=<path>` loads a given
+[METHODOLOGY.md](METHODOLOGY.md)). The file records the GGUF's name and size; a different GGUF, a missing file, a v2 file (unless
+`TALUS_Q27_W4I=auto`) or `TALUS_Q27_W4I=0` keeps the exact int8 prompt path (a missing file logs one line). `TALUS_Q27_W4I=<path>` loads a given
 file, `TALUS_Q27_W4I_PLANES` picks the layers (`ffn:48-63` = the default).
 
 **Opt-ins:** `TALUS_Q27_W4I=fast` (needs `Qwen3.8-27B-UD-IQ4_XS.fast.w4i`): 4-bit prompt math in the feed-forward of all
@@ -146,7 +190,8 @@ tiles' tile-plane copies add 13 GB (12.0 GiB) when they fit: they come last (con
 take only what is left above the 8 GiB floor and a 3 GiB reserve, and never shrink the automatic context. Without them
 the tiles read the GGUF rows, somewhat slower. One log line says which and why (`wide verify tiles on with tile-plane
 copies of 387 matrices, 12.0 GiB (auto: they fit with the reserve; ...)`). Lowest `MemAvailable`
-in the release run (64K context): 66 GiB.
+in the v0.1.2 release run on our desktop: 42 GiB at the shipped 256K context,
+56 GiB at 64K (`--max-context 65536`, measured on the first release candidate).
 
 **Context by machine.** Without `--max-context` the engine takes the largest of 256K, 128K and 64K whose KV cache fits
 beside the weights, the int8 prompt weights and a 3 GiB reserve, keeping 8 GiB of `MemAvailable` free, and logs one
@@ -154,7 +199,7 @@ line such as `context 65536 (auto, no --max-context): 37.1 GiB free above the 8 
 
 | Machine | Automatic context | Notes |
 |---|---|---|
-| 128 GB Strix Halo | 256K | int8 prompt weights and the wide tiles' copies on. Lowest `MemAvailable` while serving: about 46 GiB at 256K (59 GiB without the copies), 66 GiB at 64K. |
+| 128 GB Strix Halo | 256K | int8 prompt weights and the wide tiles' copies on. Lowest `MemAvailable` while serving (laptop, v0.1.0): about 46 GiB at 256K (59 GiB without the copies), 66 GiB at 64K; v0.1.2 on the desktop: see **Memory** above. |
 | 64 GB Strix Halo | 64K (checked with a 62 GiB budget, `TALUS_MEM_LIMIT_MIB=63488`, on a 128 GB machine) | int8 prompt weights on; the wide tiles run without their copies. `--max-context 131072` still keeps the int8 prompt weights, by about 0.3 GiB when nothing else runs; a desktop session or other programs push them out. `--max-context 262144` does not leave room for them. |
 
 An explicit `--max-context` is always honoured. When the int8 prompt weights do not fit beside its KV cache, the engine
@@ -184,8 +229,10 @@ source, 26 windows; the `Q8_0` row is the measurement floor):
 On prose the two 4-bit files are close. On code `UD-Q4_K_XL` has about half the divergence of `UD-IQ4_XS`; the median
 token is nearly unchanged in both, and the difference sits in a tail of uncertain tokens. To run `UD-Q4_K_XL`, download
 `Qwen3.8-27B-UD-Q4_K_XL.gguf` and pass it to `--model` (and as the server's `tokenizer`); everything else stays the same,
-except the opt-in 4-bit prompt weights (`.w4i`), which exist for `UD-IQ4_XS` only. Talus does not run the BF16 or F16
-weights: its decode kernels are built for quantized weights.
+except the opt-in 4-bit prompt weights (`.w4i`), which exist for `UD-IQ4_XS` only. **Opt-in reference path:** from
+v0.1.2 Talus also runs the BF16 (or F16) weights: pass the BF16 GGUF (the first file of a split GGUF) to `--model`. It is
+a reference for quality comparisons, not for daily use: its output matches llama.cpp's BF16 (KL 0.0003), at
+about 490 tok/s prompt at 2K and about 4 tok/s decode on the laptop.
 
 ## Qwen3.8-Flash-Next
 
@@ -195,36 +242,46 @@ the kernel library (a pure-Rust port is in progress). All of Strata's flags and 
 | | |
 |---|---|
 | Weights | Unsloth `Qwen3.8-Flash-Next-UD-IQ4_XS` GGUF, three shards (about 88 GB), from `unsloth/Qwen3.8-Flash-Next-GGUF` |
-| Pack | A Strata pack built from the GGUF with `tools/iq_pack.py --gguf <shard 1> --out <pack> --compat-bf16`; it also holds the tokenizer |
+| Pack | A Strata pack built from the GGUF with `tools/iq_pack.py --gguf <shard 1> --out <pack> --compat-bf16`; it also holds the tokenizer: the server's run config points `tokenizer` at `<pack>/tokenizer` (`talus setup` writes it) |
 | MTP | The MTP runtime directory built with `tools/mtp_fetch.py`, `tools/mtp_pack.py` and `tools/mtp_rt.py` (each script's header shows its usage) |
-| Expert profile | `data/expert-profile.bin` (in this repository) |
+| Expert profile | `data/expert-profile.bin` (shipped: `<prefix>/data/` of the release tarball / the installer, also in this repository) |
 | Context / KV | 256K shipped (`--max-context 262144`), int8 KV |
 | License | Qwen Community License 1.0. Note its condition 2: a business that offers model inference as a service or an AI coding / office assistant needs a separate license from Qwen for commercial use. |
 
-Shipped arguments:
+Shipped arguments (`<prefix>` is the install prefix: the release tarball's top folder, `~/.local/share/talus` for
+the installer; `bin/`, `data/` and `tools/` are under it, and a source checkout has the same `data/` and `tools/`):
 
 ```
 --pack <pack> --native Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf
---expert-profile data/expert-profile.bin --expert-cache 24576 --resident-budget-gib 55
+--expert-profile <prefix>/data/expert-profile.bin --expert-cache 24576 --resident-budget-gib 55
 --prefill auto:16384 --spec 5 --spec-min-p 0.5 --mtp <mtp runtime dir> --mtp-window 8192
---mtp-draft-vocab data/draft_vocab_en.bin --max-context 262144 --kv int8
+--mtp-draft-vocab <prefix>/data/draft_vocab_en.bin --max-context 262144 --kv int8
 ```
 
 Shipped environment (these turn on prompt paths that are off in Strata's code defaults):
 
 ```
-STRATA_HIPBLASLT_TUNING=tools/hip/gfx1151-hipblaslt-100401.txt
 STRATA_PF_FUSED=1 STRATA_PF_GEMM=1 STRATA_HC_UPMIX=1 STRATA_PA_FAST=1 STRATA_HIP_WMMA=1
 STRATA_SELECT_WMMA=1 STRATA_HC_Q8=1 STRATA_PF_SWITCH_MIN_T=0 STRATA_PREFILL_STREAM_MIN=128
 ```
 
-The hipBLASLt table is chosen per ROCm version: if the named table is for another hipBLASLt version, the engine loads
-the file for the running version from the same directory.
+**The hipBLASLt prompt table** ships in the release tarball and the installer's `bin/hip/`
+(`gfx1151-hipblaslt-100500.txt` on the ROCm 10.2 pin) and is found by the kernel library itself, with no variable: it
+loads `<arch>-hipblaslt-<running hipBLASLt version>.txt` from the first of `<dir of libtalus_kernels.so>/hip/`,
+`../share/talus/hip/` and `../tools/hip/` (a build in the source tree), and logs `prefill gemm: hipBLASLt tuning
+enabled (... found next to libtalus_kernels.so)`. `STRATA_HIPBLASLT_TUNING` overrides it: a table file (when that file
+is for another hipBLASLt version, the file for the running version in the same directory is loaded), a directory of
+tables, or empty / `off` for no table. Without a table the engine log says `talus: WARN: no hipBLASLt tuning table ...`
+and prompts run untuned (hipBLASEx: about 22 % slower at 2K tokens, and different numerics);
+`talus doctor` shows which table applies. v0.1.1's tarball did not contain the table (see its known issues).
 
 **Drafting.** The MTP head with `--spec 5` and a window of 8192 tokens, plus a suffix drafter (on by default,
 `--suffix-draft 3`; `--suffix-draft 0` for MTP only) that proposes continuations of earlier text. A long copy (see
 **Long copies** under Laguna) fills a whole 8-token verify window without the MTP head's drafts (the head then only
-catches up), or extends the head's drafts; the verify window is 8 tokens (`--spec 8 --mtp-max-t 5`). The MTP head drafts
+catches up), or extends the head's drafts; the verify window is 8 tokens (`--spec 8 --mtp-max-t 5`). A copy whose estimated per-token acceptance is at least
+`TALUS_COPY_WIDE_Q` (default 0.95) verifies up to `TALUS_COPY_VERIFY` (default 16) tokens in one window instead; every
+row equals one-row decoding bit for bit (edit mix 22.7 % faster on our desktop). `TALUS_COPY_VERIFY=8`
+keeps every window at 8 tokens. The MTP head drafts
 from the English-and-code token subset `data/draft_vocab_en.bin` (40,525 tokens, an 81 MB head instead of the runtime
 directory's 106,299-token, 213 MB one): each draft step reads fewer bytes. Verification is unchanged, so greedy output
 stays exact and sampled requests keep their exact distribution; only the drafts differ. For mostly non-English (CJK)
@@ -239,8 +296,15 @@ use, where tokens outside the subset cannot be drafted, remove the flag (the ful
 | Q4_K / Q5_K decode lane layout | `STRATA_MMVQ_KQ8=0` | |
 | Wave32 decode matvec | `STRATA_MMVQ_W32=0` | |
 
+**Opt-in (changes numerics):** `STRATA_PREFILL_EQUAL=1` reads a prompt longer than one prompt chunk (16K by
+default) in equal chunks instead of full chunks and a short last one (from upstream Strata PR #693; idea raised by
+Avalon). It makes prompts 2.2-4.2 % faster at 19K-33K tokens (laptop), but it failed the v0.1.2
+release KLD gate on prompts over 16K (first-token KL 0.0311 against the
+0.0275 limit; 0.0242 with it off), so it is opt-in. Prompts within one chunk
+are unchanged either way.
+
 **Opt-in (changes numerics):** `TALUS_FN_HC_BF16=2` stores the prompt-path residual (hyper-connection) streams in fp16
-(`=1`: bf16). It speeds up prompts and passes needle and agentic, but its first-token KL is over the release gate, so
+(`=1`: bf16). It speeds up prompts and passes needle and the agentic smoke test, but its first-token KL is over the release gate, so
 it is off by default.
 
 **Exact defaults.** `STRATA_GFX1151_DEFAULTS=0` turns off the whole gfx1151 table of bitwise speed switches (and the
@@ -248,7 +312,7 @@ HC-down default above). The table is in `src/core/arch_defaults.cpp`; each entry
 `TALUS_COPY=0` turns off long prompt copies (in every engine). The turn-checkpoint GDN buffer pool omits unused `conv_state` staging to save host/device memory.
 
 **Memory.** Weights about 88 GB (`UD-IQ4_XS`), read through the expert cache (`--expert-cache` in MiB) and a resident budget
-(`--resident-budget-gib`). Unsloth's `UD-Q4_K_XL` GGUF also runs when packed with `tools/iq_pack.py`: its larger `K`-quant experts use more memory and increase expert-cache traffic on long prompts and long-context decode, while reading slightly faster on short cold prompts. Lowest `MemAvailable` in the release run: 51 GiB.
+(`--resident-budget-gib`). Unsloth's `UD-Q4_K_XL` GGUF also runs when packed with `tools/iq_pack.py`: its larger `K`-quant experts use more memory and increase expert-cache traffic on long prompts and long-context decode, while reading slightly faster on short cold prompts. Lowest `MemAvailable` in the v0.1.2 release run on our desktop: 51 GiB.
 
 ## GLM-5.3-Flash
 
@@ -274,8 +338,14 @@ No environment variables are needed. The GLM engine ignores flags it does not kn
 **Drafting.** The NextN layer drafts two tokens per round and the model verifies three positions. `--no-mtp` turns
 drafting off. The draft vocabulary only affects drafting.
 
-**Memory guard.** The engine refuses to start unless `MemAvailable` is at least `--minstart` GiB (default 112), and
-exits if it drops below `--minavail` GiB (default 8) while running. Start it on an otherwise idle machine.
+**Memory guard.** The engine refuses to start unless `MemAvailable` is at least `--minstart` GiB (default 112). While
+running, when `MemAvailable` comes within 512 MiB of the `--minavail` floor (default 8 GiB) it frees memory it can
+rebuild (decode graphs, prompt work buffers, then the prompt-cache snapshot; a turn that loses its snapshot reads its
+prompt cold, and its greedy text can differ from a warm resume, as on any cache miss; `TALUS_MEM_SHED_INEXACT=0`
+fails the request instead). If memory stays below the floor, only that request fails (`insufficient_memory`, HTTP
+503) and the server keeps running; it exits only 2 GiB below the floor. `TALUS_MEM_FLOOR_GIB` (2-64) moves the 8 GiB
+floor for the load check and the run-time guard together, for a machine with a little less free memory than ours;
+the engine logs the floor it uses. Start it on an otherwise idle machine.
 
 **Defaults that change numerics**
 
@@ -293,7 +363,7 @@ exits if it drops below `--minavail` GiB (default 8) while running. Start it on 
 `GLM_SPARSE_SKIP`, `STRATA_MMQ_KQ`, and `STRATA_PREFILL_NO_BLAS` (memory: no hipBLAS workspace).
 
 **Opt-ins:** `GLM_N4=1` (fp16 WMMA for the `Q4_K` attention and shared-expert projections in prompt windows; changes
-numerics; speeds up prompts and passes the KLD, needle and agentic gates, kept off by default because it is the
+numerics; speeds up prompts and passes the KLD and needle gates and the agentic smoke test, kept off by default because it is the
 largest numeric step of the three), `GLM_COPY=1` (long prompt copies; see **Long copies** under Laguna),
 `GLM_SPARSE_WMMA=1` or `2` (changes numerics; only with `GLM_SPARSE_2P=0`), `GLM_HC_BF16=1` (fp16 mHC streams in
 prompt windows; changes numerics, measured slower). Exact but measured slower inside the decode graph:
@@ -307,7 +377,7 @@ dense MLA/KDA projections and two-pass sparse attention. In decode and NextN ver
 snapshots, default 1), never from decode.
 
 **Memory.** Weights about 110 GB, the largest of the five. It serves at about 9 GiB free, closest of the five to the 8 GiB floor. Lowest
-`MemAvailable` in the release run: 9 GiB.
+`MemAvailable` in the v0.1.2 release run on our desktop: 9 GiB.
 
 ## MiMo-V2.6-Flash
 
@@ -352,8 +422,8 @@ and layer-0 `Q6_K` FFN), `TP_MOE_IQ1M_ONE` (shared-input `IQ1_M` prompt GEMM), `
 copies), `TALUS_MIMO_GRAPH` (HIP graphs), and the shared prompt switches `TALUS_PF_MOE`, `TALUS_PF_MOE_GU`,
 `TALUS_PF_DENSE_MOE`.
 
-**Memory.** Weights and drafter about 92 GB. The host keeps a floor of 11 GiB free for this model. Lowest
-`MemAvailable` in the release run: 14 GiB.
+**Memory.** Weights and drafter about 92 GB. The engine keeps a run-time floor of 8 GiB free for this model. Lowest
+`MemAvailable` in the v0.1.2 release run on our desktop: 15 GiB.
 
 ## Laguna-S-2.1
 
@@ -362,7 +432,7 @@ Mixture-of-experts model from poolside with sliding-window and full-attention la
 | | |
 |---|---|
 | Weights | `Laguna-S-2.1-Q4-lean` ([j2ipper/Laguna-S-2.1-Q4-lean](https://huggingface.co/j2ipper/Laguna-S-2.1-Q4-lean)), three shards (about 68 GB): Unsloth's UD-Q4_K_XL of `poolside/Laguna-S-2.1` with leaner attention and shared experts |
-| Drafter | Prompt lookup, plus the optional DFlash block-diffusion drafter `laguna-s-2.1-dflash-Q8_0.gguf` (Q8_0, about 1.2 GB) from [wimmmm/poolside-Laguna-S-2.1-DFlash-GGUF](https://huggingface.co/wimmmm/poolside-Laguna-S-2.1-DFlash-GGUF), a community conversion of `poolside/Laguna-S-2.1-DFlash`: its license is unclear, check the repository before use. Without it (drop `--dflash-gguf`), Laguna drafts with prompt lookup only. The guided install downloads it only when asked (`talus setup --advanced` or `--opt-in-drafters`). |
+| Drafter | The DFlash block-diffusion drafter `laguna-s-2.1-dflash-Q8_0.gguf` (Q8_0, about 1.2 GB, sha256 `b8dd55dddf48a32442c100493b4bdd7e2b2ec25bafcef46d1c977405abdcebf7`) from [j2ipper/Laguna-S-2.1-DFlash-GGUF](https://huggingface.co/j2ipper/Laguna-S-2.1-DFlash-GGUF): our Q8_0 of poolside's BF16 drafter GGUF ([`poolside/Laguna-S-2.1-GGUF`](https://huggingface.co/poolside/Laguna-S-2.1-GGUF), OpenMDW-1.1, from [`poolside/Laguna-S-2.1-DFlash`](https://huggingface.co/poolside/Laguna-S-2.1-DFlash)), with tensor data identical to the community conversion our earlier figures used; plus prompt lookup, which needs no extra weights. On by default from v0.1.2: the guided install downloads it with the other drafters and passes `--dflash-gguf <file>`; greedy output is byte-identical with and without it. `talus setup --advanced` (drafters off) leaves it out, and Laguna then drafts with prompt lookup only. An install with the earlier community file fails the new checksum check; `talus doctor --fix` downloads ours. |
 | Context / KV | 256K, the model's own (`--max-context 262144`), q8_0 KV |
 | Stop tokens | `〈|EOS|〉`, `</assistant>` (`--eos-ids 2,24`) |
 | License | OpenMDW-1.1 (and poolside's Acceptable Use Policy) |
@@ -406,6 +476,7 @@ is lower. It needs q8 KV.
 |---|---|---|
 | Confident-prefix verify for greedy requests | `TALUS_LAGUNA_DF_CONF=0` | After the DFlash drafter runs, the round verifies only the longest prefix of its drafts whose running product of the drafter's own confidence in each draft stays at or above 0.45; the rest would mostly be rejected. Greedy output is unchanged (every token is still the model's own argmax); code about 12 % faster. Sampled requests keep the full block (`TALUS_LAGUNA_DF_CONF_S=<threshold>` opts in) |
 | Sparse decode from 32K | omit `--sparse` (dense everywhere); `LAGUNA_SPARSE_32K=0` (start from `MIN`, floored at four times `BS`×`K`); `LAGUNA_SPARSE_MIN=65536` (start later) | Changes numerics past the start. |
+| Tail-row pruning in prompts | `TALUS_LAGUNA_TAIL_PRUNE=0` | Layers 44-47 compute only the rows that the output head, the drafter and later queries read (about 7.5 % faster prompts at 32K). Prompt results are bitwise equal. After four or more requests in a row that each resume about 1,700 tokens further back, the engine prefills the prompt again from the start, so that request's text can differ from a run without pruning |
 
 **Exact defaults (kill switches):** `LAGUNA_EXPERT_MAJOR=0` (expert-major routed matvec), `STRATA_MMVQ_XT=0` (wide
 multi-token dense verify matvec, default 9 rows), `TALUS_LAGUNA_I8=0` (int8 prompt cache for dense `Q5_K`/`Q6_K`
@@ -419,7 +490,7 @@ decode matvec without wave32 to match its reference.
 survives restarts and model switches (on by default; see [Prompt cache on disk](#prompt-cache-on-disk)).
 
 **Memory.** Weights about 68 GB; 256K of q8 KV for the full-attention layers fits in the rest. Lowest
-`MemAvailable` in the release run: 38 GiB.
+`MemAvailable` in the v0.1.2 release run on our desktop: 38 GiB.
 
 ## Prompt cache on disk
 

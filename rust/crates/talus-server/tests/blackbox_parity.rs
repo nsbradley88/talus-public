@@ -538,3 +538,81 @@ fn test_dual_server_python_and_rust_parity_suite() {
     );
     assert!(stdout.contains("ALL 12/12 DUAL-SERVER PARITY CHECKS PASSED"));
 }
+
+/// talus#58: the run config's "log" gets the engine's stderr (appended), and the engine still starts.
+#[test]
+fn test_run_config_log_receives_engine_stderr() {
+    let dir = std::env::temp_dir().join(format!(
+        "talus-fix58-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let log = dir.join("state").join("model.engine.log"); // parent missing: created on start
+    let py_mock = r#"
+import sys
+sys.stderr.write("talus: fix58 engine starting\n")
+sys.stderr.flush()
+sys.stdout.write("READY 4096\n")
+sys.stdout.flush()
+for line in sys.stdin:
+    if line.strip() == "QUIT":
+        break
+"#;
+    let run_config = |log: &std::path::Path| {
+        let raw = JsonValue::Object(vec![
+            ("exe".to_string(), JsonValue::Str("python3".to_string())),
+            (
+                "args".to_string(),
+                JsonValue::Array(vec![
+                    JsonValue::Str("-u".to_string()),
+                    JsonValue::Str("-c".to_string()),
+                    JsonValue::Str(py_mock.to_string()),
+                ]),
+            ),
+            ("log".to_string(), JsonValue::Str(log.display().to_string())),
+            ("port".to_string(), JsonValue::Int(0)),
+        ]);
+        ServerConfig::from_json(&raw).expect("ServerConfig::from_json")
+    };
+    let wait_for = |n: usize| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text.matches("talus: fix58 engine starting").count() >= n
+                || std::time::Instant::now() >= deadline
+            {
+                return text;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+
+    let cfg = run_config(&log);
+    assert_eq!(cfg.log_path.as_deref(), Some(log.as_path()));
+    let state = ServiceState::from_config(cfg).expect("engine starts with a log path");
+    let text = wait_for(1);
+    assert!(
+        text.contains("talus: fix58 engine starting\n"),
+        "log: {text:?}"
+    );
+    drop(state);
+
+    // A second start appends instead of truncating.
+    let state = ServiceState::from_config(run_config(&log)).expect("second start");
+    let text = wait_for(2);
+    assert_eq!(
+        text.matches("talus: fix58 engine starting").count(),
+        2,
+        "log: {text:?}"
+    );
+    drop(state);
+
+    // A log that cannot be opened is a warning; the engine still starts (stderr passthrough only).
+    let bad = std::path::Path::new("/proc/self/nonexistent-dir/x.engine.log");
+    ServiceState::from_config(run_config(bad)).expect("engine starts with an unwritable log");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

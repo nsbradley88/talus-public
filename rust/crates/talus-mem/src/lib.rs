@@ -6,6 +6,7 @@ pub mod arena;
 pub mod budget;
 pub mod error;
 pub mod placement;
+pub mod pressure;
 pub mod probe;
 
 pub use arena::{

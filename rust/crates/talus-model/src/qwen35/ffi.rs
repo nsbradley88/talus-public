@@ -186,8 +186,60 @@ struct LoadedKernels {
     // the opt-in W4A4 (iu4, integer group scales) prompt GEMM of src/prefill/tp_w4i.cu (optional symbols)
     w4i_pack: Option<W4iPackFn>,
     w4i_gemm: Option<W4iGemmFn>,
+    // rd-q4quant-B: residual add + RMSNorm + W4 pack(s) in one launch (optional symbol)
+    w4i_fused: Option<W4iAddRmsPackFn>,
+    // rd-q4quant-B: gate + up in one W4 GEMM with the SwiGLU epilogue, and its weight interleave (optional symbols)
+    w4i_gu: Option<(W4iGemmGuFn, W4iInterleaveGuFn)>,
+    // pack with per-channel smoothing + best-of-4-clip group scales (optional symbol)
+    w4i_pack2: Option<W4iPack2Fn>,
     // the wide verify tiles' state and their tile-plane weight copies (optional symbols)
     wide: Option<WideFns>,
+    // the loaded library's path (the optional kv8 symbols are resolved from it)
+    so_path: String,
+    // the 16-bit weight (BF16 / F16) mat-vec + GEMM of src/prefill/tp_w16.cu (optional symbols)
+    w16: Option<W16Fns>,
+}
+
+/// `talus_w16_gemv(wtype, w, ldw, n_out, n_in, x, ldx, y, ldy, n_tok, stream)`
+pub type W16GemvFn = unsafe extern "C" fn(
+    c_int,
+    *const c_void,
+    i64,
+    c_int,
+    c_int,
+    *const f32,
+    i64,
+    *mut f32,
+    i64,
+    c_int,
+    *mut c_void,
+) -> c_int;
+/// `talus_w16_gemm(wtype, w, ldw, n_out, n_in, x, ldx, y, ldy, n_tok, x16, scratch_elems, stream)`
+pub type W16GemmFn = unsafe extern "C" fn(
+    c_int,
+    *const c_void,
+    i64,
+    c_int,
+    c_int,
+    *const f32,
+    i64,
+    *mut f32,
+    i64,
+    c_int,
+    *mut c_void,
+    i64,
+    *mut c_void,
+) -> c_int;
+/// `talus_w16_supported(wtype, n_out, n_in)` / `talus_w16_info(what)`
+pub type W16SupportedFn = unsafe extern "C" fn(c_int, i64, i64) -> c_int;
+pub type W16InfoFn = unsafe extern "C" fn(c_int) -> c_int;
+
+#[derive(Clone, Copy)]
+struct W16Fns {
+    gemv: W16GemvFn,
+    gemm: W16GemmFn,
+    supported: W16SupportedFn,
+    info: W16InfoFn,
 }
 
 /// `talus_mmvq_wide_*` (include/talus_kernels.h)
@@ -212,6 +264,75 @@ pub type W4iPackFn = unsafe extern "C" fn(
     *const i8,
     c_int,
     *mut u8,
+    *mut u8,
+    *mut f32,
+    *mut c_void,
+) -> c_int;
+/// rd-q4quant-B: `talus_pf_w4i_add_rms_pack(x, y, w, h, T, K, eps, signs, wg, inv_s, xq, xk, xS, signs2, wg2,
+/// inv_s2, xq2, xk2, xS2, kmode, stream)`
+pub type W4iAddRmsPackFn = unsafe extern "C" fn(
+    *mut f32,
+    *const f32,
+    *const f32,
+    *mut f32,
+    c_int,
+    c_int,
+    f32,
+    *const i8,
+    c_int,
+    *const f32,
+    *mut u8,
+    *mut u8,
+    *mut f32,
+    *const i8,
+    c_int,
+    *const f32,
+    *mut u8,
+    *mut u8,
+    *mut f32,
+    c_int,
+    *mut c_void,
+) -> c_int;
+/// `talus_pf_w4i_pack2(x, gate, T, K, ldx, signs, wg, inv_s, kmode, xq, xk, xS, stream)`
+pub type W4iPack2Fn = unsafe extern "C" fn(
+    *const f32,
+    *const f32,
+    c_int,
+    c_int,
+    i64,
+    *const i8,
+    c_int,
+    *const f32,
+    c_int,
+    *mut u8,
+    *mut u8,
+    *mut f32,
+    *mut c_void,
+) -> c_int;
+/// rd-q4quant-B: `talus_pf_w4i_gemm_gu(wq_gu, ws_gu, wg, F, K, xq, xk, xS, T, dst, ld, stream)`
+pub type W4iGemmGuFn = unsafe extern "C" fn(
+    *const u8,
+    *const f32,
+    c_int,
+    c_int,
+    c_int,
+    *const u8,
+    *const u8,
+    *const f32,
+    c_int,
+    *mut f32,
+    i64,
+    *mut c_void,
+) -> c_int;
+/// rd-q4quant-B: `talus_pf_w4i_interleave_gu(gq, uq, gs, us, wg, F, K, oq, os, stream)`
+pub type W4iInterleaveGuFn = unsafe extern "C" fn(
+    *const u8,
+    *const u8,
+    *const f32,
+    *const f32,
+    c_int,
+    c_int,
+    c_int,
     *mut u8,
     *mut f32,
     *mut c_void,
@@ -279,9 +400,22 @@ fn load_kernels_once() -> &'static std::result::Result<LoadedKernels, String> {
             }
         }
         let (lib, chosen_path) = loaded_lib.ok_or(last_err)?;
+        let so_path = chosen_path.clone();
 
         #[cfg(unix)]
-        let (set_w32, set_w32_waves, w32_config, w32_active, w4i_pack, w4i_gemm, wide) = unsafe {
+        let (
+            set_w32,
+            set_w32_waves,
+            w32_config,
+            w32_active,
+            w4i_pack,
+            w4i_gemm,
+            w4i_fused,
+            w4i_gu,
+            w4i_pack2,
+            wide,
+            w16,
+        ) = unsafe {
             let c_path = CString::new(chosen_path).ok();
             let handle = c_path
                 .as_ref()
@@ -300,6 +434,10 @@ fn load_kernels_once() -> &'static std::result::Result<LoadedKernels, String> {
             let p4 = resolve(b"_ZN6strata7kernels22native_mmvq_w32_activeEv\0");
             let p5 = resolve(b"talus_pf_w4i_pack\0");
             let p6 = resolve(b"talus_pf_w4i_gemm\0");
+            let p7 = resolve(b"talus_pf_w4i_add_rms_pack\0");
+            let p8 = resolve(b"talus_pf_w4i_gemm_gu\0");
+            let p9 = resolve(b"talus_pf_w4i_interleave_gu\0");
+            let p10 = resolve(b"talus_pf_w4i_pack2\0");
             let pw = [
                 resolve(b"talus_mmvq_wide_active\0"),
                 resolve(b"talus_mmvq_wide_pack_mode\0"),
@@ -309,6 +447,22 @@ fn load_kernels_once() -> &'static std::result::Result<LoadedKernels, String> {
                 resolve(b"talus_mmvq_wide_release\0"),
                 resolve(b"talus_mmvq_wide_packed_bytes\0"),
             ];
+            let q = [
+                resolve(b"talus_w16_gemv\0"),
+                resolve(b"talus_w16_gemm\0"),
+                resolve(b"talus_w16_supported\0"),
+                resolve(b"talus_w16_info\0"),
+            ];
+            let w16 = if q.iter().any(|p| p.is_null()) {
+                None
+            } else {
+                Some(W16Fns {
+                    gemv: std::mem::transmute::<*mut c_void, W16GemvFn>(q[0]),
+                    gemm: std::mem::transmute::<*mut c_void, W16GemmFn>(q[1]),
+                    supported: std::mem::transmute::<*mut c_void, W16SupportedFn>(q[2]),
+                    info: std::mem::transmute::<*mut c_void, W16InfoFn>(q[3]),
+                })
+            };
             (
                 if p1.is_null() {
                     None
@@ -352,6 +506,24 @@ fn load_kernels_once() -> &'static std::result::Result<LoadedKernels, String> {
                 } else {
                     Some(std::mem::transmute::<*mut c_void, W4iGemmFn>(p6))
                 },
+                if p7.is_null() {
+                    None
+                } else {
+                    Some(std::mem::transmute::<*mut c_void, W4iAddRmsPackFn>(p7))
+                },
+                if p8.is_null() || p9.is_null() {
+                    None
+                } else {
+                    Some((
+                        std::mem::transmute::<*mut c_void, W4iGemmGuFn>(p8),
+                        std::mem::transmute::<*mut c_void, W4iInterleaveGuFn>(p9),
+                    ))
+                },
+                if p10.is_null() {
+                    None
+                } else {
+                    Some(std::mem::transmute::<*mut c_void, W4iPack2Fn>(p10))
+                },
                 if pw.iter().any(|p| p.is_null()) {
                     None
                 } else {
@@ -385,11 +557,25 @@ fn load_kernels_once() -> &'static std::result::Result<LoadedKernels, String> {
                         >(pw[6]),
                     })
                 },
+                w16,
             )
         };
         #[cfg(not(unix))]
-        let (set_w32, set_w32_waves, w32_config, w32_active, w4i_pack, w4i_gemm, wide) =
-            (None, None, None, None, None, None, None);
+        let (
+            set_w32,
+            set_w32_waves,
+            w32_config,
+            w32_active,
+            w4i_pack,
+            w4i_gemm,
+            w4i_fused,
+            w4i_gu,
+            w4i_pack2,
+            wide,
+            w16,
+        ) = (
+            None, None, None, None, None, None, None, None, None, None, None,
+        );
 
         Ok(LoadedKernels {
             lib,
@@ -399,7 +585,12 @@ fn load_kernels_once() -> &'static std::result::Result<LoadedKernels, String> {
             w32_active,
             w4i_pack,
             w4i_gemm,
+            w4i_fused,
+            w4i_gu,
+            w4i_pack2,
             wide,
+            so_path,
+            w16,
         })
     })
 }
@@ -445,6 +636,92 @@ pub fn mmvq_wide_release(w: *const c_void) {
     }
 }
 
+fn w16_fns() -> Option<W16Fns> {
+    match load_kernels_once() {
+        Ok(k) => k.w16,
+        Err(_) => None,
+    }
+}
+
+/// true when libtalus_kernels exports the 16-bit weight (BF16 / F16) entry points.
+pub fn talus_w16_available() -> bool {
+    w16_fns().is_some()
+}
+
+/// `talus_w16_info(what)` (0: ABI version, 1: the GEMM runs on WMMA on this device); -1 when absent.
+pub fn talus_w16_info(what: i32) -> i32 {
+    match w16_fns() {
+        Some(f) => unsafe { (f.info)(what) },
+        None => -1,
+    }
+}
+
+/// the 16-bit weight kernels take a `n_out` x `n_in` matrix of GGML type `wtype` (30 BF16, 1 F16).
+pub fn talus_w16_supported(wtype: i32, n_out: i64, n_in: i64) -> bool {
+    match w16_fns() {
+        Some(f) => unsafe { (f.supported)(wtype, n_out, n_in) == 1 },
+        None => false,
+    }
+}
+
+/// y[t][n] = sum_k w[n][k] x[t][k] for n_tok columns (any count; 16-column launches). 0 OK.
+#[allow(clippy::too_many_arguments)]
+pub fn talus_w16_gemv(
+    wtype: i32,
+    w: *const c_void,
+    n_out: i32,
+    n_in: i32,
+    x: *const f32,
+    ldx: i64,
+    y: *mut f32,
+    ldy: i64,
+    n_tok: i32,
+    stream: *mut c_void,
+) -> i32 {
+    match w16_fns() {
+        Some(f) => unsafe { (f.gemv)(wtype, w, 0, n_out, n_in, x, ldx, y, ldy, n_tok, stream) },
+        None => 1,
+    }
+}
+
+/// the prompt GEMM (activations rounded once to the weight type into `x16`, WMMA, fp32 accumulation). 0 OK.
+#[allow(clippy::too_many_arguments)]
+pub fn talus_w16_gemm(
+    wtype: i32,
+    w: *const c_void,
+    n_out: i32,
+    n_in: i32,
+    x: *const f32,
+    ldx: i64,
+    y: *mut f32,
+    ldy: i64,
+    n_tok: i32,
+    x16: *mut c_void,
+    scratch_elems: i64,
+    stream: *mut c_void,
+) -> i32 {
+    match w16_fns() {
+        Some(f) => unsafe {
+            (f.gemm)(
+                wtype,
+                w,
+                0,
+                n_out,
+                n_in,
+                x,
+                ldx,
+                y,
+                ldy,
+                n_tok,
+                x16,
+                scratch_elems,
+                stream,
+            )
+        },
+        None => 1,
+    }
+}
+
 /// true when libtalus_kernels exports the W4A4 (tp_w4i) entry points.
 pub fn talus_pf_w4i_available() -> bool {
     matches!(load_kernels_once(), Ok(k) if k.w4i_pack.is_some() && k.w4i_gemm.is_some())
@@ -473,6 +750,139 @@ pub fn talus_pf_w4i_pack(
     }
 }
 
+/// true when libtalus_kernels exports `talus_pf_w4i_pack2` (smoothing / best-of-4-clip scales).
+pub fn talus_pf_w4i_pack2_available() -> bool {
+    matches!(load_kernels_once(), Ok(k) if k.w4i_pack2.is_some())
+}
+
+/// `talus_pf_w4i_pack` + optional per-channel smoothing `inv_s` [K] (null: none) and `kmode` (0 absmax
+/// group scales = the rc-a4 pack, 1 best of 4 clips).  false: not available / shape.
+#[allow(clippy::too_many_arguments)]
+pub fn talus_pf_w4i_pack2(
+    x: *const f32,
+    gate: *const f32,
+    t: i32,
+    k: i32,
+    ldx: i64,
+    signs: *const i8,
+    wg: i32,
+    inv_s: *const f32,
+    kmode: i32,
+    xq: *mut u8,
+    xk: *mut u8,
+    xs: *mut f32,
+    stream: *mut c_void,
+) -> bool {
+    match load_kernels_once() {
+        Ok(LoadedKernels {
+            w4i_pack2: Some(f), ..
+        }) => unsafe {
+            f(
+                x, gate, t, k, ldx, signs, wg, inv_s, kmode, xq, xk, xs, stream,
+            ) == 0
+        },
+        _ => false,
+    }
+}
+
+/// rd-q4quant-B: true when libtalus_kernels exports `talus_pf_w4i_add_rms_pack`.
+pub fn talus_pf_w4i_fused_available() -> bool {
+    matches!(load_kernels_once(), Ok(k) if k.w4i_fused.is_some())
+}
+
+/// rd-q4quant-B: one packed activation set of `talus_pf_w4i_add_rms_pack` (signs null: no second set)
+#[derive(Clone, Copy)]
+pub struct W4iPackSet {
+    pub signs: *const i8,
+    pub wg: i32,
+    pub inv_s: *const f32,
+    pub xq: *mut u8,
+    pub xk: *mut u8,
+    pub xs: *mut f32,
+}
+
+/// rd-q4quant-B: x += y; h = rms(x) * w (bit for bit `tk_q36_add_rms`; h null: not written) and the W4 pack of h
+/// with `signs` (+ with `signs2` into the second buffers when not null).  false: not available / shape (nothing ran).
+#[allow(clippy::too_many_arguments)]
+pub fn talus_pf_w4i_add_rms_pack(
+    x: *mut f32,
+    y: *const f32,
+    w: *const f32,
+    h: *mut f32,
+    t: i32,
+    k: i32,
+    eps: f32,
+    a: W4iPackSet,
+    b: W4iPackSet,
+    kmode: i32,
+    stream: *mut c_void,
+) -> bool {
+    match load_kernels_once() {
+        Ok(LoadedKernels {
+            w4i_fused: Some(f), ..
+        }) => unsafe {
+            f(
+                x, y, w, h, t, k, eps, a.signs, a.wg, a.inv_s, a.xq, a.xk, a.xs, b.signs, b.wg,
+                b.inv_s, b.xq, b.xk, b.xs, kmode, stream,
+            ) == 0
+        },
+        _ => false,
+    }
+}
+
+/// rd-q4quant-B: true when libtalus_kernels exports the fused gate + up W4 GEMM and its interleave.
+pub fn talus_pf_w4i_gu_available() -> bool {
+    matches!(load_kernels_once(), Ok(k) if k.w4i_gu.is_some())
+}
+
+/// rd-q4quant-B: dst [T][ld] = silu(gate x) * (up x) from an interleaved gate / up pair (`talus_pf_w4i_interleave_gu`).
+#[allow(clippy::too_many_arguments)]
+pub fn talus_pf_w4i_gemm_gu(
+    wq: *const u8,
+    ws: *const f32,
+    wg: i32,
+    f: i32,
+    k: i32,
+    xq: *const u8,
+    xk: *const u8,
+    xs: *const f32,
+    t: i32,
+    dst: *mut f32,
+    ld: i64,
+    stream: *mut c_void,
+) -> bool {
+    match load_kernels_once() {
+        Ok(LoadedKernels {
+            w4i_gu: Some((g, _)),
+            ..
+        }) => unsafe { g(wq, ws, wg, f, k, xq, xk, xs, t, dst, ld, stream) == 0 },
+        _ => false,
+    }
+}
+
+/// rd-q4quant-B: oq / os = gate and up (wg 0, F x K) interleaved by 16-row tiles.
+#[allow(clippy::too_many_arguments)]
+pub fn talus_pf_w4i_interleave_gu(
+    gq: *const u8,
+    uq: *const u8,
+    gs: *const f32,
+    us: *const f32,
+    wg: i32,
+    f: i32,
+    k: i32,
+    oq: *mut u8,
+    os: *mut f32,
+    stream: *mut c_void,
+) -> bool {
+    match load_kernels_once() {
+        Ok(LoadedKernels {
+            w4i_gu: Some((_, i)),
+            ..
+        }) => unsafe { i(gq, uq, gs, us, wg, f, k, oq, os, stream) == 0 },
+        _ => false,
+    }
+}
+
 /// dst [T][ld] = the W4A4 product of packed activations with a tp_w4i weight matrix.
 #[allow(clippy::too_many_arguments)]
 pub fn talus_pf_w4i_gemm(
@@ -494,6 +904,155 @@ pub fn talus_pf_w4i_gemm(
             w4i_gemm: Some(f), ..
         }) => unsafe { f(wq, ws, wg, n, k, xq, xk, xs, t, dst, ld, stream) == 0 },
         _ => false,
+    }
+}
+
+// ---- the 27B int8 KV copy (src/qwen35/q36_kv8.cu), optional symbols
+
+/// `talus_q36_kv8_quant(kc, vt, ctx, vt_ctx, hkv, hd, kq, ks, vq, vs, pos0, c0, n, stream)`
+pub type Kv8QuantFn = unsafe extern "C" fn(
+    *const c_void,
+    *const c_void,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *const i32,
+    c_int,
+    c_int,
+    *mut c_void,
+) -> c_int;
+/// `talus_q36_attn_wmma_kv8(n_chunk, hkv, q, kq, ks, vq, vs, pos0, T, H, ctx, vt_ctx, sc, chunk, pacc, pm, pl, stream,
+/// variant)`
+pub type Kv8AttnFn = unsafe extern "C" fn(
+    c_int,
+    c_int,
+    *const f32,
+    *const c_void,
+    *const c_void,
+    *const c_void,
+    *const c_void,
+    *const i32,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    f32,
+    c_int,
+    *mut f32,
+    *mut f32,
+    *mut f32,
+    *mut c_void,
+    c_int,
+) -> c_int;
+
+#[derive(Clone, Copy)]
+struct Kv8Fns {
+    version: unsafe extern "C" fn() -> c_int,
+    quant: Kv8QuantFn,
+    attn: Kv8AttnFn,
+}
+
+fn kv8_fns() -> Option<Kv8Fns> {
+    static K: OnceLock<Option<Kv8Fns>> = OnceLock::new();
+    *K.get_or_init(|| {
+        #[cfg(unix)]
+        unsafe {
+            let Ok(k) = load_kernels_once() else {
+                return None;
+            };
+            let c_path = CString::new(k.so_path.clone()).ok()?;
+            let handle = dlopen(c_path.as_ptr(), RTLD_NOW | RTLD_LOCAL);
+            if handle.is_null() {
+                return None;
+            }
+            let v = dlsym(handle, c"talus_q36_kv8_version".as_ptr());
+            let q = dlsym(handle, c"talus_q36_kv8_quant".as_ptr());
+            let a = dlsym(handle, c"talus_q36_attn_wmma_kv8".as_ptr());
+            if v.is_null() || q.is_null() || a.is_null() {
+                return None;
+            }
+            Some(Kv8Fns {
+                version: std::mem::transmute::<*mut c_void, unsafe extern "C" fn() -> c_int>(v),
+                quant: std::mem::transmute::<*mut c_void, Kv8QuantFn>(q),
+                attn: std::mem::transmute::<*mut c_void, Kv8AttnFn>(a),
+            })
+        }
+        #[cfg(not(unix))]
+        None
+    })
+}
+
+/// the kernel library's int8 KV format version (0: not exported).
+pub fn talus_q36_kv8_version() -> i32 {
+    kv8_fns().map(|f| unsafe { (f.version)() }).unwrap_or(0)
+}
+
+/// quantize cells `[base, base + n)` (base = `*pos0 + c0`, or `c0` when `pos0` is null) of one layer's f16
+/// K cache / vt copy into its int8 copy.  false: not available or bad arguments.
+#[allow(clippy::too_many_arguments)]
+pub fn talus_q36_kv8_quant(
+    kc: *const c_void,
+    vt: *const c_void,
+    ctx: i32,
+    vt_ctx: i32,
+    hkv: i32,
+    hd: i32,
+    kq: *mut c_void,
+    ks: *mut c_void,
+    vq: *mut c_void,
+    vs: *mut c_void,
+    pos0: *const i32,
+    c0: i32,
+    n: i32,
+    stream: *mut c_void,
+) -> bool {
+    match kv8_fns() {
+        Some(f) => unsafe {
+            (f.quant)(
+                kc, vt, ctx, vt_ctx, hkv, hd, kq, ks, vq, vs, pos0, c0, n, stream,
+            ) == 0
+        },
+        None => false,
+    }
+}
+
+/// decode / verify attention partials over the int8 copy (merge with `tk_q36_attn_merge`); `variant` 0 =
+/// exact codes in the WMMA operands, 1 = offset operands with per-row corrections (`TALUS_Q27_KV8_OFS=1`).
+#[allow(clippy::too_many_arguments)]
+pub fn talus_q36_attn_wmma_kv8(
+    n_chunk: i32,
+    hkv: i32,
+    q: *const f32,
+    kq: *const c_void,
+    ks: *const c_void,
+    vq: *const c_void,
+    vs: *const c_void,
+    pos0: *const i32,
+    t_rows: i32,
+    h_q: i32,
+    ctx: i32,
+    vt_ctx: i32,
+    sc: f32,
+    chunk: i32,
+    pacc: *mut f32,
+    pm: *mut f32,
+    pl: *mut f32,
+    stream: *mut c_void,
+    variant: i32,
+) -> bool {
+    match kv8_fns() {
+        Some(f) => unsafe {
+            (f.attn)(
+                n_chunk, hkv, q, kq, ks, vq, vs, pos0, t_rows, h_q, ctx, vt_ctx, sc, chunk, pacc,
+                pm, pl, stream, variant,
+            ) == 0
+        },
+        None => false,
     }
 }
 

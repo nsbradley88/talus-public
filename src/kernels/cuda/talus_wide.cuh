@@ -26,6 +26,9 @@
 #ifndef TALUS_TW_SCHED
 #define TALUS_TW_SCHED 1
 #endif
+#ifndef TALUS_TR_EPI_IGLP   // talus#45: reproducible rd-wide2 tr kernels (see tr_body's add)
+#define TALUS_TR_EPI_IGLP 1
+#endif
 namespace {
 namespace tw = talus_wide;
 
@@ -346,11 +349,22 @@ __device__ __forceinline__ void tr_body(const uint8_t* __restrict__ w, const Q81
                 for (int c = 0; c < NC; ++c) part[j][c][lane] = acc[j][c];
     };
     auto add = [&](int wv) {
-        if (wave == wv)
+        if (wave == wv) {
+#if TALUS_TR_EPI_IGLP
+            // talus#45: make this block an IGLP region. The GCN schedulers then run only the IGLP mutation on it
+            // (no edges: there is no WMMA/MFMA here), so the post-RA VOPD pairing mutation is skipped. In ROCm
+            // 10.2.0a20261014 (LLVM bdc35841) that mutation's load-overlap check fills a lazy cache while iterating a
+            // SmallPtrSet<SUnit *> (pointer-hash order beyond 8 loads; fixed upstream in llvm 8cf7c89664). With this
+            // block's 8 NC staged loads, its schedule - and the code object - followed the heap layout (ASLR) and
+            // changed from one compile to the next. VOPD forming (GCNCreateVOPD) still runs. Drop with an SDK
+            // that has the fix.
+            __builtin_amdgcn_iglp_opt(0);
+#endif
 #pragma unroll
             for (int j = 0; j < 8; ++j)
 #pragma unroll
                 for (int c = 0; c < NC; ++c) acc[j][c] = acc[j][c] + part[j][c][lane];
+        }
     };
     put(2); __syncthreads(); add(0); __syncthreads();
     put(3); __syncthreads(); add(1); __syncthreads();

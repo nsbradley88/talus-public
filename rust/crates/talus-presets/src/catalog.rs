@@ -146,8 +146,22 @@ const Q27_NGRAM: [Choice; 2] = toggle(&[Edit::Remove("--ngram")]);
 const Q27_PCACHE: [Choice; 2] = toggle(&[Edit::Arg("--prompt-cache", "0")]);
 const Q27_NUM: [Choice; 2] = toggle(&[Edit::Env("TALUS_PF_FA", "0")]);
 const Q27_I8: [Choice; 2] = toggle(&[Edit::Env("TALUS_PF_I8", "0")]);
-const Q27_W4: [Choice; 2] = opt_in(&[Edit::Env("TALUS_Q27_W4I", "auto")]);
+/// rd-q4quant (2026-11-01): the 4-bit prompt path is the engine default when a format-v3 `<stem>.w4i` sits next to the
+/// GGUF (layers 48-63, gated). On = the engine default (no edit); Off = `TALUS_Q27_W4I=0` (the exact int8 path).
+const Q27_W4: [Choice; 2] = [
+    Choice {
+        value: OFF,
+        label: "Off",
+        edits: &[Edit::Env("TALUS_Q27_W4I", "0")],
+    },
+    Choice {
+        value: ON,
+        label: "On",
+        edits: &[],
+    },
+];
 const Q27_W4FAST: [Choice; 2] = opt_in(&[Edit::Env("TALUS_Q27_W4I", "fast")]);
+const Q27_KV8: [Choice; 2] = opt_in(&[Edit::Env("TALUS_Q27_KV8", "1")]);
 
 const Q27_OPTIONS: &[TuneOption] = &[
     TuneOption {
@@ -237,12 +251,12 @@ const Q27_OPTIONS: &[TuneOption] = &[
     TuneOption {
         id: "w4_prompt",
         label: "4-bit prompt math (last 16 layers)",
-        description: "Reads prompts with 4-bit math in the feed-forward of the last 16 layers: about 7% faster prompts.",
-        tradeoff: "Passed our quality gate, but replies after a 2K prompt generate about 11% slower. Needs the 2 GiB .w4i file.",
-        switch: "TALUS_Q27_W4I=auto",
+        description: "Reads prompts with 4-bit math in the feed-forward of the last 16 layers: about 6-7% faster prompts.",
+        tradeoff: "Passed every quality gate; decode and drafting unchanged. Needs the 2.2 GB v3 .w4i file (without it, prompts stay exact).",
+        switch: "TALUS_Q27_W4I=0 turns it off",
         group: Group::Accuracy,
         quality: Quality::Gated,
-        default: OFF,
+        default: ON,
         choices: &Q27_W4,
         requires: None,
     },
@@ -256,6 +270,18 @@ const Q27_OPTIONS: &[TuneOption] = &[
         quality: Quality::Reduced,
         default: OFF,
         choices: &Q27_W4FAST,
+        requires: None,
+    },
+    TuneOption {
+        id: "kv8",
+        label: "8-bit KV cache for replies",
+        description: "Replies read an 8-bit copy of the attention cache: about half the attention bytes, faster at long context.",
+        tradeoff: "Not yet through our quality gates; slightly changes replies. Uses about a third more KV memory. Off by default.",
+        switch: "TALUS_Q27_KV8=1",
+        group: Group::Accuracy,
+        quality: Quality::Reduced,
+        default: OFF,
+        choices: &Q27_KV8,
         requires: None,
     },
     TuneOption {
@@ -742,12 +768,12 @@ pub static MODELS: &[ModelSpec] = &[
         name: "Qwen3.8-27B",
         engine: "qwen35",
         summary: "Dense 27B model. Fast and light; the easiest one to start with.",
-        weights: "about 17 GB with drafters, + the 2 GiB 4-bit prompt file (+26 GiB for int8 prompt weights)",
+        weights: "about 17 GB with drafters, + the 2.2 GB 4-bit prompt file (+26 GiB for int8 prompt weights)",
         drafter: "MTP head + DFlash2, picked by depth",
         min_free_gib: 8,
         license: "Apache-2.0",
         options: Q27_OPTIONS,
-        reference: &[("numerics", OFF)],
+        reference: &[("numerics", OFF), ("w4_prompt", OFF)],
         reference_note: "Turns off flash prompt attention and 4-bit prompt math: bit-for-bit reference output, slower prompts.",
         fast: &[("w4_fast", ON)],
         fast_note: "Turns on 4-bit prompt math in every layer: about 30% faster prompts, but it failed our quality gate (needs the 8 GiB .fast.w4i file).",

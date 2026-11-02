@@ -1,33 +1,52 @@
 # How Talus is measured
 
 This page explains how we measure Talus: what runs, on which machine, what counts as a pass, and how to run the same
-protocol yourself. The numbers are in [RESULTS.md](RESULTS.md), generated from each model's recorded freeze run. No
+protocol yourself. The numbers are in [RESULTS.md](RESULTS.md), generated from the recorded release runs. No
 other figures appear in this repository. A model whose release run has not passed shows "pending".
 
 ## Hardware and power
 
-Every Talus figure comes from one machine:
+Talus figures come from two machines with the same chip and memory. Every table in [RESULTS.md](RESULTS.md) names its
+machine; a figure from one is not comparable with a figure from the other.
 
-| Item | Value |
-|---|---|
-| Machine | HP ZBook Ultra G1a (a laptop) |
-| APU | AMD Ryzen AI Max+ 395 with a Radeon 8060S iGPU (gfx1151, RDNA 3.5, 40 compute units) |
-| Memory | 128 GB LPDDR5X, unified: CPU and GPU share it (the GPU uses it as GTT memory) |
-| Power | 70 W firmware ceiling. We change no clocks or power limits. |
-| Kernel / boot | Linux 7.0, headless (`multi-user.target`, no desktop session). Kernel parameters: `ttm.pages_limit=31457280 ttm.page_pool_size=31457280` (GPU memory pool 120 GiB instead of the default), `kho=off` (Ubuntu's default kexec-handover reserve otherwise keeps about 9 GiB away from the GPU), `amd_iommu=off`, `amdgpu.lockup_timeout=10000,60000,10000,10000` (compute jobs may run 60 s). GLM-5.3-Flash and MiMo-V2.6-Flash do not fit without the first two. See [MODELS.md](MODELS.md#system-setup). |
-| OS / runtime | Linux; ROCm SDK 10.2.0a20261014 |
-| Talus build | the builds released as Talus v0.1.0; each model's figures come from its own frozen release run (see [RESULTS.md](RESULTS.md)) |
+| Item | Laptop | Desktop |
+|---|---|---|
+| Machine | HP ZBook Ultra G1a | GMKtec EVO-X2 |
+| APU | AMD Ryzen AI Max+ 395 with a Radeon 8060S iGPU (gfx1151, RDNA 3.5, 40 compute units) | the same |
+| Memory | 128 GB LPDDR5X, unified: CPU and GPU share it (the GPU uses it as GTT memory) | the same |
+| Power | 70 W firmware ceiling (HP's sustained package power limit). ACPI platform profile `performance`, set at every boot (the firmware default is `balanced`, under which GLM-5.3-Flash decoded at 11.2 tok/s instead of about 24 tok/s); `talus setup` offers the same setting. | About 120 W sustained. No ACPI platform profile: the BIOS power mode is set to its highest sustained mode. |
+| Kernel / boot | Linux 7.0, headless (`multi-user.target`, no desktop session). Kernel parameters: `ttm.pages_limit=31457280 ttm.page_pool_size=31457280` (GPU memory pool 120 GiB instead of the default), `kho=off` (Ubuntu's default kexec-handover reserve otherwise keeps about 9 GiB away from the GPU), `amd_iommu=off`, `amdgpu.lockup_timeout=10000,60000,10000,10000` (compute jobs may run 60 s). GLM-5.3-Flash and MiMo-V2.6-Flash do not fit without the first two. `amd_iommu=off` turns the IOMMU off: we have not measured its effect on speed (Talus runs with it on), it makes the NPU unavailable, and `talus setup` does not set it. See [MODELS.md](MODELS.md#system-setup). | The same kernel parameters, `amd_iommu=off` included |
+| OS / runtime | Linux; ROCm SDK 10.2.0a20261014 | the same |
+
+Which figures come from which machine:
+
+| Figures | Machine | Build |
+|---|---|---|
+| Speed of the current release (RESULTS "Speed" tables, the README's first table) | desktop | the v0.1.2 release candidate tarball (rc2; the same source as the published tarball, see RESULTS) |
+| The previous release on the same machine (RESULTS "v0.1.1" rows) | desktop | the v0.1.1 release binaries |
+| Quality gates of the current release | laptop (some soaks on the desktop; RESULTS names the machine) | the same release (RESULTS says which build each gate ran on) |
+| Comparisons with other engines (llama.cpp "halo4", gufo, Talus C++) | laptop | the v0.1.0 release runs; not re-measured since |
 
 Notes on the context:
 
 - **One model at a time.** The box serves one model and nothing else, so each engine can spend memory for speed.
   We keep at least 8 GiB of `MemAvailable` free while serving (GLM-5.3-Flash runs closest to it, at about 9 GiB). The engine's memory
   accountant refuses any allocation that would take it below that floor.
-- **70 W is low for this chip.** Most published Strix Halo results come from desktops and mini-PCs that run the same
-  APU at 85-140 W. Expect higher numbers on those machines, and lower ones under thermal load on a laptop.
-- **Served, end to end.** Every figure is measured through the HTTP server, with the client on another machine on
-  the local network, one request at a time, and a fresh server per model and run. So it includes tokenization,
-  templating, sampling, speculative decoding and the HTTP stack, as a user would see it.
+- **Power.** 70 W is low for this chip; the desktop holds about 120 W. Other machines with the same APU run it at
+  different limits (most published Strix Halo results come from desktops and mini-PCs at 85-140 W). Expect different
+  numbers on them, and lower ones under thermal load on a laptop. Apart from the platform profile and the BIOS power
+  mode we change no clocks or power limits through Talus.
+- **Laptop host changes after the v0.1.0 release runs.** The v0.1.0 runs (2026-10-28) used the settings in the table.
+  Since 2026-10-29 the laptop loads `amd_pmf` with `smart_pc_support=0` (HP's Smart PC power policy off), and since
+  2026-10-31 it raises the firmware's skin-temperature target from 43 C to 45 C, so the 70 W limit holds through long
+  jobs instead of sagging to about 55-58 W. The v0.1.2 quality gates ran with both.
+- **Served, end to end, as shipped.** Every figure is measured through the HTTP server, with the client on another
+  machine on the local network, one request at a time, and a fresh server per model and run. So it includes
+  tokenization, templating, sampling, speculative decoding and the HTTP stack, as a user would see it. From v0.1.2 the
+  release runs unpack the release tarball for each run and serve its own `talus-server` and engine with the run
+  configs `talus setup` writes (arguments, environment, sampling block, stop tokens, the tokenizer from the GGUF), on
+  the model files listed in [MODELS.md](MODELS.md). The v0.1.0 runs went through an earlier Python server with the
+  same engine invocations.
 
 ## The matrix
 
@@ -66,10 +85,15 @@ continuations of the same prompt, and the single-prompt cell then measures the t
 Qwen3.8-27B we saw one 32K prompt move by about 21% (one standard deviation) between builds
 whose per-step speed was the same.
 
-So `tg2k` and `tg32k` use four prompts, cut at corpus offsets 0, 100K, 200K and 300K tokens. The cell is all
-generated tokens over all decode time across the four. The four-prompt aggregate still carries about
-10.5% (one standard error) of text-driven noise between numerically different builds or
-engines. We do not claim a `tg` win smaller than that against another engine.
+So `tg2k` and `tg32k` use several prompts. In the current release runs: 12 prompts at about 2K tokens (corpus
+offsets 0, 30K, 60K, 100K, 130K, 160K, 200K, 230K, 260K, 300K, 330K and 360K tokens) and 8 at about 32K (0, 50K,
+100K, 150K, 200K, 250K, 300K and 340K). The cell is all generated tokens over all decode time across the prompts, and
+`pp2k` / `pp32k` are likewise all prompt tokens over all prompt time across the same prompts; each prompt's own
+figure is recorded too. The v0.1.0 runs (the comparison rows) used four prompts at offsets 0, 100K, 200K and 300K for
+`tg` and the first prompt alone for `pp`. The four-prompt aggregate carries about 10.5% (one
+standard error) of text-driven noise between numerically different builds or engines; we have not derived the figure
+for the 12 / 8-prompt cells yet, so we do not claim a `tg` win smaller than the four-prompt figure against another
+engine.
 
 ### Noise bands
 
@@ -87,18 +111,19 @@ tie. These bands describe one build's session noise (the same greedy text). Betw
 
 ## Quality gates
 
-Speed counts only if the output is right. Each model has to pass all of these at the release build:
+Speed counts only if the output is right. Each model has to pass all of these at the release build (for v0.1.2 on
+the laptop, with the release tarball and its `talus-server`):
 
 | Gate | What it checks | Pass |
 |---|---|---|
 | Needle 60K | Long-context recall: five codenames hidden at five evenly spaced depths (from a tenth to nine tenths of the way in) of a 60K-token prompt from the corpus; the model must list all five. Three seeds. | every codename in every seed |
 | Needle 81K | The same at 81K tokens, for the models served with more than 64K of context (Flash-Next, MiMo, Laguna) | every codename in every seed |
-| Agentic | Five SWE-bench-style tasks on the Go library `charmbracelet/bubbles` v0.21.1, driven by the opencode agent against the served model; graded offline by hidden Go tests that the agent never sees | all five tasks |
+| Agentic smoke test | Five SWE-bench-style tasks on the Go library `charmbracelet/bubbles` v0.21.1, driven by the opencode agent against the served model; graded offline by hidden Go tests that the agent never sees. Each task runs once, so this is a smoke test: it catches broken tool use or editing, but cannot distinguish small quality differences (five pass/fail outcomes). Model quality is gated by KL divergence, greedy output identity and long-context recall | all five tasks |
 | KLD | Kullback-Leibler divergence of the model's next-token distribution against a reference, per model (below) | within the model's threshold |
 | Greedy identity | The greedy outputs of the `code` and `edit` mixes are byte-identical to the previous gated build, where the change claims to keep numerics unchanged | every output identical |
 | Soak | Continuous mixed traffic on the served configuration (below) | see below |
 
-The needle prompts use temperature 1.0 / top-p 0.95 with a fixed seed. The agentic suite runs the model's own
+The needle prompts use temperature 1.0 / top-p 0.95 with a fixed seed. The agentic smoke test runs the model's own
 sampling defaults. 64K-context configurations (GLM-5.3-Flash, and Qwen3.8-27B in the release runs) let opencode compact the conversation.
 
 ### KLD references per model
@@ -149,7 +174,7 @@ Every kernel change in Talus falls into one of two classes.
 - **Opt-in numerics.** The change rounds differently (for example a faster attention kernel that accumulates in a
   different order, or a lower-precision prompt path). It ships behind an environment variable, off by default. It
   can become the default only if it passes the KLD gate within the noise of the current default, needle at 60K and
-  the full agentic suite, and the maintainer then decides. The defaults that change numerics are listed per model,
+  the agentic smoke test, and the maintainer then decides. The defaults that change numerics are listed per model,
   with their kill switches, in [MODELS.md](MODELS.md).
 
 What "exact" covers for the prompt cache: a request that restores cached state gives the same answer as the same
@@ -181,8 +206,8 @@ from `TALUS_API_KEY` (or `TALUS_API_KEY_FILE`); run them from another machine, o
 2. Tier 1:
    - `bench/bench27.py LABEL chat,code,edit` for the three mixes (`edit` uses the files in `bench/editsrc/`;
      `DUMP=FILE` writes the greedy outputs for the byte-identity check);
-   - `DEPTH_OFFSETS=0,100000,200000,300000 bench/bench.py LABEL 2000,32000` for `pp2k`, `pp32k`, the four-prompt
-     `tg2k` / `tg32k` and the TTFT samples (`bench/chatdepth.py` does the same through `/v1/chat/completions`).
+   - `DEPTH_OFFSETS="0,30000,60000,100000,130000,160000,200000,230000,260000,300000,330000,360000;16000:0,50000,100000,150000,200000,250000,300000,340000" bench/bench.py LABEL 2000,32000`
+     for `pp2k`, `pp32k`, the 12 / 8-prompt `tg2k` / `tg32k` and the TTFT samples (`bench/chatdepth.py` does the same through `/v1/chat/completions`).
      The corpus is the Python standard library of the client machine.
 3. Gates:
    - `bench/needle.py LABEL 60000` (and `81000`; seeds 1, 2 and 3 by default);
@@ -195,8 +220,8 @@ from `TALUS_API_KEY` (or `TALUS_API_KEY_FILE`); run them from another machine, o
      logits dumped on the original FP8 weights and the quant lineage (GLM-5.3-Flash), or teacher-forced
      full logits (`--dump-full-logits`) at 2K and 32K, scored as KL(reference || build) against the reference build with
      numerics switches off (MiMo-V2.6-Flash and Laguna-S-2.1).
-4. Compare cell by cell with the noise bands above. Compare `tg` cells across engines only on the four-prompt
-   aggregate.
+4. Compare cell by cell with the noise bands above. Compare `tg` cells across engines only on multi-prompt
+   aggregates with the same prompts, and only on the same machine.
 
 Results inside a noise band are a tie. A release run records every cell, the gate results and a manifest (commit
 and binary checksums) of the build it measured; [RESULTS.md](RESULTS.md) is generated from those records.

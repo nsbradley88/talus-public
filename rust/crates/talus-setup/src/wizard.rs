@@ -2,13 +2,15 @@
 //!
 //! 1. This computer: a verdict per hardware check.
 //! 2. Models: the five, with download size, context, fit next to a desktop, release speed and license.
-//! 3. Options: drafters on; Qwen3.8-27B's 4-bit prompt weights opt-in (`--advanced`); disk space check.
+//! 3. Options: drafters on; Qwen3.8-27B's 4-bit prompt weights (v3) on (`--advanced` asks); disk space check.
 //! 4. Downloads: resumable, checksum-verified; Flash-Next's pack.
-//! 5. System settings: the kernel parameters GLM and MiMo need, shown as a diff, applied only on an explicit "yes".
+//! 5. System settings: the kernel parameters GLM and MiMo need, shown as a diff, applied only on an explicit "yes";
+//!    the ACPI platform profile `performance` Talus is measured with (asked, default yes; `--no-power-profile` skips).
 //! 6. Run configs, the optional user service, start the server, open the TUI.
 //!
 //! Re-running offers add / remove / repair. `--dry-run` prints every action without doing it. `--yes` takes every
-//! default and never touches boot settings unless `--allow-system-changes` is also given.
+//! default and never touches boot settings unless `--allow-system-changes` is also given. `--yes` does take the
+//! platform profile (a default-yes runtime setting, not a boot setting) unless `--no-power-profile` is given.
 
 use crate::boot;
 use crate::checks::{self, Verdict};
@@ -46,8 +48,11 @@ pub struct Args {
     pub force: bool,
     /// Skip downloads (configs only; for tests and pre-seeded model folders).
     pub no_download: bool,
-    /// Also download opt-in drafters (Laguna-S-2.1's DFlash drafter; license unclear).
+    /// Also download opt-in drafters (`Role::DrafterOptIn`; none today: Laguna-S-2.1's DFlash drafter is a default
+    /// drafter since v0.1.2, talus#53).
     pub opt_in_drafters: bool,
+    /// Leave the ACPI platform profile alone.
+    pub no_power_profile: bool,
 }
 
 const STEPS: usize = 6;
@@ -139,8 +144,8 @@ fn ask_models(
         println!("{l}");
     }
     ui::note(&format!(
-        "Speeds: tokens per second in chat (answer) and reading a 2K prompt, release {} on a 70 W HP ZBook Ultra G1a.",
-        manifest::RELEASE
+        "Speeds: tokens per second in chat (answer) and reading a 2K prompt, {}; a 70 W laptop is slower.",
+        manifest::SPEED_SOURCE
     ));
     ui::note("One model serves at a time; install several to switch between them in talus-tui.");
     let have = st.map(|s| !s.models.is_empty()).unwrap_or(false);
@@ -199,7 +204,7 @@ fn ask_choices(
             ui::note(o.tradeoff);
         }
         c.w4i = p.confirm(
-            "Download the 4-bit prompt weights (2.1 GB; turn them on later in talus-tui)?",
+            "Download the 4-bit prompt weights (2.2 GB; Talus uses them by default, about 6-7% faster prompts)?",
             c.w4i,
         );
     }
@@ -435,6 +440,96 @@ pub fn system_settings(
     Ok(true)
 }
 
+/// The ACPI platform profile (talus#54): explain, show the change, ask (default yes), apply now and for every boot.
+/// Returns whether it was changed. A failure is reported with the lines to copy; it never stops the setup.
+pub fn power_profile(x: &Exec, p: &mut Prompter, sys: &SysInfo, skip: bool, date: &str) -> bool {
+    use crate::power::{self, Status};
+    let current = match power::status(sys) {
+        Status::NotHalo => return false,
+        Status::Absent => {
+            ui::note("No ACPI platform profile on this machine: its power mode is a firmware (BIOS) setting. \
+                      Talus is measured in the highest sustained mode (performance).");
+            return false;
+        }
+        Status::NoPerformance { current, choices } => {
+            ui::note(&format!(
+                "Platform profile {current}: the firmware offers no \"performance\" (choices: {}). Talus is \
+                 measured in performance; this machine may be slower.",
+                choices.join(" ")
+            ));
+            return false;
+        }
+        Status::Performance => {
+            println!(
+                "  {} {:<22} now: {}",
+                ui::tag(Verdict::Pass),
+                "platform profile",
+                power::describe(sys)
+            );
+            return false;
+        }
+        Status::Other { current } => current,
+    };
+    println!(
+        "  {} {:<22} now: {}",
+        ui::tag(Verdict::Warn),
+        "platform profile",
+        power::describe(sys)
+    );
+    let plan = power::plan(sys, date);
+    if skip {
+        ui::say("Platform profile left alone (--no-power-profile). To set it yourself:");
+        ui::block(&plan.manual);
+        return false;
+    }
+    ui::say(power::WHY);
+    match plan.mechanism {
+        power::Mechanism::Daemon => ui::say(
+            "power-profiles-daemon manages the profile here; it keeps the choice across reboots.",
+        ),
+        power::Mechanism::Tmpfiles => {
+            if let Some((path, content)) = &plan.file {
+                ui::say("The change (a new file that systemd applies at every boot; nothing else is edited):");
+                ui::block(&boot::diff(&path.display().to_string(), None, content));
+            }
+        }
+    }
+    ui::say("What would run (no reboot, no kernel parameter):");
+    for s in &plan.steps {
+        ui::say(&format!("  {}", s.describe()));
+    }
+    ui::say(&format!("To undo later: {}", plan.undo));
+    if !p.confirm(
+        &format!(
+            "Switch the platform profile from {current} to performance, now and at every boot?"
+        ),
+        true,
+    ) {
+        ui::say("Skipped. To do it yourself:");
+        ui::block(&plan.manual);
+        return false;
+    }
+    for s in &plan.steps {
+        let r = match s {
+            boot::Step::Sudo(a) => x.sudo(a, "platform profile"),
+            boot::Step::WriteRoot { path, content } => {
+                x.sudo_write(path, content, "platform profile at boot")
+            }
+        };
+        if let Err(e) = r {
+            ui::warn(&format!(
+                "The platform profile was not changed ({e}). To do it yourself:"
+            ));
+            ui::block(&plan.manual);
+            return false;
+        }
+    }
+    ui::say(&ui::good(
+        "Platform profile: performance (also after a reboot).",
+    ));
+    true
+}
+
 fn start_server(x: &Exec, paths: &Paths, st: &SetupState, use_service: bool) -> Result<(), String> {
     if use_service {
         x.run(
@@ -650,8 +745,10 @@ fn run_inner(a: Args) -> Result<(), String> {
     }
     if !a.advanced && !chosen.is_empty() {
         ui::say("Drafters on (speculative decoding: same output, faster answers).");
-        if chosen.iter().any(|m| m.has_role(Role::W4i)) {
-            ui::note("Qwen3.8-27B's 4-bit prompt weights are an opt-in: `talus setup --advanced` offers them.");
+        if picks.iter().any(|(m, c)| m.has_role(Role::W4i) && c.w4i) {
+            ui::say("Qwen3.8-27B's 4-bit prompt weights (2.2 GB, about 6-7% faster prompts) are included: `talus setup --advanced` can leave them out.");
+        } else if chosen.iter().any(|m| m.has_role(Role::W4i)) {
+            ui::note("Qwen3.8-27B's 4-bit prompt weights are off for this install: `talus setup --advanced` offers them.");
         }
         if chosen.iter().any(|m| m.has_role(Role::DrafterOptIn)) && !a.opt_in_drafters {
             ui::note("Laguna-S-2.1 drafts with prompt lookup. Its DFlash drafter is an opt-in (license unclear): \
@@ -775,6 +872,7 @@ fn run_inner(a: Args) -> Result<(), String> {
         a.allow_system_changes,
         (&stamp.0, &stamp.1),
     )?;
+    power_profile(&x, &mut p, &sys, a.no_power_profile, &stamp.0);
     if all
         .iter()
         .any(|m| m.desktop_fit == manifest::DesktopFit::HeadlessOnly)
@@ -941,6 +1039,16 @@ mod tests {
             assert!(t.contains(n), "{n}");
         }
         assert!(t.contains("headless only") && t.contains("tight") && t.contains("Apache-2.0"));
+        // v0.1.2 speeds (rc1 on the desktop, shipped talus-server): chat / 2K prompt
+        for v in [
+            "51 / 599 tok/s",
+            "62 / 1093 tok/s",
+            "34 / 564 tok/s",
+            "38 / 739 tok/s",
+            "37 / 1164 tok/s",
+        ] {
+            assert!(t.contains(v), "{v}");
+        }
         assert!(t.contains("needs the GPU memory pool raised"));
         assert!(
             t.contains("Qwen Community License 1.0") && !t.contains("commercial services need")
