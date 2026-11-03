@@ -33,7 +33,8 @@ Press Enter to accept each suggested answer. The installer:
    without a gfx1151 GPU it stops here; `--force` continues anyway (for example to prepare a disk).
 2. **Installs the build tools**: a C/C++ compiler, git, curl and Python from your distribution (it shows the
    command and asks first), then CMake, Ninja and Rust (rustup, with the version this release pins) in your
-   home directory. Your shell configuration is not changed.
+   home directory. Your shell configuration is not changed. With a prebuilt release (`TALUS_RELEASE=<tag>`) it
+   installs only git, curl and Python: no compiler, CMake, Ninja or Rust.
 3. **Gets Talus and the ROCm SDK**: the source into `~/.local/share/talus/src` and AMD's ROCm SDK (TheRock wheels,
    the exact version this release was built and measured with, named in the repository's `rocm.version`) into
    `~/.local/share/talus/rocm`, a download of several GB from AMD's index
@@ -62,13 +63,12 @@ Run the same command again at any time: finished steps are skipped and a stopped
   3  GLM-5.3-Flash          118 GB  64K     headless only  .. / ... tok/s   MIT
   4  MiMo-V2.6-Flash         98 GB  192K    tight          .. / ... tok/s   MIT
   5  Laguna-S-2.1            73 GB  256K    yes            .. / ... tok/s   OpenMDW-1.1
-  Speeds: tokens per second in chat (answer) and reading a 2K prompt, v0.1.2 on a GMKtec EVO-X2 desktop (Ryzen AI Max+ 395, 128 GB, about 120 W); a 70 W laptop is slower.
+  Speeds: tokens per second in chat (answer) and reading a 2K prompt, v0.1.3 on a GMKtec EVO-X2 desktop (Ryzen AI Max+ 395, 128 GB, about 120 W); a 70 W laptop is slower.
   Models to install (numbers like 1,5 or all): [1]
 ```
 
-(The real table shows rounded chat and 2K-prompt speeds of v0.1.2 measured on that desktop during release testing;
-[RESULTS.md](RESULTS.md) has the release run's figures, within about 1 % of them, and the machine each figure comes
-from.)
+(The real table shows the chat and 2K-prompt speeds of the v0.1.3 release run on that desktop, rounded;
+[RESULTS.md](RESULTS.md) has the same figures with one decimal, and the machine each figure comes from.)
 
 - **Download** is the size with the drafters (speculative decoding), which are on by default. Since v0.1.2 that
   includes Laguna-S-2.1's DFlash drafter, our Q8_0 of poolside's drafter
@@ -112,7 +112,8 @@ To undo: `sudo rm /etc/default/grub.d/90-talus.cfg && sudo update-grub`, then re
 ## Running Talus
 
 At the end, setup offers to install a user service (the server then starts when you log in) and to start the
-server now. Then:
+server now. With `--yes` (or without a terminal) the service is installed only when you add `--service`; the
+server is still started once, in the background, unless you add `--no-start`. Then:
 
 - The API is at `http://127.0.0.1:8000/v1` (OpenAI and Anthropic compatible; see the README).
 - When the server is reachable from your network, clients need the API key from `~/.config/talus/api-key`:
@@ -174,12 +175,18 @@ talus setup --remove glm
 ## Without questions
 
 - `--yes` takes every suggested answer. It never changes boot settings unless you also give
-  `--allow-system-changes`.
+  `--allow-system-changes`, and it installs the user service only with `--service` (before v0.1.3 `--yes`
+  installed it by default).
+- `install.sh` passes `--models-dir DIR`, `--no-power-profile`, `--service` and `--no-service` on to `talus setup`.
+- With a prebuilt release (`TALUS_RELEASE=<tag>` or `TALUS_PREBUILT_URL`), `install.sh` installs no compiler, CMake,
+  Ninja or Rust: it needs only git, curl and Python 3. The first `talus update` that compiles installs them then.
 - `--dry-run` prints every action (downloads with their URL, size and checksum, files it would write, commands it
   would run) and changes nothing. It works for `install.sh`, `talus setup`, `talus doctor --fix` and `talus update`.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nsbradley88/talus-public/main/install.sh | bash -s -- --yes
+# the same, models on another disk, with the service:
+curl -fsSL https://raw.githubusercontent.com/nsbradley88/talus-public/main/install.sh | bash -s -- --yes --models-dir /data/models --service
 ```
 
 ## Where everything goes

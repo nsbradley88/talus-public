@@ -10,7 +10,7 @@ talus: install, check and update Talus
 USAGE
   talus setup   [--advanced] [--yes] [--dry-run] [--allow-system-changes]
                 [--models LIST | --add LIST | --remove LIST] [--models-dir DIR]
-                [--port N] [--lan] [--no-start] [--no-service] [--force]
+                [--port N] [--lan] [--no-start] [--service | --no-service] [--force]
                 [--opt-in-drafters]  (opt-in drafters; none today: Laguna's DFlash drafter is a default since 0.1.2)
                 [--no-power-profile] (leave the ACPI platform profile alone)
   talus doctor  [--fix] [--yes] [--report] [--deep] [--offline] [--dry-run] [--allow-system-changes]
@@ -24,7 +24,8 @@ USAGE
 LIST is model numbers, ids or short names, comma-separated: 1,5  or  27b,laguna  or  all.
   1 qwen3.8-27b   2 qwen3.8-flash-next   3 glm-5.3-flash   4 mimo-v2.6-flash   5 laguna-s-2.1
 
---yes takes every default without asking. Boot settings (kernel parameters) change only after you type
+--yes takes every default without asking, except the user service (the server starting at every login):
+without a person at the terminal it is installed only with --service. Boot settings (kernel parameters) change only after you type
 \"yes\", or with --yes --allow-system-changes. Nothing ever reboots by itself.
 On Strix Halo, setup offers the \"performance\" ACPI platform profile Talus is measured with (default yes, so
 --yes takes it; it needs sudo and is kept across reboots). --no-power-profile skips it.
@@ -61,6 +62,7 @@ fn parse_setup(args: Vec<String>) -> Result<wizard::Args, String> {
             "--lan" => a.bind_lan = true,
             "--no-start" => a.no_start = true,
             "--no-service" => a.no_service = true,
+            "--service" => a.service = true,
             "--no-download" => a.no_download = true,
             "--opt-in-drafters" => a.opt_in_drafters = true,
             "--no-power-profile" => a.no_power_profile = true,

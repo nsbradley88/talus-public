@@ -101,6 +101,23 @@ fn memory_json() -> JsonValue {
     }
 }
 
+/// `VmRSS` in bytes from `/proc/<pid>/status` text.
+pub fn parse_vm_rss(text: &str) -> Option<u64> {
+    text.lines()
+        .find(|l| l.starts_with("VmRSS:"))
+        .and_then(|l| l["VmRSS:".len()..].split_whitespace().next())
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|kib| kib * 1024)
+}
+
+fn rss_bytes(proc_dir: &str) -> JsonValue {
+    std::fs::read_to_string(format!("/proc/{proc_dir}/status"))
+        .ok()
+        .and_then(|t| parse_vm_rss(&t))
+        .map(JsonValue::from)
+        .unwrap_or(JsonValue::Null)
+}
+
 fn selection_json(state: &ServiceState) -> JsonValue {
     state
         .config
@@ -181,6 +198,9 @@ pub fn recover_after_failed_start(
 }
 
 pub fn status_json(state: &ServiceState) -> JsonValue {
+    // bench extensions: hash the small build files and start the energy sampler on the first status request
+    let _ = state.fingerprint.start_hashing(false);
+    state.energy.start();
     let running = state.running_requests.load(Ordering::Relaxed);
     let waiting = state.waiting_requests.load(Ordering::Relaxed);
     let loaded = state.engine.is_loaded();
@@ -246,6 +266,7 @@ pub fn status_json(state: &ServiceState) -> JsonValue {
                 ("port", JsonValue::from(state.config.port as u64)),
                 ("api_key", JsonValue::from(state.config.api_key.is_some())),
                 ("api_key_from_env", JsonValue::from(key_from_env())),
+                ("rss_bytes", rss_bytes("self")),
             ]),
         ),
         (
@@ -256,6 +277,34 @@ pub fn status_json(state: &ServiceState) -> JsonValue {
                 ("last_error", last_error_json(state)),
             ]),
         ),
+        (
+            "engine",
+            JsonValue::obj(vec![
+                (
+                    "pid",
+                    state
+                        .engine
+                        .pid()
+                        .map(JsonValue::from)
+                        .unwrap_or(JsonValue::Null),
+                ),
+                (
+                    "rss_bytes",
+                    state
+                        .engine
+                        .pid()
+                        .map(|p| rss_bytes(&p.to_string()))
+                        .unwrap_or(JsonValue::Null),
+                ),
+            ]),
+        ),
+        (
+            "build",
+            state
+                .fingerprint
+                .to_json(&|k: &str| state.engine.info_value(k)),
+        ),
+        ("energy", state.energy.to_json()),
     ])
 }
 
@@ -330,6 +379,30 @@ pub fn presets_json(state: &ServiceState) -> JsonValue {
         ),
         ("selection", selection_json(state)),
     ])
+}
+
+/// [`handle_get`] with the query string: `GET /v1/talus/status?hash=weights` also starts hashing the large weight
+/// files (from this computer, or with an API key configured, as for apply).
+pub fn handle_get_query(
+    path: &str,
+    query: &str,
+    state: &ServiceState,
+    peer_is_local: bool,
+) -> (u16, JsonValue) {
+    if path == "/v1/talus/status" && query.split('&').any(|q| q == "hash=weights") {
+        if !peer_is_local && state.config.api_key.is_none() {
+            return (
+                403,
+                error(
+                    403,
+                    "hashing is started only from this computer unless the server has an API key",
+                )
+                .body,
+            );
+        }
+        let _ = state.fingerprint.start_hashing(true);
+    }
+    handle_get(path, state)
 }
 
 pub fn handle_get(path: &str, state: &ServiceState) -> (u16, JsonValue) {
@@ -803,6 +876,14 @@ mod tests {
             Some(bin.clone())
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn vm_rss_parse() {
+        let t = "Name:\ttalus-cli\nVmPeak:\t 9 kB\nVmRSS:\t  123456 kB\nRssAnon: 1 kB\n";
+        assert_eq!(parse_vm_rss(t), Some(123456 * 1024));
+        assert_eq!(parse_vm_rss("Name: x\n"), None);
+        assert!(rss_bytes("self").as_i64().unwrap_or(0) > 0);
     }
 
     #[test]

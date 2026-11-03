@@ -19,6 +19,8 @@ pub enum EngineError {
     EngineDied(String),
     EngineStarting(String),
     NonFinite(String),
+    /// The engine does not implement this feature (E1 logprobs / E2 scoring): the server answers 400 / 501.
+    Unsupported(String),
     Cancelled,
 }
 
@@ -29,6 +31,7 @@ impl fmt::Display for EngineError {
             EngineError::EngineDied(s) => f.write_str(s),
             EngineError::EngineStarting(s) => f.write_str(s),
             EngineError::NonFinite(s) => f.write_str(s),
+            EngineError::Unsupported(s) => f.write_str(s),
             EngineError::Cancelled => f.write_str("cancelled"),
         }
     }
@@ -55,6 +58,11 @@ pub struct SamplingParams {
     pub reasoning_budget_tokens: Option<i64>,
     pub reasoning_effort: Option<String>,
     pub enable_thinking: Option<bool>,
+    /// E1: opt-in top-k logprobs per generated token (`GEN ... logprobs=K`); None = off (no GEN key at all).
+    pub logprobs: Option<usize>,
+    /// E6: compact JSON Schema (prepared by `talus_text::json_grammar::prepare`) the engine must constrain the
+    /// output to; sent as the GEN key `json_schema=` only to engines that advertise `INFO grammar=json_schema`.
+    pub json_schema: Option<String>,
 }
 
 impl Default for SamplingParams {
@@ -77,6 +85,8 @@ impl Default for SamplingParams {
             reasoning_budget_tokens: None,
             reasoning_effort: None,
             enable_thinking: None,
+            logprobs: None,
+            json_schema: None,
         }
     }
 }
@@ -141,8 +151,31 @@ impl SamplingParams {
                 keys.push_str(&format!(" pin={pin}"));
             }
         }
+        if let Some(k) = self.logprobs {
+            keys.push_str(&format!(" logprobs={k}"));
+        }
+        if let Some(ref js) = self.json_schema {
+            keys.push_str(" json_schema=");
+            keys.push_str(&gen_value_encode(js));
+        }
         keys
     }
+}
+
+/// A GEN key value carries no space (the line is space separated): `%` and the whitespace bytes are %-encoded.
+pub fn gen_value_encode(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for ch in v.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            ' ' => out.push_str("%20"),
+            '\n' => out.push_str("%0A"),
+            '\r' => out.push_str("%0D"),
+            '\t' => out.push_str("%09"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -152,6 +185,122 @@ pub struct GenerateRequest {
     pub sampling: SamplingParams,
     pub stop_tokens: Vec<u32>,
     pub stop_strings: Vec<String>,
+}
+
+/// E1: one generated token's logprob under the target model at temperature 1 (before sampling filters), and the
+/// top-k alternatives in descending order. From the engine's `L <lp> <k> <id>:<lp>,...` line.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenLogprob {
+    pub logprob: f32,
+    pub top: Vec<(u32, f32)>,
+}
+
+impl TokenLogprob {
+    /// Parse the part after `L `: `<lp> <k> <id>:<lp>,...` (`-` or nothing for an empty list).
+    pub fn parse_l(rest: &str) -> Option<Self> {
+        let mut f = rest.split_whitespace();
+        let logprob = parse_lp(f.next()?)?;
+        let _k = f.next();
+        let top = parse_top(f.next().unwrap_or("-"))?;
+        Some(Self { logprob, top })
+    }
+
+    pub fn to_line(&self) -> String {
+        format!(
+            "L {} {} {}",
+            self.logprob,
+            self.top.len(),
+            format_top(&self.top)
+        )
+    }
+}
+
+/// E2: one teacher-forced continuation position (the distribution before that token).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScorePosition {
+    pub id: u32,
+    pub logprob: f32,
+    pub rank: u32,
+    pub entropy: f32,
+    pub top: Vec<(u32, f32)>,
+}
+
+impl ScorePosition {
+    /// Parse the part after `S `: `<id> <lp> <rank> <entropy> <k> <id>:<lp>,...`.
+    pub fn parse_s(rest: &str) -> Option<Self> {
+        let mut f = rest.split_whitespace();
+        let id = f.next()?.parse().ok()?;
+        let logprob = parse_lp(f.next()?)?;
+        let rank = f.next()?.parse().ok()?;
+        let entropy = parse_lp(f.next()?)?;
+        let _k = f.next();
+        let top = parse_top(f.next().unwrap_or("-"))?;
+        Some(Self {
+            id,
+            logprob,
+            rank,
+            entropy,
+            top,
+        })
+    }
+
+    pub fn to_line(&self) -> String {
+        format!(
+            "S {} {} {} {} {} {}",
+            self.id,
+            self.logprob,
+            self.rank,
+            self.entropy,
+            self.top.len(),
+            format_top(&self.top)
+        )
+    }
+}
+
+/// E2 request as the engine sees it (`SCORE <top_k> <prompt ids>|<continuation ids>`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScoreRequest {
+    pub prompt_ids: Vec<u32>,
+    pub continuation_ids: Vec<u32>,
+    pub top_k: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScoreResult {
+    pub positions: Vec<ScorePosition>,
+    pub prompt_ms: f64,
+    pub total_ms: f64,
+}
+
+fn parse_lp(s: &str) -> Option<f32> {
+    match s {
+        "-inf" => Some(f32::NEG_INFINITY),
+        "inf" => Some(f32::INFINITY),
+        _ => s.parse::<f32>().ok(),
+    }
+}
+
+fn parse_top(s: &str) -> Option<Vec<(u32, f32)>> {
+    if s == "-" || s.is_empty() {
+        return Some(Vec::new());
+    }
+    s.split(',')
+        .filter(|e| !e.is_empty())
+        .map(|e| {
+            let (id, lp) = e.split_once(':')?;
+            Some((id.parse().ok()?, parse_lp(lp)?))
+        })
+        .collect()
+}
+
+fn format_top(top: &[(u32, f32)]) -> String {
+    if top.is_empty() {
+        return "-".to_string();
+    }
+    top.iter()
+        .map(|(id, lp)| format!("{id}:{lp}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -267,6 +416,16 @@ pub trait Engine: Send + Sync {
         Some("0.1.44")
     }
 
+    /// Process id of the engine child, if it runs in one (`/v1/talus/status` `engine.rss_bytes`).
+    fn pid(&self) -> Option<u32> {
+        None
+    }
+
+    /// A value from the engine's start-up `INFO key=value` lines.
+    fn info_value(&self, _key: &str) -> Option<String> {
+        None
+    }
+
     fn load(&self) -> Result<(), EngineError> {
         Ok(())
     }
@@ -288,6 +447,34 @@ pub trait Engine: Send + Sync {
         on_token: &mut dyn FnMut(u32) -> bool,
         on_progress: &mut dyn FnMut(usize, usize),
     ) -> Result<EngineTimings, EngineError>;
+
+    /// E1: the engine emits per-token logprobs when a request sets `sampling.logprobs` (`INFO logprobs=1`).
+    fn supports_logprobs(&self) -> bool {
+        false
+    }
+
+    /// As [`Self::generate`], and `on_token` also gets the token's logprobs when the request asked for them (and the
+    /// engine supports them); else None. The default delegates to `generate` (no logprobs).
+    fn generate_with_logprobs(
+        &self,
+        req: &GenerateRequest,
+        cancel: Arc<AtomicBool>,
+        on_token: &mut dyn FnMut(u32, Option<TokenLogprob>) -> bool,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<EngineTimings, EngineError> {
+        self.generate(req, cancel, &mut |t| on_token(t, None), on_progress)
+    }
+
+    /// E2: teacher-forced scoring (`SCORE`, `INFO score=1`).
+    fn supports_score(&self) -> bool {
+        false
+    }
+
+    fn score(&self, _req: &ScoreRequest) -> Result<ScoreResult, EngineError> {
+        Err(EngineError::Unsupported(
+            "scoring not supported by this engine".to_string(),
+        ))
+    }
 
     fn tokenize(&self, text: &str, parse_special: bool) -> Vec<u32>;
 
@@ -313,6 +500,12 @@ pub trait Engine: Send + Sync {
 
     fn erase_slot(&self, _slot_id: usize) -> Result<usize, EngineError> {
         Ok(0)
+    }
+
+    /// E6: the engine constrains output to `SamplingParams::json_schema`. Engines that do not say so get a 400 for
+    /// `response_format: json_schema` instead of an unconstrained answer.
+    fn supports_json_schema(&self) -> bool {
+        false
     }
 }
 
@@ -347,6 +540,26 @@ pub struct ScriptedMockEngine {
     delay: Duration,
     cancelled: AtomicBool,
     state: Mutex<MockState>,
+    /// E1/E2 support advertised (`INFO logprobs=1 score=1`) and served with deterministic mock values.
+    logprobs_on: AtomicBool,
+    score_on: AtomicBool,
+    /// E6 tests: advertise json_schema support, and the last schema a request carried.
+    json_schema_ok: AtomicBool,
+    last_json_schema: Mutex<Option<String>>,
+}
+
+/// The mock's deterministic logprobs for generated step `step` (0-based) choosing `tok`: the token is the top-1.
+pub fn mock_token_logprob(step: usize, tok: u32, k: usize) -> TokenLogprob {
+    let lp = -0.05 * ((step % 7) as f32) - 0.01;
+    let mut top = Vec::with_capacity(k);
+    for j in 0..k {
+        if j == 0 {
+            top.push((tok, lp));
+        } else {
+            top.push((tok.wrapping_add(j as u32), lp - j as f32));
+        }
+    }
+    TokenLogprob { logprob: lp, top }
 }
 
 impl Default for ScriptedMockEngine {
@@ -400,7 +613,30 @@ impl ScriptedMockEngine {
                 cache_snapshots: Vec::new(),
                 saved_slots: HashMap::new(),
             }),
+            logprobs_on: AtomicBool::new(false),
+            score_on: AtomicBool::new(false),
+            json_schema_ok: AtomicBool::new(false),
+            last_json_schema: Mutex::new(None),
         }
+    }
+
+    /// Advertise and serve E1 logprobs (mock values, see [`mock_token_logprob`]).
+    pub fn set_logprobs_support(&self, on: bool) {
+        self.logprobs_on.store(on, Ordering::Relaxed);
+    }
+
+    /// Advertise and serve E2 scoring (mock values: position i = `mock_token_logprob(i, id, k)`).
+    pub fn set_score_support(&self, on: bool) {
+        self.score_on.store(on, Ordering::Relaxed);
+    }
+
+    pub fn set_json_schema_support(&self, on: bool) {
+        self.json_schema_ok.store(on, Ordering::Relaxed);
+    }
+
+    /// The `json_schema` of the last generate request (E6 tests).
+    pub fn last_json_schema(&self) -> Option<String> {
+        self.last_json_schema.lock().unwrap().clone()
     }
 
     pub fn set_max_context(&self, ctx: usize) {
@@ -485,6 +721,14 @@ impl ScriptedMockEngine {
             writer,
             "INFO version=0.1.44 arena_mib=1024 vram_free_mib=8192 slot_cache=1"
         )?;
+        if self.logprobs_on.load(Ordering::Relaxed) || self.score_on.load(Ordering::Relaxed) {
+            writeln!(
+                writer,
+                "INFO logprobs={} score={}",
+                u8::from(self.logprobs_on.load(Ordering::Relaxed)),
+                u8::from(self.score_on.load(Ordering::Relaxed))
+            )?;
+        }
         writeln!(writer, "READY {ctx} stop")?;
         writer.flush()?;
 
@@ -524,6 +768,30 @@ impl ScriptedMockEngine {
                 let path = Path::new(rest.trim());
                 match self.restore_slot(0, path) {
                     Ok((n, _, _)) => writeln!(writer, "RESTORED {n}")?,
+                    Err(e) => writeln!(writer, "ERR {e}")?,
+                }
+                writer.flush()?;
+                line.clear();
+                continue;
+            }
+            if trimmed.starts_with("SCORE ") {
+                match parse_score_cmd(trimmed) {
+                    Ok(req) => match self.score(&req) {
+                        Ok(res) => {
+                            for p in &res.positions {
+                                writeln!(writer, "{}", p.to_line())?;
+                            }
+                            writeln!(
+                                writer,
+                                "DONE {} {} {:.1} {:.1} stop 0 0 0",
+                                0,
+                                req.prompt_ids.len() + req.continuation_ids.len(),
+                                res.prompt_ms,
+                                res.total_ms
+                            )?;
+                        }
+                        Err(e) => writeln!(writer, "ERR {e}")?,
+                    },
                     Err(e) => writeln!(writer, "ERR {e}")?,
                 }
                 writer.flush()?;
@@ -597,6 +865,7 @@ impl ScriptedMockEngine {
                             "cache" => sampling.cache_prompt = !(v == "0" || v == "false"),
                             "ckpt" => sampling.checkpoint = !(v == "0" || v == "false"),
                             "pin" => sampling.pin_prefix_tokens = v.parse().ok(),
+                            "logprobs" => sampling.logprobs = v.parse().ok(),
                             _ => {}
                         }
                     }
@@ -616,11 +885,11 @@ impl ScriptedMockEngine {
                 };
                 let cancel = Arc::new(AtomicBool::new(false));
                 let mut emitted_tokens = Vec::new();
-                let res = self.generate(
+                let res = self.generate_with_logprobs(
                     &req,
                     cancel,
-                    &mut |tok_id| {
-                        emitted_tokens.push(tok_id);
+                    &mut |tok_id, lp| {
+                        emitted_tokens.push((tok_id, lp));
                         true
                     },
                     &mut |_read, _total| {},
@@ -637,7 +906,10 @@ impl ScriptedMockEngine {
                             prompt_ids.len(),
                             timings.prompt_ms
                         )?;
-                        for tok_id in emitted_tokens {
+                        for (tok_id, lp) in emitted_tokens {
+                            if let Some(lp) = lp {
+                                writeln!(writer, "{}", lp.to_line())?;
+                            }
                             writeln!(writer, "T {tok_id}")?;
                         }
                         let draft_acc = timings.draft_accepted.unwrap_or(0);
@@ -688,6 +960,10 @@ impl Engine for ScriptedMockEngine {
         Ok(())
     }
 
+    fn supports_json_schema(&self) -> bool {
+        self.json_schema_ok.load(Ordering::Relaxed)
+    }
+
     fn generate(
         &self,
         req: &GenerateRequest,
@@ -695,6 +971,57 @@ impl Engine for ScriptedMockEngine {
         on_token: &mut dyn FnMut(u32) -> bool,
         on_progress: &mut dyn FnMut(usize, usize),
     ) -> Result<EngineTimings, EngineError> {
+        self.generate_with_logprobs(req, cancel, &mut |t, _| on_token(t), on_progress)
+    }
+
+    fn supports_logprobs(&self) -> bool {
+        self.logprobs_on.load(Ordering::Relaxed)
+    }
+
+    fn supports_score(&self) -> bool {
+        self.score_on.load(Ordering::Relaxed)
+    }
+
+    fn score(&self, req: &ScoreRequest) -> Result<ScoreResult, EngineError> {
+        if !self.score_on.load(Ordering::Relaxed) {
+            return Err(EngineError::Unsupported(
+                "scoring not supported by this engine".to_string(),
+            ));
+        }
+        let positions = req
+            .continuation_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| {
+                let t = mock_token_logprob(i, id, req.top_k);
+                ScorePosition {
+                    id,
+                    logprob: t.logprob,
+                    rank: 1,
+                    entropy: 0.5,
+                    top: t.top,
+                }
+            })
+            .collect();
+        Ok(ScoreResult {
+            positions,
+            prompt_ms: 1.0,
+            total_ms: 1.0,
+        })
+    }
+
+    fn generate_with_logprobs(
+        &self,
+        req: &GenerateRequest,
+        cancel: Arc<AtomicBool>,
+        on_token: &mut dyn FnMut(u32, Option<TokenLogprob>) -> bool,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<EngineTimings, EngineError> {
+        let lp_k = req
+            .sampling
+            .logprobs
+            .filter(|_| self.logprobs_on.load(Ordering::Relaxed));
+        let lp_of = |step: usize, t: u32| lp_k.map(|k| mock_token_logprob(step, t, k));
         self.load()?;
         self.cancelled.store(false, Ordering::Relaxed);
         let prompt_len = req.prompt_ids.len();
@@ -703,6 +1030,7 @@ impl Engine for ScriptedMockEngine {
             let scripts = self.scripts.lock().unwrap();
             let mut st = self.state.lock().unwrap();
             st.last_prompt = req.prompt_ids.clone();
+            *self.last_json_schema.lock().unwrap() = req.sampling.json_schema.clone();
 
             let fixed = *self.fixed_cache_n.lock().unwrap();
             let reused = if !req.sampling.cache_prompt {
@@ -759,7 +1087,7 @@ impl Engine for ScriptedMockEngine {
                 let tok_id = filler[i % filler.len()];
                 predicted_n += 1;
                 generated_ids.push(tok_id);
-                if !on_token(tok_id) {
+                if !on_token(tok_id, lp_of(predicted_n - 1, tok_id)) {
                     finish_reason = "stop".to_string();
                     break;
                 }
@@ -779,7 +1107,7 @@ impl Engine for ScriptedMockEngine {
                 }
                 predicted_n += 1;
                 generated_ids.push(tok_id);
-                if !on_token(tok_id) {
+                if !on_token(tok_id, lp_of(predicted_n - 1, tok_id)) {
                     finish_reason = "stop".to_string();
                     break;
                 }
@@ -893,6 +1221,33 @@ impl Engine for ScriptedMockEngine {
     }
 }
 
+/// Parse `SCORE <top_k> <prompt ids>|<continuation ids>` (the mock engine's side of E2).
+fn parse_score_cmd(line: &str) -> Result<ScoreRequest, String> {
+    let rest = line
+        .strip_prefix("SCORE ")
+        .ok_or_else(|| "malformed SCORE command".to_string())?;
+    let (k, ids) = rest
+        .trim()
+        .split_once(' ')
+        .ok_or_else(|| "malformed SCORE command".to_string())?;
+    let top_k = k
+        .parse::<usize>()
+        .map_err(|_| "malformed SCORE top_k".to_string())?;
+    let (p, c) = ids
+        .split_once('|')
+        .ok_or_else(|| "malformed SCORE ids".to_string())?;
+    let parse = |s: &str| -> Vec<u32> {
+        s.split(',')
+            .filter_map(|x| x.trim().parse::<u32>().ok())
+            .collect()
+    };
+    Ok(ScoreRequest {
+        prompt_ids: parse(p),
+        continuation_ids: parse(c),
+        top_k,
+    })
+}
+
 struct SubprocessHandle {
     child: Child,
     stdin: Arc<Mutex<ChildStdin>>,
@@ -910,6 +1265,7 @@ pub struct StdioSubprocessEngine {
     max_context: usize,
     stop_token: Option<u32>,
     info: HashMap<String, String>,
+    pid: u32,
     proc: Mutex<SubprocessHandle>,
     stdin_cancel: Arc<Mutex<ChildStdin>>,
 }
@@ -1061,6 +1417,7 @@ impl StdioSubprocessEngine {
             max_context,
             stop_token,
             info,
+            pid: child.id(),
             proc: Mutex::new(SubprocessHandle {
                 child,
                 stdin: shared_stdin.clone(),
@@ -1110,11 +1467,109 @@ impl Engine for StdioSubprocessEngine {
         self.info.get("version").map(|s| s.as_str())
     }
 
+    fn pid(&self) -> Option<u32> {
+        Some(self.pid)
+    }
+
+    fn info_value(&self, key: &str) -> Option<String> {
+        self.info.get(key).cloned()
+    }
+
+    fn supports_json_schema(&self) -> bool {
+        self.info
+            .get("grammar")
+            .is_some_and(|v| v.split(',').any(|g| g == "json_schema"))
+    }
+
     fn generate(
         &self,
         req: &GenerateRequest,
         cancel: Arc<AtomicBool>,
         on_token: &mut dyn FnMut(u32) -> bool,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<EngineTimings, EngineError> {
+        self.generate_with_logprobs(req, cancel, &mut |t, _| on_token(t), on_progress)
+    }
+
+    fn supports_logprobs(&self) -> bool {
+        self.info.get("logprobs").map(|v| v == "1").unwrap_or(false)
+    }
+
+    fn supports_score(&self) -> bool {
+        self.info.get("score").map(|v| v == "1").unwrap_or(false)
+    }
+
+    fn score(&self, req: &ScoreRequest) -> Result<ScoreResult, EngineError> {
+        if !self.supports_score() {
+            return Err(EngineError::Unsupported(
+                "scoring not supported by this engine".to_string(),
+            ));
+        }
+        let mut handle = self.proc.lock().unwrap();
+        let csv = |ids: &[u32]| {
+            ids.iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let cmd = format!(
+            "SCORE {} {}|{}\n",
+            req.top_k,
+            csv(&req.prompt_ids),
+            csv(&req.continuation_ids)
+        );
+        {
+            let mut stdin = handle.stdin.lock().unwrap();
+            stdin
+                .write_all(cmd.as_bytes())
+                .and_then(|_| stdin.flush())
+                .map_err(|e| EngineError::EngineDied(format!("engine stdin write failed: {e}")))?;
+        }
+        let mut positions = Vec::with_capacity(req.continuation_ids.len());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = handle
+                .stdout
+                .read_line(&mut line)
+                .map_err(|e| EngineError::EngineDied(format!("engine stdout read failed: {e}")))?;
+            if n == 0 {
+                return Err(EngineError::EngineDied(
+                    "the engine process ended unexpectedly".to_string(),
+                ));
+            }
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("S ") {
+                let p = ScorePosition::parse_s(rest).ok_or_else(|| {
+                    EngineError::EngineDied(format!("malformed S line: {trimmed}"))
+                })?;
+                positions.push(p);
+            } else if let Some(rest) = trimmed.strip_prefix("DONE ") {
+                let f: Vec<&str> = rest.split_whitespace().collect();
+                let prompt_ms = f.get(2).and_then(|x| x.parse().ok()).unwrap_or(0.0);
+                let total_ms = f.get(3).and_then(|x| x.parse().ok()).unwrap_or(0.0);
+                if f.get(4) == Some(&"nonfinite") {
+                    return Err(EngineError::NonFinite(
+                        "the engine encountered non-finite logits".to_string(),
+                    ));
+                }
+                return Ok(ScoreResult {
+                    positions,
+                    prompt_ms,
+                    total_ms,
+                });
+            } else if let Some(rest) = trimmed.strip_prefix("ERR") {
+                return Err(EngineError::InvalidRequest(rest.trim().to_string()));
+            }
+            // progress lines (PP ...) and anything else are ignored
+        }
+    }
+
+    fn generate_with_logprobs(
+        &self,
+        req: &GenerateRequest,
+        cancel: Arc<AtomicBool>,
+        on_token: &mut dyn FnMut(u32, Option<TokenLogprob>) -> bool,
         on_progress: &mut dyn FnMut(usize, usize),
     ) -> Result<EngineTimings, EngineError> {
         let mut handle = self.proc.lock().unwrap();
@@ -1137,6 +1592,7 @@ impl Engine for StdioSubprocessEngine {
         let mut reused = 0usize;
         let mut stop_sent = false;
         let mut line = String::new();
+        let mut pending_lp: Option<TokenLogprob> = None;
 
         loop {
             if cancel.load(Ordering::Relaxed) && !stop_sent {
@@ -1160,7 +1616,9 @@ impl Engine for StdioSubprocessEngine {
             if trimmed.is_empty() {
                 continue;
             }
-            if let Some(rest) = trimmed.strip_prefix("RESUME ") {
+            if let Some(rest) = trimmed.strip_prefix("L ") {
+                pending_lp = TokenLogprob::parse_l(rest);
+            } else if let Some(rest) = trimmed.strip_prefix("RESUME ") {
                 reused = rest.trim().parse::<usize>().unwrap_or(0);
             } else if let Some(rest) = trimmed.strip_prefix("PP ") {
                 let f: Vec<&str> = rest.split_whitespace().collect();
@@ -1170,6 +1628,7 @@ impl Engine for StdioSubprocessEngine {
                     on_progress(reused + read, total);
                 }
             } else if let Some(rest) = trimmed.strip_prefix("T ") {
+                let lp = pending_lp.take();
                 if let Ok(tok_id) = rest.trim().parse::<u32>() {
                     if (self.tok.is_stop_token(tok_id) || req.stop_tokens.contains(&tok_id))
                         && !req.sampling.ignore_eos
@@ -1181,7 +1640,7 @@ impl Engine for StdioSubprocessEngine {
                             }
                             stop_sent = true;
                         }
-                    } else if !stop_sent && !on_token(tok_id) {
+                    } else if !stop_sent && !on_token(tok_id, lp) {
                         if let Ok(mut stdin) = handle.stdin.lock() {
                             let _ = stdin.write_all(b"STOP\n");
                             let _ = stdin.flush();

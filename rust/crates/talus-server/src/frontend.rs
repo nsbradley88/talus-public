@@ -93,6 +93,36 @@ impl TemplateKwargs {
     }
 }
 
+/// Message suffix of a non-text content part refusal; `content_err_code` maps it to `unsupported_content`.
+pub const UNSUPPORTED_CONTENT_SUFFIX: &str = " input is not supported by this model";
+
+/// The 400 message for a non-text content part (`image input is not supported by this model`, ...).
+pub fn unsupported_content_msg(part_type: &str, part: &JsonValue) -> String {
+    let t = part_type.to_ascii_lowercase();
+    let kind = if t.contains("image")
+        || part.contains_key("image")
+        || part.contains_key("image_url")
+        || part.contains_key("source")
+    {
+        "image"
+    } else if t.contains("audio") {
+        "audio"
+    } else if t.contains("video") {
+        "video"
+    } else if t.contains("file") || t == "document" {
+        "file"
+    } else {
+        "non-text"
+    };
+    format!("{kind}{UNSUPPORTED_CONTENT_SUFFIX}")
+}
+
+/// The OpenAI error `code` for a request error message: `unsupported_content` for a refused non-text part.
+pub fn content_err_code(msg: &str) -> Option<&'static str> {
+    msg.ends_with(UNSUPPORTED_CONTENT_SUFFIX)
+        .then_some("unsupported_content")
+}
+
 /// Extract text from a content field (string, array of content parts, or null).
 pub fn text_of_content(content: Option<&JsonValue>) -> Result<String, String> {
     match content {
@@ -114,12 +144,12 @@ pub fn text_of_content(content: Option<&JsonValue>) -> Result<String, String> {
                                 "content part is missing string 'text'".to_string()
                             })?;
                             out.push(txt.to_string());
-                        } else if t == "image"
-                            || t == "image_url"
-                            || p.contains_key("image")
-                            || p.contains_key("image_url")
-                        {
-                            out.push("<|vision_start|><|image_pad|><|vision_end|>".to_string());
+                        } else if t == "refusal" {
+                            // an assistant refusal part replayed from history: text-only, nothing to render (as before)
+                        } else {
+                            // image_url / input_image / input_audio / file / ...: no vision or audio encoder yet, so
+                            // refuse (HTTP 400 unsupported_content) instead of answering without the input
+                            return Err(unsupported_content_msg(t, p));
                         }
                     }
                     _ => return Err("content part must be an object or string".to_string()),
@@ -589,6 +619,9 @@ pub fn anthropic_to_messages_with_effort(
                         Some(other) => other.to_json_string(),
                     };
                     tool_results.push(txt);
+                }
+                "image" | "document" | "audio" | "video" | "file" => {
+                    return Err(unsupported_content_msg(btype, b));
                 }
                 _ => {}
             }
@@ -1366,4 +1399,71 @@ fn partial_suffix_len(s: &str, tags: &[&str]) -> usize {
         }
     }
     best
+}
+
+#[cfg(test)]
+mod content_part_tests {
+    use super::*;
+
+    fn parts(json: &str) -> JsonValue {
+        JsonValue::parse(json).unwrap()
+    }
+
+    #[test]
+    fn text_parts_unchanged() {
+        let c = parts(
+            r#"[{"type":"text","text":"Hello "},"there",{"type":"input_text","text":"!"},{"type":"refusal","refusal":"no"}]"#,
+        );
+        assert_eq!(text_of_content(Some(&c)).unwrap(), "Hello there!");
+        let s = JsonValue::from("plain");
+        assert_eq!(text_of_content(Some(&s)).unwrap(), "plain");
+    }
+
+    #[test]
+    fn non_text_parts_are_refused() {
+        for (json, kind) in [
+            (
+                r#"[{"type":"text","text":"what is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]"#,
+                "image",
+            ),
+            (
+                r#"[{"type":"input_image","image_url":"https://example.com/a.png"}]"#,
+                "image",
+            ),
+            (
+                r#"[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]"#,
+                "image",
+            ),
+            (
+                r#"[{"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}]"#,
+                "audio",
+            ),
+            (r#"[{"type":"file","file":{"file_id":"f1"}}]"#, "file"),
+            (r#"[{"type":"hologram"}]"#, "non-text"),
+        ] {
+            let e = text_of_content(Some(&parts(json))).unwrap_err();
+            assert_eq!(
+                e,
+                format!("{kind} input is not supported by this model"),
+                "{json}"
+            );
+            assert_eq!(content_err_code(&e), Some("unsupported_content"));
+        }
+        assert_eq!(
+            content_err_code("messages: expected a non-empty list of messages"),
+            None
+        );
+    }
+
+    #[test]
+    fn anthropic_image_block_is_refused() {
+        let req = parts(
+            r#"{"max_tokens":8,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"describe"}]}]}"#,
+        );
+        let e = match anthropic_to_messages(&req, false) {
+            Err(e) => e,
+            Ok(_) => panic!("an Anthropic image block was accepted"),
+        };
+        assert_eq!(e, "image input is not supported by this model");
+    }
 }

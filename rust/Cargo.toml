@@ -19,11 +19,13 @@ members = [
     "crates/talus-presets",
     "crates/talus-tui",
     "crates/talus-setup",
+    "crates/talus-bench-core",
+    "crates/talus-bench",
     "tools/oracle",
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license = "MIT"
 
@@ -44,4 +46,5 @@ talus-server = { path = "crates/talus-server" }
 talus-cli = { path = "crates/talus-cli" }
 talus-cluster = { path = "crates/talus-cluster" }
 talus-presets = { path = "crates/talus-presets" }
+talus-bench-core = { path = "crates/talus-bench-core" }
 oracle = { path = "tools/oracle" }

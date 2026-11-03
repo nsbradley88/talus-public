@@ -30,6 +30,10 @@ pub enum MsgType {
     Err = 10,
     Bye = 11,
     Heartbeat = 12,
+    /// A prompt-cache operation, mirrored on every stage's shard (talus#47 Phase 2).
+    Cache = 13,
+    /// The reply to a cache operation that needs one (restore: the restored length).
+    CacheAck = 14,
 }
 
 impl MsgType {
@@ -48,6 +52,8 @@ impl MsgType {
             10 => Err,
             11 => Bye,
             12 => Heartbeat,
+            13 => Cache,
+            14 => CacheAck,
             _ => return None,
         })
     }

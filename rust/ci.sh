@@ -33,5 +33,9 @@ cargo deny check licenses
 if [ "${TALUS_CI_KERNELS:-0}" = 1 ]; then
   echo "ci.sh: kernel build check (build.sh, stale-build guard)"
   BUILD="${BUILD:-$SCRIPT_DIR/../build-ci}" TARGETS="${TARGETS:-talus_kernels}" "$SCRIPT_DIR/../build.sh"
+  # GDN prompt-scan kernels: no spills, the production grid resident in one pass on gfx1151 (exit 77 = cannot check here)
+  rc=0; ROCM_SDK="${ROCM_SDK:-}" python3 "$SCRIPT_DIR/../tools/check_gdn_occupancy.py" \
+    "${BUILD:-$SCRIPT_DIR/../build-ci}/libtalus_kernels.so" || rc=$?
+  [ "$rc" = 0 ] || [ "$rc" = 77 ] || exit "$rc"
 fi
 echo "ci.sh: OK"

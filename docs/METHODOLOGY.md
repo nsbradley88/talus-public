@@ -22,8 +22,9 @@ Which figures come from which machine:
 
 | Figures | Machine | Build |
 |---|---|---|
-| Speed of the current release (RESULTS "Speed" tables, the README's first table) | desktop | the v0.1.2 release candidate tarball (rc2; the same source as the published tarball, see RESULTS) |
-| The previous release on the same machine (RESULTS "v0.1.1" rows) | desktop | the v0.1.1 release binaries |
+| Speed of the current release (RESULTS "Speed" tables, the README's first table) | desktop | the v0.1.3 release candidate tarball (rc1; the same engine source as the published tarball, see RESULTS) |
+| The previous release on the same machine (RESULTS "v0.1.2" rows and the change table) | desktop | the published v0.1.2 tarball, interleaved with the current release in the same session |
+| Qwen3.8-27B 4-bit weights against BF16 (RESULTS) | desktop | v0.1.2 (release candidate 2); not re-measured for v0.1.3 |
 | Quality gates of the current release | laptop (some soaks on the desktop; RESULTS names the machine) | the same release (RESULTS says which build each gate ran on) |
 | Comparisons with other engines (llama.cpp "halo4", gufo, Talus C++) | laptop | the v0.1.0 release runs; not re-measured since |
 
@@ -39,7 +40,7 @@ Notes on the context:
 - **Laptop host changes after the v0.1.0 release runs.** The v0.1.0 runs (2026-10-28) used the settings in the table.
   Since 2026-10-29 the laptop loads `amd_pmf` with `smart_pc_support=0` (HP's Smart PC power policy off), and since
   2026-10-31 it raises the firmware's skin-temperature target from 43 C to 45 C, so the 70 W limit holds through long
-  jobs instead of sagging to about 55-58 W. The v0.1.2 quality gates ran with both.
+  jobs instead of sagging to about 55-58 W. The v0.1.2 and v0.1.3 quality gates ran with both.
 - **Served, end to end, as shipped.** Every figure is measured through the HTTP server, with the client on another
   machine on the local network, one request at a time, and a fresh server per model and run. So it includes
   tokenization, templating, sampling, speculative decoding and the HTTP stack, as a user would see it. From v0.1.2 the
@@ -111,8 +112,8 @@ tie. These bands describe one build's session noise (the same greedy text). Betw
 
 ## Quality gates
 
-Speed counts only if the output is right. Each model has to pass all of these at the release build (for v0.1.2 on
-the laptop, with the release tarball and its `talus-server`):
+Speed counts only if the output is right. Each model has to pass all of these at the release build (for v0.1.3 on
+the laptop, with the release candidate tarball and its `talus-server`):
 
 | Gate | What it checks | Pass |
 |---|---|---|
@@ -161,6 +162,10 @@ growth is reported separately as informational), and each request kind's median 
 within 3% of the first half when computed over whole prompt-rotation periods (each half trimmed to a
 multiple of the rotation period so per-rotation speed patterns do not read as drift; sampled `chat` is reported but not judged).
 
+v0.1.3: the Qwen3.8-27B soak had 0 errors and flat memory, but 5 of 96 greedy checks differed, all on one `edit`
+prompt whose cold and cache-restored answers differ (the prompt-cache split effect under "Exact" below). The
+maintainer accepted it for this release; RESULTS has the details.
+
 ## "Exact" and "opt-in numerics"
 
 Every kernel change in Talus falls into one of two classes.
@@ -179,8 +184,13 @@ Every kernel change in Talus falls into one of two classes.
 
 What "exact" covers for the prompt cache: a request that restores cached state gives the same answer as the same
 request read cold. Prompt (prefill) kernels and decode kernels round differently, so the cache restores only state
-that a prefill computed and re-reads the rest; it never restores rows that a decode step wrote. A warm answer
-therefore equals a cold one, bit for bit.
+that a prefill computed and re-reads the rest; it never restores rows that a decode step wrote.
+
+Known exception (Qwen3.8-27B, v0.1.2 and v0.1.3): the restored part and the re-read rest are processed as separate
+prompt chunks, and the 27B's prompt path rounds slightly differently depending on where the chunks split. A warm
+greedy answer can therefore differ from the cold one: in the v0.1.3 soak, one prompt whose first 2,048 tokens came
+from the cache. Both answers are valid, and each is reproducible for the same cache state. Prompt processing that gives
+the same bits wherever the split falls is planned.
 
 ## Comparisons with other engines
 

@@ -48,6 +48,11 @@ impl Client {
         self.api_key.is_some()
     }
 
+    /// The key in use (handed to talus-bench runs started from the TUI; never written to disk by them).
+    pub fn api_key(&self) -> Option<String> {
+        self.api_key.clone()
+    }
+
     pub fn set_api_key(&mut self, key: Option<String>) {
         self.api_key = key.filter(|k| !k.is_empty());
     }

@@ -25,6 +25,12 @@ use talus_gguf::{GgufFile, GgufValue};
 pub const K_MAX_DRAFT: usize = 15;
 pub const K_MAX_STEPS: usize = 8;
 
+/// 27B round cost (ms) by verify rows 1..=8 near (2K) and far (32K) depth for greedy MTP windows, from the
+/// desktop traces of 2026-11-02 (near: DFlash2 fit 70.8 + 1.54 ms/row + the MTP head; 32K MTP fit 78.9 + 3.0 ms/row).
+/// Rule defaults: calibration exponent 1.6, chained draft step 1.3 ms.
+const Q27_CD_NEAR: [f64; 8] = [72.3, 73.9, 75.4, 77.0, 78.5, 80.0, 81.6, 83.1];
+const Q27_CD_FAR: [f64; 8] = [81.9, 84.9, 87.9, 90.9, 93.9, 96.9, 99.9, 102.9];
+
 #[derive(Debug)]
 pub struct DraftLen {
     pub mode: i32,
@@ -39,6 +45,10 @@ pub struct DraftLen {
     pub samp: bool,
     pub dfl_dmin: i32,
     pub dfl_cum: [f32; 2],
+    /// cost-table draft depth for greedy MTP windows (TALUS_Q27_COSTDEPTH) and DFlash2 windows
+    /// (TALUS_Q27D_COSTDEPTH); None = the confidence-threshold rules above.
+    pub cd: Option<talus_spec::CostDepth>,
+    pub cdd: Option<talus_spec::CostDepth>,
     pub tries: [[f64; K_MAX_DRAFT + 1]; 2],
     pub keeps: [[f64; K_MAX_DRAFT + 1]; 2],
     pub cost: [f64; K_MAX_DRAFT + 1],
@@ -100,6 +110,8 @@ impl Default for DraftLen {
             samp: false,
             dfl_dmin: 2,
             dfl_cum: [0.40, 0.30],
+            cd: None,
+            cdd: None,
             tries: [[8.0; K_MAX_DRAFT + 1]; 2],
             keeps: [[8.0 * 0.80; K_MAX_DRAFT + 1], [8.0 * 0.70; K_MAX_DRAFT + 1]],
             cost: [0.0; K_MAX_DRAFT + 1],
@@ -222,6 +234,17 @@ impl DraftLen {
         self.dfl_cum[0] = env_float("STRATA_DFL_CUM", 0.40);
         self.dfl_cum[1] = env_float("STRATA_DFL_CUM_S", 0.30);
 
+        // default ON for greedy MTP windows (outputs bitwise)
+        self.cd = talus_spec::CostDepth::from_env_with(
+            "Q27",
+            &Q27_CD_NEAR,
+            &Q27_CD_FAR,
+            true,
+            1.6,
+            1,
+            1.3,
+        );
+        self.cdd = talus_spec::CostDepth::from_env("Q27D", &Q27_CD_NEAR, &Q27_CD_FAR, false);
         self.enabled = self.mode != 0;
         self.fixed_k = if self.mode == 0 { d_fixed } else { 0 };
         self.c_stop = self.cum[0];
@@ -3670,13 +3693,24 @@ impl Q36Engine {
     /// Stop-mode prefix extension (`Engine::stop_extend` in `q36_engine.cu:1728-1735`).
     pub fn stop_extend(&mut self, mut n: i32) -> i32 {
         let s = self.draft_samp_on;
+        let depth = self.n_past as f64;
         loop {
             let _ = unsafe { hipStreamSynchronize(self.s_main) };
             let top_slice = unsafe { std::slice::from_raw_parts(self.hconf.add(16), 16) };
-            let k = self.dl.keep(top_slice, n, s);
-            if k < n || n >= self.dl.dmax_for(s) {
-                self.win_chain = n;
-                return k;
+            if let (Some(cd), false) = (self.dl.cd.as_ref(), s) {
+                // the cost-table rule for greedy windows
+                let nn = n.max(0) as usize;
+                let k = cd.keep(top_slice, nn, depth) as i32;
+                if k < n || n >= self.dl.dmax_for(s) || !cd.want_more(top_slice, nn, depth) {
+                    self.win_chain = n;
+                    return k;
+                }
+            } else {
+                let k = self.dl.keep(top_slice, n, s);
+                if k < n || n >= self.dl.dmax_for(s) {
+                    self.win_chain = n;
+                    return k;
+                }
             }
             n += 1;
             let idx = n as usize;
@@ -4131,7 +4165,14 @@ impl Q36Engine {
         if self.use_dflash && self.df.ready && self.dfl_win && self.dl.dfl_stop() {
             let _ = unsafe { hipStreamSynchronize(self.s_main) };
             let top_slice = unsafe { std::slice::from_raw_parts(self.hconf.add(16), 16) };
-            self.win_t = 1 + self.dl.keep_dfl(top_slice, self.win_t - 1, samp_on);
+            self.win_t = 1 + match (self.dl.cdd.as_ref(), samp_on) {
+                (Some(cd), false) => cd.keep(
+                    top_slice,
+                    (self.win_t - 1).max(0) as usize,
+                    self.n_past as f64,
+                ) as i32,
+                _ => self.dl.keep_dfl(top_slice, self.win_t - 1, samp_on),
+            };
         }
         let T = self.win_t.clamp(1, 16);
         *D_out = T - 1;
@@ -4990,7 +5031,7 @@ impl Q36Engine {
             n_drafted,
             n_accepted,
             ngram,
-            |_| true,
+            |_, _| true,
         );
     }
 
@@ -5011,7 +5052,7 @@ impl Q36Engine {
         mut ngram: Option<&mut NgramMod>,
         mut on_token: F,
     ) where
-        F: FnMut(i32) -> bool,
+        F: FnMut(i32, Option<&talus_spec::logprobs::RowLogprobs>) -> bool,
     {
         if max_new <= 0 {
             return;
@@ -5043,7 +5084,10 @@ impl Q36Engine {
         if let Some(ref mut ng) = ngram {
             ng.feed(first_tok);
         }
-        if !on_token(first_tok) || is_eos(first_tok) || (out.len() as i32) >= max_new {
+        // E1: `first_tok` came from the prompt's last row (host logits_h)
+        let lp0 = self.lp_k.map(|k| self.host_row_logprobs(first_tok, k));
+        if !on_token(first_tok, lp0.as_ref()) || is_eos(first_tok) || (out.len() as i32) >= max_new
+        {
             return;
         }
         if self.n_past + d_cap + 1 > self.ctx_len {
@@ -5121,11 +5165,29 @@ impl Q36Engine {
         // a copy replaces the MTP / DFlash2 drafts: only buckets that keep >= this many copied tokens
         let copy_qmin = talus_spec::copy_env_f64("QMIN").unwrap_or(0.85);
 
+        // STRATA_ADRAFT_TRACE=1 prints one `spectr` line per round to stderr (kind m = MTP, d = DFlash2,
+        // n = n-gram / copy; window rows T, drafts chained, accepted a, depth, verify ms incl. the stop-mode extension,
+        // round ms = loop top to loop top, drafter tops / DFlash2 selector weights of the chained drafts)
+        let trace = std::env::var_os("STRATA_ADRAFT_TRACE").is_some();
+        let mut tr_prev: Option<(std::time::Instant, String)> = None;
         loop {
             let mut d_cur = D_init;
             let mut win = [0i32; 16];
             let mut picks = [0i32; 16];
+            let tr0 = std::time::Instant::now();
+            if let Some((t0, line)) = tr_prev.take() {
+                eprintln!("{line} rms {:.3}", (tr0 - t0).as_secs_f64() * 1000.0);
+            }
+            let tr_kind = if self.dfl_win {
+                'd'
+            } else if self.last_mtp {
+                'm'
+            } else {
+                'n'
+            };
+            let tr_depth = self.n_past;
             self.spec_verify_window(&mut d_cur, &mut win, &mut picks);
+            let tr_vms = tr0.elapsed().as_secs_f64() * 1000.0;
 
             let mut a = 0i32;
             let mut xn = 0i32;
@@ -5265,6 +5327,40 @@ impl Q36Engine {
             }
             self.st_decide_ms += td.elapsed().as_secs_f64() * 1000.0;
             self.st_rounds += 1;
+            if trace {
+                let nch = (self.win_chain.max(0) as usize).min(16);
+                let tops = unsafe { std::slice::from_raw_parts(self.hconf.add(16), 16) };
+                let confs = unsafe { std::slice::from_raw_parts(self.hconf, 16) };
+                let mut line = format!(
+                    "spectr {} s{} T {} ch {} a {} p {} vms {:.3} top",
+                    tr_kind,
+                    u8::from(!greedy),
+                    d_cur + 1,
+                    self.win_chain,
+                    a,
+                    tr_depth,
+                    tr_vms
+                );
+                for t in &tops[..nch] {
+                    line.push_str(&format!(" {t:.4}"));
+                }
+                line.push_str(" conf");
+                for c in &confs[..nch] {
+                    line.push_str(&format!(" {c:.4}"));
+                }
+                tr_prev = Some((tr0, line));
+            }
+
+            // E1 (opt-in): the emitted tokens' logprobs from the verify rows (target logits, full vocabulary,
+            // temperature 1): win[i] (i = 1..=a) from row i-1, xn from row a. The sampled path already has the rows
+            // on the host in logits_v_h; the greedy path copies rows 0..=a now (before the next round's drafts).
+            let lp_rows = if let Some(k) = self.lp_k {
+                let mut chosen: Vec<i32> = (1..=(a as usize)).map(|i| win[i]).collect();
+                chosen.push(xn);
+                self.device_rows_logprobs(&chosen, k, !greedy)
+            } else {
+                Vec::new()
+            };
 
             *n_drafted += d_cur as i64;
             *n_accepted += a as i64;
@@ -5282,7 +5378,10 @@ impl Q36Engine {
                 if let Some(ref mut ng) = ngram {
                     ng.feed(tok);
                 }
-                if !on_token(tok) || is_eos(tok) || (out.len() as i32) >= max_new {
+                if !on_token(tok, lp_rows.get(i - 1))
+                    || is_eos(tok)
+                    || (out.len() as i32) >= max_new
+                {
                     self.spec_finish_window(i as i32, picks[i]);
                     return;
                 }
@@ -5296,7 +5395,8 @@ impl Q36Engine {
             if let Some(ref mut ng) = ngram {
                 ng.feed(xn);
             }
-            if !on_token(xn) || is_eos(xn) || (out.len() as i32) >= max_new {
+            if !on_token(xn, lp_rows.get(a as usize)) || is_eos(xn) || (out.len() as i32) >= max_new
+            {
                 self.spec_finish_window(a, xn);
                 return;
             }

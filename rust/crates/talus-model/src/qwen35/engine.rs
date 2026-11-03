@@ -154,7 +154,13 @@ pub fn q27_bytes_per_token(model: &Q36Model) -> usize {
             .map(|v| v == "1")
             .unwrap_or(false);
     let row = (g.kv_dim() as usize) * 2;
-    n_state * row * if vc { 3 } else { 2 } + 16 * (g.n_head as usize) * 6
+    // the int8 decode / verify copy (default ON for the gated 27B) beside the f16 cells
+    let kv8 = if super::kv8::kv8_on(model) {
+        n_state * (g.n_head_kv as usize) * super::kv8::KV8_CELL_BYTES
+    } else {
+        0
+    };
+    n_state * row * if vc { 3 } else { 2 } + kv8 + 16 * (g.n_head as usize) * 6
 }
 
 /// Context ladder for the 27B when no `--max-context` is given.
@@ -473,6 +479,11 @@ pub struct Q36Engine {
     /// lookup has nothing (matches of 12-23 tokens, or 5+ where the last accepted copy stopped).  Opt-in
     /// (TALUS_Q27_COPY=1; the n-gram lookup already copies long repeats).
     pub copy: Option<talus_spec::CopyProposer>,
+    /// E1 (talus-bench, opt-in per request): top-k of the per-token logprobs the speculative loop reports with each
+    /// token, from the verify (target) logits rows; None = off (no extra copies or host work).
+    pub lp_k: Option<usize>,
+    /// E2 scoring: every row of a prompt chunk gets a head (logits) row (chunks of <= 16 rows); false = normal.
+    pub all_heads: bool,
 
     pub prof: bool,
     pub prof_dt: [f64; 10],
@@ -762,6 +773,8 @@ impl Q36Engine {
                     .map(|v| v == "1")
                     .unwrap_or(false))
             .then(|| talus_spec::CopyProposer::new(talus_spec::copy_cfg_from_env())),
+            lp_k: None,
+            all_heads: false,
             prof: false,
             prof_dt: [0.0; 10],
             prof_n: 0,
@@ -971,11 +984,11 @@ impl Q36Engine {
         self.ks8.clear();
         self.vq8.clear();
         self.vs8.clear();
-        if super::kv8::kv8_requested() {
+        if super::kv8::kv8_requested(super::kv8::kv8_default_model(model)) {
             let ver = talus_q36_kv8_version();
             if g.head_dim as usize != super::kv8::KV8_HD || ver != super::kv8::KV8_VERSION {
                 eprintln!(
-                    "talus: TALUS_Q27_KV8=1 ignored (head dim {}, kernel library int8 KV version {} != {})",
+                    "talus: int8 KV (TALUS_Q27_KV8) not used (head dim {}, kernel library int8 KV version {} != {})",
                     g.head_dim,
                     ver,
                     super::kv8::KV8_VERSION
@@ -995,7 +1008,7 @@ impl Q36Engine {
                 self.kv8 = true;
                 self.kv8_variant = super::kv8::kv8_variant();
                 eprintln!(
-                    "talus: int8 KV for decode/verify attention ON (TALUS_Q27_KV8=1): +{:.2} GiB",
+                    "talus: int8 KV for decode/verify attention ON (TALUS_Q27_KV8=0 turns it off): +{:.2} GiB",
                     ((a + 2 * b + c + 2 * d) * self.n_attn_state as usize) as f64
                         / (1u64 << 30) as f64
                 );
@@ -4469,7 +4482,13 @@ impl Q36Engine {
                     self.s_main,
                 );
             }
-            let heads = if want_logits && last { 1 } else { 0 };
+            let heads = if self.all_heads {
+                T.min(16)
+            } else if want_logits && last {
+                1
+            } else {
+                0
+            };
             self.cur_p0_h = p0;
             self.forward_full(self.tok_d, T, self.pos0_d, heads, false);
             self.cur_p0_h = -1;
@@ -4600,6 +4619,56 @@ impl Q36Engine {
                 ""
             }
         );
+    }
+
+    /// E1/E2: logprobs of `chosen` in the host logits row `logits_h` (the last `process` / prompt row).
+    pub fn host_row_logprobs(&self, chosen: i32, k: usize) -> talus_spec::logprobs::RowLogprobs {
+        let v = self.n_vocab().max(0) as usize;
+        let sl = unsafe { std::slice::from_raw_parts(self.logits_h, v) };
+        talus_spec::logprobs::row_logprobs(sl, chosen, k)
+    }
+
+    /// E1/E2: copy the first `rows` (<= 16) device logits rows to `logits_v_h` (unless `already_on_host`) and
+    /// compute the logprobs of `chosen[i]` in row i (rows in parallel on the host).
+    pub fn device_rows_logprobs(
+        &mut self,
+        chosen: &[i32],
+        k: usize,
+        already_on_host: bool,
+    ) -> Vec<talus_spec::logprobs::RowLogprobs> {
+        let rows = chosen.len().min(16);
+        let v = self.n_vocab().max(0) as usize;
+        if rows == 0 || v == 0 {
+            return Vec::new();
+        }
+        if !already_on_host {
+            unsafe {
+                let _ = hipMemcpyAsync(
+                    self.logits_v_h.cast::<c_void>(),
+                    self.logits.cast::<c_void>(),
+                    rows * v * 4,
+                    HIP_MEMCPY_DEVICE_TO_HOST,
+                    self.s_main,
+                );
+                let _ = hipStreamSynchronize(self.s_main);
+            }
+        }
+        let all = unsafe { std::slice::from_raw_parts(self.logits_v_h, rows * v) };
+        if rows == 1 {
+            return vec![talus_spec::logprobs::row_logprobs(&all[..v], chosen[0], k)];
+        }
+        std::thread::scope(|s| {
+            let hs: Vec<_> = (0..rows)
+                .map(|i| {
+                    let row = &all[i * v..(i + 1) * v];
+                    let c = chosen[i];
+                    s.spawn(move || talus_spec::logprobs::row_logprobs(row, c, k))
+                })
+                .collect();
+            hs.into_iter()
+                .map(|h| h.join().expect("logprobs row"))
+                .collect()
+        })
     }
 
     /// Return the argmax token ID from the most recently populated `pick_v_h` / `logits_h` host buffer.
@@ -5280,8 +5349,12 @@ impl Q36Engine {
             .map(|h| (0..fill).map(|cl| kv8_v_row(&gpu, h, cl, vt_ctx)).collect())
             .collect();
         let sc = 1.0f32 / (HD as f32).sqrt();
-        let (mut worst, mut q_err, mut q_ref) = ([0.0f32; 2], 0.0f64, 0.0f64);
-        for var in [0i32, 1] {
+        let nvar = (super::kv8::KV8_MAX_VARIANT + 1) as usize;
+        let (mut worst, mut q_err, mut q_ref) = (vec![0.0f32; nvar], 0.0f64, 0.0f64);
+        let mut var0_rows: std::collections::HashMap<(usize, usize), Vec<f32>> =
+            std::collections::HashMap::new();
+        let mut not_bitwise = vec![0usize; nvar];
+        for var in 0..nvar as i32 {
             for &f in &[1usize, 17, 63, 64, 65, 257, 512, 1024] {
                 for &t in &[1usize, 2, 4, 6, 8, 16] {
                     if f + t > fill {
@@ -5296,6 +5369,15 @@ impl Q36Engine {
                     let r = ref_attention(&hq, &hg, t, H, HKV, p0 as usize, sc, &kf, &vf);
                     for (x, y) in got.iter().zip(&r) {
                         worst[var as usize] = worst[var as usize].max((x - y).abs());
+                    }
+                    // the exact variants must give variant 0's bits
+                    if var == 0 {
+                        var0_rows.insert((f, t), got.clone());
+                    } else if super::kv8::kv8_variant_exact(var) {
+                        if var0_rows.get(&(f, t)).is_some_and(|z| z[..] != got[..]) {
+                            eprintln!("kv8-test: variant {var} fill {f} T {t}: rows differ from variant 0");
+                            not_bitwise[var as usize] += 1;
+                        }
                     }
                     // the quantization effect: int8 vs the f16 kernel on the same rows (information only)
                     if var == 0 {
@@ -5356,7 +5438,18 @@ impl Q36Engine {
             worst[1],
             (q_err / q_ref.max(1e-30)).sqrt()
         );
-        ok && worst[0] <= 3e-3 && worst[1] <= 3e-3
+        for v in 2..nvar {
+            eprintln!(
+                "kv8-test: variant {v} max |diff| {:.2e}{}",
+                worst[v],
+                if super::kv8::kv8_variant_exact(v as i32) {
+                    format!(", {} (fill, T) cases not bitwise variant 0", not_bitwise[v])
+                } else {
+                    String::new()
+                }
+            );
+        }
+        ok && worst.iter().all(|&w| w <= 3e-3) && not_bitwise.iter().all(|&n| n == 0)
     }
 
     /// Run attention microbenchmark (`Engine::attn_bench`): one layer's decode / verify attention (WMMA kernel +
@@ -5374,7 +5467,15 @@ impl Q36Engine {
                 continue;
             }
             for &T in &[1i32, 6, 8, 16] {
-                for (kv8, var) in [(false, 0), (true, 0), (true, 1)] {
+                // TALUS_KV8_BENCH_VARS=0,2 picks the int8 variants (default 0,2)
+                let vars: Vec<i32> = std::env::var("TALUS_KV8_BENCH_VARS")
+                    .ok()
+                    .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+                    .unwrap_or_else(|| vec![0, 2]);
+                let arms: Vec<(bool, i32)> = std::iter::once((false, 0))
+                    .chain(vars.iter().map(|&v| (true, v)))
+                    .collect();
+                for (kv8, var) in arms {
                     if kv8 && !self.kv8 {
                         continue;
                     }
@@ -5395,11 +5496,15 @@ impl Q36Engine {
                     println!(
                         "attn-bench kv={} cells={} T={} us={:.1} GB/s={:.1}",
                         if !kv8 {
-                            "f16"
+                            "f16".to_string()
                         } else if var == 0 {
-                            "int8"
+                            "int8".to_string()
+                        } else if var == 1 {
+                            "int8-ofs".to_string()
+                        } else if var == 2 {
+                            "int8-rdkv27".to_string()
                         } else {
-                            "int8-ofs"
+                            format!("int8-v{var}")
                         },
                         fill,
                         T,

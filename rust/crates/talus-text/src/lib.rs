@@ -3,6 +3,7 @@
 //! Implements WP-1.4a (`talus-text`), porting `tools/strata_tokenizer.py` and
 //! `serve/frontend.py` + `serve/chat_template.jinja`.
 
+pub mod json_grammar;
 pub mod parser;
 pub mod template;
 pub mod tokenizer;

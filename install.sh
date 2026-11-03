@@ -5,19 +5,23 @@
 #
 # What it does, each step skipped when already done (run it again any time):
 #   1. checks this computer: Linux, x86-64, the gfx1151 GPU, 128 GB of memory, free disk;
-#   2. installs what the build needs: a C/C++ compiler, git, curl, Python 3 with venv (asks before sudo),
-#      CMake and Ninja (into your home when the system's are missing or old), Rust (rustup, the pinned toolchain);
+#   2. installs what it needs: git, curl, Python 3 with venv (asks before sudo); to compile (no prebuilt release),
+#      also a C/C++ compiler, CMake and Ninja (into your home when the system's are missing or old) and Rust
+#      (rustup, the pinned toolchain). A prebuilt release (TALUS_RELEASE / TALUS_PREBUILT_URL) needs none of those;
 #   3. the ROCm SDK into your home (AMD TheRock wheels in ~/.local/share/talus/rocm), or one you already have
 #      (ROCM_SDK=/path);
-#   4. builds Talus (the HIP kernel library and the Rust programs) and installs it to ~/.local/share/talus/bin, with
-#      `talus` and `talus-tui` in ~/.local/bin;
+#   4. builds Talus (the HIP kernel library and the Rust programs), or unpacks the prebuilt release, and installs it
+#      to ~/.local/share/talus/bin, with `talus` and `talus-tui` in ~/.local/bin;
 #   5. starts `talus setup`: choose models, download them, the kernel parameters (shown and asked, never silent),
-#      the run configs and an optional user service.
+#      the run configs and an optional user service (with --yes only when --service is given).
 # Nothing is installed system-wide except the distribution packages in step 2, and only after you say yes.
 #
 # Options: --yes (take every default) --dry-run (print the actions, change nothing) --advanced (all choices)
 #          --allow-system-changes (with --yes: apply the kernel parameters too) --force (continue on unsupported
 #          hardware) --build-only (steps 1-4, no setup; what `talus update` runs, so the GPU check only warns) --src DIR (a Talus checkout to build) --no-setup
+#          passed on to `talus setup`: --models-dir DIR (where the models go) --no-power-profile (leave the ACPI
+#          platform profile alone) --service / --no-service (install the user service that starts the server at login;
+#          with --yes it is installed only with --service)
 # Environment: TALUS_HOME, ROCM_SDK (use an SDK you have), TALUS_ROCM_VERSION / TALUS_ROCM_INDEX (override the pin
 #              in rocm.version / AMD's nightly index), TALUS_ROCM_STABLE, TALUS_REPO, TALUS_BRANCH (default: the newest release tag),
 #              TALUS_RELEASE=<tag> or TALUS_PREBUILT_URL=<tar.gz> (a release tarball instead of compiling),
@@ -38,6 +42,7 @@ ROCM_STABLE_INDEX=https://stable.repo.amd.com/rocm/whl-next/
 RUST_FALLBACK=1.99.1
 
 YES=0 DRY=0 ADVANCED=0 ALLOW_SYS=0 FORCE=0 BUILD_ONLY=0 NO_SETUP=0 SRC=""
+MODELS_DIR="" NO_POWER=0 SERVICE=""   # passed on to talus setup; SERVICE: "", --service or --no-service
 while [ $# -gt 0 ]; do
   case $1 in
     --yes|-y) YES=1 ;;
@@ -47,8 +52,11 @@ while [ $# -gt 0 ]; do
     --force) FORCE=1 ;;
     --build-only) BUILD_ONLY=1 ;;
     --no-setup) NO_SETUP=1 ;;
-    --src) SRC=$2; shift ;;
-    -h|--help) sed -n '2,27p' "$0" 2>/dev/null || echo "see https://github.com/nsbradley88/talus-public"; return 0 ;;
+    --src) [ $# -ge 2 ] || { echo "install.sh: --src needs a directory" >&2; return 2; }; SRC=$2; shift ;;
+    --models-dir) [ $# -ge 2 ] || { echo "install.sh: --models-dir needs a directory" >&2; return 2; }; MODELS_DIR=$2; shift ;;
+    --no-power-profile) NO_POWER=1 ;;
+    --service|--no-service) SERVICE=$1 ;;
+    -h|--help) sed -n '2,31p' "$0" 2>/dev/null || echo "see https://github.com/nsbradley88/talus-public"; return 0 ;;
     *) echo "install.sh: unknown option $1" >&2; return 2 ;;
   esac
   shift
@@ -113,6 +121,13 @@ if [ "$(id -u)" != 0 ]; then SUDO=sudo; fi
 
 printf '\n%s Talus %s %sinstaller%s%s\n' "$BN" "$N" "$B" "$N" "$( [ "$DRY" = 1 ] && echo " (dry run: nothing is changed)" )"
 
+# a release tarball instead of compiling: TALUS_PREBUILT_URL, or the GitHub release asset of TALUS_RELEASE=<tag>.
+# Known before step 2: a prebuilt install needs no compiler, CMake, Ninja or Rust (talus#18 itest18).
+PREBUILT=${TALUS_PREBUILT_URL:-}
+if [ -z "$PREBUILT" ] && [ -n "${TALUS_RELEASE:-}" ]; then
+  PREBUILT="https://github.com/nsbradley88/talus-public/releases/download/$TALUS_RELEASE/talus-$TALUS_RELEASE-linux-x86_64-gfx1151.tar.gz"
+fi
+
 # ---- 1. this computer
 step 1 "This computer"
 [ "$(uname -s)" = Linux ] || die "Talus runs on Linux only."
@@ -150,60 +165,90 @@ for g in render video; do
   fi
 done
 
-# ---- 2. build tools
-step 2 "Build tools"
-PM="" PKGS=""
+# ---- 2. tools
+step 2 "Tools"
+PM="" PKGS="" BASE_PKGS=""
 case " $OS_ID $OS_LIKE " in
-  *" ubuntu "*|*" debian "*) PM="apt-get"; PKGS="build-essential git curl python3 python3-venv cmake ninja-build pkg-config" ;;
-  *" fedora "*|*" rhel "*) PM="dnf"; PKGS="gcc gcc-c++ make git curl python3 cmake ninja-build" ;;
-  *" arch "*|*" cachyos "*|*" endeavouros "*|*" manjaro "*) PM="pacman"; PKGS="base-devel git curl python cmake ninja" ;;
-  *" opensuse-tumbleweed "*|*" suse "*|*" opensuse "*) PM="zypper"; PKGS="gcc gcc-c++ make git curl python3 cmake ninja" ;;
+  *" ubuntu "*|*" debian "*) PM="apt-get"; BASE_PKGS="git curl ca-certificates python3 python3-venv"; PKGS="build-essential $BASE_PKGS cmake ninja-build pkg-config" ;;
+  *" fedora "*|*" rhel "*) PM="dnf"; BASE_PKGS="git curl python3"; PKGS="gcc gcc-c++ make $BASE_PKGS cmake ninja-build" ;;
+  *" arch "*|*" cachyos "*|*" endeavouros "*|*" manjaro "*) PM="pacman"; BASE_PKGS="git curl python"; PKGS="base-devel $BASE_PKGS cmake ninja" ;;
+  *" opensuse-tumbleweed "*|*" suse "*|*" opensuse "*) PM="zypper"; BASE_PKGS="git curl python3"; PKGS="gcc gcc-c++ make $BASE_PKGS cmake ninja" ;;
 esac
-MISSING=""
-for t in cc c++ make git curl python3 bash; do have "$t" || MISSING="$MISSING $t"; done
-if have python3 && ! python3 -c 'import venv, ensurepip' >/dev/null 2>&1; then MISSING="$MISSING python3-venv"; fi
-if [ -z "$MISSING" ]; then
-  ok "Compiler, git, Python" "present"
-elif [ -z "$PM" ]; then
-  bad "Build tools" "missing:$MISSING"
-  die "Install them with your package manager (a C/C++ compiler, make, git, curl, Python 3 with venv), then run this again."
-else
-  wrn "Build tools" "missing:$MISSING"
+# need_pkgs LABEL "TOOLS" "PACKAGES" WHAT: install the distribution packages when one of the tools is missing
+need_pkgs() {
+  MISSING=""
+  for t in $2; do have "$t" || MISSING="$MISSING $t"; done
+  # Python's venv: the ROCm SDK wheels (and CMake/Ninja for a build) go into virtual environments
+  if have python3 && [ "$NEED_VENV" = 1 ] && ! python3 -c 'import venv, ensurepip' >/dev/null 2>&1; then MISSING="$MISSING python3-venv"; fi
+  if [ -z "$MISSING" ]; then ok "$1" "present"; return 0; fi
+  if [ -z "$PM" ]; then
+    bad "$1" "missing:$MISSING"
+    die "Install them with your package manager ($4), then run this again."
+  fi
+  wrn "$1" "missing:$MISSING"
   case $PM in
-    apt-get) CMD="$SUDO apt-get update && $SUDO apt-get install -y $PKGS" ;;
-    dnf) CMD="$SUDO dnf install -y $PKGS" ;;
-    pacman) CMD="$SUDO pacman -S --needed --noconfirm $PKGS" ;;
-    zypper) CMD="$SUDO zypper install -y $PKGS" ;;
+    apt-get) CMD="$SUDO apt-get update && $SUDO apt-get install -y $3" ;;
+    dnf) CMD="$SUDO dnf install -y $3" ;;
+    pacman) CMD="$SUDO pacman -S --needed --noconfirm $3" ;;
+    zypper) CMD="$SUDO zypper install -y $3" ;;
   esac
   say "To install them: $CMD"
   if [ "$DRY" = 1 ]; then run sh -c "$CMD"
   elif ask "Install them now (sudo asks for your password)?" y; then sh -c "$CMD" || die "the package install failed (see above)"
   else die "install the packages above, then run this again"; fi
-fi
+}
 TOOLS="$DATA/tools"
-cmake_ok() { have cmake && cmake --version | awk 'NR==1{split($3,v,"."); exit !(v[1]>3 || (v[1]==3 && v[2]>=24))}'; }
-if cmake_ok && have ninja; then ok "CMake, Ninja" "$(cmake --version | awk 'NR==1{print $3}'), $(ninja --version)"
-elif [ -x "$TOOLS/bin/cmake" ] && [ -x "$TOOLS/bin/ninja" ]; then ok "CMake, Ninja" "in $TOOLS"
-else
-  say "CMake 3.24+ and Ninja go into $TOOLS (no sudo) ..."
-  run python3 -m venv "$TOOLS"
-  run "$TOOLS/bin/pip" install -q cmake ninja
-fi
-[ -x "$TOOLS/bin/cmake" ] && PATH="$TOOLS/bin:$PATH"
 CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}
+[ -x "$TOOLS/bin/cmake" ] && PATH="$TOOLS/bin:$PATH"
 [ -x "$CARGO_HOME/bin/cargo" ] && PATH="$CARGO_HOME/bin:$PATH"
 export PATH
-if have rustup; then ok "Rust" "$(rustup --version 2>/dev/null | head -1)"
-else
-  say "Installing Rust with rustup into $CARGO_HOME (your shell files are not changed) ..."
-  if [ "$DRY" = 1 ]; then run sh rustup-init.sh -y --profile minimal --default-toolchain none --no-modify-path
+NEED_VENV=1
+if [ -n "$PREBUILT" ] && { [ -n "${ROCM_SDK:-}" ] || [ -x "$DATA/rocm/bin/rocm-sdk" ]; }; then NEED_VENV=0; fi
+# build_tools: what compiling needs (a C/C++ compiler, make, CMake 3.24+, Ninja, rustup). Run in this step for a
+# source build; for a prebuilt release only if it has to compile after all (step 4).
+BUILD_TOOLS=0
+build_tools() {
+  [ "$BUILD_TOOLS" = 0 ] || return 0
+  BUILD_TOOLS=1 NEED_VENV=1
+  need_pkgs "Compiler, git, Python" "cc c++ make git curl python3 bash" "$PKGS" "a C/C++ compiler, make, git, curl, Python 3 with venv"
+  cmake_ok() { have cmake && cmake --version | awk 'NR==1{split($3,v,"."); exit !(v[1]>3 || (v[1]==3 && v[2]>=24))}'; }
+  if cmake_ok && have ninja; then ok "CMake, Ninja" "$(cmake --version | awk 'NR==1{print $3}'), $(ninja --version)"
+  elif [ -x "$TOOLS/bin/cmake" ] && [ -x "$TOOLS/bin/ninja" ]; then ok "CMake, Ninja" "in $TOOLS"
   else
-    t=$(mktemp -d)
-    curl -fsSL --proto '=https' --tlsv1.2 https://sh.rustup.rs -o "$t/rustup-init.sh" || die "could not download rustup"
-    sh "$t/rustup-init.sh" -y --profile minimal --default-toolchain none --no-modify-path >/dev/null || die "rustup failed"
-    rm -rf "$t"
-    PATH="$CARGO_HOME/bin:$PATH"; export PATH
+    say "CMake 3.24+ and Ninja go into $TOOLS (no sudo) ..."
+    run python3 -m venv "$TOOLS"
+    run "$TOOLS/bin/pip" install -q cmake ninja
   fi
+  [ -x "$TOOLS/bin/cmake" ] && PATH="$TOOLS/bin:$PATH"
+  export PATH
+  if have rustup; then ok "Rust" "$(rustup --version 2>/dev/null | head -1)"
+  else
+    say "Installing Rust with rustup into $CARGO_HOME (your shell files are not changed) ..."
+    if [ "$DRY" = 1 ]; then run sh rustup-init.sh -y --profile minimal --default-toolchain none --no-modify-path
+    else
+      t=$(mktemp -d)
+      curl -fsSL --proto '=https' --tlsv1.2 https://sh.rustup.rs -o "$t/rustup-init.sh" || die "could not download rustup"
+      sh "$t/rustup-init.sh" -y --profile minimal --default-toolchain none --no-modify-path >/dev/null || die "rustup failed"
+      rm -rf "$t"
+      PATH="$CARGO_HOME/bin:$PATH"; export PATH
+    fi
+  fi
+  [ "$SRC_READY" = 1 ] && rust_toolchain
+  return 0
+}
+# rust_toolchain: the toolchain pinned in the source (rust/rust-toolchain.toml); needs the source and rustup
+SRC_READY=0
+rust_toolchain() {
+  TOOLCHAIN=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$SRC/rust/rust-toolchain.toml" 2>/dev/null || true)
+  TOOLCHAIN=${TOOLCHAIN:-$RUST_FALLBACK}
+  if rustup toolchain list 2>/dev/null | grep -q "^$TOOLCHAIN"; then ok "Rust toolchain" "$TOOLCHAIN"
+  else say "Rust $TOOLCHAIN (pinned in rust/rust-toolchain.toml) ..."; run rustup toolchain install "$TOOLCHAIN" --profile minimal -c rustfmt,clippy; fi
+}
+if [ -n "$PREBUILT" ]; then
+  need_pkgs "git, curl, Python" "git curl python3" "$BASE_PKGS" "git, curl, Python 3 with venv"
+  ok "Build tools" "not needed: prebuilt release (no compiler, CMake or Rust)"
+else
+  build_tools
 fi
 
 # ---- 3. the source and the ROCm SDK
@@ -222,12 +267,11 @@ else
   REF=$(release_ref)
   say "Getting Talus $REF from $REPO ..."
   run mkdir -p "$DATA"
-  run git clone --quiet --depth 1 -b "$REF" "$REPO" "$SRC"
+  # a release tag is a detached HEAD: no advice about it (talus#18)
+  run git -c advice.detachedHead=false clone --quiet --depth 1 -b "$REF" "$REPO" "$SRC"
 fi
-TOOLCHAIN=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$SRC/rust/rust-toolchain.toml" 2>/dev/null || true)
-TOOLCHAIN=${TOOLCHAIN:-$RUST_FALLBACK}
-if rustup toolchain list 2>/dev/null | grep -q "^$TOOLCHAIN"; then ok "Rust toolchain" "$TOOLCHAIN"
-else say "Rust $TOOLCHAIN (pinned in rust/rust-toolchain.toml) ..."; run rustup toolchain install "$TOOLCHAIN" --profile minimal -c rustfmt,clippy; fi
+SRC_READY=1
+[ "$BUILD_TOOLS" = 1 ] && rust_toolchain
 
 # the ROCm version this release was built and measured with: rocm.version in the source (one place to re-pin)
 [ -r "$SRC/rocm.version" ] && ROCM_PIN=$(grep -v '^[[:space:]]*#' "$SRC/rocm.version" | grep -m1 . | tr -d ' \t\r')
@@ -291,11 +335,7 @@ build_rust() {
   run mkdir -p "$BIN"
   for f in "$@"; do run install -m 0755 "$SRC/rust/target/release/$f" "$BIN/$f"; done
 }
-# a release tarball instead of compiling: TALUS_PREBUILT_URL, or the GitHub release asset of TALUS_RELEASE=<tag>
-PREBUILT=${TALUS_PREBUILT_URL:-}
-if [ -z "$PREBUILT" ] && [ -n "${TALUS_RELEASE:-}" ]; then
-  PREBUILT="https://github.com/nsbradley88/talus-public/releases/download/$TALUS_RELEASE/talus-$TALUS_RELEASE-linux-x86_64-gfx1151.tar.gz"
-fi
+# a prebuilt release (PREBUILT, set before step 2)
 if [ -n "$PREBUILT" ]; then
   say "Prebuilt release: $PREBUILT"
   if [ "$DRY" = 1 ]; then
@@ -339,10 +379,12 @@ if [ -n "$PREBUILT" ]; then
   fi
   # older release archives have no talus-setup: build just that (small) program
   if [ -n "$PREBUILT" ] && [ ! -x "$BIN/talus-setup" ] && [ "$DRY" = 0 ]; then
+    build_tools
     build_rust talus-setup
   fi
 fi
 if [ -z "$PREBUILT" ]; then
+  build_tools   # no-op unless a prebuilt release fell back to compiling (glibc too old)
   build_kernels
   build_rust talus-cli talus-server talus-tui talus-setup
   run install -m 0755 "$SRC/build/libtalus_kernels.so" "$BIN/libtalus_kernels.so"
@@ -383,6 +425,9 @@ set -- setup --src "$SRC" --rocm-sdk "$ROCM_ROOT"
 [ "$ADVANCED" = 1 ] && set -- "$@" --advanced
 [ "$ALLOW_SYS" = 1 ] && set -- "$@" --allow-system-changes
 [ "$FORCE" = 1 ] && set -- "$@" --force
+[ -n "$MODELS_DIR" ] && set -- "$@" --models-dir "$MODELS_DIR"
+[ "$NO_POWER" = 1 ] && set -- "$@" --no-power-profile
+[ -n "$SERVICE" ] && set -- "$@" "$SERVICE"
 if [ -x "$SETUP" ]; then
   exec "$SETUP" "$@"
 else

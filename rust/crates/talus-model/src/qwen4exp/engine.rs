@@ -876,6 +876,28 @@ impl Drop for BusyGuard {
     }
 }
 
+/// TALUS_FN_COSTDEPTH (default ON; =0 = the per-draft --spec-min-p rule; see talus_spec::costdepth).
+/// Tables: FN verify ms by rows 1..=5 at 2K and 32K from the development laptop's traces of 2026-11-02.
+fn fn_costdepth() -> Option<&'static talus_spec::CostDepth> {
+    static CD: std::sync::OnceLock<Option<talus_spec::CostDepth>> = std::sync::OnceLock::new();
+    CD.get_or_init(|| {
+        let cd = talus_spec::CostDepth::from_env_with(
+            "FN",
+            &[32.4, 36.8, 40.8, 44.8, 49.8],
+            &[34.3, 38.5, 43.8, 46.7, 53.1],
+            true,
+            1.5,
+            1,
+            0.0,
+        );
+        if let Some(c) = cd.as_ref() {
+            eprintln!("qwen4exp: MTP windows: {}", c.describe());
+        }
+        cd
+    })
+    .as_ref()
+}
+
 fn plan_window_rust(
     spec: &mut SpecState,
     first_window: bool,
@@ -891,9 +913,16 @@ fn plan_window_rust(
     dprob: &[f32],
     sbuf: &mut [i32],
     cbuf: &mut [i32],
+    depth: i64,
 ) -> (i32, i32, bool, i32, i32, i32) {
     let mut t = initial_t;
-    if use_mtp && spec_min_p > 0.0 {
+    if let (true, Some(cd)) = (use_mtp, fn_costdepth()) {
+        // the MTP window from the cost table (the drafts made so far and their probabilities)
+        let cap = s_mtp.min(room).max(1);
+        let n = ((cap - 1).max(0) as usize).min(dprob.len());
+        let made = dprob[..n].iter().take_while(|q| **q > 0.0).count();
+        t = 1 + cd.keep(&dprob[..made], made, depth as f64) as i32;
+    } else if use_mtp && spec_min_p > 0.0 {
         let cap = s_mtp.min(room);
         t = 1;
         while t < cap
@@ -1253,6 +1282,8 @@ unsafe extern "C" fn cb_run_serve_loop(
 
         let d0 = Instant::now();
         let use_mtp = info.use_mtp != 0;
+        let fn_trace = std::env::var_os("TALUS_FN_SPEC_TRACE").is_some();
+        let mut fn_tr_line: Option<String> = None;
 
         while !cancelled && produced_n < parsed.max_new {
             let initial_t = if use_mtp { info.mtp_max_t } else { 1 };
@@ -1281,6 +1312,7 @@ unsafe extern "C" fn cb_run_serve_loop(
                         &dprob,
                         &mut sbuf,
                         &mut cbuf,
+                        p,
                     )
                 } else {
                     (1, 1, false, 0, 0, 0)
@@ -1326,6 +1358,7 @@ unsafe extern "C" fn cb_run_serve_loop(
                 window[(t_mtp as usize) + i] = cbuf[i];
             }
 
+            let tr_v0 = Instant::now();
             if state.rust_engine.piece4_verify_mtp.serve_verify(
                 &k, ctx, t, t_mtp, from_sfx, p, &window, &consumed, &mut outv,
             ) < 0
@@ -1346,9 +1379,42 @@ unsafe extern "C" fn cb_run_serve_loop(
                     });
             }
 
+            let tr_vms = tr_v0.elapsed().as_secs_f64() * 1000.0;
             let mut a = 0i32;
             while a < t - 1 && window[(a + 1) as usize] == outv[a as usize] {
                 a += 1;
+            }
+            // TALUS_FN_SPEC_TRACE=1 prints one `fntr` line per window to stderr (rows t, MTP rows t_mtp,
+            // suffix / copy flags, accepted a, position, verify / draft / round ms, the MTP drafts' probabilities and
+            // whether each MTP draft matched the target's pick: m = matched up to the window's rows, x = past them)
+            if fn_trace {
+                let nd = (info.mtp_max_t - 1).max(0) as usize;
+                let mut line = format!(
+                    "fntr t {t} tm {t_mtp} sfx {} ch {chain_n} cp {} a {a} p {p} s {} vms {tr_vms:.3}",
+                    u8::from(from_sfx),
+                    u8::from(copy_round),
+                    u8::from(sampled)
+                );
+                line.push_str(" dp");
+                for q in dprob.iter().take(nd) {
+                    line.push_str(&format!(" {q:.4}"));
+                }
+                // the MTP drafts' match pattern against this window's picks (valid up to the first mismatch only:
+                // later picks condition on an accepted prefix), for the replay of longer windows from short ones
+                line.push_str(" mm ");
+                for i in 0..nd {
+                    let c = if i + 1 < t_mtp as usize && !from_sfx {
+                        if window[i + 1] == outv[i] {
+                            'm'
+                        } else {
+                            'r'
+                        }
+                    } else {
+                        '.'
+                    };
+                    line.push(c);
+                }
+                fn_tr_line = Some(line);
             }
             if from_sfx {
                 sfx_windows += 1;
@@ -1447,6 +1513,13 @@ unsafe extern "C" fn cb_run_serve_loop(
             dec_windows += 1;
 
             let round_ms = round0.elapsed().as_secs_f64() * 1000.0;
+            if let Some(line) = fn_tr_line.take() {
+                eprintln!(
+                    "{line} dms {:.3} rms {round_ms:.3} first {}",
+                    tr_v0.elapsed().as_secs_f64() * 1000.0 - tr_vms,
+                    u8::from(!timed_round)
+                );
+            }
             if let Some(fc) = copy.as_mut() {
                 if timed_round && !eos {
                     fc.time_round(copy_kind, t, round_ms);
@@ -1693,6 +1766,7 @@ unsafe extern "C" fn cb_run_generate_loop(
                 &dprob,
                 &mut sbuf,
                 &mut cbuf,
+                p,
             );
 
             let timed_round = !first_window;

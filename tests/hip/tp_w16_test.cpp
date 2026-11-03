@@ -338,7 +338,13 @@ void gpu_gemm() {
         HC(hipMemcpy(yl.data(), dY, yl.size() * 4, hipMemcpyDeviceToHost));
         for (int t = 0; t < p.T; ++t) std::memcpy(&y[(size_t) t * p.N], &yl[(size_t) t * ldy], (size_t) p.N * 4);
         const double rel = max_rel(y, ref, mag);
-        CHECK(rc == 0 && rel < 4e-6, "gpu gemm type %d N %d K %d T %d: rc %d max rel %.3g", s.wt, s.N, s.K, s.T, rc, rel);
+        // Bound 1e-4 (was 4e-6): the GEMM runs on the bf16/f16 WMMA with fp32 accumulators, which sum each 16x16 tile's
+        // K products in the hardware's order, then the K tiles in sequence; the fp64 reference sums them exactly.  The
+        // measured error vs fp64 grows with K: 8e-6 (K 1024), 1.3e-5..3.4e-5 (K 2048..6144), 5.9e-5 (K 17408) on gfx1151
+        // (rd-bf16 unit 11010529), with KL vs llama.cpp's BF16 at its own CPU-vs-GPU floor (LEDGER 2026-11-01).  A tile
+        // or indexing bug is still caught: a lost or doubled 16-wide K slice is ~16/K of the row's magnitude (>= 9e-4
+        // at K 17408), a wrong row or column is of order 1.
+        CHECK(rc == 0 && rel < 1e-4, "gpu gemm type %d N %d K %d T %d: rc %d max rel %.3g", s.wt, s.N, s.K, s.T, rc, rel);
         bool pad_ok = true;
         for (int t = 0; t < p.T; ++t)
             for (int64_t j = p.N; j < ldy; ++j) pad_ok &= yl[(size_t) t * ldy + j] == 0.0f;

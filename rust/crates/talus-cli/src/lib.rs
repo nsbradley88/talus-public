@@ -15,6 +15,7 @@
 
 mod disk_tier;
 pub mod glm_serve;
+pub mod grammar;
 use core::ffi::c_void;
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -196,6 +197,10 @@ pub struct CliConfig {
     pub cluster_addr: Option<String>,
     /// `--cluster-split N`: the worker owns layers N.. (default: the middle, on a 4-layer boundary).
     pub cluster_split: Option<u32>,
+    /// `--cluster PATH` (or `TALUS_CLUSTER`): a cluster.toml; with `--node NAME` (or `TALUS_CLUSTER_NODE`) it gives
+    /// the role, addresses (LAN ones from its hosts file) and split instead of the three flags above.
+    pub cluster_file: Option<String>,
+    pub cluster_node: Option<String>,
 }
 
 impl Default for CliConfig {
@@ -280,6 +285,8 @@ impl Default for CliConfig {
             cluster_role: None,
             cluster_addr: None,
             cluster_split: None,
+            cluster_file: None,
+            cluster_node: None,
         }
     }
 }
@@ -538,6 +545,12 @@ where
                 let v = next_val(&mut i, a)?;
                 cfg.cache_live = parse_i32_arg(a, &v)?;
             }
+            "--cluster" => {
+                cfg.cluster_file = Some(next_val(&mut i, a)?);
+            }
+            "--node" => {
+                cfg.cluster_node = Some(next_val(&mut i, a)?);
+            }
             "--cluster-role" => {
                 cfg.cluster_role = Some(next_val(&mut i, a)?);
             }
@@ -777,7 +790,8 @@ Every model's shipped arguments: docs/MODELS.md. Environment switches: TALUS_X a
   --attn-bench               WMMA attention microbenchmark
   --cluster-role head|worker 27B pipeline split across two processes (talus#47; off by default)
   --cluster-addr HOST:PORT   worker listen / head connect address (default 127.0.0.1:7701)
-  --cluster-split N          the worker owns layers N.. (default: the middle, on a 4-layer boundary)"
+  --cluster-split N          the worker owns layers N.. (default: the middle, on a 4-layer boundary)
+  --cluster PATH --node NAME cluster.toml (role, addresses from its hosts file, split) for this node"
     );
 }
 
@@ -853,6 +867,29 @@ pub struct Q36StdioBackend {
     pub snap_msg: i32,
     /// Disk tier of the prompt cache (`--prompt-cache-disk`), `None` when off.
     pub disk: Option<talus_state::disk::DiskCache>,
+    /// E6: the model file (its tokenizer backs json_schema masks) and the lazily built grammar context.
+    pub model_path: Option<std::path::PathBuf>,
+    pub grammar: Option<grammar::GrammarCtx>,
+}
+
+/// End tokens of the Q36 decode loop (also the tokens a json_schema request may end with).
+const Q36_EOS: [i32; 4] = [248044, 248046, 151643, 151645];
+
+/// E6: the next token of a constrained request from the engine's host logits (-1 = the schema cannot continue).
+fn grammar_next(
+    eng: &Q36Engine,
+    m: &talus_text::json_grammar::Matcher,
+    cmd: &GenCommand,
+    samp: &Sampling,
+    hist: &[i32],
+    rng: &mut SplitMix64,
+    scratch: &mut Vec<f32>,
+) -> i32 {
+    let sl = unsafe { std::slice::from_raw_parts(eng.logits_h, eng.n_vocab() as usize) };
+    grammar::pick(m, sl, !cmd.needs_logits(), scratch, |x| {
+        sample(x, samp, hist, rng)
+    })
+    .unwrap_or(-1)
 }
 
 impl Q36StdioBackend {
@@ -864,6 +901,7 @@ impl Q36StdioBackend {
         pc.max_snaps = max_snaps;
         pc.max_msg = if max_snaps > 0 { 4 } else { 0 };
         pc.stash_budget = stash_budget;
+        eng.cl_pc_init(&mut pc); // talus#47: shard the cache over the cluster stages (no-op on one process)
         let n_spec = if eng.use_dflash && eng.df.ready {
             if eng.dp.uses_mtp() && cfg.mtp > 0 {
                 cfg.mtp
@@ -894,6 +932,8 @@ impl Q36StdioBackend {
             n_spec,
             snap_msg,
             disk: None,
+            model_path: cfg.model.as_ref().map(std::path::PathBuf::from),
+            grammar: None,
         };
         me.disk = disk_tier::open(&mut me, cfg);
         me
@@ -923,7 +963,85 @@ impl EngineProtocolBackend for Q36StdioBackend {
         self.eng.n_vocab()
     }
 
+    // E1/E2 (talus-bench): host log-softmax over D2H copies of the target logits rows; not on a cluster stage
+    fn supports_logprobs(&self) -> bool {
+        self.eng.cl.is_none()
+    }
+
+    fn supports_score(&self) -> bool {
+        self.eng.cl.is_none()
+    }
+
+    fn handle_score(
+        &mut self,
+        top_k: usize,
+        prompt: &[i32],
+        cont: &[i32],
+        cancel: &CancelToken,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        q36_score(self, top_k, prompt, cont, cancel, out)
+    }
+
     fn handle_gen(
+        &mut self,
+        cmd: &GenCommand,
+        cancel: &CancelToken,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        if !self.eng.is_cluster_head() {
+            return self.handle_gen_one(cmd, cancel, out);
+        }
+        // talus#47 Phase 2: a lost worker fails this request with `ERR stage_unavailable` (HTTP 503) instead of
+        // ending the engine; the link is re-established before the next request (the worker keeps its weights).
+        if !self.eng.cluster_link_up() {
+            if let Err(e) = self.cluster_recover(2) {
+                return writeln!(out, "ERR stage_unavailable: {e}").and_then(|_| out.flush());
+            }
+        }
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.handle_gen_one(cmd, cancel, out)
+        }));
+        match r {
+            Ok(v) => v,
+            Err(p) => {
+                let why = p
+                    .downcast_ref::<talus_model::qwen35::cluster::ClusterLost>()
+                    .map(|c| c.0.clone())
+                    .or_else(|| p.downcast_ref::<String>().cloned())
+                    .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "panic".into());
+                eprintln!("talus-serve: request failed on the cluster link: {why}");
+                writeln!(out, "ERR stage_unavailable: {why}")?;
+                out.flush()?;
+                if let Err(e) = self.cluster_recover(5) {
+                    eprintln!(
+                        "talus-serve: worker not back yet ({e}); retrying on the next request"
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Q36StdioBackend {
+    /// After a lost link: reconnect (waiting up to `wait_s`), and drop the prompt-cache state (the worker's shard
+    /// went with its session) and the live sequence.
+    fn cluster_recover(&mut self, wait_s: u64) -> Result<(), String> {
+        self.eng.cluster_reconnect(wait_s)?;
+        let mut pc = Q36PromptCache::new();
+        pc.max_snaps = self.pc.max_snaps;
+        pc.max_msg = self.pc.max_msg;
+        pc.stash_budget = self.pc.stash_budget;
+        self.eng.cl_pc_init(&mut pc);
+        self.pc = pc;
+        self.live.clear();
+        self.live_pf = 0;
+        Ok(())
+    }
+
+    fn handle_gen_one(
         &mut self,
         cmd: &GenCommand,
         cancel: &CancelToken,
@@ -956,6 +1074,33 @@ impl EngineProtocolBackend for Q36StdioBackend {
             return out.flush();
         }
 
+        // E6: a json_schema request is compiled before the prompt is read, so a bad schema fails fast
+        let mut gm: Option<talus_text::json_grammar::Matcher> = None;
+        if let Some(ref js) = cmd.json_schema {
+            if self.grammar.is_none() {
+                let n_vocab = self.eng.n_vocab().max(0) as usize;
+                let loaded = match self.model_path.as_deref() {
+                    Some(p) => grammar::GrammarCtx::load(p, n_vocab, &Q36_EOS),
+                    None => Err("json_schema: no model path for the tokenizer".to_string()),
+                };
+                match loaded {
+                    Ok(g) => self.grammar = Some(g),
+                    Err(e) => {
+                        writeln!(out, "ERR {e}")?;
+                        return out.flush();
+                    }
+                }
+            }
+            match self.grammar.as_mut().map(|g| g.matcher(js)) {
+                Some(Ok(m)) => gm = Some(m),
+                Some(Err(e)) => {
+                    writeln!(out, "ERR {e}")?;
+                    return out.flush();
+                }
+                None => {}
+            }
+        }
+
         let cache_enabled = self.pc.max_snaps > 0 || self.pc.max_msg > 0;
         let gridc = !self.cache_live;
         let grid = (self.eng.max_batch.max(1)) as usize;
@@ -965,6 +1110,7 @@ impl EngineProtocolBackend for Q36StdioBackend {
             if cache_enabled && !self.live.is_empty() {
                 let view = make_layer_state_view(&mut self.eng);
                 self.pc.stash_kv_with_pf(&view, &self.live, 0, self.live_pf);
+                self.eng.cl_pc_stash(&self.live, 0, self.live_pf);
             }
             self.eng.reset();
             self.live.clear();
@@ -989,17 +1135,20 @@ impl EngineProtocolBackend for Q36StdioBackend {
             if !self.live.is_empty() {
                 self.pc
                     .stash_kv_with_pf(&view, &self.live, lcp, self.live_pf);
+                self.eng.cl_pc_stash(&self.live, lcp, self.live_pf);
             }
             if self.disk.is_some() {
                 disk_tier::restore_into_ram(self, &view, ids, gridc);
             }
-            let (r, r_from) = if gridc {
-                self.pc
-                    .restore_with_pf(&mut view, ids, &self.live, self.live_pf, true)
+            let (live_pf, pf_only) = if gridc {
+                (self.live_pf, true)
             } else {
-                self.pc
-                    .restore_with_pf(&mut view, ids, &self.live, usize::MAX, false)
+                (usize::MAX, false)
             };
+            let (r, r_from) = self
+                .pc
+                .restore_with_pf(&mut view, ids, &self.live, live_pf, pf_only);
+            self.eng.cl_pc_restore(ids, &self.live, live_pf, pf_only, r);
             if r > 0 {
                 sync_layer_state_view_back(&mut self.eng, &view);
                 self.live.clear();
@@ -1090,6 +1239,7 @@ impl EngineProtocolBackend for Q36StdioBackend {
                 if cache_enabled && (self.eng.n_past as usize) == self.live.len() {
                     let mut view = make_layer_state_view(&mut self.eng);
                     self.pc.save(&mut view, &self.live, mk == cg && cut > 0);
+                    self.eng.cl_pc_save(&self.live, mk == cg && cut > 0);
                 }
             }
             if at < ids.len() {
@@ -1122,6 +1272,7 @@ impl EngineProtocolBackend for Q36StdioBackend {
             if cache_enabled && (self.eng.n_past as usize) == self.live.len() {
                 let mut view = make_layer_state_view(&mut self.eng);
                 self.pc.save(&mut view, &self.live, true);
+                self.eng.cl_pc_save(&self.live, true);
             }
             let base = (cut - reuse) as i64;
             self.eng.process_with_callback(&ids[cut..], true, |done| {
@@ -1150,6 +1301,7 @@ impl EngineProtocolBackend for Q36StdioBackend {
         if !gridc && fresh > 0 && cache_enabled && (self.eng.n_past as usize) == self.live.len() {
             let mut view = make_layer_state_view(&mut self.eng);
             self.pc.save(&mut view, &self.live, false);
+            self.eng.cl_pc_save(&self.live, false);
         }
         self.live_pf = self.live.len();
 
@@ -1186,7 +1338,10 @@ impl EngineProtocolBackend for Q36StdioBackend {
         let mut accepted = 0i64;
         let finish: &'static str;
 
-        let mut nx = if cmd.needs_logits() {
+        let mut gscratch: Vec<f32> = Vec::new();
+        let mut nx = if let Some(ref m) = gm {
+            grammar_next(&self.eng, m, cmd, &samp, &hist, &mut rng, &mut gscratch)
+        } else if cmd.needs_logits() {
             let sl = unsafe {
                 std::slice::from_raw_parts(self.eng.logits_h, self.eng.n_vocab() as usize)
             };
@@ -1195,7 +1350,9 @@ impl EngineProtocolBackend for Q36StdioBackend {
             self.eng.greedy_from_host_logits()
         };
 
-        let spec_active = self.n_spec > 0 && (self.eng.model().has_mtp || self.eng.use_dflash);
+        // E6: constrained requests decode without drafts (the masked target picks every token)
+        let spec_active =
+            gm.is_none() && self.n_spec > 0 && (self.eng.model().has_mtp || self.eng.use_dflash);
         let max_new = cmd.max_new.max(0) as usize;
 
         if spec_active && max_new > 1 && (self.eng.n_past + self.n_spec + 2) < self.eng.max_seq() {
@@ -1208,6 +1365,7 @@ impl EngineProtocolBackend for Q36StdioBackend {
             } else {
                 None
             };
+            self.eng.lp_k = cmd.logprobs;
             self.eng.spec_run_with_callback(
                 self.n_spec,
                 max_new as i32,
@@ -1219,7 +1377,14 @@ impl EngineProtocolBackend for Q36StdioBackend {
                 &mut offered,
                 &mut accepted,
                 ng_opt,
-                |tok| {
+                |tok, lp| {
+                    if let Some(lp) = lp {
+                        if let Err(e) = writeln!(out, "{}", talus_spec::logprobs::format_l_line(lp))
+                        {
+                            io_err = Some(e);
+                            return false;
+                        }
+                    }
                     if let Err(e) = write_token_line(out, tok) {
                         io_err = Some(e);
                         return false;
@@ -1235,6 +1400,7 @@ impl EngineProtocolBackend for Q36StdioBackend {
                     true
                 },
             );
+            self.eng.lp_k = None;
             if let Some(e) = io_err {
                 return Err(e);
             }
@@ -1251,8 +1417,55 @@ impl EngineProtocolBackend for Q36StdioBackend {
             } else {
                 finish = "length";
             }
+        } else if let Some(m) = gm.as_mut() {
+            loop {
+                if nx < 0 {
+                    eprintln!(
+                        "talus-serve: json_schema: no token is allowed here; ending the reply"
+                    );
+                    finish = "stop";
+                    break;
+                }
+                write_token_line(out, nx)?;
+                produced += 1;
+                hist.push(nx);
+                if is_eos(nx) || !m.advance(nx as u32) {
+                    finish = "stop";
+                    break;
+                }
+                if m.finished() {
+                    // the value is complete: only an end token could follow
+                    finish = "stop";
+                    break;
+                }
+                if produced >= max_new {
+                    finish = "length";
+                    break;
+                }
+                if cancel.is_cancelled() {
+                    finish = "cancel";
+                    break;
+                }
+                if (self.eng.n_past + 1) >= self.eng.max_seq() {
+                    finish = "length";
+                    break;
+                }
+                let one = [nx];
+                self.eng.process(&one, true);
+                self.live.push(nx);
+                nx = grammar_next(&self.eng, m, cmd, &samp, &hist, &mut rng, &mut gscratch);
+            }
+            let (computed, reused, mask_ms) = m.stats();
+            eprintln!(
+                "talus-serve: json_schema: {computed} masks computed ({mask_ms:.1} ms), {reused} reused, no drafts"
+            );
         } else {
             loop {
+                if let Some(k) = cmd.logprobs {
+                    // E1: nx came from the host logits row (the prompt's last row or the last decode step)
+                    let lp = self.eng.host_row_logprobs(nx, k);
+                    writeln!(out, "{}", talus_spec::logprobs::format_l_line(&lp))?;
+                }
                 write_token_line(out, nx)?;
                 produced += 1;
                 hist.push(nx);
@@ -1345,6 +1558,7 @@ impl EngineProtocolBackend for Q36StdioBackend {
         {
             let mut view = make_layer_state_view(&mut self.eng);
             self.pc.save(&mut view, &self.live, false);
+            self.eng.cl_pc_save(&self.live, false);
         } else if !gridc && cache_enabled {
             eprintln!(
                 "talus-serve: no snapshot (engine at {}, {} tokens held)",
@@ -1375,6 +1589,92 @@ impl EngineProtocolBackend for Q36StdioBackend {
         }
         Ok(())
     }
+}
+
+/// E2 `SCORE` for the Qwen3.8-27B engine: one cold prefill of the prompt (prompt cache off: the live state is
+/// stashed as for `cache=0`, nothing restored or saved), the first continuation position from the prompt's last row,
+/// then the continuation teacher-forced in chunks of <= 16 rows with a head on every row (`all_heads`); with
+/// `TALUS_SCORE_STEP=1` one token per step instead (the plain decode path). The engine is reset afterwards.
+fn q36_score(
+    b: &mut Q36StdioBackend,
+    top_k: usize,
+    prompt: &[i32],
+    cont: &[i32],
+    cancel: &CancelToken,
+    out: &mut dyn Write,
+) -> io::Result<()> {
+    use talus_spec::logprobs::format_s_line;
+    let cache_enabled = b.pc.max_snaps > 0 || b.pc.max_msg > 0;
+    if cache_enabled && !b.live.is_empty() {
+        let view = make_layer_state_view(&mut b.eng);
+        b.pc.stash_kv_with_pf(&view, &b.live, 0, b.live_pf);
+    }
+    b.eng.reset();
+    b.live.clear();
+    b.live_pf = 0;
+    let t0 = Instant::now();
+    b.eng.process(prompt, true);
+    let prompt_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    writeln!(
+        out,
+        "{}",
+        format_s_line(&b.eng.host_row_logprobs(cont[0], top_k))
+    )?;
+    let step = std::env::var("TALUS_SCORE_STEP").is_ok_and(|v| v == "1");
+    let chunk = if step {
+        1
+    } else {
+        16usize.min(b.eng.max_batch.max(1) as usize)
+    };
+    let mut finish = "stop";
+    let mut done = 1usize;
+    let forced = &cont[..cont.len() - 1];
+    for (ci, part) in forced.chunks(chunk).enumerate() {
+        if cancel.is_cancelled() {
+            finish = "cancel";
+            break;
+        }
+        let next = &cont[1 + ci * chunk..1 + ci * chunk + part.len()];
+        if step {
+            b.eng.process(part, true);
+            writeln!(
+                out,
+                "{}",
+                format_s_line(&b.eng.host_row_logprobs(next[0], top_k))
+            )?;
+        } else {
+            b.eng.all_heads = true;
+            b.eng.process(part, false);
+            b.eng.all_heads = false;
+            for r in b.eng.device_rows_logprobs(next, top_k, false) {
+                writeln!(out, "{}", format_s_line(&r))?;
+            }
+        }
+        done += part.len();
+        out.flush()?;
+    }
+    let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    b.eng.reset();
+    eprintln!(
+        "talus-serve: scored {done} of {} continuation tokens after a {}-token prompt in {total_ms:.1} ms (prompt {prompt_ms:.1} ms, {})",
+        cont.len(),
+        prompt.len(),
+        if step { "per-token steps" } else { "16-row chunks" }
+    );
+    write_done_line(
+        out,
+        &DoneStats {
+            produced: 0,
+            prompt_tokens: prompt.len() + cont.len(),
+            prompt_ms,
+            decode_ms: total_ms,
+            finish,
+            accepted: 0,
+            offered: 0,
+            reuse: 0,
+            fresh: (prompt.len() + cont.len()) as i64,
+        },
+    )
 }
 
 /// Adapter implementing `talus_server::Engine` directly over `Q36StdioBackend` when `--serve <PORT>` is used.
@@ -1410,6 +1710,10 @@ impl talus_server::Engine for Q36HttpServerEngine {
     fn cancel(&self) {
         self.cancel_flag
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn supports_json_schema(&self) -> bool {
+        true
     }
 
     fn generate(
@@ -1495,6 +1799,9 @@ impl talus_server::Engine for Q36HttpServerEngine {
             ignore_eos: req.sampling.ignore_eos,
             use_cache: req.sampling.cache_prompt,
             prompt_ids: req.prompt_ids.iter().map(|&u| u as i32).collect(),
+            // the in-process adapter does not advertise E1 (talus-server answers 400)
+            logprobs: None,
+            json_schema: req.sampling.json_schema.clone(),
         };
 
         let cancel_tok = CancelToken::from_arc(Arc::clone(&cancel));
@@ -2279,11 +2586,18 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
     opts.dflash_path = cfg.dflash_gguf.clone().unwrap_or_default();
 
     // talus#47: a cluster stage loads only its layers. Off unless --cluster-role / TALUS_CLUSTER_ROLE.
-    let cl_spec = match talus_cluster::Spec::from_parts(
-        cfg.cluster_role.as_deref(),
-        cfg.cluster_addr.as_deref(),
-        cfg.cluster_split,
-    ) {
+    let cl_spec = match talus_cluster::Spec::from_file(
+        cfg.cluster_file.as_deref(),
+        cfg.cluster_node.as_deref(),
+    )
+    .and_then(|f| match f {
+        Some(s) => Ok(Some(s)),
+        None => talus_cluster::Spec::from_parts(
+            cfg.cluster_role.as_deref(),
+            cfg.cluster_addr.as_deref(),
+            cfg.cluster_split,
+        ),
+    }) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("talus-cli: {e}");
@@ -2313,8 +2627,10 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
             eprintln!("talus-cli: cluster split {split} outside 1..{n_layer}");
             return 2;
         }
-        if cfg.mmvq_bench.is_some() || cfg.attn_test || cfg.attn_bench || cfg.livecold_test > 0 {
-            eprintln!("talus-cli: --mmvq-bench / --attn-test / --attn-bench / --livecold-test run on one process only");
+        if cfg.mmvq_bench.is_some() || cfg.attn_test || cfg.attn_bench {
+            eprintln!(
+                "talus-cli: --mmvq-bench / --attn-test / --attn-bench run on one process only"
+            );
             return 2;
         }
         match sp.role {
@@ -2358,12 +2674,18 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
     let cfg = if let Some(sp) = cl_spec.as_ref() {
         let max_batch = if cfg.chunk > 0 { cfg.chunk } else { 512 };
         let explicit = cfg.ctx_explicit.then_some(cfg.max_context);
-        let (link, ctx) = match talus_model::qwen35::cluster::cluster_connect_head(
+        let wait_s = std::env::var("TALUS_CLUSTER_WAIT_S")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(900);
+        let hl = match talus_model::qwen35::cluster::cluster_connect_head(
             &model,
             &sp.addr,
+            sp.alt.as_deref(),
             explicit,
             max_batch,
             cfg.use_graph,
+            wait_s,
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -2371,17 +2693,27 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
                 return 1;
             }
         };
-        cl_link = Some(link);
+        let ctx = hl.ctx;
+        cl_link = Some((
+            hl,
+            talus_model::qwen35::cluster::Recon {
+                addr: sp.addr.clone(),
+                alt: sp.alt.clone(),
+                ctx,
+                max_batch,
+                use_graph: cfg.use_graph,
+            },
+        ));
         model.cfg.max_seq = ctx;
         model.opts.max_seq = ctx;
         cl_cfg = cfg.clone();
         cl_cfg.max_context = ctx;
-        if cl_cfg.serve && (cl_cfg.prompt_cache > 0 || cl_cfg.snap_msg > 0) {
-            // Phase 1: the prompt cache's snapshots are not sharded across stages yet (DESIGN.md 2.2)
-            eprintln!("talus-cli: cluster: prompt cache off (RAM and disk; sharded snapshots are Phase 2)");
+        // the RAM prompt cache is sharded over the stages (cl_pc_*); the disk tier is not yet (one box's files)
+        if cl_cfg.serve {
+            eprintln!(
+                "talus-cli: cluster: prompt cache sharded over the stages (RAM); disk tier off"
+            );
         }
-        cl_cfg.prompt_cache = 0;
-        cl_cfg.snap_msg = 0;
         cl_cfg.prompt_cache_disk = Some("off".to_string());
         &cl_cfg
     } else {
@@ -2440,8 +2772,14 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
         },
     );
     eng.dfl_sample = eng.use_dflash && eng.dl.dfl_sample();
-    if let Some(link) = cl_link.take() {
-        if let Err(e) = eng.cluster_attach_head(link) {
+    if let Some(cd) = eng.dl.cd.as_ref() {
+        eprintln!("talus-cli: MTP greedy windows: {}", cd.describe());
+    }
+    if let Some(cd) = eng.dl.cdd.as_ref() {
+        eprintln!("talus-cli: DFlash2 greedy windows: {}", cd.describe());
+    }
+    if let Some((hl, recon)) = cl_link.take() {
+        if let Err(e) = eng.cluster_attach_head(hl, recon) {
             eprintln!("talus-cli: cluster: {e}");
             return 1;
         }
@@ -2536,6 +2874,9 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
             talus_mem::pressure::PressureConfig::strix_default(),
             "talus-serve",
         );
+        // E6: talus-server sends json_schema= GEN keys only to engines that advertise this
+        println!("INFO grammar=json_schema");
+        let _ = io::stdout().flush();
         return serve_stdio(&mut backend);
     }
 
@@ -2924,6 +3265,7 @@ pub fn livecold_test(eng: &mut Q36Engine, ids: &[i32], n_tok: i32) -> i32 {
     };
 
     let mut pc = Q36PromptCache::new();
+    eng.cl_pc_init(&mut pc); // talus#47: shard over the cluster stages (no-op on one process)
     let mut live: Vec<i32> = Vec::new();
     let mut live_pf: usize = 0;
 
@@ -2936,7 +3278,9 @@ pub fn livecold_test(eng: &mut Q36Engine, ids: &[i32], n_tok: i32) -> i32 {
                 .count();
             let mut view = make_layer_state_view(eng);
             pc.stash_kv_with_pf(&view, &live, lcp, live_pf);
+            eng.cl_pc_stash(&live, lcp, live_pf);
             let (reuse, mut from) = pc.restore_with_pf(&mut view, p, &live, live_pf, true);
+            eng.cl_pc_restore(p, &live, live_pf, true, reuse);
             if reuse > 0 {
                 sync_layer_state_view_back(eng, &view);
                 live.clear();
@@ -2955,6 +3299,7 @@ pub fn livecold_test(eng: &mut Q36Engine, ids: &[i32], n_tok: i32) -> i32 {
                 if (eng.n_past as usize) == live.len() {
                     let mut v2 = make_layer_state_view(eng);
                     pc.save(&mut v2, &live, false);
+                    eng.cl_pc_save(&live, false);
                 }
             }
             if at < p.len() {

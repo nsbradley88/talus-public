@@ -44,6 +44,9 @@ pub struct Args {
     pub bind_lan: bool,
     pub no_start: bool,
     pub no_service: bool,
+    /// Install the user service without asking. Without a person at the terminal (`--yes`, or no terminal) the
+    /// service is installed only with this flag (talus#18: a persistent service is not a silent default).
+    pub service: bool,
     /// Continue on hardware that cannot run Talus (downloads and configs only).
     pub force: bool,
     /// Skip downloads (configs only; for tests and pre-seeded model folders).
@@ -530,6 +533,18 @@ pub fn power_profile(x: &Exec, p: &mut Prompter, sys: &SysInfo, skip: bool, date
     true
 }
 
+/// The user-service answer decided without asking: `--service` installs it; without a person at the terminal
+/// (`--yes`, or no terminal) it is not installed (talus#18). `None`: ask (default yes).
+pub fn service_preset(service_flag: bool, interactive: bool) -> Option<bool> {
+    if service_flag {
+        Some(true)
+    } else if interactive {
+        None
+    } else {
+        Some(false)
+    }
+}
+
 fn start_server(x: &Exec, paths: &Paths, st: &SetupState, use_service: bool) -> Result<(), String> {
     if use_service {
         x.run(
@@ -949,10 +964,22 @@ fn run_inner(a: Args) -> Result<(), String> {
         ));
     } else if !a.no_service && !use_service {
         if sys.user_systemd {
-            if p.confirm(
-                "Install a user service so the server starts when you log in?",
-                true,
-            ) {
+            const Q: &str = "Install a user service so the server starts when you log in?";
+            let want = match service_preset(a.service, p.interactive()) {
+                Some(true) => {
+                    ui::say(&format!("{Q} {}", ui::dim("yes (--service)")));
+                    true
+                }
+                Some(false) => {
+                    ui::say(&format!(
+                        "{Q} {}",
+                        ui::dim("no (without a person at the terminal only with --service)")
+                    ));
+                    false
+                }
+                None => p.confirm(Q, true),
+            };
+            if want {
                 install_service(&x, &paths)?;
                 st.service = true;
                 use_service = true;
@@ -1022,6 +1049,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn service_only_with_flag_when_nobody_answers() {
+        assert_eq!(
+            service_preset(false, false),
+            Some(false),
+            "--yes alone: no service"
+        );
+        assert_eq!(service_preset(true, false), Some(true), "--yes --service");
+        assert_eq!(service_preset(false, true), None, "a person is asked");
+        assert_eq!(service_preset(true, true), Some(true));
+    }
+
+    #[test]
     fn table_lists_five_models_with_fit_and_license() {
         let sys = SysInfo {
             mem_total_kib: 125 * 1048576,
@@ -1039,13 +1078,13 @@ mod tests {
             assert!(t.contains(n), "{n}");
         }
         assert!(t.contains("headless only") && t.contains("tight") && t.contains("Apache-2.0"));
-        // v0.1.2 speeds (rc1 on the desktop, shipped talus-server): chat / 2K prompt
+        // v0.1.3 speeds (rc1 on the desktop, shipped talus-server): chat / 2K prompt
         for v in [
-            "51 / 599 tok/s",
-            "62 / 1093 tok/s",
-            "34 / 564 tok/s",
-            "38 / 739 tok/s",
-            "37 / 1164 tok/s",
+            "50 / 595 tok/s",
+            "64 / 1102 tok/s",
+            "34 / 561 tok/s",
+            "40 / 734 tok/s",
+            "44 / 1154 tok/s",
         ] {
             assert!(t.contains(v), "{v}");
         }

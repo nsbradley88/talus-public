@@ -250,7 +250,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hip-sys"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "ident_case"
@@ -310,6 +310,12 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "libyaml-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e126dda6f34391ab7b444f9922055facc83c07a910da3eb16f1e4d9c45dc777"
 
 [[package]]
 name = "linux-raw-sys"
@@ -378,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "oracle"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -461,6 +467,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "regex"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -661,8 +679,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "talus-bench"
+version = "0.1.3"
+dependencies = [
+ "serde_json",
+ "talus-bench-core",
+]
+
+[[package]]
+name = "talus-bench-core"
+version = "0.1.3"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "talus-presets",
+ "yaml_serde",
+]
+
+[[package]]
 name = "talus-cli"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "hip-sys",
  "oracle",
@@ -683,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "talus-cluster"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "libc",
  "sha2",
@@ -691,18 +728,18 @@ dependencies = [
 
 [[package]]
 name = "talus-core-api"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "talus-gguf"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "talus-core-api",
 ]
 
 [[package]]
 name = "talus-hip"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "hip-sys",
  "talus-core-api",
@@ -710,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "talus-kernels"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "hip-sys",
  "talus-core-api",
@@ -722,18 +759,18 @@ dependencies = [
 
 [[package]]
 name = "talus-kernels-sys"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "talus-mem"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "talus-core-api",
 ]
 
 [[package]]
 name = "talus-model"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "hip-sys",
  "talus-cluster",
@@ -750,11 +787,11 @@ dependencies = [
 
 [[package]]
 name = "talus-presets"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "talus-sched"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "hip-sys",
  "talus-core-api",
@@ -771,9 +808,10 @@ dependencies = [
 
 [[package]]
 name = "talus-server"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde_json",
+ "sha2",
  "talus-core-api",
  "talus-presets",
  "talus-text",
@@ -781,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "talus-setup"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "libc",
  "serde",
@@ -792,7 +830,7 @@ dependencies = [
 
 [[package]]
 name = "talus-spec"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "hip-sys",
  "talus-core-api",
@@ -805,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "talus-state"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "hip-sys",
  "talus-core-api",
@@ -815,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "talus-text"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "aho-corasick",
  "fancy-regex",
@@ -827,11 +865,12 @@ dependencies = [
 
 [[package]]
 name = "talus-tui"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "crossterm",
  "ratatui",
  "serde_json",
+ "talus-bench-core",
  "talus-presets",
 ]
 
@@ -1017,6 +1056,19 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "yaml_serde"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33b729a08a9a6be689bbad3e2bf8015926db54b6622cc89c3a5f7dc174b9e918"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "libyaml-rs",
+ "ryu",
+ "serde",
+]
 
 [[package]]
 name = "zmij"

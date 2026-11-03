@@ -4,9 +4,12 @@ pub use talus_core_api as api;
 
 pub mod config;
 pub mod control;
+pub mod energy;
 pub mod engine;
+pub mod fingerprint;
 pub mod frontend;
 pub mod json;
+pub mod logprobs;
 pub mod prometheus;
 pub mod responses;
 pub mod server;
@@ -14,8 +17,8 @@ pub mod tokenizer;
 
 pub use config::{ServerConfig, DEFERRED_FEATURES, DROPPED_FEATURES};
 pub use engine::{
-    Engine, EngineError, EngineTimings, GenerateRequest, SamplingParams, ScriptedMockEngine,
-    StdioSubprocessEngine,
+    Engine, EngineError, EngineTimings, GenerateRequest, SamplingParams, ScorePosition,
+    ScoreRequest, ScoreResult, ScriptedMockEngine, StdioSubprocessEngine, TokenLogprob,
 };
 pub use json::JsonValue;
 pub use server::{slot_filename_problem, ServerHandle, ServiceState, TalusServer};

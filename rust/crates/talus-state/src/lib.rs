@@ -25,8 +25,8 @@ pub use prefix_cache::{
     compute_i32_tokens_hash, compute_tokens_hash, PrefixMetaEntry, TalusPrefixCache,
 };
 pub use q36_cache::{
-    q36_kv_bytes, q36_kv_copy, q36_kv_copy_range, q36_state_bytes, q36_state_copy, Q36KvCacheSlice,
-    Q36LayerStateView, Q36PromptCache, Q36Snap, Q36Stash, Q36StateSnapshot,
+    q36_kv_bytes, q36_kv_copy, q36_kv_copy_range, q36_shape_view, q36_state_bytes, q36_state_copy,
+    Q36KvCacheSlice, Q36LayerStateView, Q36PromptCache, Q36Snap, Q36Stash, Q36StateSnapshot,
     DEFAULT_Q36_STASH_BUDGET,
 };
 

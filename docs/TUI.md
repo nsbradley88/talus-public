@@ -82,7 +82,7 @@ requests:
 - **Accepted**: the share of drafted tokens the model kept (speculative decoding).
 
 ```
- Talus   1 Status  2 Models  3 Tuning                                       ● http://127.0.0.1:8000
+ Talus   1 Status  2 Models  3 Tuning  4 Bench                              ● http://127.0.0.1:8000
 ┌ Serving ─────────────────────────────────────────────────────────────────────────────────────────┐
 │ Model      MiMo-V2.6-Flash   ● generating   up 0s                                                │
 │ Accuracy   Balanced (our tuned defaults)                                                         │
@@ -107,7 +107,7 @@ requests:
 │22,821   14,577   622     xxx           xx.x          x.xx s     xx%       stop                   │
 │17,278   12,970   568     xxx           xx.x          x.xx s     xx%       length                 │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
- 1-3 screens · g refresh · ? keys · q quit (the server keeps running)
+ 1-4 screens · g refresh · ? keys · q quit (the server keeps running)
 ```
 
 These pictures come from the fake server, with its made-up speeds shown as x.
@@ -118,7 +118,7 @@ The five models with their size, shipped context and whether they are installed 
 arrow keys and press Enter to open a model's tuning panel. Applying there switches the server to that model.
 
 ```
- Talus   1 Status  2 Models  3 Tuning                                       ● http://127.0.0.1:8000
+ Talus   1 Status  2 Models  3 Tuning  4 Bench                              ● http://127.0.0.1:8000
 ┌ Choose a model ──────────────────────────────────────────────────────────────────────────────────┐
 │  Model                Engine    Weights                            Context  On this server       │
 │  Qwen3.8-27B          qwen35    about 17 GB with drafters          256K     ● serving            │
@@ -155,7 +155,7 @@ Keys: Left/Right change the value, `d` puts the highlighted option back to its d
 back to our tuned defaults, `a` applies.
 
 ```
- Talus   1 Status  2 Models  3 Tuning                                       ● http://127.0.0.1:8000
+ Talus   1 Status  2 Models  3 Tuning  4 Bench                              ● http://127.0.0.1:8000
  MiMo-V2.6-Flash  ● serving now
 ┌ Tuning: MiMo-V2.6-Flash ─────────────────────────────────────────────────────────────────────────┐
 │ Accuracy                                                                                         │
@@ -187,7 +187,7 @@ back to our tuned defaults, `a` applies.
 Applying asks first and names every change. Options that may lower quality carry a warning:
 
 ```
- Talus   1 Status  2 Models  3 Tuning                                       ● http://127.0.0.1:8000
+ Talus   1 Status  2 Models  3 Tuning  4 Bench                              ● http://127.0.0.1:8000
  MiMo-V2.6-Flash  ● serving now
 ┌ Tuning: MiMo-V2.6-Flash ─────────────────────────────────────────────────────────────────────────┐
 │ Accuracy                                                                                         │
@@ -218,6 +218,60 @@ Applying asks first and names every change. Options that may lower quality carry
 
 Your choices per model are saved in `~/.config/talus/tui.json`, so a model you pick again comes back as you
 left it.
+
+### 4 Bench
+
+A quality smoke run with talus-bench, Talus against Talus: the served model at Balanced (our tuned defaults) is the
+reference, and the candidate is another accuracy level of the same model (Fast, or Reference when the model has no
+Fast opt-in; `l` switches). Each setting is applied through the control endpoint (the engine restarts twice and
+the server ends on the candidate), then the same 40 cases run on both at temperature 0: 20 structured-output
+(JSON-schema) cases and 20 GSM8K maths problems. Cases are paired by id, and the gates report the accuracy loss
+with a paired bootstrap interval and the JSON validity rate. On a read-only server the served settings run twice
+(a repeatability check). The report and every case are written under `~/.local/share/talus-bench/runs/`. The headless
+`talus-bench` CLI builds from source (`cd rust && cargo build --release -p talus-bench`); it is not in the release
+tarball.
+
+Keys: `s` start (asks first), `l` candidate level, `c` cancel after the current request.
+
+Illustrative render from the fake daemon (`talus-tui --screenshot bench`; its answers are synthetic and figures
+are masked): it shows the layout, not a measurement.
+
+```
+ Talus   1 Status  2 Models  3 Tuning  4 Bench                              ● http://127.0.0.1:8000
+┌ Bench: quality smoke (talus-bench) ──────────────────────────────────────────────────────────────┐
+│ Model      MiMo-V2.6-Flash                                                                       │
+│ Compare    Balanced (reference) vs Fast (candidate)   l to change                                │
+│ Tasks      json_schema 20 + gsm8k 20 per setting · temperature 0 · paired by case                │
+│ Gates      accuracy loss (paired bootstrap CI) · JSON validity rate · min 20 cases               │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Progress ────────────────────────────────────────────────────────────────────────────────────────┐
+│ done in x s (fake daemon: synthetic answers, illustrative only)                                  │
+│██████████████████████████████████fast xx/40 · pass xx · fail xx █████████████████████████████████│
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Result ──────────────────────────────────────────────────────────────────────────────────────────┐
+│ fast        FAIL          required gate(s) failed: json_schema accuracy loss, json_schema rate,  │
+│gsm8k accuracy loss                                                                               │
+│   FAIL          json_schema accuracy loss    xx.x pp [xx.x, xx.x]  n=20                          │
+│   FAIL          json_schema rate             xx.x% [xx.x, xx.x]  n=20                            │
+│   FAIL          gsm8k accuracy loss          xx.x pp [x.x, xx.x]  n=20                           │
+│ report: ~/.local/share/talus-bench/runs/smoke-20261025-213542/report.md                          │
+│ loading tasks and datasets                                                                       │
+│ balanced: server already on mimo-v2.6-flash {}                                                   │
+│ balanced: xx/40 passed                                                                           │
+│ fast: applying mimo-v2.6-flash {"iq1m": "on"} (engine restart)                                   │
+│ fast: engine back on mimo-v2.6-flash                                                             │
+│ fast: xx/40 passed                                                                               │
+│ pairing, statistics and gates                                                                    │
+│ done: report at /tmp/talus-tui-shot-1616138/report.md                                            │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ s start smoke run · l candidate level · c cancel · ? keys · q quit
+```
 
 ## Accuracy ↔ Speed
 

@@ -210,6 +210,8 @@ fn print_once(client: &Client) -> i32 {
 enum Msg {
     Status(Box<Result<Snapshot, String>>),
     Presets(Value),
+    Bench(talus_bench_core::runner::Event),
+    BenchDone(Box<Result<talus_bench_core::runner::RunOutcome, String>>),
 }
 
 fn run(mut app: App, client: Client) -> std::io::Result<()> {
@@ -217,6 +219,7 @@ fn run(mut app: App, client: Client) -> std::io::Result<()> {
     let client = Arc::new(Mutex::new(client));
     let interval = Duration::from_millis(app.settings.interval_ms);
     let (tx, rx) = mpsc::channel::<Msg>();
+    let bench_tx = tx.clone();
     let (wake_tx, wake_rx) = mpsc::channel::<()>();
 
     // The poller: one status request per interval (and on demand), presets now and then.
@@ -260,6 +263,11 @@ fn run(mut app: App, client: Client) -> std::io::Result<()> {
                 match m {
                     Msg::Status(s) => app.on_status(*s),
                     Msg::Presets(v) => app.on_presets(&v),
+                    Msg::Bench(e) => app.bench.on_event(e),
+                    Msg::BenchDone(r) => {
+                        app.bench.on_done(*r);
+                        let _ = wake_tx.send(());
+                    }
                 }
             }
             terminal.draw(|f| ui::draw(f, &app, &url))?;
@@ -290,6 +298,22 @@ fn run(mut app: App, client: Client) -> std::io::Result<()> {
                         client.lock().unwrap().set_api_key(Some(k));
                     }
                     let _ = wake_tx.send(());
+                }
+                Action::StartBench(cfg) => {
+                    let cancel = app.bench.start();
+                    let key = client.lock().unwrap().api_key();
+                    let btx = bench_tx.clone();
+                    std::thread::spawn(move || {
+                        let opts = talus_bench_core::runner::RunOptions {
+                            api_key: key,
+                            ..Default::default()
+                        };
+                        let t2 = btx.clone();
+                        let res = talus_bench_core::runner::run(&cfg, &opts, cancel, &mut |e| {
+                            let _ = t2.send(Msg::Bench(e));
+                        });
+                        let _ = btx.send(Msg::BenchDone(Box::new(res)));
+                    });
                 }
             }
         }
@@ -328,6 +352,9 @@ fn run_fake(args: &Args) {
 
 /// Text renders of each screen from fake data (used for docs/TUI.md).
 fn screenshot(which: &str) -> String {
+    if which == "bench" {
+        return screenshot_bench();
+    }
     let model = match which {
         "models" => "qwen3.8-27b",
         _ => "mimo-v2.6-flash",
@@ -378,4 +405,45 @@ fn screenshot(which: &str) -> String {
 
 fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
     crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+}
+
+/// The Bench screen after a finished smoke run against the fake daemon (synthetic answers, docs only).
+fn screenshot_bench() -> String {
+    let mut fs = FakeState::new("mimo-v2.6-flash");
+    fs.restart_secs = 0.05;
+    let (addr, _st) = match fake::spawn(0, fs) {
+        Ok(x) => x,
+        Err(e) => return format!("cannot start the fake daemon: {e}\n"),
+    };
+    let url = format!("http://{addr}");
+    let c = Client::new(&url, None).expect("url");
+    let mut app = App::new(Settings {
+        server: url.clone(),
+        ..Settings::default()
+    });
+    if let Ok((200, v)) = c.get("/v1/talus/status") {
+        app.on_status(Ok(stats::parse_status(&v)));
+    }
+    app.screen = Screen::Bench;
+    let mut cfg = app.bench.smoke_config(&url, Some("mimo-v2.6-flash"), true);
+    let dir = std::env::temp_dir().join(format!("talus-tui-shot-{}", std::process::id()));
+    cfg.experiment.output_dir = Some(dir.display().to_string());
+    let cancel = app.bench.start();
+    let opts = talus_bench_core::runner::RunOptions {
+        poll_ms: Some(20),
+        ..Default::default()
+    };
+    let mut events = Vec::new();
+    let res = talus_bench_core::runner::run(&cfg, &opts, cancel, &mut |e| events.push(e));
+    for e in events {
+        app.bench.on_event(e);
+    }
+    app.bench.on_done(res);
+    if let Some(r) = app.bench.result.as_mut() {
+        r.dir = std::path::PathBuf::from("~/.local/share/talus-bench/runs/smoke-20261025-213542");
+    }
+    app.bench.phase = "done in 2 s (fake daemon: synthetic answers, illustrative only)".into();
+    app.bench.log.retain(|l| !l.starts_with("done: report at"));
+    let _ = std::fs::remove_dir_all(&dir);
+    ui::render_to_string(&app, "http://127.0.0.1:8000", 100, 34)
 }

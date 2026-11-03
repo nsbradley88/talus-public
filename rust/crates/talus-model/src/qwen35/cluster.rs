@@ -32,6 +32,7 @@ use super::ffi::*;
 use super::weights::Q36Model;
 use hip_sys::hipMemcpyKind;
 use talus_cluster::{ident, Header, Kv, Link, MsgType, Role};
+use talus_state::{q36_shape_view, Q36LayerStateView, Q36PromptCache};
 
 /// Bytes reserved at the start of a bundle for the step control block.
 pub const CTL_BYTES: usize = 256;
@@ -100,6 +101,9 @@ pub struct ClState {
     pub step: u64,
     pub hops: u64,
     pub hop_s: f64,
+    /// head: the heartbeat on the control connection, and what a reconnect needs (Phase 2)
+    pub beat: Option<talus_cluster::Beat>,
+    pub recon: Option<Recon>,
 }
 
 unsafe impl Send for ClState {}
@@ -156,6 +160,8 @@ impl ClState {
             step: 0,
             hops: 0,
             hop_s: 0.0,
+            beat: None,
+            recon: None,
         }
     }
 }
@@ -192,9 +198,45 @@ fn hcopy(dst: *mut c_void, src: *const c_void, bytes: usize, kind: hipMemcpyKind
     }
 }
 
+/// The panic payload of a lost or failed cluster link (Phase 2): the head's serve loop catches it, answers the request
+/// with `ERR stage_unavailable` (HTTP 503 from talus-server) and reconnects; a worker drops its engine and waits for
+/// the next head. Outside a serve loop it ends the process like any panic.
+#[derive(Debug, Clone)]
+pub struct ClusterLost(pub String);
+
 fn die(what: &str, e: impl std::fmt::Display) -> ! {
-    eprintln!("talus-cluster: FATAL: {what}: {e}");
-    std::process::exit(70);
+    let m = format!("{what}: {e}");
+    eprintln!("talus-cluster: link failure: {m}");
+    std::panic::panic_any(ClusterLost(m));
+}
+
+/// The control (heartbeat) address: the data port + 1 (7701 -> 7702).
+pub fn ctl_addr(addr: &str) -> String {
+    match addr.rsplit_once(':') {
+        Some((h, p)) => match p.parse::<u16>() {
+            Ok(n) => format!("{h}:{}", n.wrapping_add(1)),
+            Err(_) => addr.to_string(),
+        },
+        None => addr.to_string(),
+    }
+}
+
+/// What the head needs to rebuild a lost link with the same settings.
+#[derive(Debug, Clone)]
+pub struct Recon {
+    pub addr: String,
+    pub alt: Option<String>,
+    pub ctx: i32,
+    pub max_batch: i32,
+    pub use_graph: bool,
+}
+
+/// A handshaken head link: data link, its heartbeat, the agreed context.
+pub struct HeadLink {
+    pub link: Link,
+    pub beat: Option<talus_cluster::Beat>,
+    pub ctx: i32,
+    pub addr: String,
 }
 
 impl Q36Engine {
@@ -204,12 +246,15 @@ impl Q36Engine {
     }
 
     /// Head: take over the handshaken link to the worker; allocate the bundle / return buffers.
-    pub fn cluster_attach_head(&mut self, link: Link) -> super::Result<()> {
+    pub fn cluster_attach_head(&mut self, hl: HeadLink, recon: Recon) -> super::Result<()> {
+        let link = hl.link;
         let m = unsafe { &*self.m };
         let e = m.g.n_embd as i32;
         let b = self.max_batch.max(16);
         let n = m.layers.len();
         let mut cl = ClState::new(Role::Head, Some(link));
+        cl.beat = hl.beat;
+        cl.recon = Some(recon);
         if self.use_dflash && self.df.ready {
             for li in m.stage_hi..n {
                 if self.df.wants_tap((li + 1) as i32) {
@@ -642,6 +687,65 @@ impl Q36Engine {
         }
     }
 
+    /// Head: whether the link to the worker is up (a link and, with a heartbeat, a live peer).
+    pub fn cluster_link_up(&self) -> bool {
+        self.cl.as_ref().is_some_and(|c| {
+            c.role != Role::Head
+                || (c.link.is_some() && !c.beat.as_ref().is_some_and(|b| b.is_dead()))
+        })
+    }
+
+    /// Head: after a lost link (a caught `ClusterLost`), clean up what the interrupted step left (an open graph
+    /// capture, queued work), reconnect with the same settings (the worker rebuilds or reuses its engine) and reset
+    /// the sequence on both stages. The caller drops its prompt-cache state (the worker's shard is gone).
+    pub fn cluster_reconnect(&mut self, wait_s: u64) -> std::result::Result<(), String> {
+        let Some(recon) = self.cl.as_ref().and_then(|c| c.recon.clone()) else {
+            return Err("not a cluster head".into());
+        };
+        let s = self.s_main;
+        if let Some(cl) = self.cl.as_mut() {
+            if cl.cap_on {
+                let mut gr: hipGraph_t = ptr::null_mut();
+                unsafe {
+                    let _ = hipStreamEndCapture(s, &mut gr);
+                    if !gr.is_null() {
+                        let _ = hipGraphDestroy(gr);
+                    }
+                }
+                for g in cl.cap_parts.drain(..) {
+                    let _ = unsafe { hipGraphExecDestroy(g) };
+                }
+                cl.cap_cuts.clear();
+                cl.cap_on = false;
+            }
+            cl.beat = None;
+            cl.link = None;
+            cl.step = 0;
+        }
+        let _ = unsafe { hipStreamSynchronize(s) };
+        let m = unsafe { &*self.m };
+        let hl = cluster_connect_head(
+            m,
+            &recon.addr,
+            recon.alt.as_deref(),
+            Some(recon.ctx),
+            recon.max_batch,
+            recon.use_graph,
+            wait_s,
+        )
+        .map_err(|e| e.to_string())?;
+        if let Some(cl) = self.cl.as_mut() {
+            cl.link = Some(hl.link);
+            cl.beat = hl.beat;
+        }
+        self.reset();
+        eprintln!(
+            "talus-cluster: link to the worker re-established ({})",
+            hl.addr
+        );
+        Ok(())
+    }
+
     /// Head: link statistics for the log.
     pub fn cluster_stats(&self) -> Option<(u64, f64)> {
         self.cl
@@ -709,6 +813,9 @@ impl Q36Engine {
                     s,
                 );
             }
+        }
+        if let Some(p) = poison_mode() {
+            self.cl_poison(&p, t, q8);
         }
         if q8 {
             self.mark_q8(self.h, e, t);
@@ -949,23 +1056,53 @@ fn hello_kv(model: &Q36Model) -> Kv {
 pub fn cluster_connect_head(
     model: &Q36Model,
     addr: &str,
+    alt: Option<&str>,
     ctx_explicit: Option<i32>,
     max_batch: i32,
     use_graph: bool,
-) -> super::Result<(Link, i32)> {
-    let wait = std::env::var("TALUS_CLUSTER_WAIT_S")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(900);
-    eprintln!("talus-cluster: head connecting to the worker at {addr} (waiting up to {wait} s)");
-    let mut link = Link::connect(addr, Duration::from_secs(wait))
-        .map_err(|e| super::ffi::anyhow!("cluster connect {addr}: {e}"))?;
+    wait_s: u64,
+) -> super::Result<HeadLink> {
+    eprintln!(
+        "talus-cluster: head connecting to the worker at {addr}{} (waiting up to {wait_s} s)",
+        alt.map(|a| format!(" (alt {a})")).unwrap_or_default()
+    );
+    // the primary address first; the alternate (LAN) one when the primary does not answer (link down)
+    let mut used = addr.to_string();
+    let mut link = match Link::connect(
+        addr,
+        Duration::from_secs(if alt.is_some() { 5.min(wait_s) } else { wait_s }),
+    ) {
+        Ok(l) => l,
+        Err(e0) => match alt {
+            Some(a) => {
+                eprintln!("talus-cluster: {addr} unreachable ({e0}); trying the alternate {a}");
+                used = a.to_string();
+                Link::connect(a, Duration::from_secs(wait_s))
+                    .or_else(|_| {
+                        Link::connect(addr, Duration::from_secs(5))
+                            .inspect(|_| used = addr.to_string())
+                    })
+                    .map_err(|e| super::ffi::anyhow!("cluster connect {addr} / {a}: {e}"))?
+            }
+            None => return Err(super::ffi::anyhow!("cluster connect {addr}: {e0}")),
+        },
+    };
+    let addr = used.as_str();
+    // the data plane (talus#48): TCP today; HELLO/INIT and the heartbeat always run on TCP
+    let dp = talus_cluster::DataPlane::from_env().map_err(|e| super::ffi::anyhow!("{e}"))?;
     let mut kv = hello_kv(model);
-    kv.put("split", model.stage_hi);
+    kv.put("split", model.stage_hi).put("dp", dp.as_str());
     let io = |e: std::io::Error| super::ffi::anyhow!("cluster handshake: {e}");
     link.send_msg(MsgType::Hello, &kv.encode()).map_err(io)?;
     let (_, ack) = link.expect(MsgType::HelloAck).map_err(io)?;
     let ack = Kv::decode(&ack);
+    if talus_cluster::DataPlane::parse(ack.get("dp")) != Ok(dp) {
+        return Err(super::ffi::anyhow!(
+            "cluster handshake: the worker answered data plane {:?}, asked for {}",
+            ack.get("dp"),
+            dp.as_str()
+        ));
+    }
     let i8h = super::engine::i8x_candidates(model).1 as f64;
     let pth = q27_bytes_per_token(model) as f64;
     let ctx = match ctx_explicit {
@@ -1000,7 +1137,32 @@ pub fn cluster_connect_head(
         iack.get("ctx").unwrap_or("?"),
         iack.get("note").unwrap_or("")
     );
-    Ok((link, ctx))
+    // the heartbeat on the control port (data port + 1)
+    let beat = match std::net::TcpStream::connect_timeout(
+        &std::net::ToSocketAddrs::to_socket_addrs(&ctl_addr(addr))
+            .map_err(io)?
+            .next()
+            .ok_or_else(|| super::ffi::anyhow!("no control address for {addr}"))?,
+        Duration::from_secs(10),
+    ) {
+        Ok(c) => {
+            let data = link.closer().map_err(io)?;
+            Some(talus_cluster::Beat::start(c, data, "head").map_err(io)?)
+        }
+        Err(e) => {
+            eprintln!(
+                "talus-cluster: WARN: no control connection at {} ({e}): no heartbeat",
+                ctl_addr(addr)
+            );
+            None
+        }
+    };
+    Ok(HeadLink {
+        link,
+        beat,
+        ctx,
+        addr: addr.to_string(),
+    })
 }
 
 /// Worker: check a HELLO against this process.
@@ -1028,6 +1190,7 @@ fn check_hello(model: &Q36Model, h: &Kv) -> std::result::Result<(), String> {
             model.stage_lo
         ));
     }
+    talus_cluster::DataPlane::parse(h.get("dp")).map_err(|e| format!("mismatch dp: {e}"))?;
     if h.get("env") != mine.get("env") {
         let names = |kv: &Kv| -> Vec<(String, String)> {
             kv.0.iter()
@@ -1047,6 +1210,16 @@ pub fn worker_main(model: &mut Q36Model, addr: &str) -> i32 {
         Ok(l) => l,
         Err(e) => {
             eprintln!("talus-cluster: worker cannot listen on {addr}: {e}");
+            return 1;
+        }
+    };
+    let ctl_listener = match Link::listen(&ctl_addr(addr)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "talus-cluster: worker cannot listen on {}: {e}",
+                ctl_addr(addr)
+            );
             return 1;
         }
     };
@@ -1070,10 +1243,51 @@ pub fn worker_main(model: &mut Q36Model, addr: &str) -> i32 {
             }
         };
         eprintln!("talus-cluster: head connected from {}", link.peer);
-        let r = worker_session(model, &mut eng, &mut cur, &mut link);
+        // the head's control connection follows once the handshake is done; it is accepted on a thread so the
+        // session can start (heads without one simply run without a heartbeat)
+        let data2 = link.closer().ok();
+        let cl2 = ctl_listener.try_clone().ok();
+        let quit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let quit2 = quit.clone();
+        let beat_th = std::thread::spawn(move || -> Option<talus_cluster::Beat> {
+            let l = cl2?;
+            let _ = l.set_nonblocking(true);
+            let t0 = Instant::now();
+            loop {
+                match l.accept() {
+                    Ok((c, _)) => {
+                        let _ = c.set_nonblocking(false);
+                        return talus_cluster::Beat::start(c, data2?, "worker").ok();
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if quit2.load(std::sync::atomic::Ordering::Relaxed)
+                            || t0.elapsed() > Duration::from_secs(900)
+                        {
+                            return None;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => return None,
+                }
+            }
+        });
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            worker_session(model, &mut eng, &mut cur, &mut link)
+        }));
+        if let Ok(c) = link.closer() {
+            c.close();
+        }
+        quit.store(true, std::sync::atomic::Ordering::Relaxed);
+        let beat = beat_th.join().ok().flatten();
+        drop(beat);
         match r {
-            Ok(()) => eprintln!("talus-cluster: head said BYE"),
-            Err(e) => eprintln!("talus-cluster: head session ended: {e}"),
+            Ok(Ok(())) => eprintln!("talus-cluster: head said BYE"),
+            Ok(Err(e)) => eprintln!("talus-cluster: head session ended: {e}"),
+            Err(_) => {
+                eprintln!("talus-cluster: head session failed mid-step: rebuilding the engine (weights stay loaded)");
+                eng = None;
+                cur = None;
+            }
         }
         if let Some(e) = eng.as_mut() {
             e.reset();
@@ -1105,7 +1319,9 @@ fn worker_session(
         return Err(why);
     }
     let mut ack = Kv::new();
+    let dp = talus_cluster::DataPlane::parse(hello.get("dp"))?;
     ack.put("ok", 1)
+        .put("dp", dp.as_str())
         .put("box", ident::box_id())
         .put("i8", super::engine::i8x_candidates(model).1)
         .put("per_tok", q27_bytes_per_token(model))
@@ -1159,6 +1375,8 @@ fn worker_session(
         ),
     );
     link.send_msg(MsgType::InitAck, &ia.encode()).map_err(io)?;
+    // this stage's shard of the prompt cache (created by the head's first cache message; dropped with the session)
+    let mut pc: Option<Q36PromptCache> = None;
     loop {
         let h = link.recv_header().map_err(io)?;
         match h.msg() {
@@ -1192,6 +1410,12 @@ fn worker_session(
             Some(MsgType::Heartbeat) => {
                 let _ = link.recv_vec(&h).map_err(io)?;
             }
+            Some(MsgType::Cache) => {
+                let body = link.recv_vec(&h).map_err(io)?;
+                if let Some(reply) = e.cl_worker_cache(&mut pc, &body)? {
+                    link.send_msg(MsgType::CacheAck, &reply).map_err(io)?;
+                }
+            }
             other => {
                 let _ = link.recv_vec(&h);
                 return Err(format!("unexpected message {other:?}"));
@@ -1221,6 +1445,395 @@ pub fn cluster_bye(eng: &mut Q36Engine) {
             }
         }
     }
+}
+
+// ----------------------------------------------------------------------------------------------------------------
+// Poison test (DESIGN.md 1.2 / 4.2 items 6-7)
+// ----------------------------------------------------------------------------------------------------------------
+//
+// `TALUS_CLUSTER_POISON` on the worker, after the bundle is copied in:
+// - `scratch`: fill every scratch buffer a layer writes before it reads (and x_q8 when no q8 copy was shipped) with
+//   NaN. The logits sha must stay equal: nothing outside the bundle is live at the cut.
+// - `x`, `h`, `q8`: replace that shipped segment with NaN. The sha must change (the control: the test can see it).
+
+fn poison_mode() -> Option<String> {
+    static M: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        std::env::var("TALUS_CLUSTER_POISON")
+            .ok()
+            .filter(|v| !v.is_empty())
+    })
+    .clone()
+}
+
+impl Q36Engine {
+    fn cl_poison(&mut self, mode: &str, t: i32, q8: bool) {
+        let m = unsafe { &*self.m };
+        let g = &m.g;
+        let b = self.max_batch.max(16) as usize;
+        let e = g.n_embd as usize;
+        let c = g.ssm_qkv_dim() as usize;
+        let qg = g.q_gate_dim() as usize;
+        let qd = g.q_dim() as usize;
+        let kv = g.kv_dim() as usize;
+        let v = g.ssm_inner_size as usize;
+        let hv = g.ssm_time_step_rank as usize;
+        let f = g.n_ff as usize;
+        let s = self.s_main;
+        let nan = |p: *mut c_void, bytes: usize| {
+            if !p.is_null() && bytes > 0 {
+                let _ = unsafe { hipMemsetAsync(p, 0xff, bytes, s) };
+            }
+        };
+        let row = (t as usize) * e * 4;
+        match mode {
+            "x" => nan(self.x.cast(), row),
+            "h" => nan(self.h.cast(), row),
+            "q8" => {
+                if q8 {
+                    nan(self.x_q8, tk_q8_1_bytes(e as i32, t))
+                }
+            }
+            "scratch" => {
+                let f4 = |n: usize| n * 4;
+                nan(self.y.cast(), f4(b * v.max(e)));
+                nan(self.qkv.cast(), f4(b * c.max(qg + 2 * kv)));
+                nan(self.hc.cast(), f4(b * c));
+                nan(self.z.cast(), f4(b * v.max(qd)));
+                nan(self.alpha.cast(), f4(b * 2 * hv));
+                nan(self.beta.cast(), f4(b * hv));
+                nan(self.qg.cast(), f4(b * qg));
+                nan(self.q.cast(), f4(b * qd));
+                nan(self.k.cast(), f4(b * kv));
+                nan(self.v.cast(), f4(b * kv));
+                nan(self.gate.cast(), f4(b * qd));
+                nan(self.att.cast(), f4(b * qd));
+                if m.dense {
+                    nan(self.sh_g.cast(), f4(b * f));
+                    nan(self.sh_u.cast(), f4(b * f));
+                    nan(self.sh_y.cast(), f4(b * e));
+                }
+                nan(self.h_last.cast(), f4(b * e));
+                let max_in = e.max(v).max(qd).max(f) as i32;
+                nan(self.y_q8, tk_q8_1_bytes(max_in, b as i32));
+                if !q8 {
+                    nan(self.x_q8, tk_q8_1_bytes(max_in, b as i32));
+                } else {
+                    // only the rows past the shipped ones
+                    let shipped = tk_q8_1_bytes(e as i32, t);
+                    let all = tk_q8_1_bytes(max_in, b as i32);
+                    nan(
+                        unsafe { self.x_q8.cast::<u8>().add(shipped) }.cast(),
+                        all - shipped,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------------------------------------------
+// Sharded prompt cache (talus#47 Phase 2)
+// ----------------------------------------------------------------------------------------------------------------
+//
+// Every stage holds a `Q36PromptCache` over its own layers. The head mirrors each cache call (stash, save, restore)
+// to the worker in order; both run the same code on the same token arrays, and the stash budget is charged with the
+// whole model's bytes on both (`Q36PromptCache::acct_peer`), so both take the same decisions. A restore returns the
+// worker's restored length, which the head checks against its own (a mismatch is a bug: the head exits).
+
+const PC_INIT: u8 = 0;
+const PC_STASH: u8 = 1;
+const PC_SAVE: u8 = 2;
+const PC_RESTORE: u8 = 3;
+
+fn put_u64(b: &mut Vec<u8>, v: u64) {
+    b.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_ids(b: &mut Vec<u8>, ids: &[i32]) {
+    put_u64(b, ids.len() as u64);
+    for &t in ids {
+        b.extend_from_slice(&t.to_le_bytes());
+    }
+}
+
+struct Rd<'a> {
+    b: &'a [u8],
+    o: usize,
+}
+
+impl Rd<'_> {
+    fn u64(&mut self) -> std::result::Result<u64, String> {
+        let s = self
+            .b
+            .get(self.o..self.o + 8)
+            .ok_or("short cache message")?;
+        self.o += 8;
+        let mut a = [0u8; 8];
+        a.copy_from_slice(s);
+        Ok(u64::from_le_bytes(a))
+    }
+    fn ids(&mut self) -> std::result::Result<Vec<i32>, String> {
+        let n = self.u64()? as usize;
+        let s = self
+            .b
+            .get(self.o..self.o + 4 * n)
+            .ok_or("short cache message")?;
+        self.o += 4 * n;
+        Ok(s.chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+}
+
+/// A stage's KV shape for the cache accounting: attention states, those with a std-layout V, KV heads, head dim,
+/// DFlash2 rings / keep rows / kv dim.
+type KvShape = [i64; 7];
+
+impl Q36Engine {
+    /// The prompt-cache view of this engine's own layers (as talus-cli's `make_layer_state_view`, which the head
+    /// uses; flushing the pending GDN commit is the head's job and is mirrored).
+    pub fn cl_state_view(&mut self) -> Q36LayerStateView {
+        let g = &self.model().g;
+        let na = self.n_attn_state as usize;
+        let (dk, dv, ring, keep, kvd, block) = if self.use_dflash && self.df.ready {
+            (
+                self.df.k_ring.clone(),
+                self.df.v_ring.clone(),
+                self.df.ring(),
+                self.df.keep(),
+                self.df.mdl.n_kv * self.df.mdl.head_dim,
+                self.df.block(),
+            )
+        } else {
+            (Vec::new(), Vec::new(), 0, 0, 0, 0)
+        };
+        Q36LayerStateView {
+            ssm_d_conv: 4,
+            ssm_conv_channels: g.ssm_qkv_dim() as i32,
+            ssm_v_heads: g.ssm_time_step_rank as i32,
+            ssm_state_size: g.ssm_state_size as i32,
+            n_head_kv: g.n_head_kv as i32,
+            head_dim: g.head_dim as i32,
+            n_embd: g.n_embd as i32,
+            ctx: self.ctx_len,
+            vt_ctx: self.vt_ctx,
+            has_mtp: self.model().has_mtp,
+            conv: self.conv.clone(),
+            s: self.S.clone(),
+            kc: self.kc[..na].iter().map(|&p| p.cast::<c_void>()).collect(),
+            vc: self.vc[..na].iter().map(|&p| p.cast::<c_void>()).collect(),
+            vtc: self.vtc[..na].iter().map(|&p| p.cast::<c_void>()).collect(),
+            hlast: self.h_mtp,
+            gctl: self.gctl,
+            gdn_pending: 0,
+            pos: self.n_past as i64,
+            st: self.s_main,
+            dfl_k_ring: dk,
+            dfl_v_ring: dv,
+            dfl_ring: ring,
+            dfl_keep: keep,
+            dfl_kv_dim: kvd,
+            dfl_block: block,
+            dctx_lo: self.dctx.lo(),
+            dctx_hi: self.dctx.hi(),
+        }
+    }
+
+    fn cl_kv_shape(&self) -> KvShape {
+        let g = &self.model().g;
+        let na = self.n_attn_state as usize;
+        let nv = self.vc.iter().take(na).filter(|p| !p.is_null()).count();
+        let (dn, keep, kvd) = if self.use_dflash && self.df.ready {
+            (
+                self.df.k_ring.len(),
+                self.df.keep(),
+                self.df.mdl.n_kv * self.df.mdl.head_dim,
+            )
+        } else {
+            (0, 0, 0)
+        };
+        [
+            na as i64,
+            nv as i64,
+            g.n_head_kv,
+            g.head_dim,
+            dn as i64,
+            keep as i64,
+            kvd as i64,
+        ]
+    }
+
+    fn cl_head_cache(&mut self, payload: &[u8], want_reply: bool) -> Option<Vec<u8>> {
+        let cl = self.cl.as_mut()?;
+        if cl.role != Role::Head {
+            return None;
+        }
+        let link = cl.link.as_mut().unwrap();
+        if let Err(e) = link.send_msg(MsgType::Cache, payload) {
+            die("send a cache op to the worker", e);
+        }
+        if !want_reply {
+            return None;
+        }
+        match link.expect(MsgType::CacheAck) {
+            Ok((_, b)) => Some(b),
+            Err(e) => die("cache op on the worker", e),
+        }
+    }
+
+    /// Head: create the worker's cache shard with this cache's settings and make both shards charge the whole
+    /// model's KV bytes. No-op outside a cluster head.
+    pub fn cl_pc_init(&mut self, pc: &mut Q36PromptCache) {
+        if !self.is_cluster_head() {
+            return;
+        }
+        let mut b = vec![PC_INIT];
+        put_u64(&mut b, pc.max_snaps as u64);
+        put_u64(&mut b, pc.max_msg as u64);
+        put_u64(&mut b, pc.stash_budget as u64);
+        for v in self.cl_kv_shape() {
+            put_u64(&mut b, v as u64);
+        }
+        let r = self.cl_head_cache(&b, true).unwrap_or_default();
+        let mut rd = Rd { b: &r, o: 0 };
+        let mut w = [0i64; 7];
+        for x in w.iter_mut() {
+            *x = rd.u64().unwrap_or(0) as i64;
+        }
+        pc.acct_peer = Some(shape_view(&w));
+        eprintln!("talus-cluster: prompt cache sharded over both stages (worker KV shape {w:?})");
+    }
+
+    /// Head: mirror `stash_kv_with_pf(live, keep, pf)` (call right after the local one).
+    pub fn cl_pc_stash(&mut self, live: &[i32], keep: usize, pf: usize) {
+        if !self.is_cluster_head() {
+            return;
+        }
+        let mut b = vec![PC_STASH];
+        put_u64(&mut b, keep as u64);
+        put_u64(&mut b, pf as u64);
+        put_ids(&mut b, live);
+        self.cl_head_cache(&b, false);
+    }
+
+    /// Head: mirror `save(ids, msg)`.
+    pub fn cl_pc_save(&mut self, ids: &[i32], msg: bool) {
+        if !self.is_cluster_head() {
+            return;
+        }
+        let mut b = vec![PC_SAVE];
+        put_u64(&mut b, msg as u64);
+        put_ids(&mut b, ids);
+        self.cl_head_cache(&b, false);
+    }
+
+    /// Head: mirror `restore_with_pf(ids, live, live_pf, pf_only)`; `r` is the head's restored length, which the
+    /// worker's must equal.
+    pub fn cl_pc_restore(
+        &mut self,
+        ids: &[i32],
+        live: &[i32],
+        live_pf: usize,
+        pf_only: bool,
+        r: usize,
+    ) {
+        if !self.is_cluster_head() {
+            return;
+        }
+        let mut b = vec![PC_RESTORE];
+        put_u64(&mut b, live_pf as u64);
+        put_u64(&mut b, pf_only as u64);
+        put_ids(&mut b, ids);
+        put_ids(&mut b, live);
+        let rep = self.cl_head_cache(&b, true).unwrap_or_default();
+        let rw = Rd { b: &rep, o: 0 }.u64().unwrap_or(u64::MAX) as usize;
+        if rw != r {
+            die(
+                "prompt cache shards diverged",
+                format!("head restored {r} tokens, worker {rw}"),
+            );
+        }
+    }
+
+    /// Worker: apply one mirrored cache op on this stage's shard; returns the reply payload if the op has one.
+    fn cl_worker_cache(
+        &mut self,
+        pc: &mut Option<Q36PromptCache>,
+        body: &[u8],
+    ) -> std::result::Result<Option<Vec<u8>>, String> {
+        let op = *body.first().ok_or("empty cache message")?;
+        let mut rd = Rd { b: body, o: 1 };
+        match op {
+            PC_INIT => {
+                let mut c = Q36PromptCache::new();
+                c.max_snaps = rd.u64()? as usize;
+                c.max_msg = rd.u64()? as usize;
+                c.stash_budget = rd.u64()? as usize;
+                let mut hs = [0i64; 7];
+                for x in hs.iter_mut() {
+                    *x = rd.u64()? as i64;
+                }
+                c.acct_peer = Some(shape_view(&hs));
+                *pc = Some(c);
+                let mut b = Vec::new();
+                for v in self.cl_kv_shape() {
+                    put_u64(&mut b, v as u64);
+                }
+                Ok(Some(b))
+            }
+            PC_STASH => {
+                let keep = rd.u64()? as usize;
+                let pf = rd.u64()? as usize;
+                let live = rd.ids()?;
+                let view = self.cl_state_view();
+                pc.as_mut()
+                    .ok_or("cache op before INIT")?
+                    .stash_kv_with_pf(&view, &live, keep, pf);
+                Ok(None)
+            }
+            PC_SAVE => {
+                let msg = rd.u64()? != 0;
+                let ids = rd.ids()?;
+                let mut view = self.cl_state_view();
+                pc.as_mut()
+                    .ok_or("cache op before INIT")?
+                    .save(&mut view, &ids, msg);
+                Ok(None)
+            }
+            PC_RESTORE => {
+                let live_pf = rd.u64()? as usize;
+                let pf_only = rd.u64()? != 0;
+                let ids = rd.ids()?;
+                let live = rd.ids()?;
+                let mut view = self.cl_state_view();
+                let (r, _) = pc
+                    .as_mut()
+                    .ok_or("cache op before INIT")?
+                    .restore_with_pf(&mut view, &ids, &live, live_pf, pf_only);
+                if r > 0 {
+                    // as sync_layer_state_view_back on the head: the restored state is committed
+                    self.gdn_pending = 0;
+                    self.gdn_valid = true;
+                }
+                let mut b = Vec::new();
+                put_u64(&mut b, r as u64);
+                Ok(Some(b))
+            }
+            x => Err(format!("unknown cache op {x}")),
+        }
+    }
+}
+
+fn shape_view(s: &KvShape) -> Q36LayerStateView {
+    q36_shape_view(
+        s[0].max(0) as usize,
+        s[1].max(0) as usize,
+        s[2] as i32,
+        s[3] as i32,
+        (s[4].max(0) as usize, s[5] as i32, s[6] as i32),
+    )
 }
 
 #[cfg(test)]

@@ -30,6 +30,7 @@ pub fn draw(f: &mut Frame, app: &App, server_url: &str) {
         Screen::Status => draw_status(f, body, app, server_url),
         Screen::Models => draw_models(f, body, app),
         Screen::Tuning => draw_tuning(f, body, app),
+        Screen::Bench => draw_bench(f, body, app),
     }
     draw_footer(f, foot, app);
     match &app.modal {
@@ -66,19 +67,37 @@ pub fn draw(f: &mut Frame, app: &App, server_url: &str) {
             )));
             dialog(f, title, text);
         }
+        Modal::ConfirmBench { lines, .. } => {
+            let mut text: Vec<Line> = lines.iter().map(|l| Line::from(l.as_str())).collect();
+            text.push(Line::from(""));
+            text.push(Line::from(vec![
+                Span::styled("[y]", Style::new().fg(GOOD).bold()),
+                Span::raw(" start   "),
+                Span::styled("[n]", Style::new().fg(BAD).bold()),
+                Span::raw(" cancel"),
+            ]));
+            dialog(f, "Start a bench run?", text);
+        }
         Modal::Help => dialog(f, "Keys", help_lines()),
     }
 }
 
 fn help_lines() -> Vec<Line<'static>> {
     [
-        ("1 2 3 / Tab", "switch screen: Status, Models, Tuning"),
+        (
+            "1 2 3 4 / Tab",
+            "switch screen: Status, Models, Tuning, Bench",
+        ),
         ("Up Down / j k", "move"),
         ("Enter", "Models: tune this model"),
         ("Left Right / h l", "Tuning: change the value"),
         ("d", "Tuning: this option back to our tuned default"),
         ("r", "Tuning: every option back to our tuned defaults"),
         ("a", "Tuning: apply (asks first; restarts the engine)"),
+        (
+            "s / l / c",
+            "Bench: start a smoke run (asks first) / candidate level / cancel",
+        ),
         ("g / F5", "refresh now"),
         ("q / Esc", "quit (the server keeps running)"),
     ]
@@ -158,9 +177,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, url: &str) {
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let hints = match app.screen {
-        Screen::Status => "1-3 screens · g refresh · ? keys · q quit (the server keeps running)",
+        Screen::Status => "1-4 screens · g refresh · ? keys · q quit (the server keeps running)",
         Screen::Models => "↑↓ move · Enter tune this model · ? keys · q quit",
         Screen::Tuning => "↑↓ move · ←→ change · d default · r reset all · a apply · ? keys",
+        Screen::Bench => "s start smoke run · l candidate level · c cancel · ? keys · q quit",
     };
     let line = match &app.notice {
         Some(n) => Line::from(vec![
@@ -867,4 +887,166 @@ pub fn render_to_string(app: &App, url: &str, width: u16, height: u16) -> String
         out.push('\n');
     }
     out
+}
+
+fn status_color(s: talus_bench_core::gates::GateStatus) -> Color {
+    use talus_bench_core::gates::GateStatus::*;
+    match s {
+        Pass => GOOD,
+        Warn | NotRun | NotSupported => WARN,
+        Fail => BAD,
+    }
+}
+
+fn draw_bench(f: &mut Frame, area: Rect, app: &App) {
+    let b = &app.bench;
+    let spec = app.served_id().and_then(talus_presets::model);
+    let name = spec
+        .map(|m| m.name.to_string())
+        .or_else(|| app.snapshot.as_ref().map(|s| s.model.clone()))
+        .unwrap_or_else(|| "(not connected)".into());
+    let control = app.control_enabled();
+    let [top, mid, bottom] = Layout::vertical([
+        Constraint::Length(6),
+        Constraint::Length(4),
+        Constraint::Min(4),
+    ])
+    .areas(area);
+
+    let cand = if control && spec.is_some() {
+        format!(
+            "Balanced (reference) vs {} (candidate)",
+            b.level_for(spec).label()
+        )
+    } else {
+        "served settings twice (read-only server: repeatability check)".to_string()
+    };
+    let lines = vec![
+        kv("Model", vec![Span::styled(name, Style::new().bold())]),
+        kv(
+            "Compare",
+            vec![
+                Span::raw(cand),
+                Span::styled("   l to change", Style::new().fg(DIM)),
+            ],
+        ),
+        kv(
+            "Tasks",
+            vec![Span::raw(
+                "json_schema 20 + gsm8k 20 per setting · temperature 0 · paired by case",
+            )],
+        ),
+        kv(
+            "Gates",
+            vec![Span::raw(
+                "accuracy loss (paired bootstrap CI) · JSON validity rate · min 20 cases",
+            )],
+        ),
+    ];
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(" Bench: quality smoke (talus-bench) ")),
+        top,
+    );
+
+    let block = Block::bordered().title(" Progress ");
+    let inner = block.inner(mid);
+    f.render_widget(block, mid);
+    let [pl, pg] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+    let phase = if b.running || !b.phase.is_empty() {
+        b.phase.clone()
+    } else {
+        "idle: press s to start".into()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            format!(" {phase}"),
+            Style::new().fg(if b.running { ACCENT } else { DIM }),
+        )])),
+        pl,
+    );
+    let ratio = if b.total > 0 {
+        (b.done as f64 / b.total as f64).min(1.0)
+    } else {
+        0.0
+    };
+    let label = if b.total > 0 {
+        format!(
+            "{} {}/{} · pass {} · fail {}",
+            b.model, b.done, b.total, b.passes, b.fails
+        )
+    } else {
+        String::new()
+    };
+    f.render_widget(
+        Gauge::default()
+            .ratio(ratio)
+            .label(label)
+            .gauge_style(Style::new().fg(ACCENT).bg(Color::Black)),
+        pg,
+    );
+
+    let mut out: Vec<Line> = Vec::new();
+    if let Some(e) = &b.error {
+        out.push(Line::from(Span::styled(
+            format!(" stopped: {e}"),
+            Style::new().fg(BAD),
+        )));
+    }
+    if let Some(r) = &b.result {
+        for v in &r.verdicts {
+            out.push(Line::from(vec![
+                Span::raw(format!(" {:<12}", v.candidate_id)),
+                Span::styled(
+                    format!("{:<14}", v.overall.as_str()),
+                    Style::new().fg(status_color(v.overall)).bold(),
+                ),
+                Span::raw(v.reasons.join("; ")),
+            ]));
+            for g in &v.gates {
+                let val = g
+                    .value
+                    .map(|x| format!("{x:.1}{}", talus_bench_core::gates::unit(&g.kind)))
+                    .unwrap_or_default();
+                let iv = g
+                    .interval
+                    .map(|i| format!(" [{:.1}, {:.1}]", i.lo, i.hi))
+                    .unwrap_or_default();
+                out.push(Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(
+                        format!("{:<14}", g.status.as_str()),
+                        Style::new().fg(status_color(g.status)),
+                    ),
+                    Span::raw(format!("{:<28} {val}{iv}  n={}", g.gate, g.n)),
+                ]));
+            }
+        }
+        out.push(Line::from(Span::styled(
+            format!(" report: {}", r.dir.join("report.md").display()),
+            Style::new().fg(DIM),
+        )));
+    }
+    let room = bottom.height.saturating_sub(2) as usize;
+    if out.len() < room {
+        let n = room - out.len();
+        let start = b.log.len().saturating_sub(n);
+        for l in b.log.iter().skip(start) {
+            out.push(Line::from(Span::styled(
+                format!(" {l}"),
+                Style::new().fg(DIM),
+            )));
+        }
+    }
+    let title = if b.result.is_some() {
+        " Result "
+    } else {
+        " Log "
+    };
+    f.render_widget(
+        Paragraph::new(out)
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered().title(title)),
+        bottom,
+    );
 }

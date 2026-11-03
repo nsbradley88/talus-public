@@ -12,7 +12,7 @@ cmake_minimum_required(VERSION 3.24)
 # release the fork is based on; TALUS_VERSION is the fork's own.  Internal names (strata:: namespaces, CMake targets)
 # stay Strata's so upstream merges stay cheap; the binaries are renamed at the end of this file.
 project(strata VERSION 0.1.44.1 LANGUAGES CXX)
-set(TALUS_VERSION 0.1.2)
+set(TALUS_VERSION 0.1.3)
 # EXPERIMENTAL: the Intel Arc engine, the SYCL port in sycl/ (PR #423; icpx + oneMKL, docs/INTEL_ARC.md). It is its
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
 option(STRATA_ENABLE_SYCL "EXPERIMENTAL: build the Intel Arc (SYCL) engine from sycl/ - docs/INTEL_ARC.md" OFF)
@@ -1764,6 +1764,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endif()
   if(STRATA_ENABLE_HIP AND _strata_has_gfx11)
     target_compile_definitions(talus_kernels PRIVATE STRATA_WMMA_GFX11=1)
+  endif()
+  # wave 1 item 1.10: the GDN prompt-scan kernels must not spill or outgrow one resident pass of their grid on gfx1151
+  # (hipfire's occupancy cliff). Reads the built library's gfx1151 code objects; SKIP (77) without llvm-readelf / gfx1151.
+  if(STRATA_ENABLE_HIP)
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+      enable_testing()
+      get_filename_component(_talus_llvm_bin "${CMAKE_HIP_COMPILER}" DIRECTORY)
+      add_test(NAME gdn_occupancy_check COMMAND ${CMAKE_COMMAND} -E env "PATH=${_talus_llvm_bin}:$ENV{PATH}"
+               ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_gdn_occupancy.py $<TARGET_FILE:talus_kernels>)
+      set_tests_properties(gdn_occupancy_check PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    endif()
   endif()
 
   set(_talus_kernels_whole_archive strata_kernels strata_prefill)

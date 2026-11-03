@@ -841,7 +841,7 @@ pub fn serve_main(
         .unwrap_or(0);
     let mut df_round_ctr: usize = 0;
     // confident-prefix verify of the DFlash drafts (talus_spec::ConfPrefix; TALUS_LAGUNA_DF_CONF /
-    // TALUS_DF_CONF for greedy, default 0.45 (0 = off); _S for sampled requests, off). Drafting only: greedy output never depends on it.
+    // TALUS_DF_CONF for greedy, default 0.45 (0 = off); _S for sampled requests, default 0.7). Drafting only: greedy output never depends on it.
     let conf_rule = talus_spec::ConfPrefix::from_env("LAGUNA");
     let p_df0_init: f64 = p_df0;
     let mut p_df_all = [[p_df0_init; DF_MAX_BLOCK - 1]; 2];

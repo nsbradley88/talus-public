@@ -1022,7 +1022,8 @@ pub fn talus_q36_kv8_quant(
 }
 
 /// decode / verify attention partials over the int8 copy (merge with `tk_q36_attn_merge`); `variant` 0 =
-/// exact codes in the WMMA operands, 1 = offset operands with per-row corrections (`TALUS_Q27_KV8_OFS=1`).
+/// the default reader, 1 = the offset-operand reader (`TALUS_Q27_KV8_OFS=1`), 2 = the earlier reader
+/// (bitwise 0; `TALUS_Q27_KV8_VAR=2`).
 #[allow(clippy::too_many_arguments)]
 pub fn talus_q36_attn_wmma_kv8(
     n_chunk: i32,

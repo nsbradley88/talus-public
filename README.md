@@ -8,23 +8,26 @@ serves each model through an OpenAI-compatible HTTP API.
 
 ## How fast is it?
 
-Tokens per second for Talus v0.1.2 on a Ryzen AI Max+ 395 desktop (GMKtec EVO-X2, 128 GB, about 120 W
-sustained), end to end through the HTTP server, each model in its shipped configuration. `code` is the coding-prompt
-mix, `pp32k` prompt processing and `tg32k` generation at about 32K tokens of context.
+Tokens per second for Talus v0.1.3 (its release candidate 1) on a Ryzen AI Max+ 395 desktop (GMKtec
+EVO-X2, 128 GB, about 120 W sustained), end to end through the HTTP server, each model in its shipped configuration.
+`chat` is the sampled chat mix, `code` the coding-prompt mix, `pp32k` prompt processing and `tg32k` generation at about
+32K tokens of context. In brackets: the change from the published v0.1.2 tarball, measured in the same session on the
+same desktop.
 
-| Model | code | pp32k | tg32k |
-|---|---|---|---|
-| Qwen3.8-27B | 67.8 | 545 | 36.2 |
-| Qwen3.8-Flash-Next | 73.8 | 1,486 | 65.6 |
-| GLM-5.3-Flash | 34.7 | 567 | 35.4 |
-| MiMo-V2.6-Flash | 49.1 | 661 | 42.3 |
-| Laguna-S-2.1 | 52.3 | 1,008 | 36.2 |
+| Model | chat | code | pp32k | tg32k |
+|---|---|---|---|---|
+| Qwen3.8-27B | 49.8 (−2.9 %) | 66.7 (−1.8 %) | 544 (−0.2 %) | 39.0 (+7.7 %) |
+| Qwen3.8-Flash-Next | 63.9 (+4.4 %) | 73.9 (+0.1 %) | 1,484 (+0.2 %) | 66.3 (+0.8 %) |
+| GLM-5.3-Flash | 34.1 (+0.3 %) | 34.7 (+0.3 %) | 567 (0.0 %) | 35.4 (0.0 %) |
+| MiMo-V2.6-Flash | 40.0 (+4.2 %) | 49.3 (0.0 %) | 664 (+0.3 %) | 42.5 (0.0 %) |
+| Laguna-S-2.1 | 44.2 (+16.3 %) | 54.6 (+4.4 %) | 1,009 (+0.4 %) | 36.7 (+1.4 %) |
 
 The quality gates (long-context recall, an agentic smoke test on five coding tasks, KL divergence against a reference, a 45-minute soak
 test) ran mostly on our 70 W laptop (HP ZBook Ultra G1a); [docs/RESULTS.md](docs/RESULTS.md) says where each ran. The
 two machines have the same chip but different power limits, so their figures are not comparable with each other.
 
-How much the 27B's shipped 4-bit weights give up against the full BF16 weights, on the same desktop:
+How much the 27B's shipped 4-bit weights give up against the full BF16 weights, measured with v0.1.2 on the same
+desktop (not re-measured for v0.1.3):
 
 | Weights | Size | KL code | top-1 code | code | pp32k | tg32k, no speculation |
 |---|---|---|---|---|---|---|
@@ -36,7 +39,7 @@ Lower KL and higher top-1 = closer to BF16. `code` is served with speculative de
 decode without it. Details, wiki text and all speed cells:
 [docs/RESULTS.md](docs/RESULTS.md#qwen38-27b-our-4-bit-weights-against-bf16).
 
-Against other engines, on the 70 W laptop with the v0.1.0 builds (not re-measured for v0.1.2):
+Against other engines, on the 70 W laptop with the v0.1.0 builds (not re-measured since):
 
 | Model | Engine | code | pp32k | tg32k |
 |---|---|---|---|---|
@@ -52,7 +55,7 @@ Against other engines, on the 70 W laptop with the v0.1.0 builds (not re-measure
 | Laguna-S-2.1 | **Talus v0.1.0** | 43.7 | 783 | 33.4 |
 | | llama.cpp (our patched build) | 44.6 | 514 | 30.4 |
 
-Full tables (chat, edit, 2K cells, time to first token, memory, the v0.1.1 figures on the same desktop, quality gates):
+Full tables (edit, 2K cells, time to first token, memory, the v0.1.2 figures from the same session, quality gates):
 [docs/RESULTS.md](docs/RESULTS.md). Every figure there names its machine and build. A model whose release run has not
 passed shows "pending". The comparison rows are our own patched build of llama.cpp ("halo4"), not stock llama.cpp, and
 other engines measured on the same laptop under stated conditions. How everything is measured:
@@ -73,7 +76,7 @@ In geology, talus is the slope of broken rock that collects at the foot of strat
 | OS | Linux with a ROCm SDK (see [Build](#build)) |
 
 We develop and measure on two machines with the same chip and 128 GB: an HP ZBook Ultra G1a laptop, whose firmware
-limits the APU to 70 W, and a GMKtec EVO-X2 desktop, which holds about 120 W. The v0.1.2 speed figures come from the
+limits the APU to 70 W, and a GMKtec EVO-X2 desktop, which holds about 120 W. The v0.1.3 speed figures come from the
 desktop and the quality gates from the laptop; every figure in [docs/RESULTS.md](docs/RESULTS.md) names its machine.
 Other Strix Halo machines may allow other power limits; we have not measured them.
 
@@ -114,13 +117,15 @@ Talus, and starts `talus setup`: pick models (Qwen3.8-27B is suggested for a fir
 
 To skip the compile, use the prebuilt programs of a [release](https://github.com/nsbradley88/talus-public/releases):
 each release has `talus-<tag>-linux-x86_64-gfx1151.tar.gz` with its `.sha256`, a build manifest and `SHA256SUMS`.
-`TALUS_RELEASE=<tag>` makes the installer download and check it instead of building:
+`TALUS_RELEASE=<tag>` makes the installer download and check it instead of building, and then it installs no
+compiler, CMake, Ninja or Rust (it needs only git, curl and Python 3):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nsbradley88/talus-public/main/install.sh | TALUS_RELEASE=<tag> bash
 ```
 
-The release notes show how to unpack the tarball by hand; [scripts/release/README.md](scripts/release/README.md)
+With `--yes` (no questions) the user service is installed only when you add `--service`; interactive installs still
+offer it. The release notes show how to unpack the tarball by hand; [scripts/release/README.md](scripts/release/README.md)
 describes its layout and how it is built.
 
 The manual steps follow.
@@ -215,10 +220,16 @@ and chat UIs connect to it directly.
 - **Thinking control:** `enable_thinking` and `reasoning_effort` through `chat_template_kwargs` or top-level fields,
   or Anthropic's `thinking` object.
 - **Prompt cache:** a new request reuses the longest cached prefix of an earlier conversation and reads only the rest.
-  The usage reports the reused tokens (`usage.prompt_tokens_details.cached_tokens`). A warm answer is identical to
-  the same request read cold (see "exact" in [docs/METHODOLOGY.md](docs/METHODOLOGY.md#exact-and-opt-in-numerics)).
+  The usage reports the reused tokens (`usage.prompt_tokens_details.cached_tokens`). A warm answer is normally
+  identical to the same request read cold (see "exact" in [docs/METHODOLOGY.md](docs/METHODOLOGY.md#exact-and-opt-in-numerics)).
+  Known exception: on Qwen3.8-27B, a prompt whose start comes from the cache can give different greedy text than the
+  same prompt read whole (both are valid; see the release notes' known issues).
 - **Auth:** `Authorization: Bearer <key>` or `x-api-key`, with the key from `TALUS_API_KEY` (or `STRATA_API_KEY`) or `--api-key`.
 - **Timings:** each response carries prompt and decode timings, as llama.cpp's server does.
+- **Text only:** the models are served as text models. A request with an image, audio or file content part
+  (`image_url`, `input_image`, `image`, `input_audio`, `file`, ...) gets HTTP 400 with the error code
+  `unsupported_content` (on `/v1/messages`, an Anthropic `invalid_request_error`), instead of an answer that ignores
+  the attachment.
 
 `talus-server` starts the engine (`talus-cli`) as a subprocess and talks to it over stdin/stdout; see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#serving).

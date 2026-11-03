@@ -1,6 +1,10 @@
 //! A fake talus-server for developing and testing the TUI without a GPU: it serves the same `/v1/talus/*` API with
 //! synthetic statistics (made-up numbers, roughly the right size per model) and simulates the restart on apply.
 //! Run it with `talus-tui fake-daemon [--port N]`.
+//!
+//! It also answers `/v1/chat/completions` for the Bench tab: talus-bench's own cases get the ground-truth answer
+//! (talus_bench_core::mock), except that at the Fast level a fixed fraction (`fast_wrong_rate`) is answered wrongly,
+//! so a smoke run shows a regression. Synthetic, for development only.
 
 use serde_json::{json, Map, Value};
 use std::collections::VecDeque;
@@ -27,6 +31,12 @@ pub struct FakeState {
     busy_until: Option<Instant>,
     rng: u64,
     pub restart_secs: f64,
+    /// Fraction of bench answers made wrong while the Fast level is selected.
+    pub fast_wrong_rate: f64,
+    /// Chat requests served (tests).
+    pub chats: u64,
+    /// Applies accepted (tests).
+    pub applies: u64,
 }
 
 impl FakeState {
@@ -47,6 +57,9 @@ impl FakeState {
             busy_until: None,
             rng: 0x9e37_79b9_7f4a_7c15,
             restart_secs: 3.0,
+            fast_wrong_rate: 0.25,
+            chats: 0,
+            applies: 0,
         }
     }
 
@@ -199,6 +212,28 @@ impl FakeState {
         })
     }
 
+    /// A chat completion (bench oracle; degraded at the Fast level).
+    pub fn chat(&mut self, body: &Value) -> (u16, Value) {
+        if self.restarting() {
+            return (503, json!({"error": {"message": "engine restarting"}}));
+        }
+        self.chats += 1;
+        let spec = talus_presets::model(self.model).expect("fake model in catalog");
+        let wrong = if spec.level_of(&self.selection) == Some(Level::Fast) {
+            self.fast_wrong_rate
+        } else {
+            0.0
+        };
+        talus_bench_core::mock::chat_reply(
+            body,
+            talus_bench_core::mock::Degrade {
+                wrong_rate: wrong,
+                error_rate: 0.0,
+                seed: 7,
+            },
+        )
+    }
+
     pub fn presets(&self) -> Value {
         let models: Vec<Value> = talus_presets::MODELS
             .iter()
@@ -277,6 +312,7 @@ impl FakeState {
             self.restart_secs
         };
         self.restart_until = Some(Instant::now() + Duration::from_secs_f64(secs));
+        self.applies += 1;
         self.pending = Some((spec.id, spec.normalize(&sel), bind));
         (
             202,
@@ -326,6 +362,11 @@ fn handle(mut stream: TcpStream, state: Arc<Mutex<FakeState>>) -> std::io::Resul
             ("GET", "/v1/talus/status") => (200, st.status()),
             ("GET", "/v1/talus/presets") => (200, st.presets()),
             ("POST", "/v1/talus/apply") => st.apply(&body),
+            ("POST", "/v1/chat/completions") => st.chat(&body),
+            ("GET", "/v1/models") => (
+                200,
+                json!({"object": "list", "data": [{"id": st.model, "object": "model"}]}),
+            ),
             _ => (404, json!({"error": {"message": "not found"}})),
         }
     };
@@ -424,5 +465,54 @@ mod tests {
         assert_eq!(v["control"]["selection"]["level"], "fast");
         assert_eq!(v["server"]["host"], "0.0.0.0");
         drop(state);
+    }
+
+    /// The Bench tab's smoke run end to end against the fake daemon: Balanced is applied, then Fast; Fast answers
+    /// a quarter of the cases wrongly, so the candidate fails the accuracy gate.
+    #[test]
+    fn bench_smoke_through_the_fake_daemon() {
+        let mut st = FakeState::new("mimo-v2.6-flash");
+        st.restart_secs = 0.05;
+        st.selection = talus_presets::model("mimo-v2.6-flash")
+            .unwrap()
+            .level_selection(Level::Fast); // start on Fast: the reference must be applied first
+        let (addr, state) = spawn(0, st).unwrap();
+        let url = format!("http://{addr}");
+        let b = crate::bench::BenchState::default();
+        let mut cfg = b.smoke_config(&url, Some("mimo-v2.6-flash"), true);
+        let dir = std::env::temp_dir().join(format!("talus-tui-bench-{}", std::process::id()));
+        cfg.experiment.output_dir = Some(dir.display().to_string());
+        let opts = talus_bench_core::runner::RunOptions {
+            poll_ms: Some(20),
+            ..Default::default()
+        };
+        let mut ui = crate::bench::BenchState::default();
+        let cancel = ui.start();
+        let mut events = Vec::new();
+        let res = talus_bench_core::runner::run(&cfg, &opts, cancel, &mut |e| events.push(e));
+        for e in events {
+            ui.on_event(e);
+        }
+        ui.on_done(res);
+        let r = ui.result.as_ref().expect("finished");
+        assert_eq!(r.verdicts[0].candidate_id, "fast");
+        assert_eq!(
+            r.verdicts[0].overall,
+            talus_bench_core::gates::GateStatus::Fail,
+            "{:#?}",
+            r.verdicts[0]
+        );
+        let st = state.lock().unwrap();
+        assert_eq!(st.applies, 2, "balanced, then fast");
+        assert_eq!(st.chats, 80, "40 cases per setting");
+        assert_eq!(st.model, "mimo-v2.6-flash");
+        drop(st);
+        assert!(dir.join("report.md").is_file());
+        let manifest = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
+        assert!(
+            manifest.contains("\"level\": \"fast\""),
+            "selection fingerprinted"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

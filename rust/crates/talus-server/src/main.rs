@@ -30,6 +30,11 @@ fn main() {
         if !cfg.mock_scripts.is_empty() {
             engine.set_scripts(cfg.mock_scripts);
         }
+        // E1/E2 protocol tests: advertise `INFO logprobs=1 score=1` and serve mock values
+        if std::env::var("TALUS_MOCK_LOGPROBS").is_ok_and(|v| v == "1") {
+            engine.set_logprobs_support(true);
+            engine.set_score_support(true);
+        }
         let stdin = io::stdin();
         let stdout = io::stdout();
         if let Err(e) = engine.run_stdio_loop(stdin.lock(), stdout.lock()) {

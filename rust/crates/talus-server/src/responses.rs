@@ -418,8 +418,10 @@ pub fn input_messages(req: &JsonValue) -> Result<Vec<JsonValue>, ResponsesError>
                 let text = match out_val {
                     None | Some(JsonValue::Null) => String::new(),
                     Some(JsonValue::Str(s)) => s.clone(),
-                    Some(JsonValue::Array(_)) => text_of_content(out_val)
-                        .map_err(|e| ResponsesError::invalid(e, Some("input"), None))?,
+                    Some(JsonValue::Array(_)) => text_of_content(out_val).map_err(|e| {
+                        let code = crate::frontend::content_err_code(&e);
+                        ResponsesError::invalid(e, Some("input"), code)
+                    })?,
                     Some(other) => other.to_json_string(),
                 };
                 rest.push(JsonValue::obj(vec![
@@ -446,8 +448,10 @@ pub fn input_messages(req: &JsonValue) -> Result<Vec<JsonValue>, ResponsesError>
                 if role != "assistant" || !pending_calls.is_empty() {
                     flush_pending(&mut rest, &mut pending_reasoning, &mut pending_calls);
                 }
-                let text = text_of_content(item.get("content"))
-                    .map_err(|e| ResponsesError::invalid(e, Some("input"), None))?;
+                let text = text_of_content(item.get("content")).map_err(|e| {
+                    let code = crate::frontend::content_err_code(&e);
+                    ResponsesError::invalid(e, Some("input"), code)
+                })?;
                 if role == "system" || role == "developer" {
                     if !text.trim().is_empty() {
                         if rest.is_empty() {

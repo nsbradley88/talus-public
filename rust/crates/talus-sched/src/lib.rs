@@ -321,6 +321,10 @@ pub struct GenCommand {
     pub ignore_eos: bool,
     pub use_cache: bool,
     pub prompt_ids: Vec<i32>,
+    /// E1 (opt-in, `logprobs=K`): emit `L <lp> <k> <id>:<lp>,...` before each `T` line; None = off.
+    pub logprobs: Option<usize>,
+    /// E6: compact JSON Schema to constrain the output to (GEN key `json_schema=`, %-encoded); `None` = off.
+    pub json_schema: Option<String>,
 }
 
 impl Default for GenCommand {
@@ -339,6 +343,8 @@ impl Default for GenCommand {
             ignore_eos: false,
             use_cache: true,
             prompt_ids: Vec::new(),
+            logprobs: None,
+            json_schema: None,
         }
     }
 }
@@ -461,6 +467,26 @@ fn parse_c_f32(v: &str) -> f32 {
     }
 }
 
+/// Undoes the %-encoding of a GEN key value (talus-server `gen_value_encode`): `%XX` -> byte, the rest verbatim.
+pub fn gen_value_decode(v: &str) -> String {
+    let b = v.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = |c: u8| (c as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Parses a `GEN <max_new> [key=value ...] <id,id,...>` line, matching `q36_engine.cu:2656–2692`.
 pub fn parse_gen_line(line: &str) -> Result<GenCommand, String> {
     let line = line.trim_end_matches(['\r', '\n']);
@@ -510,6 +536,11 @@ pub fn parse_gen_line(line: &str) -> Result<GenCommand, String> {
             "seed" => cmd.seed = parse_c_u64(v),
             "ignore_eos" => cmd.ignore_eos = v.eq_ignore_ascii_case("true") || parse_c_i32(v) != 0,
             "cache" => cmd.use_cache = v.eq_ignore_ascii_case("true") || parse_c_i32(v) != 0,
+            "logprobs" => {
+                cmd.logprobs =
+                    Some(parse_c_i32(v).clamp(0, talus_spec::logprobs::MAX_TOP_K as i32) as usize)
+            }
+            "json_schema" => cmd.json_schema = Some(gen_value_decode(v)),
             _ => {}
         }
     }
@@ -607,6 +638,88 @@ pub trait EngineProtocolBackend {
         stop: &CancelToken,
         out: &mut dyn std::io::Write,
     ) -> std::io::Result<()>;
+
+    /// E1: honours `GEN ... logprobs=K` (advertised as `INFO logprobs=1` before `READY`).
+    fn supports_logprobs(&self) -> bool {
+        false
+    }
+
+    /// E2: implements `SCORE` (advertised as `INFO score=1`).
+    fn supports_score(&self) -> bool {
+        false
+    }
+
+    /// E2: teacher-forced scoring of `cont` after `prompt` (validated: non-empty, in the vocabulary, within the
+    /// context): one `S <id> <lp> <rank> <entropy> <k> <id>:<lp>,...` line per continuation token, then `DONE`.
+    fn handle_score(
+        &mut self,
+        _top_k: usize,
+        _prompt: &[i32],
+        _cont: &[i32],
+        _stop: &CancelToken,
+        out: &mut dyn std::io::Write,
+    ) -> std::io::Result<()> {
+        writeln!(out, "ERR unknown command")?;
+        out.flush()
+    }
+}
+
+/// `INFO logprobs=1 score=1` for a backend that supports E1 / E2 (nothing otherwise).
+pub fn write_capability_info(
+    backend: &dyn EngineProtocolBackend,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
+    let (lp, sc) = (backend.supports_logprobs(), backend.supports_score());
+    if lp || sc {
+        writeln!(out, "INFO logprobs={} score={}", u8::from(lp), u8::from(sc))?;
+    }
+    Ok(())
+}
+
+/// Validate and run a `SCORE` line (E2). Returns false when `line` is not a SCORE command.
+fn dispatch_score(
+    backend: &mut dyn EngineProtocolBackend,
+    line: &str,
+    ctx: i32,
+    n_vocab: i32,
+    stop: &CancelToken,
+    out: &mut dyn Write,
+) -> Option<std::io::Result<()>> {
+    if !line.starts_with("SCORE ") {
+        return None;
+    }
+    let r = (|| -> std::io::Result<()> {
+        if !backend.supports_score() {
+            writeln!(out, "ERR unknown command")?;
+            return out.flush();
+        }
+        let (k, prompt, cont) = match talus_spec::logprobs::parse_score_line(line) {
+            Ok(v) => v,
+            Err(e) => {
+                writeln!(out, "{e}")?;
+                return out.flush();
+            }
+        };
+        if (prompt.len() + cont.len()) as i64 > ctx as i64 {
+            writeln!(
+                out,
+                "ERR prompt ({}) + continuation ({}) exceeds the context ({ctx})",
+                prompt.len(),
+                cont.len()
+            )?;
+            return out.flush();
+        }
+        if prompt
+            .iter()
+            .chain(cont.iter())
+            .any(|&t| t < 0 || t >= n_vocab)
+        {
+            writeln!(out, "ERR a token id is outside the vocabulary")?;
+            return out.flush();
+        }
+        backend.handle_score(k, &prompt, &cont, stop, out)
+    })();
+    Some(r)
 }
 
 /// Runs the stdio engine protocol loop over arbitrary `reader` and `out` streams.
@@ -625,6 +738,7 @@ pub fn serve_stdio_with_io(
 ) -> std::io::Result<i32> {
     let ctx = backend.max_context();
     let n_vocab = backend.n_vocab();
+    write_capability_info(backend, out)?;
     write_ready_line(out, ctx)?;
 
     let stop = CancelToken::new();
@@ -650,6 +764,11 @@ pub fn serve_stdio_with_io(
 
         while let Some(line) = queue.pop_line() {
             if line.is_empty() {
+                continue;
+            }
+            if let Some(r) = dispatch_score(backend, &line, ctx, n_vocab, &stop, out) {
+                queue.complete_request();
+                r?;
                 continue;
             }
             let cmd = match parse_gen_line(&line) {
@@ -700,7 +819,9 @@ pub fn serve_stdio(backend: &mut dyn EngineProtocolBackend) -> i32 {
     let ctx = backend.max_context();
     let n_vocab = backend.n_vocab();
     let mut stdout = std::io::stdout();
-    if write_ready_line(&mut stdout, ctx).is_err() {
+    if write_capability_info(backend, &mut stdout).is_err()
+        || write_ready_line(&mut stdout, ctx).is_err()
+    {
         return 1;
     }
 
@@ -727,6 +848,13 @@ pub fn serve_stdio(backend: &mut dyn EngineProtocolBackend) -> i32 {
 
     while let Some(line) = queue.pop_line() {
         if line.is_empty() {
+            continue;
+        }
+        if let Some(r) = dispatch_score(backend, &line, ctx, n_vocab, &stop, &mut stdout) {
+            queue.complete_request();
+            if r.is_err() {
+                return 1;
+            }
             continue;
         }
         let cmd = match parse_gen_line(&line) {
@@ -1041,6 +1169,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_gen_line_json_schema_key() {
+        let cmd =
+            parse_gen_line("GEN 8 cache=1 json_schema={\"enum\":[\"a%20b\",\"100%25\"]} 1,2,3")
+                .unwrap();
+        assert_eq!(
+            cmd.json_schema.as_deref(),
+            Some(r#"{"enum":["a b","100%"]}"#)
+        );
+        assert_eq!(cmd.prompt_ids, vec![1, 2, 3]);
+        assert!(cmd.use_cache);
+        assert_eq!(parse_gen_line("GEN 8 1,2").unwrap().json_schema, None);
+        assert_eq!(gen_value_decode("%zz%4"), "%zz%4");
+    }
+
+    #[test]
     fn parse_gen_line_errors() {
         assert_eq!(
             parse_gen_line("HELLO 10 1,2,3"),
@@ -1086,6 +1229,28 @@ GEN 2 cache=1 1,2,3,50,51,4,5\n";
         assert_eq!(lines[7], "T 50");
         assert_eq!(lines[8], "T 51");
         assert_eq!(lines[9], "DONE 2 7 12.0 25.0 length 0 0 5 0 0 0 0 0.0 2 0");
+    }
+
+    #[test]
+    fn logprobs_key_and_score_without_support() {
+        let cmd = parse_gen_line("GEN 4 temperature=0 logprobs=5 1,2,3").unwrap();
+        assert_eq!(cmd.logprobs, Some(5));
+        assert_eq!(cmd.prompt_ids, vec![1, 2, 3]);
+        assert_eq!(parse_gen_line("GEN 4 1,2").unwrap().logprobs, None);
+        assert_eq!(
+            parse_gen_line("GEN 4 logprobs=999 1").unwrap().logprobs,
+            Some(64)
+        );
+        // a backend without E1/E2 advertises nothing and answers SCORE with ERR (talus-server: 501)
+        let mut backend = ScriptedProtocolBackend::new(1024, 248320).with_tokens(vec![50]);
+        let input = "SCORE 3 1,2|3,4\nGEN 1 cache=0 1,2,3\n";
+        let mut out = Vec::new();
+        serve_stdio_with_io(&mut backend, Cursor::new(input.as_bytes()), &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "READY 1024 stop");
+        assert_eq!(lines[1], "ERR unknown command");
+        assert!(lines.contains(&"T 50"));
     }
 
     #[test]

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "Talus pipeline-parallel clustering: framing, TCP stage link, build identity (talus#47)"
+description = "Talus pipeline-parallel clustering: framing, stage link over a transport (TCP), build identity (talus#47)"
 
 [dependencies]
 libc = "0.2"

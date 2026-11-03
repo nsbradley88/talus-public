@@ -26,19 +26,56 @@ pub const KV8_CELL_BYTES: usize = 2 * KV8_HD + 2 * KV8_GROUPS * 2;
 /// Format version (must equal `talus_q36_kv8_version()` of the kernel library).
 pub const KV8_VERSION: i32 = 1;
 
-/// `TALUS_Q27_KV8=1` (default off): decode / verify attention reads the int8 copy.
-pub fn kv8_requested() -> bool {
-    std::env::var("TALUS_Q27_KV8")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("q8"))
-        .unwrap_or(false)
+/// `TALUS_Q27_KV8`: decode / verify attention reads the int8 copy. Default ON for the gated model,
+/// the dense quantized 27B (`gated_default`); opt-in (`=1`) for MoE and 16-bit (BF16 / F16 reference) weights. `0` /
+/// `off` turns it off: decode / verify read the f16 cells, bit for bit the pre-int8 path.
+pub fn kv8_requested(gated_default: bool) -> bool {
+    match std::env::var("TALUS_Q27_KV8") {
+        Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("f16")),
+        Err(_) => gated_default,
+    }
+}
+
+/// The model the int8 KV default was gated on: dense (no experts) with quantized FFN weights (not the BF16 / F16
+/// reference path).
+pub fn kv8_default_model(model: &super::weights::Q36Model) -> bool {
+    model.dense
+        && !model
+            .layers
+            .iter()
+            .any(|l| super::w16::is_w16_type(l.ffn_down.qtype as i32))
+}
+
+/// Whether the int8 copy will be allocated for `model` (env + default + head dim / kernel version).
+pub fn kv8_on(model: &super::weights::Q36Model) -> bool {
+    kv8_requested(kv8_default_model(model))
+        && model.g.head_dim as usize == KV8_HD
+        && super::ffi::talus_q36_kv8_version() == KV8_VERSION
 }
 
 /// `TALUS_Q27_KV8_OFS=1`: the reader variant with offset operands and per-row corrections (fewer VALU ops; numerics
 /// differ from variant 0 at rounding level).  0 = exact codes (default).
+/// `TALUS_Q27_KV8_VAR=N` picks a reader directly (see `talus_q36_attn_wmma_kv8`): 0 = the prefetching reader
+/// (default), 1 = the rd-kv27 OFS reader, 2 = the rd-kv27 reader (bitwise 0; A/B).  It overrides `TALUS_Q27_KV8_OFS`.
 pub fn kv8_variant() -> i32 {
+    if let Some(v) = std::env::var("TALUS_Q27_KV8_VAR")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|v| (0..=KV8_MAX_VARIANT).contains(v))
+    {
+        return v;
+    }
     std::env::var("TALUS_Q27_KV8_OFS")
         .map(|v| i32::from(v == "1"))
         .unwrap_or(0)
+}
+
+/// The highest reader variant the kernel library takes.
+pub const KV8_MAX_VARIANT: i32 = 2;
+
+/// Variants whose rows are bitwise variant 0's (same per-row arithmetic).
+pub fn kv8_variant_exact(v: i32) -> bool {
+    matches!(v, 0 | 2)
 }
 
 // ------------------------------------------------------------------------------------------------ fp16 helpers

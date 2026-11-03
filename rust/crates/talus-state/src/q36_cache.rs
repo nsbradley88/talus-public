@@ -53,6 +53,52 @@ pub struct Q36LayerStateView {
 unsafe impl Send for Q36LayerStateView {}
 unsafe impl Sync for Q36LayerStateView {}
 
+/// talus#47: a view that carries only a stage's KV shape (for [`q36_kv_bytes`] accounting): `na` attention states, `nv`
+/// of them with the std-layout V copy, `dfl` = (DFlash2 KV rings, keep rows, kv_dim) on the drafter's stage. The
+/// pointers are dangling non-null markers; never copy through this view.
+pub fn q36_shape_view(
+    na: usize,
+    nv: usize,
+    n_head_kv: i32,
+    head_dim: i32,
+    dfl: (usize, i32, i32),
+) -> Q36LayerStateView {
+    let nn = ptr::NonNull::<u8>::dangling().as_ptr().cast::<c_void>();
+    let nf = ptr::NonNull::<f32>::dangling().as_ptr();
+    Q36LayerStateView {
+        ssm_d_conv: 0,
+        ssm_conv_channels: 0,
+        ssm_v_heads: 0,
+        ssm_state_size: 0,
+        n_head_kv,
+        head_dim,
+        n_embd: 0,
+        ctx: 0,
+        vt_ctx: 0,
+        has_mtp: false,
+        conv: Vec::new(),
+        s: Vec::new(),
+        kc: vec![nn; na],
+        vc: (0..na)
+            .map(|i| if i < nv { nn } else { ptr::null_mut() })
+            .collect(),
+        vtc: vec![nn; na],
+        hlast: ptr::null_mut(),
+        gctl: ptr::null_mut(),
+        gdn_pending: 0,
+        pos: 0,
+        st: ptr::null_mut(),
+        dfl_k_ring: vec![nf; dfl.0],
+        dfl_v_ring: vec![nf; dfl.0],
+        dfl_ring: 0,
+        dfl_keep: dfl.1,
+        dfl_kv_dim: dfl.2,
+        dfl_block: 0,
+        dctx_lo: 0,
+        dctx_hi: 0,
+    }
+}
+
 /// Total recurrent state bytes for [`Q36LayerStateView`] (`q36_engine.cu:2034-2042`).
 pub fn q36_state_bytes(eng: &Q36LayerStateView) -> usize {
     let cb = ((eng.ssm_d_conv - 1).max(0) as usize) * (eng.ssm_conv_channels.max(0) as usize) * 4;
@@ -643,6 +689,8 @@ pub struct Q36Stash {
     pub bytes: usize,
     pub used: u64,
     pub pf: usize,
+    /// bytes charged to the stash budget: `bytes`, plus the other stages' share in a cluster stage (talus#47)
+    pub charge: usize,
 }
 
 unsafe impl Send for Q36Stash {}
@@ -659,6 +707,10 @@ pub struct Q36PromptCache {
     pub max_snaps: usize,
     pub max_msg: usize,
     pub clock: u64,
+    /// talus#47 cluster stage: the KV shape of the other stage(s). The stash budget is then charged with the whole
+    /// model's bytes on every stage, so each stage's cache takes the same store/evict decisions as one process would
+    /// (a stage's own bytes differ). None outside a cluster: unchanged.
+    pub acct_peer: Option<Q36LayerStateView>,
 }
 
 impl Default for Q36PromptCache {
@@ -678,7 +730,15 @@ impl Q36PromptCache {
             max_snaps: DEFAULT_MAX_SNAPS,
             max_msg: DEFAULT_MAX_MSG,
             clock: 0,
+            acct_peer: None,
         }
+    }
+
+    /// The other stages' KV bytes for `n` positions (0 outside a cluster).
+    fn peer_kv_bytes(&self, n: usize) -> usize {
+        self.acct_peer
+            .as_ref()
+            .map_or(0, |p| q36_kv_bytes(p, n as i32, 0))
     }
 
     fn lcp(a: &[i32], b: &[i32]) -> usize {
@@ -756,10 +816,11 @@ impl Q36PromptCache {
             }
         }
         let need = q36_kv_bytes(eng, live.len() as i32, 0);
-        if need == 0 || need > self.stash_budget {
+        let charge = need + self.peer_kv_bytes(live.len());
+        if need == 0 || charge > self.stash_budget {
             return;
         }
-        while self.stash_used + need > self.stash_budget && !self.stashes.is_empty() {
+        while self.stash_used + charge > self.stash_budget && !self.stashes.is_empty() {
             let old = self
                 .stashes
                 .iter()
@@ -771,7 +832,7 @@ impl Q36PromptCache {
             unsafe {
                 let _ = hipFree(removed.buf.cast::<c_void>());
             }
-            self.stash_used = self.stash_used.saturating_sub(removed.bytes);
+            self.stash_used = self.stash_used.saturating_sub(removed.charge);
         }
         let mut raw: *mut c_void = ptr::null_mut();
         if unsafe { hipMalloc(&mut raw, need) }.is_success() {
@@ -784,15 +845,16 @@ impl Q36PromptCache {
                     unsafe {
                         let _ = hipFree(removed.buf.cast::<c_void>());
                     }
-                    self.stash_used = self.stash_used.saturating_sub(removed.bytes);
+                    self.stash_used = self.stash_used.saturating_sub(removed.charge);
                 }
             }
-            self.stash_used += need;
+            self.stash_used += charge;
             self.clock += 1;
             self.stashes.push(Q36Stash {
                 ids: live.to_vec(),
                 buf,
                 bytes: need,
+                charge,
                 used: self.clock,
                 pf: pf.min(live.len()),
             });
@@ -908,7 +970,8 @@ impl Q36PromptCache {
         host: &[u8],
     ) -> bool {
         let need = q36_kv_bytes(eng, ids.len() as i32, 0);
-        if need == 0 || host.len() != need || need > self.stash_budget {
+        let charge = need + self.peer_kv_bytes(ids.len());
+        if need == 0 || host.len() != need || charge > self.stash_budget {
             return false;
         }
         if let Some(i) = self.stashes.iter().position(|s| s.ids.as_slice() == ids) {
@@ -916,9 +979,9 @@ impl Q36PromptCache {
             unsafe {
                 let _ = hipFree(removed.buf.cast::<c_void>());
             }
-            self.stash_used = self.stash_used.saturating_sub(removed.bytes);
+            self.stash_used = self.stash_used.saturating_sub(removed.charge);
         }
-        while self.stash_used + need > self.stash_budget && !self.stashes.is_empty() {
+        while self.stash_used + charge > self.stash_budget && !self.stashes.is_empty() {
             let old = self
                 .stashes
                 .iter()
@@ -930,7 +993,7 @@ impl Q36PromptCache {
             unsafe {
                 let _ = hipFree(removed.buf.cast::<c_void>());
             }
-            self.stash_used = self.stash_used.saturating_sub(removed.bytes);
+            self.stash_used = self.stash_used.saturating_sub(removed.charge);
         }
         let mut raw: *mut c_void = ptr::null_mut();
         if !unsafe { hipMalloc(&mut raw, need) }.is_success() {
@@ -943,12 +1006,13 @@ impl Q36PromptCache {
             }
             return false;
         }
-        self.stash_used += need;
+        self.stash_used += charge;
         self.clock += 1;
         self.stashes.push(Q36Stash {
             ids: ids.to_vec(),
             buf,
             bytes: need,
+            charge,
             used: self.clock,
             pf: pf.min(ids.len()),
         });

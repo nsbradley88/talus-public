@@ -4,6 +4,7 @@
 //! engine; the TUI itself never touches the GPU.
 
 pub mod app;
+pub mod bench;
 pub mod client;
 pub mod fake;
 pub mod settings;

@@ -18,7 +18,8 @@
 //!   TALUS_<MODEL>_DF_CONF / TALUS_DF_CONF        greedy threshold on the running product (0 = off; unset = the
 //!                                                model's default: MIMO 0.6, LAGUNA 0.45 - greedy output unchanged,
 //!                                                faster code; other models off)
-//!   TALUS_<MODEL>_DF_CONF_S / TALUS_DF_CONF_S    sampled threshold (unset / 0 = off)
+//!   TALUS_<MODEL>_DF_CONF_S / TALUS_DF_CONF_S    sampled threshold (0 = off; unset = the model's default: MIMO 0.6,
+//!                                                LAGUNA 0.7)
 //!   TALUS_DF_CONF_DMIN                           drafts always verified (default 1)
 //!   TALUS_DF_CONF_TRACE=1                        compute the tops and log one `dfconf` line per DFlash round to stderr
 //!                                                (with the thresholds off: calibration data, output and timing of
@@ -62,6 +63,17 @@ pub fn default_greedy_threshold(model: &str) -> f32 {
     }
 }
 
+/// Default sampled threshold per model when no variable is set (interleaved A/B on the sampled chat mix: faster chat and
+/// higher draft acceptance; exact in distribution, per-seed bytes differ from the uncut rounds; needle and agentic
+/// smoke test gates pass).
+pub fn default_sampled_threshold(model: &str) -> f32 {
+    match model.to_ascii_uppercase().as_str() {
+        "MIMO" => 0.6,
+        "LAGUNA" => 0.7,
+        _ => 0.0,
+    }
+}
+
 impl ConfPrefix {
     /// The rule from the environment for `model` (`"MIMO"`, `"LAGUNA"`).
     pub fn from_env(model: &str) -> Self {
@@ -82,7 +94,8 @@ impl ConfPrefix {
             thr: [
                 g.unwrap_or_else(|| default_greedy_threshold(&m))
                     .clamp(0.0, 1.0),
-                s.unwrap_or(0.0).clamp(0.0, 1.0),
+                s.unwrap_or_else(|| default_sampled_threshold(&m))
+                    .clamp(0.0, 1.0),
             ],
             dmin,
             trace,

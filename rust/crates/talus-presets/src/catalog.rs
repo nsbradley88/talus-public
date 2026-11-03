@@ -161,7 +161,7 @@ const Q27_W4: [Choice; 2] = [
     },
 ];
 const Q27_W4FAST: [Choice; 2] = opt_in(&[Edit::Env("TALUS_Q27_W4I", "fast")]);
-const Q27_KV8: [Choice; 2] = opt_in(&[Edit::Env("TALUS_Q27_KV8", "1")]);
+const Q27_KV8: [Choice; 2] = toggle(&[Edit::Env("TALUS_Q27_KV8", "0")]);
 
 const Q27_OPTIONS: &[TuneOption] = &[
     TuneOption {
@@ -275,12 +275,12 @@ const Q27_OPTIONS: &[TuneOption] = &[
     TuneOption {
         id: "kv8",
         label: "8-bit KV cache for replies",
-        description: "Replies read an 8-bit copy of the attention cache: about half the attention bytes, faster at long context.",
-        tradeoff: "Not yet through our quality gates; slightly changes replies. Uses about a third more KV memory. Off by default.",
-        switch: "TALUS_Q27_KV8=1",
+        description: "Replies read an 8-bit copy of the attention cache: about half the attention bytes, 6-10% faster verify rounds at 32-64K.",
+        tradeoff: "Passed every quality gate; slightly changes replies. Keeps the 16-bit cache for prompts too, so about 2.2 GiB more memory at 64K.",
+        switch: "TALUS_Q27_KV8=0 turns it off",
         group: Group::Accuracy,
-        quality: Quality::Reduced,
-        default: OFF,
+        quality: Quality::Gated,
+        default: ON,
         choices: &Q27_KV8,
         requires: None,
     },

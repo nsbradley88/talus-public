@@ -3,7 +3,7 @@
 //! Names, licenses, memory floors and the trade-off text of each option come from `talus_presets::MODELS` (the
 //! catalog the TUI and the server use). This file adds only what the catalog does not have: the files to download
 //! (Hugging Face repository, path, size, SHA-256, exactly as docs/MODELS.md lists them), how well each model fits
-//! next to a desktop session (docs/MODELS.md "System setup") and a one-line speed headline (`SPEED_SOURCE`: the v0.1.2 run;
+//! next to a desktop session (docs/MODELS.md "System setup") and a one-line speed headline (`SPEED_SOURCE`: the v0.1.3 run;
 //! memory figures: docs/RESULTS.md, release `RELEASE`).
 //!
 //! The SHA-256 values are the ones Hugging Face publishes for each file (the LFS object id), and for our own
@@ -14,9 +14,9 @@ use talus_presets::ModelSpec;
 
 /// The release the memory figures come from.
 pub const RELEASE: &str = "43c94474";
-/// Where the speed headlines (`chat_tps`, `prompt_tps`) come from: v0.1.2 measured on rc1 through the shipped talus-server.
+/// Where the speed headlines (`chat_tps`, `prompt_tps`) come from: v0.1.3 measured on rc1 through the shipped talus-server.
 pub const SPEED_SOURCE: &str =
-    "v0.1.2 on a GMKtec EVO-X2 desktop (Ryzen AI Max+ 395, 128 GB, about 120 W)";
+    "v0.1.3 on a GMKtec EVO-X2 desktop (Ryzen AI Max+ 395, 128 GB, about 120 W)";
 /// The ROCm SDK the release was built and measured with: the repository's `rocm.version` file, which install.sh
 /// reads too (one place to re-pin).
 pub const ROCM_VERSION_FILE: &str = include_str!("../../../../rocm.version");
@@ -287,8 +287,8 @@ pub const MODELS: &[ModelInstall] = &[
         release_free_gib: 41,
         auto_context_gib: 12,
         auto_pack_gib: 13,
-        chat_tps: 51.3,
-        prompt_tps: 599.0,
+        chat_tps: 49.8,
+        prompt_tps: 595.0,
         context: "256K",
     },
     ModelInstall {
@@ -325,8 +325,8 @@ pub const MODELS: &[ModelInstall] = &[
         release_free_gib: 51,
         auto_context_gib: 0,
         auto_pack_gib: 0,
-        chat_tps: 62.2,
-        prompt_tps: 1093.0,
+        chat_tps: 63.9,
+        prompt_tps: 1102.0,
         context: "256K",
     },
     ModelInstall {
@@ -377,7 +377,7 @@ pub const MODELS: &[ModelInstall] = &[
         auto_context_gib: 0,
         auto_pack_gib: 0,
         chat_tps: 34.1,
-        prompt_tps: 564.0,
+        prompt_tps: 561.0,
         context: "64K",
     },
     ModelInstall {
@@ -427,8 +427,8 @@ pub const MODELS: &[ModelInstall] = &[
         release_free_gib: 14,
         auto_context_gib: 0,
         auto_pack_gib: 0,
-        chat_tps: 38.1,
-        prompt_tps: 739.0,
+        chat_tps: 40.0,
+        prompt_tps: 734.0,
         context: "192K",
     },
     ModelInstall {
@@ -478,8 +478,8 @@ pub const MODELS: &[ModelInstall] = &[
         release_free_gib: 38,
         auto_context_gib: 0,
         auto_pack_gib: 0,
-        chat_tps: 37.4,
-        prompt_tps: 1164.0,
+        chat_tps: 44.2,
+        prompt_tps: 1154.0,
         context: "256K",
     },
 ];

@@ -1,15 +1,16 @@
-//! A persistent TCP connection between two stages: `TCP_NODELAY`, 4 MiB socket buffers, `TCP_QUICKACK` after each
-//! receive. One message = header + payload parts written with one vectored write sequence.
+//! A persistent connection between two stages. One message = a 64 B header + payload parts (+ an optional CRC32C
+//! tail), written with one vectored write sequence. The bytes move over a [`Transport`]: TCP today
+//! ([`TcpTransport`]: `TCP_NODELAY`, 4 MiB socket buffers, `TCP_QUICKACK` after each receive, optional busy-poll).
 
-use std::io::{self, IoSlice, Read, Write};
+use std::io::{self, IoSlice};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 use crate::frame::{crc32c, crc32c_update, Header, MsgType, FLAG_CRC, HDR_BYTES};
+use crate::transport::{Closer, TcpTransport, Transport};
 
 pub struct Link {
-    s: TcpStream,
+    t: Box<dyn Transport>,
     crc: bool,
     pub peer: String,
     pub sent_msgs: u64,
@@ -17,34 +18,28 @@ pub struct Link {
     pub recv_bytes: u64,
 }
 
-fn setopt(fd: i32, level: i32, name: i32, val: i32) {
-    unsafe {
-        let _ = libc::setsockopt(
-            fd,
-            level,
-            name,
-            (&val as *const i32).cast::<libc::c_void>(),
-            std::mem::size_of::<i32>() as libc::socklen_t,
-        );
-    }
-}
-
 impl Link {
-    pub fn from_stream(s: TcpStream) -> io::Result<Self> {
-        s.set_nodelay(true)?;
-        let fd = s.as_raw_fd();
-        setopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, 4 << 20);
-        setopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, 4 << 20);
-        setopt(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, 1);
-        let peer = s.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-        Ok(Self {
-            s,
+    /// A link over any transport.
+    pub fn with_transport(t: Box<dyn Transport>) -> Self {
+        let peer = t.peer();
+        Self {
+            t,
             crc: crate::crc_enabled(),
             peer,
             sent_msgs: 0,
             sent_bytes: 0,
             recv_bytes: 0,
-        })
+        }
+    }
+
+    /// A TCP link (the default data plane).
+    pub fn from_stream(s: TcpStream) -> io::Result<Self> {
+        Ok(Self::with_transport(Box::new(TcpTransport::new(s)?)))
+    }
+
+    /// The transport's name (`tcp`, ...).
+    pub fn kind(&self) -> &'static str {
+        self.t.kind()
     }
 
     /// Connect to `addr`, retrying until `wait` elapses (the worker may still be loading its weights).
@@ -75,8 +70,13 @@ impl Link {
         Self::from_stream(s)
     }
 
+    /// A handle that closes the link from another thread (the heartbeat, the worker's session teardown).
+    pub fn closer(&self) -> io::Result<Closer> {
+        self.t.closer()
+    }
+
     pub fn set_read_timeout(&self, t: Option<Duration>) -> io::Result<()> {
-        self.s.set_read_timeout(t)
+        self.t.set_read_timeout(t)
     }
 
     /// Send one message; `hdr.payload_len` and the CRC flag are set here from `parts`.
@@ -104,7 +104,7 @@ impl Link {
         if self.crc {
             sl.push(IoSlice::new(&tail));
         }
-        write_all_vectored(&mut self.s, &mut sl)?;
+        self.t.write_all_vectored(&mut sl)?;
         self.sent_msgs += 1;
         self.sent_bytes += HDR_BYTES as u64 + n;
         Ok(())
@@ -116,8 +116,8 @@ impl Link {
 
     pub fn recv_header(&mut self) -> io::Result<Header> {
         let mut b = [0u8; HDR_BYTES];
-        self.s.read_exact(&mut b)?;
-        setopt(self.s.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_QUICKACK, 1);
+        self.t.read_exact(&mut b)?;
+        self.t.after_recv();
         Header::decode(&b).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
@@ -135,10 +135,10 @@ impl Link {
                 format!("payload {n} B exceeds the receive buffer ({} B)", buf.len()),
             ));
         }
-        self.s.read_exact(&mut buf[..n])?;
+        self.t.read_exact(&mut buf[..n])?;
         if h.flags & FLAG_CRC != 0 {
             let mut t = [0u8; 4];
-            self.s.read_exact(&mut t)?;
+            self.t.read_exact(&mut t)?;
             if u32::from_le_bytes(t) != crc32c(&buf[..n]) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -146,7 +146,7 @@ impl Link {
                 ));
             }
         }
-        setopt(self.s.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_QUICKACK, 1);
+        self.t.after_recv();
         self.recv_bytes += h.payload_len + HDR_BYTES as u64;
         Ok(n)
     }
@@ -173,18 +173,6 @@ impl Link {
             )),
         }
     }
-}
-
-fn write_all_vectored(s: &mut TcpStream, bufs: &mut [IoSlice<'_>]) -> io::Result<()> {
-    let mut bufs: &mut [IoSlice<'_>] = bufs;
-    while !bufs.is_empty() {
-        let n = s.write_vectored(bufs)?;
-        if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::WriteZero, "link closed"));
-        }
-        IoSlice::advance_slices(&mut bufs, n);
-    }
-    Ok(())
 }
 
 #[cfg(test)]

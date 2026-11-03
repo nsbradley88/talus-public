@@ -521,7 +521,7 @@ pub fn serve_main(engine: &mut MimoEngine) -> Result<()> {
         let fast = sp.greedy_plain();
         let use_dflash = engine.use_dflash();
         // confident-prefix verify of the DFlash drafts (talus_spec::ConfPrefix; TALUS_MIMO_DF_CONF /
-        // TALUS_DF_CONF for greedy, default 0.6 (0 = off); _S for sampled requests, off)
+        // TALUS_DF_CONF for greedy, default 0.6 (0 = off); _S for sampled requests, default 0.6)
         let conf_rule = talus_spec::ConfPrefix::from_env("MIMO");
         let env_sampled_cap = std::env::var("TALUS_MIMO_SPEC_SAMPLED").ok();
         let draft_max = effective_request_draft_max(

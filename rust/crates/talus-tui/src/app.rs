@@ -1,6 +1,7 @@
 //! TUI state and key handling. No terminal or network here: the runner feeds in status replies and key presses,
 //! and carries out the `Action`s this returns, so all of it is unit-testable.
 
+use crate::bench::BenchState;
 use crate::settings::Settings;
 use crate::stats::Snapshot;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -15,16 +16,23 @@ pub enum Screen {
     Status,
     Models,
     Tuning,
+    Bench,
 }
 
 impl Screen {
-    pub const ALL: [Screen; 3] = [Screen::Status, Screen::Models, Screen::Tuning];
+    pub const ALL: [Screen; 4] = [
+        Screen::Status,
+        Screen::Models,
+        Screen::Tuning,
+        Screen::Bench,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
             Screen::Status => "Status",
             Screen::Models => "Models",
             Screen::Tuning => "Tuning",
+            Screen::Bench => "Bench",
         }
     }
 }
@@ -52,6 +60,11 @@ pub enum Modal {
         title: String,
         lines: Vec<String>,
     },
+    /// Start a talus-bench smoke run with this config?
+    ConfirmBench {
+        lines: Vec<String>,
+        cfg: Box<talus_bench_core::config::Config>,
+    },
     Help,
 }
 
@@ -66,6 +79,8 @@ pub enum Action {
         body: Value,
         new_key: Option<String>,
     },
+    /// Run this talus-bench config on a worker thread; feed its events to `App::bench`.
+    StartBench(Box<talus_bench_core::config::Config>),
 }
 
 pub struct App {
@@ -95,6 +110,7 @@ pub struct App {
     pub restart_model: Option<String>,
     /// The server was seen restarting or down since the apply.
     restart_seen_down: bool,
+    pub bench: BenchState,
 }
 
 impl App {
@@ -120,6 +136,7 @@ impl App {
             restarting_since: None,
             restart_model: None,
             restart_seen_down: false,
+            bench: BenchState::default(),
         }
     }
 
@@ -628,6 +645,18 @@ impl App {
                     }
                 };
             }
+            Modal::ConfirmBench { lines, cfg } => {
+                return match k.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                        Action::StartBench(cfg)
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Action::None,
+                    _ => {
+                        self.modal = Modal::ConfirmBench { lines, cfg };
+                        Action::None
+                    }
+                };
+            }
             Modal::Message { .. } | Modal::Help => return Action::None,
             Modal::None => {}
         }
@@ -641,6 +670,7 @@ impl App {
             KeyCode::Char('1') => self.screen = Screen::Status,
             KeyCode::Char('2') => self.screen = Screen::Models,
             KeyCode::Char('3') => self.screen = Screen::Tuning,
+            KeyCode::Char('4') => self.screen = Screen::Bench,
             KeyCode::Tab => self.screen = next_screen(self.screen, 1),
             KeyCode::BackTab => self.screen = next_screen(self.screen, -1),
             KeyCode::F(5) | KeyCode::Char('g') => return Action::Refresh,
@@ -648,9 +678,85 @@ impl App {
                 Screen::Status => {}
                 Screen::Models => self.models_key(k.code),
                 Screen::Tuning => self.tuning_key(k.code),
+                Screen::Bench => self.bench_key(k.code),
             },
         }
         Action::None
+    }
+
+    fn served_spec(&self) -> Option<&'static ModelSpec> {
+        self.served_id().and_then(talus_presets::model)
+    }
+
+    fn bench_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('s') | KeyCode::Enter => self.prepare_bench(),
+            KeyCode::Char('l') | KeyCode::Left | KeyCode::Right if !self.bench.running => {
+                let spec = self.served_spec();
+                self.bench.cycle_level(spec)
+            }
+            KeyCode::Char('c') => self.bench.request_cancel(),
+            _ => {}
+        }
+    }
+
+    /// Build the confirmation for a smoke run, or say why not.
+    pub fn prepare_bench(&mut self) {
+        if self.bench.running {
+            self.notice = Some("A bench run is already going (c cancels it).".into());
+            return;
+        }
+        let Some(snap) = self.snapshot.as_ref() else {
+            self.message(
+                "Not connected",
+                vec!["The server is not answering yet.".into()],
+            );
+            return;
+        };
+        if snap.state == "restarting" || !snap.loaded {
+            self.message(
+                "Server busy",
+                vec!["Wait until the model is loaded.".into()],
+            );
+            return;
+        }
+        let control = snap.control_enabled;
+        let preset = snap.preset.clone();
+        let spec = self.served_spec();
+        let cfg = self
+            .bench
+            .smoke_config(&self.settings.server, preset.as_deref(), control);
+        let level = self.bench.level_for(spec);
+        let name = spec
+            .map(|m| m.name.to_string())
+            .unwrap_or_else(|| snap.model.clone());
+        let mut lines = vec![format!(
+            "Quality smoke on {name}: json_schema (20) + gsm8k (20) per setting, temperature 0."
+        )];
+        if control && spec.is_some() {
+            lines.push(format!(
+                "Reference: Balanced   Candidate: {}",
+                level.label()
+            ));
+            lines.push(
+                "Each setting is applied through the control endpoint: the engine restarts".into(),
+            );
+            lines.push(
+                "twice and the server ends on the candidate setting. Other clients wait.".into(),
+            );
+        } else {
+            lines.push(
+                "Read-only server: the served settings run twice (a repeatability check).".into(),
+            );
+        }
+        lines.push(format!(
+            "Artifacts: {}",
+            cfg.experiment.output_dir.clone().unwrap_or_default()
+        ));
+        self.modal = Modal::ConfirmBench {
+            lines,
+            cfg: Box::new(cfg),
+        };
     }
 
     fn models_key(&mut self, code: KeyCode) {
@@ -690,7 +796,7 @@ impl App {
 
 fn next_screen(s: Screen, d: i32) -> Screen {
     let i = Screen::ALL.iter().position(|&x| x == s).unwrap_or(0) as i32;
-    Screen::ALL[((i + d).rem_euclid(3)) as usize]
+    Screen::ALL[((i + d).rem_euclid(Screen::ALL.len() as i32)) as usize]
 }
 
 #[cfg(test)]
@@ -954,5 +1060,52 @@ mod tests {
         assert_eq!(a.on_key(key(KeyCode::Char('q'))), Action::Quit);
         assert_eq!(a.on_key(key(KeyCode::Tab)), Action::None);
         assert_eq!(a.screen, Screen::Models);
+    }
+
+    #[test]
+    fn bench_tab_flow() {
+        let mut a = app_on("mimo-v2.6-flash");
+        a.on_key(key(KeyCode::Char('4')));
+        assert_eq!(a.screen, Screen::Bench);
+        a.on_key(key(KeyCode::Char('s')));
+        let Modal::ConfirmBench { lines, cfg } = a.modal.clone() else {
+            panic!("{:?}", a.modal)
+        };
+        assert!(
+            lines.iter().any(|l| l.contains("Candidate: Fast")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            cfg.candidates[0].talus.as_ref().unwrap().level.as_deref(),
+            Some("fast")
+        );
+        assert!(matches!(
+            a.on_key(key(KeyCode::Char('y'))),
+            Action::StartBench(_)
+        ));
+        // l switches the candidate level while idle
+        a.on_key(key(KeyCode::Char('l')));
+        a.on_key(key(KeyCode::Char('s')));
+        assert!(
+            matches!(&a.modal, Modal::ConfirmBench { lines, .. } if lines.iter().any(|l| l.contains("Candidate: Reference")))
+        );
+        a.modal = Modal::None;
+        // while running: no second run, c cancels
+        let cancel = a.bench.start();
+        a.on_key(key(KeyCode::Char('s')));
+        assert_eq!(a.modal, Modal::None);
+        assert!(a.notice.as_deref().unwrap().contains("already"));
+        a.on_key(key(KeyCode::Char('c')));
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+        // read-only server: repeatability check, no apply
+        let mut b = App::new(Settings::default());
+        b.on_status(Ok(snap("mimo-v2.6-flash", false)));
+        b.screen = Screen::Bench;
+        b.on_key(key(KeyCode::Char('s')));
+        let Modal::ConfirmBench { lines, cfg } = b.modal.clone() else {
+            panic!("{:?}", b.modal)
+        };
+        assert!(lines.iter().any(|l| l.contains("Read-only")));
+        assert!(cfg.reference.talus.is_none());
     }
 }

@@ -3473,10 +3473,180 @@ __device__ __forceinline__ void group_rows_pass(const MmvqItem& it, const typena
     __syncthreads();
 }
 
+// ---- grouped experts, v2 pass (Q4_K / Q5_K; default on, STRATA_EGROUP_V2=0 = group_rows_pass above) ----
+// group_rows_pass re-loads every column's q8_1 slice once per row block (16 row blocks per block) and walks kbx with a
+// run-time trip count: at n >= 32 (2-6 columns per expert) the kernel waits on VMEM (rocprof: SQ_WAIT_CNT_VMVS 4x the
+// v2 pass) and the experts ran at ~155 GB/s. Here a lane's activation slice (its kqs at its KI kbx values, the same for
+// every row it touches) is loaded ONCE per pass into registers, and the KI x ROWS weight loads of a row block are
+// issued together as raw words (compile-time KI, fully unrolled), then decoded and applied. Same tpr, kbx order,
+// decode, impl expression, warp_sum and partial order as batch_body: every column is bitwise the row-block-major
+// kernel's (and the 1-column decode kernel's) result. Bench: higher bandwidth at n 64; Laguna verify(64) experts faster.
+template<typename F> struct GxTraits;
+template<> struct GxTraits<Q4KTraits> {
+    using Block = Q4KBlock;
+    struct R { int q0, q1; uint32_t s0, s2, s4; half2 dm; };
+    struct X { int u[4]; float d8[2]; };
+    __device__ static R raw(const Block* __restrict__ b, int iqs) {
+        R r;
+        const int bq8_offset = 2 * ((iqs / 2) / 4);
+        const int* ql = reinterpret_cast<const int*>(b->qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+        r.q0 = ql[0];
+        r.q1 = ql[4];
+        const uint16_t* scales = reinterpret_cast<const uint16_t*>(b->scales);
+        const int jm = (bq8_offset / 2) & 1;
+        r.s0 = scales[jm];
+        r.s2 = scales[jm + 2];
+        r.s4 = scales[jm + 4];
+        r.dm = b->dm;
+        return r;
+    }
+    __device__ static X act(const Q81Block* __restrict__ bq8, int iqs) {   // = Q4KTraits::apply's activation loads
+        X x;
+        const int bq8_offset = 2 * ((iqs / 2) / 4);
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const Q81Block* bq8i = bq8 + bq8_offset + i;
+            x.d8[i] = __low2float(bq8i->ds);
+            const int* q8 = reinterpret_cast<const int*>(bq8i->qs) + ((iqs / 2) % 4);
+            x.u[2 * i] = q8[0];
+            x.u[2 * i + 1] = q8[4];
+        }
+        return x;
+    }
+    struct W { int v[2]; uint16_t aux[2]; half2 dm; };
+    __device__ static W decode(const R& r, int iqs) {   // = Q4KTraits::load's scale unpacking
+        W w;
+        const int j = (2 * ((iqs / 2) / 4)) / 2;
+        const uint32_t hi = uint32_t(-int32_t(j >= 2));
+        w.v[0] = r.q0;
+        w.v[1] = r.q1;
+        w.aux[0] = uint16_t(((r.s0 & 0x3f3f) & ~hi) | ((((r.s4 >> 0) & 0x0f0f) | ((r.s0 & 0xc0c0) >> 2)) & hi));
+        w.aux[1] = uint16_t(((r.s2 & 0x3f3f) & ~hi) | ((((r.s4 >> 4) & 0x0f0f) | ((r.s2 & 0xc0c0) >> 2)) & hi));
+        w.dm = r.dm;
+        return w;
+    }
+    __device__ static float apply(const W& w, const X& x) {
+        const uint8_t* sc = reinterpret_cast<const uint8_t*>(w.aux);
+        return q4_q8_dot_impl(w.v, x.u, sc, sc + 2, w.dm, x.d8);
+    }
+};
+template<> struct GxTraits<Q5KTraits> {
+    using Block = Q5KBlock;
+    struct R { int l0, l1, h0, h1; uint32_t s0, s2, s4; half2 dm; };
+    using X = GxTraits<Q4KTraits>::X;
+    __device__ static R raw(const Block* __restrict__ b, int iqs) {
+        R r;
+        const int bq8_offset = 2 * ((iqs / 2) / 4);
+        const int* ql = reinterpret_cast<const int*>(b->qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+        const int* qh = reinterpret_cast<const int*>(b->qh + 4 * ((iqs / 2) % 4));
+        r.l0 = ql[0];
+        r.l1 = ql[4];
+        r.h0 = qh[0];
+        r.h1 = qh[4];
+        const uint16_t* scales = reinterpret_cast<const uint16_t*>(b->scales);
+        const int jm = (bq8_offset / 2) & 1;
+        r.s0 = scales[jm];
+        r.s2 = scales[jm + 2];
+        r.s4 = scales[jm + 4];
+        r.dm = b->dm;
+        return r;
+    }
+    __device__ static X act(const Q81Block* __restrict__ bq8, int iqs) { return GxTraits<Q4KTraits>::act(bq8, iqs); }
+    struct W { int vl[2], vh[2]; uint16_t aux[2]; half2 dm; };
+    __device__ static W decode(const R& r, int iqs) {   // = Q5KTraits::load
+        W w;
+        const int bq8_offset = 2 * ((iqs / 2) / 4);
+        const int j = bq8_offset / 2;
+        const uint32_t hi = uint32_t(-int32_t(j >= 2));
+        w.vl[0] = r.l0;
+        w.vl[1] = r.l1;
+        w.vh[0] = r.h0 >> bq8_offset;
+        w.vh[1] = r.h1 >> bq8_offset;
+        w.aux[0] = uint16_t(((r.s0 & 0x3f3f) & ~hi) | ((((r.s4 >> 0) & 0x0f0f) | ((r.s0 & 0xc0c0) >> 2)) & hi));
+        w.aux[1] = uint16_t(((r.s2 & 0x3f3f) & ~hi) | ((((r.s4 >> 4) & 0x0f0f) | ((r.s2 & 0xc0c0) >> 2)) & hi));
+        w.dm = r.dm;
+        return w;
+    }
+    __device__ static float apply(const W& w, const X& x) {
+        const uint8_t* sc = reinterpret_cast<const uint8_t*>(w.aux);
+        return q5_q8_dot_impl(w.vl, w.vh, x.u, sc, sc + 2, w.dm, x.d8);
+    }
+};
+
+template<typename F, int NC, int KI>
+__device__ __forceinline__ void group_rows_pass_v2(const MmvqItem& it, const typename F::Block* __restrict__ w,
+                                                   int rb0, int rb1, int tpr, float* partial, const int* cols, int c0,
+                                                   int nc) {
+    using G = GxTraits<F>;
+    constexpr int ROWS = 2;
+    const int n_in = it.n_in, n_out = it.n_out;
+    const int xs = n_in / Q8K;
+    const int xg = it.x_group > 0 ? it.x_group : 1;
+    const Q81Block* xb = static_cast<const Q81Block*>(it.x);
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int sub = tid / tpr, ltid = tid % tpr;
+    const int groups = (WARPS * WARP) / tpr;
+    const int blocks_per_row = n_in / F::DIV;
+    const int bpi = tpr / F::T;
+    const int wpg = tpr / WARP;
+    const int kqs = F::kqs(ltid);
+    const int kb0 = ltid / F::T;   // this lane's kbx values: kb0 + j * bpi, j < KI (= blocks_per_row / bpi)
+    typename G::X x[NC][KI];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const Q81Block* xc = xb + (it.x_per_id ? (cols[c0 + min(c, nc - 1)] / xg) * xs : 0);
+#pragma unroll
+        for (int j = 0; j < KI; ++j) x[c][j] = G::act(xc + (kb0 + j * bpi) * F::KBY, kqs);
+    }
+    auto load_rb = [&](int rb, typename G::R (&r)[KI][ROWS]) {
+        const int row0 = ROWS * (rb * groups + sub);
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            const int row = min(row0 + i, n_out - 1);   // past n_out: a valid row, its sum is never stored
+#pragma unroll
+            for (int j = 0; j < KI; ++j) r[j][i] = G::raw(w + std::size_t(row) * blocks_per_row + kb0 + j * bpi, kqs);
+        }
+    };
+    for (int rb = rb0; rb < rb1; ++rb) {
+        typename G::R cur[KI][ROWS];
+        load_rb(rb, cur);
+        float tmp[NC][ROWS] = {};
+#pragma unroll
+        for (int j = 0; j < KI; ++j)
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+                const typename G::W wv = G::decode(cur[j][i], kqs);
+#pragma unroll
+                for (int c = 0; c < NC; ++c)
+                    if (c < nc) tmp[c][i] += G::apply(wv, x[c][j]);
+            }
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < nc)
+#pragma unroll
+                for (int i = 0; i < ROWS; ++i) {
+                    const float v = warp_sum(tmp[c][i]);
+                    if (threadIdx.x == 0) partial[(((rb - rb0) * WARPS + threadIdx.y) * NC + c) * ROWS + i] = v;
+                }
+    }
+    __syncthreads();
+    const int nrb = rb1 - rb0;
+    const int per_rb = groups * nc * ROWS;
+    for (int idx = tid; idx < nrb * per_rb; idx += WARPS * WARP) {
+        const int rbl = idx / per_rb, r = idx % per_rb;
+        const int g = r / (nc * ROWS), c = (r / ROWS) % nc, i = r % ROWS;
+        const int row = ROWS * ((rb0 + rbl) * groups + g) + i;
+        float v = 0.0f;
+        for (int wv = 0; wv < wpg; ++wv) v += partial[((rbl * WARPS + g * wpg + wv) * NC + c) * ROWS + i];
+        if (row < n_out) it.y[std::size_t(cols[c0 + c]) * n_out + row] = v;
+    }
+    __syncthreads();
+}
+
 // block (slot u, chunk) takes the u-th DISTINCT expert of the id list (a presence bitmap of the ids, then the
 // u-th set bit), so the grid needs only min(n_ids, n_experts) slots per chunk instead of n_ids (n 64: 256 slots, ~8%
 // empty, against 640 slots, 63% empty). n_experts = 0 (unknown): the slot is the first-occurrence test of ids[u].
-template<typename F, int NC>
+template<typename F, int NC, int KI = 0>   // KI > 0 = group_rows_pass_v2 with KI kbx per lane
 __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_mmvq_group_kernel(const GroupArgs a) {
     __shared__ float partial[kGroupRpbMax * WARPS * NC * 2];
@@ -3529,7 +3699,12 @@ __global__ void native_mmvq_group_kernel(const GroupArgs a) {
     const int rb0 = chunk * a.rpb[i], rb1 = min(rb0 + a.rpb[i], a.rblocks[i]);
     const auto* w = reinterpret_cast<const typename F::Block*>(static_cast<const uint8_t*>(it.w) +
                                                                std::size_t(e) * it.expert_bytes);
-    for (int c0 = 0; c0 < m; c0 += NC) group_rows_pass<F, NC>(it, w, rb0, rb1, a.tpr[i], partial, cols, c0, min(m - c0, NC));
+    if constexpr (KI > 0) {
+        for (int c0 = 0; c0 < m; c0 += NC)
+            group_rows_pass_v2<F, NC, KI>(it, w, rb0, rb1, a.tpr[i], partial, cols, c0, min(m - c0, NC));
+    } else {
+        for (int c0 = 0; c0 < m; c0 += NC) group_rows_pass<F, NC>(it, w, rb0, rb1, a.tpr[i], partial, cols, c0, min(m - c0, NC));
+    }
 }
 }  // namespace
 
@@ -3642,6 +3817,37 @@ void native_mmvq_batch(const MmvqItem* items, int n_items, void* stream) {
                 }
                 g.start[g.n] = blocks;
                 const auto st = static_cast<cudaStream_t>(stream);
+                // Q4_K / Q5_K through group_rows_pass_v2 when every item has the same kbx count per lane
+                // (KI = blocks per row / blocks per iteration, 1..3). STRATA_EGROUP_V2=0: the pass above (kill switch).
+                // STRATA_EGROUP_V2_NC: columns per v2 pass (2 / 4 / 8; default 4 for KI >= 2, 8 for KI = 1); every
+                // choice is bitwise the same.
+                static const bool v2_on = [] { const char* e = std::getenv("STRATA_EGROUP_V2"); return !(e && e[0] == '0'); }();
+                static const int v2_nc = [] { const char* e = std::getenv("STRATA_EGROUP_V2_NC"); return e ? std::atoi(e) : 0; }();
+                int ki = 0;
+                if (v2_on && (type == 12 || type == 13)) {
+                    for (int j = 0; j < g.n; ++j) {
+                        const int bpi = g.tpr[j] / (type == 12 ? Q4KTraits::T : Q5KTraits::T);
+                        const int bpr = g.it[j].n_in / 256;
+                        const int kj = bpi > 0 && bpr % bpi == 0 ? bpr / bpi : 0;
+                        if (j == 0) ki = kj; else if (kj != ki) ki = 0;
+                    }
+                    if (ki > 3) ki = 0;
+                }
+                if (ki > 0) {
+                    const int nc2 = v2_nc == 2 || v2_nc == 4 || v2_nc == 8 ? v2_nc : (ki == 1 ? 8 : 4);
+#define STRATA_GROUP_V2(F, K) \
+                    if (nc2 == 8) native_mmvq_group_kernel<F, 8, K><<<unsigned(blocks), dim3(WARP, WARPS), 0, st>>>(g); \
+                    else if (nc2 == 2) native_mmvq_group_kernel<F, 2, K><<<unsigned(blocks), dim3(WARP, WARPS), 0, st>>>(g); \
+                    else native_mmvq_group_kernel<F, 4, K><<<unsigned(blocks), dim3(WARP, WARPS), 0, st>>>(g);
+#define STRATA_GROUP_V2_T(F) \
+                    switch (ki) { case 1: STRATA_GROUP_V2(F, 1) break; case 2: STRATA_GROUP_V2(F, 2) break; \
+                                  default: STRATA_GROUP_V2(F, 3) break; }
+                    if (type == 12) { STRATA_GROUP_V2_T(Q4KTraits) } else { STRATA_GROUP_V2_T(Q5KTraits) }
+#undef STRATA_GROUP_V2_T
+#undef STRATA_GROUP_V2
+                    launch_check();
+                    continue;
+                }
 #define STRATA_GROUP_LAUNCH(F) \
                 if (nc_env == 2) native_mmvq_group_kernel<F, 2><<<unsigned(blocks), dim3(WARP, WARPS), 0, st>>>(g); \
                 else if (nc_env == 8) native_mmvq_group_kernel<F, 8><<<unsigned(blocks), dim3(WARP, WARPS), 0, st>>>(g); \

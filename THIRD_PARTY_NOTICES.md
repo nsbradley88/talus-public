@@ -129,7 +129,118 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+The talus-bench quality validator embeds the first 50 rows of the GSM8K test split
+(`rust/crates/talus-bench-core/data/gsm8k/test-slice50.jsonl`, from
+[openai/grade-school-math](https://github.com/openai/grade-school-math) commit `3101c7d5`, sha256 pinned in
+`datasets.rs`) under the MIT License; the full split is fetched on demand and not redistributed.
+
+talus-bench also embeds, each with its sha256 pinned in `datasets.rs`:
+
+- `data/ifeval/ifeval-supported.jsonl`: 387 of the 541 prompts of [google/IFEval](https://huggingface.co/datasets/google/IFEval)
+  (revision `966cd895`), licensed under the Apache License, Version 2.0
+  (http://www.apache.org/licenses/LICENSE-2.0). Modified: filtered to the instruction types whose rules are
+  reimplemented, re-serialized with sorted keys.
+- `data/bfcl/bfcl-v3-smoke.jsonl`: 120 rows of the
+  [Berkeley Function Calling Leaderboard](https://huggingface.co/datasets/gorilla-llm/Berkeley-Function-Calling-Leaderboard)
+  v3 (revision `61fc0608`; simple, multiple, parallel, irrelevance), licensed under the Apache License, Version 2.0.
+  Modified: question, functions and possible answers combined per row, categories interleaved. The full files
+  are fetched on demand and not redistributed.
+- `data/mmlu_pro/`: 280 test rows (20 per category) and the 70 validation rows of
+  [TIGER-Lab/MMLU-Pro](https://huggingface.co/datasets/TIGER-Lab/MMLU-Pro) (revision `b189ec76`), MIT License per
+  the dataset card. Modified: converted from parquet to JSON lines.
+
+The scoring rules of IFEval (google-research `instruction_following_eval`, Apache-2.0), the BFCL AST checker
+(ShishirPatil/gorilla, Apache-2.0) and MMLU-Pro's answer extraction (TIGER-AI-Lab/MMLU-Pro, Apache-2.0) are
+reimplemented in Rust from those projects' published rules; no third-party evaluation code is included.
+
+```text
+MIT License
+
+Copyright (c) 2021 OpenAI
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+The talus-bench task `swebench_verified` (`rust/crates/talus-bench-core/src/swe/harness.rs`) translates to Rust the
+evaluation rules of the SWE-bench harness ([SWE-bench/SWE-bench](https://github.com/SWE-bench/SWE-bench), package
+`swebench` 5.0.2): the Python log parsers, log extraction and grading, the eval-script exit-code hook and the
+patch-apply sequence. No SWE-bench data is included in this repository: the instance list is fetched at run time
+from the Hugging Face dataset `SWE-bench/SWE-bench_Verified` into a local cache, and the evaluation images and the
+target repositories (each under its own license) are pulled into the local docker store, never committed.
+
+```text
+MIT License
+
+Copyright (c) 2023 Carlos E Jimenez, John Yang, Alexander Wettig, Shunyu Yao, Kexin Pei, Ofir Press, Karthik R Narasimhan
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ---
+
+The `swebench_verified` task's optional `mini` agent harness runs the upstream
+[mini-SWE-agent](https://github.com/SWE-agent/mini-swe-agent) (package `mini-swe-agent` 2.4.6, by Kilian A. Lieret
+and Carlos E. Jimenez): its `DefaultAgent`, `LocalEnvironment`, `LitellmModel` and `config/benchmarks/swebench.yaml`,
+unmodified. It is not vendored: the operator builds a pinned, self-contained bundle outside the repository (Python
+3.12 + `mini-swe-agent==2.4.6` and its dependencies, e.g. litellm, resolved with `--exclude-newer 2026-10-14`), which
+is bind-mounted read-only into the agent container. talus-bench adds only a small runner script
+(`rust/crates/talus-bench-core/src/swe/runtime.rs`, `MINI_RUN_PY`) that points the model at the local endpoint.
+
+```text
+MIT License
+
+Copyright (c) 2025 Kilian A. Lieret and Carlos E. Jimenez
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
 
 ## 6. gufo (design idea only)
 

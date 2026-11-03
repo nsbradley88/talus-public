@@ -69,12 +69,17 @@ pub struct ServiceState {
     pub last_activity_ms: AtomicU64,
     /// talus-tui control endpoint state (`/v1/talus/*`).
     pub control: crate::control::ControlState,
+    /// `build` in `/v1/talus/status` (bench extension E3).
+    pub fingerprint: Arc<crate::fingerprint::Fingerprint>,
+    /// `energy` in `/v1/talus/status` (bench extension E5).
+    pub energy: Arc<crate::energy::EnergyMeter>,
 }
 
 impl ServiceState {
     pub fn new(config: ServerConfig, engine: Arc<dyn Engine>, tokenizer: ByteTokenizer) -> Self {
         let literal_tags = talus_text::literal_tags(tokenizer.control_tokens());
         let control = crate::control::ControlState::new(config.control_dir.clone());
+        let fingerprint = Arc::new(crate::fingerprint::Fingerprint::new(&config));
         Self {
             config,
             engine,
@@ -91,6 +96,8 @@ impl ServiceState {
             started_unix: unix_timestamp_secs(),
             last_activity_ms: AtomicU64::new(0),
             control,
+            fingerprint,
+            energy: Arc::new(crate::energy::EnergyMeter::new()),
         }
     }
 
@@ -1261,7 +1268,12 @@ fn handle_get(
         }
         "/config" => write_json(stream, 200, &state.config.raw_config, &[]),
         p if p.starts_with("/v1/talus/") => {
-            let (code, body) = crate::control::handle_get(p, state);
+            let peer_is_local = stream
+                .peer_addr()
+                .map(|a| a.ip().is_loopback())
+                .unwrap_or(false);
+            let (code, body) =
+                crate::control::handle_get_query(p, &req.query, state, peer_is_local);
             write_json(stream, code, &body, &[])
         }
         p if p.starts_with("/v1/responses/") => {
@@ -1393,6 +1405,16 @@ fn handle_post(
 
     if req.path.starts_with("/slots/") {
         return handle_slot_action(stream, req, &json_body, state);
+    }
+
+    if req.path == "/v1/talus/score" {
+        // E2 (talus-bench): teacher-forced scoring, see logprobs.rs
+        let peer_is_local = stream
+            .peer_addr()
+            .map(|a| a.ip().is_loopback())
+            .unwrap_or(false);
+        let (code, body) = crate::logprobs::handle_score(&json_body, state, peer_is_local);
+        return write_json(stream, code, &body, &[]);
     }
 
     if req.path.starts_with("/v1/talus/") {
@@ -1971,6 +1993,13 @@ impl<'a> RequestTracker<'a> {
     }
 }
 
+impl ServiceState {
+    /// E2 scoring counts as one running request (no decode metrics are recorded for it).
+    pub(crate) fn begin_score_request(&self, prompt_tokens: usize) -> impl Drop + '_ {
+        RequestTracker::begin(self, prompt_tokens)
+    }
+}
+
 impl Drop for RequestTracker<'_> {
     fn drop(&mut self) {
         self.state.running_requests.fetch_sub(1, Ordering::SeqCst);
@@ -1987,10 +2016,16 @@ fn handle_llama_completion(
         Ok(v) => v,
         Err(e) => return send_post_error(stream, "/completion", 400, &e, Some("prompt"), None),
     };
-    let (sampling, stops) = match parse_sampling_from_req(req, &state.config.sampling) {
+    let (mut sampling, stops) = match parse_sampling_from_req(req, &state.config.sampling) {
         Ok(v) => v,
         Err(e) => return send_post_error(stream, "/completion", 400, &e, None, None),
     };
+    sampling.logprobs = match crate::logprobs::parse_request(req, false, state) {
+        Ok(k) => k,
+        Err(e) => return send_post_error(stream, "/completion", 400, &e, Some("logprobs"), None),
+    };
+    let want_lp = sampling.logprobs.is_some();
+    let mut lp_entries: Vec<JsonValue> = Vec::new();
     let ctx = state.reported_ctx();
     if ids.len() >= ctx {
         return send_post_error(
@@ -2037,10 +2072,18 @@ fn handle_llama_completion(
         let mut content = String::new();
         let mut stopped_by_word = false;
 
-        let res = state.engine.generate(
+        let res = state.engine.generate_with_logprobs(
             &gen_req,
             cancel.clone(),
-            &mut |tok_id| {
+            &mut |tok_id, lp| {
+                if let Some(lp) = lp {
+                    lp_entries.push(crate::logprobs::entry_json(
+                        &state.tokenizer,
+                        tok_id,
+                        &lp,
+                        "content",
+                    ));
+                }
                 out_tokens.push(tok_id);
                 tracker.on_token(out_tokens.len());
                 let piece = detok.push(tok_id);
@@ -2101,6 +2144,13 @@ fn handle_llama_completion(
             ("stop_type", JsonValue::from(stop_type)),
             ("timings", timings_json),
         ]);
+        let mut body = body;
+        if want_lp {
+            body.insert(
+                "logprobs",
+                crate::logprobs::logprobs_obj(std::mem::take(&mut lp_entries)),
+            );
+        }
         write_json(stream, 200, &body, &[])
     } else {
         write_sse_headers(stream)?;
@@ -2114,10 +2164,18 @@ fn handle_llama_completion(
         let mut stopped_by_word = false;
         let mut stream_err = false;
 
-        let res = state.engine.generate(
+        let res = state.engine.generate_with_logprobs(
             &gen_req,
             cancel.clone(),
-            &mut |tok_id| {
+            &mut |tok_id, lp| {
+                if let Some(lp) = lp {
+                    lp_entries.push(crate::logprobs::entry_json(
+                        &state.tokenizer,
+                        tok_id,
+                        &lp,
+                        "content",
+                    ));
+                }
                 out_tokens.push(tok_id);
                 tracker.on_token(out_tokens.len());
                 let piece = detok.push(tok_id);
@@ -2131,11 +2189,17 @@ fn handle_llama_completion(
                     piece
                 };
                 if !emit.is_empty() {
-                    let chunk = JsonValue::obj(vec![
+                    let mut chunk = JsonValue::obj(vec![
                         ("content", JsonValue::from(emit)),
                         ("tokens", JsonValue::Array(vec![JsonValue::from(tok_id)])),
                         ("stop", JsonValue::from(false)),
                     ]);
+                    if want_lp {
+                        chunk.insert(
+                            "logprobs",
+                            crate::logprobs::logprobs_obj(std::mem::take(&mut lp_entries)),
+                        );
+                    }
                     let line = format!("data: {}\n\n", chunk.to_json_string());
                     if stream.write_all(line.as_bytes()).is_err() || stream.flush().is_err() {
                         stream_err = true;
@@ -2173,6 +2237,13 @@ fn handle_llama_completion(
             ("stop_type", JsonValue::from(stop_type)),
             ("timings", timings_json),
         ]);
+        let mut final_chunk = final_chunk;
+        if want_lp {
+            final_chunk.insert(
+                "logprobs",
+                crate::logprobs::logprobs_obj(std::mem::take(&mut lp_entries)),
+            );
+        }
         let line = format!("data: {}\n\n", final_chunk.to_json_string());
         let _ = stream.write_all(line.as_bytes());
         let _ = stream.flush();
@@ -2189,10 +2260,18 @@ fn handle_openai_completions(
         Ok(v) => v,
         Err(e) => return send_post_error(stream, "/v1/completions", 400, &e, Some("prompt"), None),
     };
-    let (sampling, stops) = match parse_sampling_from_req(req, &state.config.sampling) {
+    let (mut sampling, stops) = match parse_sampling_from_req(req, &state.config.sampling) {
         Ok(v) => v,
         Err(e) => return send_post_error(stream, "/v1/completions", 400, &e, None, None),
     };
+    sampling.logprobs = match crate::logprobs::parse_request(req, false, state) {
+        Ok(k) => k,
+        Err(e) => {
+            return send_post_error(stream, "/v1/completions", 400, &e, Some("logprobs"), None)
+        }
+    };
+    let want_lp = sampling.logprobs.is_some();
+    let mut lp_entries: Vec<JsonValue> = Vec::new();
     let ctx = state.reported_ctx();
     if ids.len() >= ctx {
         return send_post_error(
@@ -2242,10 +2321,18 @@ fn handle_openai_completions(
         let mut text = String::new();
         let mut stopped_by_word = false;
 
-        let res = state.engine.generate(
+        let res = state.engine.generate_with_logprobs(
             &gen_req,
             cancel.clone(),
-            &mut |tok_id| {
+            &mut |tok_id, lp| {
+                if let Some(lp) = lp {
+                    lp_entries.push(crate::logprobs::entry_json(
+                        &state.tokenizer,
+                        tok_id,
+                        &lp,
+                        "content",
+                    ));
+                }
                 out_tokens.push(tok_id);
                 tracker.on_token(out_tokens.len());
                 let piece = detok.push(tok_id);
@@ -2306,7 +2393,14 @@ fn handle_openai_completions(
                 JsonValue::Array(vec![JsonValue::obj(vec![
                     ("text", JsonValue::from(text)),
                     ("index", JsonValue::from(0)),
-                    ("logprobs", JsonValue::Null),
+                    (
+                        "logprobs",
+                        if want_lp {
+                            crate::logprobs::logprobs_obj(std::mem::take(&mut lp_entries))
+                        } else {
+                            JsonValue::Null
+                        },
+                    ),
                     ("finish_reason", JsonValue::from(finish_reason)),
                 ])]),
             ),
@@ -2340,10 +2434,18 @@ fn handle_openai_completions(
         let mut stopped_by_word = false;
         let mut stream_err = false;
 
-        let res = state.engine.generate(
+        let res = state.engine.generate_with_logprobs(
             &gen_req,
             cancel.clone(),
-            &mut |tok_id| {
+            &mut |tok_id, lp| {
+                if let Some(lp) = lp {
+                    lp_entries.push(crate::logprobs::entry_json(
+                        &state.tokenizer,
+                        tok_id,
+                        &lp,
+                        "content",
+                    ));
+                }
                 out_tokens.push(tok_id);
                 tracker.on_token(out_tokens.len());
                 let piece = detok.push(tok_id);
@@ -2367,7 +2469,16 @@ fn handle_openai_completions(
                             JsonValue::Array(vec![JsonValue::obj(vec![
                                 ("text", JsonValue::from(emit)),
                                 ("index", JsonValue::from(0)),
-                                ("logprobs", JsonValue::Null),
+                                (
+                                    "logprobs",
+                                    if want_lp {
+                                        crate::logprobs::logprobs_obj(std::mem::take(
+                                            &mut lp_entries,
+                                        ))
+                                    } else {
+                                        JsonValue::Null
+                                    },
+                                ),
                                 ("finish_reason", JsonValue::Null),
                             ])]),
                         ),
@@ -2413,7 +2524,14 @@ fn handle_openai_completions(
                 JsonValue::Array(vec![JsonValue::obj(vec![
                     ("text", JsonValue::from("")),
                     ("index", JsonValue::from(0)),
-                    ("logprobs", JsonValue::Null),
+                    (
+                        "logprobs",
+                        if want_lp {
+                            crate::logprobs::logprobs_obj(std::mem::take(&mut lp_entries))
+                        } else {
+                            JsonValue::Null
+                        },
+                    ),
                     ("finish_reason", JsonValue::from(finish_reason)),
                 ])]),
             ),
@@ -2449,6 +2567,8 @@ struct PreparedChat {
     sampling: SamplingParams,
     stops: Vec<String>,
     force: Option<String>,
+    /// E1 (opt-in): entries of generated tokens not yet handed to the client (chat streams drain it per chunk).
+    lp_entries: std::cell::RefCell<Vec<JsonValue>>,
 }
 
 fn render_and_encode_chat(
@@ -2550,6 +2670,7 @@ fn prepare_chat(
         sampling,
         stops,
         force,
+        lp_entries: std::cell::RefCell::new(Vec::new()),
     })
 }
 
@@ -2557,8 +2678,39 @@ struct ChatRunOutput {
     events: Vec<Event>,
     completion_tokens: usize,
     reasoning_tokens: usize,
+    /// Share of the decode time before the first answer (non-reasoning) token, from the server's token arrival
+    /// times (0 without reasoning, 1 without an answer).
+    reasoning_share: f64,
     timings: EngineTimings,
     stop_sequence: Option<String>,
+}
+
+impl ChatRunOutput {
+    /// Bench extension E4: `usage.completion_tokens_details.reasoning_tokens` and the reasoning/answer split of
+    /// `timings` (`reasoning_n` + `answer_n` = `predicted_n`; `reasoning_ms` + `answer_ms` = `predicted_ms`, split at
+    /// the arrival of the first answer token). Only adds keys.
+    fn add_channel_detail(&self, usage: &mut JsonValue, timings: &mut JsonValue) {
+        usage.insert(
+            "completion_tokens_details",
+            JsonValue::obj(vec![(
+                "reasoning_tokens",
+                JsonValue::from(self.reasoning_tokens),
+            )]),
+        );
+        let total_n = timings
+            .get_usize("predicted_n")
+            .unwrap_or(self.completion_tokens);
+        let r_n = self.reasoning_tokens.min(total_n);
+        let total_ms = timings.get_f64("predicted_ms").unwrap_or(0.0);
+        let r_ms = EngineTimings::round1(total_ms * self.reasoning_share.clamp(0.0, 1.0));
+        timings.insert("reasoning_n", JsonValue::from(r_n));
+        timings.insert("answer_n", JsonValue::from(total_n - r_n));
+        timings.insert("reasoning_ms", JsonValue::from(r_ms));
+        timings.insert(
+            "answer_ms",
+            JsonValue::from(EngineTimings::round1((total_ms - r_ms).max(0.0))),
+        );
+    }
 }
 
 fn run_chat_generation<F>(
@@ -2586,6 +2738,10 @@ where
     let mut all_events = Vec::new();
     let mut out_tokens = 0usize;
     let mut reasoning_tokens = 0usize;
+    // arrival of the first token, the first answer token and the last token (reasoning/answer time split)
+    let mut t_first: Option<Instant> = None;
+    let mut t_answer: Option<Instant> = None;
+    let mut t_last: Option<Instant> = None;
     let mut stopped_by_word: Option<String> = None;
     let mut client_aborted = false;
 
@@ -2654,19 +2810,38 @@ where
         true
     };
 
+    let mut channels = crate::logprobs::ChannelTracker::default();
     let mut timings = if client_aborted {
         EngineTimings::default()
     } else {
-        state.engine.generate(
+        state.engine.generate_with_logprobs(
             &gen_req,
             cancel.clone(),
-            &mut |tok_id| {
+            &mut |tok_id, lp| {
                 out_tokens += 1;
                 tracker.on_token(out_tokens);
                 let piece = detok.push(tok_id);
                 let evs = parser.feed(&piece);
+                let now = Instant::now();
+                t_first.get_or_insert(now);
+                t_last = Some(now);
                 if evs.iter().any(|e| e.kind == EventKind::Reasoning) {
                     reasoning_tokens += 1;
+                } else if t_answer.is_none() && !evs.is_empty() {
+                    t_answer = Some(now);
+                }
+                if let Some(lp) = lp {
+                    let r = evs.iter().any(|e| e.kind == EventKind::Reasoning);
+                    let a = evs.iter().any(|e| e.kind != EventKind::Reasoning);
+                    let ch = channels.channel(r, a, prep.thinking);
+                    prep.lp_entries
+                        .borrow_mut()
+                        .push(crate::logprobs::entry_json(
+                            &state.tokenizer,
+                            tok_id,
+                            &lp,
+                            ch,
+                        ));
                 }
                 if !emit_filtered(
                     evs,
@@ -2723,6 +2898,14 @@ where
         timings.finish_reason = "stop".to_string();
     }
     timings.predicted_n = out_tokens;
+    let reasoning_share = match (t_first, t_answer, t_last) {
+        _ if reasoning_tokens == 0 => 0.0,
+        (_, None, _) => 1.0,
+        (Some(a), Some(b), Some(c)) if c > a => {
+            b.saturating_duration_since(a).as_secs_f64() / (c - a).as_secs_f64()
+        }
+        _ => reasoning_tokens as f64 / out_tokens.max(1) as f64,
+    };
     let rescued = parser.recovered_from_reasoning as u64;
     tracker.finish(&timings, rescued);
 
@@ -2730,9 +2913,47 @@ where
         events: all_events,
         completion_tokens: out_tokens,
         reasoning_tokens,
+        reasoning_share,
         timings,
         stop_sequence: stopped_by_word,
     })
+}
+
+/// E6: the schema of `response_format` (`json_schema`, or `json_object` as `{"type":"object"}`), checked and
+/// compacted by `talus_text::json_grammar::prepare`. `Ok(None)` = no constraint requested (absent, null, `text`).
+pub fn response_format_schema(req: &JsonValue) -> Result<Option<String>, String> {
+    let Some(rf) = req.get("response_format").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let rf = crate::frontend::to_serde_value(rf);
+    let kind = rf.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let schema = match kind {
+        "text" => return Ok(None),
+        "json_object" => serde_json::json!({"type": "object"}),
+        "json_schema" => {
+            let js = rf.get("json_schema");
+            match js
+                .and_then(|j| j.get("schema"))
+                .or_else(|| rf.get("schema"))
+            {
+                Some(s) => s.clone(),
+                None => {
+                    return Err(
+                        "response_format: json_schema.schema is required for type json_schema"
+                            .to_string(),
+                    )
+                }
+            }
+        }
+        other => {
+            return Err(format!(
+                "response_format: type must be text, json_object or json_schema (got {other:?})"
+            ))
+        }
+    };
+    talus_text::json_grammar::prepare(&schema)
+        .map(Some)
+        .map_err(|e| format!("response_format: {e}"))
 }
 
 fn handle_openai_chat(
@@ -2740,9 +2961,48 @@ fn handle_openai_chat(
     req: &JsonValue,
     state: &Arc<ServiceState>,
 ) -> std::io::Result<()> {
-    let (messages, mut tools, kw) = match openai_to_messages(req) {
+    let (messages, mut tools, mut kw) = match openai_to_messages(req) {
         Ok(v) => v,
-        Err(e) => return send_post_error(stream, "/v1/chat/completions", 400, &e, None, None),
+        Err(e) => {
+            let code = crate::frontend::content_err_code(&e);
+            return send_post_error(stream, "/v1/chat/completions", 400, &e, None, code);
+        }
+    };
+    // E6: grammar-constrained output. Thinking is turned off for these requests (the whole reply is the JSON value);
+    // json_object stays ignored on engines without support (as before), json_schema gets an honest 400 there.
+    let json_schema = match response_format_schema(req) {
+        Ok(None) => None,
+        Ok(Some(_)) if !state.engine.supports_json_schema() => {
+            let is_object = req
+                .get("response_format")
+                .and_then(|r| r.get_str("type"))
+                .is_some_and(|t| t == "json_object");
+            if !is_object {
+                return send_post_error(
+                    stream,
+                    "/v1/chat/completions",
+                    400,
+                    "json_schema not supported by this engine",
+                    Some("response_format"),
+                    None,
+                );
+            }
+            None
+        }
+        Ok(Some(s)) => {
+            kw.enable_thinking = Some(false);
+            Some(s)
+        }
+        Err(e) => {
+            return send_post_error(
+                stream,
+                "/v1/chat/completions",
+                400,
+                &e,
+                Some("response_format"),
+                None,
+            )
+        }
     };
     let (choice_mode, _) = match tool_choice_of(req.get("tool_choice")) {
         Ok(v) => v,
@@ -2777,10 +3037,39 @@ fn handle_openai_chat(
         .get_i64("max_completion_tokens")
         .or_else(|| req.get_i64("max_tokens"))
         .unwrap_or(0);
-    let prep = match prepare_chat(&messages, tools, &kw, req, state, raw_max, force) {
+    if json_schema.is_some() && (tools.as_ref().is_some_and(|t| !t.is_empty()) || force.is_some()) {
+        return send_post_error(
+            stream,
+            "/v1/chat/completions",
+            400,
+            "response_format json_schema cannot be combined with tools (use tool_choice none)",
+            Some("response_format"),
+            None,
+        );
+    }
+    let mut prep = match prepare_chat(&messages, tools, &kw, req, state, raw_max, force) {
         Ok(p) => p,
-        Err(e) => return send_post_error(stream, "/v1/chat/completions", 400, &e, None, None),
+        Err(e) => {
+            let code = crate::frontend::content_err_code(&e);
+            return send_post_error(stream, "/v1/chat/completions", 400, &e, None, code);
+        }
     };
+    prep.sampling.logprobs = match crate::logprobs::parse_request(req, true, state) {
+        Ok(k) => k,
+        Err(e) => {
+            return send_post_error(
+                stream,
+                "/v1/chat/completions",
+                400,
+                &e,
+                Some("logprobs"),
+                None,
+            )
+        }
+    };
+    let want_lp = prep.sampling.logprobs.is_some();
+    let lp_take = |p: &PreparedChat| crate::logprobs::logprobs_obj(p.lp_entries.take());
+    prep.sampling.json_schema = json_schema;
 
     let want_stream = req.get_bool("stream").unwrap_or(false);
     let cid = format!("chatcmpl-{}", next_hex_id(24));
@@ -2879,7 +3168,17 @@ fn handle_openai_chat(
         let pt = prep.ids.len();
         let ct = out.completion_tokens;
         let reused = out.timings.cache_n.min(pt);
-        let timings_json = out.timings.to_json(pt, ct);
+        let mut timings_json = out.timings.to_json(pt, ct);
+        let mut usage = JsonValue::obj(vec![
+            ("prompt_tokens", JsonValue::from(pt)),
+            ("completion_tokens", JsonValue::from(ct)),
+            ("total_tokens", JsonValue::from(pt + ct)),
+            (
+                "prompt_tokens_details",
+                JsonValue::obj(vec![("cached_tokens", JsonValue::from(reused))]),
+            ),
+        ]);
+        out.add_channel_detail(&mut usage, &mut timings_json);
 
         let body = JsonValue::obj(vec![
             ("id", JsonValue::from(cid)),
@@ -2888,24 +3187,19 @@ fn handle_openai_chat(
             ("model", JsonValue::from(model)),
             (
                 "choices",
-                JsonValue::Array(vec![JsonValue::obj(vec![
-                    ("index", JsonValue::from(0)),
-                    ("message", msg),
-                    ("finish_reason", JsonValue::from(finish_reason)),
-                ])]),
+                JsonValue::Array(vec![{
+                    let mut c = JsonValue::obj(vec![
+                        ("index", JsonValue::from(0)),
+                        ("message", msg),
+                        ("finish_reason", JsonValue::from(finish_reason)),
+                    ]);
+                    if want_lp {
+                        c.insert("logprobs", lp_take(&prep));
+                    }
+                    c
+                }]),
             ),
-            (
-                "usage",
-                JsonValue::obj(vec![
-                    ("prompt_tokens", JsonValue::from(pt)),
-                    ("completion_tokens", JsonValue::from(ct)),
-                    ("total_tokens", JsonValue::from(pt + ct)),
-                    (
-                        "prompt_tokens_details",
-                        JsonValue::obj(vec![("cached_tokens", JsonValue::from(reused))]),
-                    ),
-                ]),
-            ),
+            ("usage", usage),
             ("timings", timings_json),
         ]);
         write_json(stream, 200, &body, &[])
@@ -3035,7 +3329,16 @@ fn handle_openai_chat(
                 }
                 _ => None,
             };
-            if let Some(c) = chunk_opt {
+            if let Some(mut c) = chunk_opt {
+                if want_lp {
+                    if let Some(ch) = c
+                        .get_mut("choices")
+                        .and_then(|v| v.as_array_mut())
+                        .and_then(|a| a.first_mut())
+                    {
+                        ch.insert("logprobs", lp_take(&prep));
+                    }
+                }
                 if stream
                     .write_all(format!("data: {}\n\n", c.to_json_string()).as_bytes())
                     .is_err()
@@ -3067,21 +3370,29 @@ fn handle_openai_chat(
         let pt = prep.ids.len();
         let ct = out.completion_tokens;
         let reused = out.timings.cache_n.min(pt);
-        let timings_json = out.timings.to_json(pt, ct);
+        let mut timings_json = out.timings.to_json(pt, ct);
+        let mut usage = JsonValue::obj(vec![
+            ("prompt_tokens", JsonValue::from(pt)),
+            ("completion_tokens", JsonValue::from(ct)),
+            ("total_tokens", JsonValue::from(pt + ct)),
+            (
+                "prompt_tokens_details",
+                JsonValue::obj(vec![("cached_tokens", JsonValue::from(reused))]),
+            ),
+        ]);
+        out.add_channel_detail(&mut usage, &mut timings_json);
 
         let mut last_chunk = make_chunk(JsonValue::empty_obj(), Some(finish_reason));
-        last_chunk.insert(
-            "usage",
-            JsonValue::obj(vec![
-                ("prompt_tokens", JsonValue::from(pt)),
-                ("completion_tokens", JsonValue::from(ct)),
-                ("total_tokens", JsonValue::from(pt + ct)),
-                (
-                    "prompt_tokens_details",
-                    JsonValue::obj(vec![("cached_tokens", JsonValue::from(reused))]),
-                ),
-            ]),
-        );
+        if want_lp {
+            if let Some(ch) = last_chunk
+                .get_mut("choices")
+                .and_then(|v| v.as_array_mut())
+                .and_then(|a| a.first_mut())
+            {
+                ch.insert("logprobs", lp_take(&prep));
+            }
+        }
+        last_chunk.insert("usage", usage);
         last_chunk.insert("timings", timings_json);
         let _ = stream.write_all(format!("data: {}\n\n", last_chunk.to_json_string()).as_bytes());
         let _ = stream.write_all(b"data: [DONE]\n\n");
@@ -3117,7 +3428,7 @@ fn handle_responses(
             let code = if e.contains("context") {
                 Some("context_length_exceeded")
             } else {
-                None
+                crate::frontend::content_err_code(&e)
             };
             let body = responses_error_body(&e, "invalid_request_error", Some("input"), code);
             return write_json(stream, 400, &body, &[]);

@@ -5,16 +5,21 @@
 //! sampler and drafters; a worker owns a contiguous layer range. One decode step crosses the link twice: the boundary
 //! bundle (the live set the fused cross-layer epilogue wrote) goes out, the final hidden state comes back.
 //!
-//! This crate is engine-agnostic: framing ([`frame`]), the TCP link ([`Link`]), the cluster spec ([`Spec`]) and the
-//! build/config identity checked at handshake ([`ident`]). Everything is off unless `--cluster-*` flags or
+//! This crate is engine-agnostic: framing ([`frame`]), the stage link ([`Link`]) over a [`Transport`] (TCP today),
+//! the cluster spec ([`Spec`]) and the build/config identity checked at handshake ([`ident`]). Everything is off unless `--cluster-*` flags or
 //! `TALUS_CLUSTER_*` variables are given; nothing here runs on a single-box engine.
 
+pub mod beat;
+pub mod config;
 pub mod frame;
 pub mod ident;
 mod link;
+pub mod transport;
 
+pub use beat::Beat;
 pub use frame::{Header, MsgType, HDR_BYTES};
 pub use link::Link;
+pub use transport::{BusyPoll, Closer, DataPlane, TcpTransport, Transport};
 
 /// The role of this process in a cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +36,8 @@ pub struct Spec {
     pub role: Role,
     /// `host:port` the worker listens on and the head connects to (TCP 7701-7702 by convention).
     pub addr: String,
+    /// head: the fallback address of the worker (the other link), tried when `addr` does not answer.
+    pub alt: Option<String>,
     /// First layer of the worker stage (the cut). 0 = engine default (`n_layer / 2`, rounded to the layer pattern).
     pub split: u32,
 }
@@ -43,6 +50,27 @@ impl Spec {
             "worker" | "stage" | "1" => Some(Role::Worker),
             _ => None,
         }
+    }
+
+    /// From a cluster.toml (`path`, else `TALUS_CLUSTER`) for node `node` (else `TALUS_CLUSTER_NODE`). LAN addresses
+    /// come from the hosts file the toml names. None when no cluster file is given.
+    pub fn from_file(path: Option<&str>, node: Option<&str>) -> Result<Option<Spec>, String> {
+        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let Some(path) = path.map(str::to_string).or_else(|| env("TALUS_CLUSTER")) else {
+            return Ok(None);
+        };
+        let node = node
+            .map(str::to_string)
+            .or_else(|| env("TALUS_CLUSTER_NODE"))
+            .ok_or("--cluster needs --node NAME (or TALUS_CLUSTER_NODE)")?;
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+        let mut f = config::parse(&text)?;
+        let hosts = match &f.hosts {
+            Some(h) => Some(std::fs::read_to_string(h).map_err(|e| format!("{h}: {e}"))?),
+            None => None,
+        };
+        f.resolve_hosts(hosts.as_deref());
+        f.spec_for(&node).map(Some)
     }
 
     /// Fill unset fields from `TALUS_CLUSTER_ROLE`, `TALUS_CLUSTER_ADDR`, `TALUS_CLUSTER_SPLIT`.
@@ -73,7 +101,12 @@ impl Spec {
                 None => 0,
             },
         };
-        Ok(Some(Spec { role, addr, split }))
+        Ok(Some(Spec {
+            role,
+            addr,
+            alt: None,
+            split,
+        }))
     }
 }
 

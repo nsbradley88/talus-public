@@ -19,8 +19,10 @@ pub const CRATE_NAME: &str = "talus-spec";
 pub mod adraft;
 pub mod confpre;
 pub mod copy;
+pub mod costdepth;
 pub mod dflash;
 pub mod draft_vocab;
+pub mod logprobs;
 pub mod ngram;
 pub mod pause;
 pub mod prompt_lookup;
@@ -39,6 +41,7 @@ pub use copy::{
     copy_cfg_from_env, copy_enabled, copy_env_f64, CopyCfg, CopyMatch, CopyProposer, CopyStats,
     COPY_KEY,
 };
+pub use costdepth::CostDepth;
 pub use dflash::{
     DFlash, DFlashDraftFn, DFlashDrafterSpec, DFlashDynConv, DFlashFamily, DFlashHeadMode,
     DFlashLayer, DFlashModelProfile, DFlashSamp, DFlashTargetInfo, DFlashTargetView, DFlashWeight,
