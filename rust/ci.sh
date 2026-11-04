@@ -10,10 +10,26 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Tests make Unix sockets under TMPDIR (SWE bridge: $TMPDIR/tb-bridge-<pid>/model.sock), and a socket path must fit
+# sun_path (107 bytes). target/tmp under a deep checkout did not, so a long TMPDIR is replaced by a
+# private directory under /tmp, removed on exit.
 S="${TMPDIR:-$SCRIPT_DIR/target/tmp}"
+if [ "${#S}" -gt 60 ]; then
+  echo "ci.sh: TMPDIR $S is too long for Unix socket paths; using a private dir under /tmp"
+  S=$(mktemp -d /tmp/talus-ci.XXXXXX)
+  trap 'rm -rf "$S"' EXIT
+fi
 mkdir -p "$S"
 export TMPDIR="$S" TMP="$S" TEMP="$S"
 export PATH="$HOME/.cargo/bin:$PATH"
+
+# Needs: rustup (the pinned toolchain installs itself), cargo-deny (below), util-linux `script` (installer colour test).
+# cargo-deny (license gate) is a separate install; say how instead of failing on "no such command"
+DENY_VERSION=0.20.2
+if ! cargo deny --version >/dev/null 2>&1; then
+  echo "ci.sh: cargo-deny is not installed; install it with: cargo install cargo-deny --version $DENY_VERSION --locked" >&2
+  exit 1
+fi
 
 # Pinned toolchain: every cargo call below runs from rust/, so rustup selects rust-toolchain.toml's channel.
 # Fail loudly if something (RUSTUP_TOOLCHAIN, a rustup override, a missing rustup) picked another compiler.

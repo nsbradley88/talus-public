@@ -8,6 +8,11 @@ serves each model through an OpenAI-compatible HTTP API.
 
 ## How fast is it?
 
+The current release is **v0.1.4**, a patch release on v0.1.3: server hardening, engine auto-restart, GLM-5.3-Flash load
+diagnostics, `--kv` warnings and an installer fix ([release notes](https://github.com/nsbradley88/talus-public/releases)).
+Its GPU kernel library is byte-identical to v0.1.3's and its greedy output is identical on all five models, so the figures
+below, measured on v0.1.3, stand for it too.
+
 Tokens per second for Talus v0.1.3 (its release candidate 1) on a Ryzen AI Max+ 395 desktop (GMKtec
 EVO-X2, 128 GB, about 120 W sustained), end to end through the HTTP server, each model in its shipped configuration.
 `chat` is the sampled chat mix, `code` the coding-prompt mix, `edit` the code-editing mix, `pp2k` / `pp32k` prompt
@@ -61,7 +66,7 @@ the same HTTP client and prompts; package power about 117-120 W for every engine
 ¹ Host-specific, cause unknown: the same llama.cpp build and settings give 82.4 on our laptop.
 
 Prompt processing is where Talus still trails: gufo and tubo prefill the 27B's `UD-Q4_K_XL` file faster, and gufo
-prefills Flash-Next 16 % faster at 32K (47 % at 2K). That is the focus of the next release.
+prefills Flash-Next 16 % faster at 32K (47 % at 2K). That is the focus of v0.1.5.
 
 Full tables (edit, 2K cells, time to first token, memory, the v0.1.2 figures from the same session, quality gates):
 [docs/RESULTS.md](docs/RESULTS.md). Every figure there names its machine and build. A model whose release run has not
@@ -234,6 +239,8 @@ and chat UIs connect to it directly.
   Known exception: on Qwen3.8-27B, a prompt whose start comes from the cache can give different greedy text than the
   same prompt read whole (both are valid; see the release notes' known issues).
 - **Auth:** `Authorization: Bearer <key>` or `x-api-key`, with the key from `TALUS_API_KEY` (or `STRATA_API_KEY`) or `--api-key`.
+- **Engine restart:** if the engine crashes, the next request restarts it, up to 3 times in 10 minutes
+  ([docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)).
 - **Timings:** each response carries prompt and decode timings, as llama.cpp's server does.
 - **Text only:** the models are served as text models. A request with an image, audio or file content part
   (`image_url`, `input_image`, `image`, `input_audio`, `file`, ...) gets HTTP 400 with the error code

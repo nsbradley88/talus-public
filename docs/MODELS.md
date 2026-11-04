@@ -245,7 +245,7 @@ the kernel library (a pure-Rust port is in progress). All of Strata's flags and 
 
 | | |
 |---|---|
-| Weights | Unsloth `Qwen3.8-Flash-Next-UD-IQ4_XS` GGUF, three shards (about 88 GB), from `unsloth/Qwen3.8-Flash-Next-GGUF` |
+| Weights | Unsloth `Qwen3.8-Flash-Next-UD-IQ4_XS` GGUF, three shards (about 88 GB), from `unsloth/Qwen3.8-Flash-Next-GGUF` at the [pinned commit](#pinned-model-files) (`main` now holds different files) |
 | Pack | A Strata pack built from the GGUF with `tools/iq_pack.py --gguf <shard 1> --out <pack> --compat-bf16`; it also holds the tokenizer: the server's run config points `tokenizer` at `<pack>/tokenizer` (`talus setup` writes it) |
 | MTP | The MTP runtime directory built with `tools/mtp_fetch.py`, `tools/mtp_pack.py` and `tools/mtp_rt.py` (each script's header shows its usage) |
 | Expert profile | `data/expert-profile.bin` (shipped: `<prefix>/data/` of the release tarball / the installer, also in this repository) |
@@ -320,7 +320,7 @@ thresholds). Verification is unchanged, so output stays exact; chat +4.4 % on th
 (v0.1.3 release candidate vs v0.1.2, same session).
 
 **Memory.** Weights about 88 GB (`UD-IQ4_XS`), read through the expert cache (`--expert-cache` in MiB) and a resident budget
-(`--resident-budget-gib`). Unsloth's `UD-Q4_K_XL` GGUF also runs when packed with `tools/iq_pack.py`: its larger `K`-quant experts use more memory and increase expert-cache traffic on long prompts and long-context decode, while reading slightly faster on short cold prompts. Lowest `MemAvailable` in the v0.1.3 release run on our desktop: 51 GiB.
+(`--resident-budget-gib`). Unsloth's `UD-Q4_K_XL` GGUF (the file we measured is at the [pinned commit](#pinned-model-files)) also runs when packed with `tools/iq_pack.py`: its larger `K`-quant experts use more memory and increase expert-cache traffic on long prompts and long-context decode, while reading slightly faster on short cold prompts. Lowest `MemAvailable` in the v0.1.3 release run on our desktop: 51 GiB.
 
 ## GLM-5.3-Flash
 
@@ -341,7 +341,13 @@ Shipped arguments:
 --model GLM-5.3-Flash-a4e3s-00001-of-00004.gguf --ctx 65536 --draft-vocab glm-dv-65536.bin
 ```
 
-No environment variables are needed. The GLM engine ignores flags it does not know.
+No environment variables are needed. The GLM engine ignores flags it does not know, and from v0.1.4 it warns about
+them (`--kv`, `--resident-budget-gib`, `--expert-cache`).
+
+If memory runs short while GLM-5.3-Flash loads (from v0.1.4): when the shortfall is only in the drafter's NextN layer, the
+engine drops that layer, warns and loads without MTP drafting, which makes generation slower; if the rest does not fit
+either, the load stops with an error that names the tensor, the memory available and the kernel limits. On a machine with
+little headroom, `--no-mtp` skips the drafter layer from the start.
 
 **Drafting.** The NextN layer drafts two tokens per round and the model verifies three positions. `--no-mtp` turns
 drafting off. The draft vocabulary only affects drafting.
@@ -506,6 +512,37 @@ survives restarts and model switches (on by default; see [Prompt cache on disk](
 
 **Memory.** Weights about 68 GB; 256K of q8 KV for the full-attention layers fits in the rest. Lowest
 `MemAvailable` in the v0.1.3 release run on our desktop: 38 GiB.
+
+## Pinned model files
+
+Talus reads each repository at a fixed commit, not at `main`, because a repository's files can change under a release. On
+2026-11-04 Unsloth replaced its Qwen3.8-Flash-Next UD quants in place ("Dynamic v3.1", with a new shard layout), and on
+2026-11-01 ggml-org replaced the MiMo-V2.6-Flash drafter. Every Talus result applies to the files at these commits, which
+`talus setup` and `talus fetch` download:
+
+| Repository | Commit |
+|---|---|
+| `unsloth/Qwen3.8-27B-GGUF` | `4ca720788d1e01f1bff70c033e0d0028fd02e502` |
+| `unsloth/Qwen3.8-Flash-Next-GGUF` | `766911a6b7369840a91dbcd95f9f997acaab6cd6` |
+| `z-lab/Qwen3.8-27B-DFlash2-GGUF` | `2d9571f8ce46e151f61c6499c99dee6079e1d610` |
+| `ggml-org/MiMo-V2.6-Flash-MOPD-GGUF` | `0522c706471508d8b7e36ae7040922563c477358` |
+| `j2ipper/draft-vocab` | `71cda5503006214ce63c8d8b1674f8b1b63dc1e9` |
+| `j2ipper/GLM-5.3-Flash-a4e3s` | `5716e4835f5063722d031a5b5c3323b6a9283307` |
+| `j2ipper/MiMo-V2.6-Flash-MOPD-a4-x` | `7c9ba384e973d410c2f9ca6c873b15a888dee9f0` |
+| `j2ipper/Laguna-S-2.1-Q4-lean` | `23609f26ee4de121aae6bc59764052a56ccd097e` |
+| `j2ipper/Laguna-S-2.1-DFlash-GGUF` | `0db718bf50dc2659a9e1df8e944f3ab5d374324c` |
+| `j2ipper/Qwen3.8-27B-W4A4-prompt-v3` | `63e641fff6fc004fe90ad8edddf53662150766d7` |
+| `j2ipper/Qwen3.8-27B-W4A4-prompt` | `ea39c6b1b19fca772d3a2e42324b654371c13656` |
+
+To download by hand, name the commit:
+
+```bash
+hf download unsloth/Qwen3.8-Flash-Next-GGUF --revision 766911a6b7369840a91dbcd95f9f997acaab6cd6 \
+  --include 'UD-IQ4_XS/*' --local-dir models/qwen3.8-flash-next
+```
+
+`scripts/release/check-hf-pins.py` checks each file's size and SHA-256 at these commits. We are evaluating Unsloth's new
+Flash-Next quants separately; they have not been through the Talus gates.
 
 ## Prompt cache on disk
 

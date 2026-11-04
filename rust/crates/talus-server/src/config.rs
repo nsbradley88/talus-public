@@ -27,6 +27,10 @@ pub const DEFERRED_FEATURES: &[(&str, &str)] = &[
     ("vision", "Multimodal image input and vision projector"),
 ];
 
+/// Default cap on simultaneous HTTP connections. The engine runs one sequence at a time; this bounds the threads and
+/// buffers that waiting clients (agents with parallel tool calls, the TUI, health checks) can hold.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub host: String,
@@ -63,6 +67,11 @@ pub struct ServerConfig {
     pub slot_save_path: String,
     pub idle_unload_seconds: u64,
     pub mock_mode: bool,
+    /// Test only: run a real (stub) engine on byte tokens when no tokenizer is configured (run config
+    /// `"byte_tokenizer": true`). Without it a real engine needs the model's tokenizer.
+    pub byte_tokenizer: bool,
+    /// Most simultaneous HTTP connections (run config `"max_connections"`); more get a 503 at accept.
+    pub max_connections: usize,
     pub mock_stdio_worker: bool,
     pub mock_scripts: Vec<String>,
     pub engine_args: Vec<String>,
@@ -115,6 +124,8 @@ impl Default for ServerConfig {
             slot_save_path: String::new(),
             idle_unload_seconds: 0,
             mock_mode: true,
+            byte_tokenizer: false,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
             mock_stdio_worker: false,
             mock_scripts: Vec::new(),
             engine_args: Vec::new(),
@@ -407,6 +418,16 @@ impl ServerConfig {
         }
         if val.get_bool("mock") == Some(true) {
             cfg.mock_mode = true;
+        }
+        if val.get_bool("byte_tokenizer") == Some(true) {
+            cfg.byte_tokenizer = true;
+        }
+        if let Some(v) = val.get("max_connections").filter(|v| !v.is_null()) {
+            cfg.max_connections = v
+                .as_i64()
+                .filter(|&n| n >= 1)
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| "max_connections: must be an integer >= 1".to_string())?;
         }
         if let Some(scripts) = val.get("mock_scripts").and_then(|v| v.as_array()) {
             for item in scripts {

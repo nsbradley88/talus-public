@@ -850,7 +850,7 @@ fn run_inner(a: Args) -> Result<(), String> {
                 if a.dry_run {
                     ui::dry(&format!(
                         "{what}: {} -> {}  (sha256 {}...)",
-                        download::resolve_url(&download::endpoint(), f.repo, f.path),
+                        download::resolve_url(&download::endpoint(), f.repo, f.revision(), f.path),
                         paths.tilde(&download::dest_of(&dir, f)),
                         &f.sha256[..16]
                     ));

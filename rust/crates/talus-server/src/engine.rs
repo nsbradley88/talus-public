@@ -396,6 +396,21 @@ impl EngineTimings {
     }
 }
 
+/// Crash/restart bookkeeping an engine reports (`/health`, `/metrics`, `/v1/talus/status`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EngineHealth {
+    /// Engine processes that exited on their own (not through unload/shutdown).
+    pub crashes: u64,
+    /// Automatic restarts after a crash.
+    pub restarts: u64,
+    /// Set when the crash-loop cap was hit: the engine stays down until `load` (POST /load) or a server restart.
+    pub down: Option<String>,
+    /// The last crash: exit status, time and the engine's last stderr lines.
+    pub last_crash: Option<String>,
+    /// Crashed and not restarted yet: the next request restarts it (within the cap).
+    pub restart_pending: bool,
+}
+
 /// Core `Engine` trait for `talus-server`.
 pub trait Engine: Send + Sync {
     fn max_context(&self) -> usize;
@@ -430,8 +445,27 @@ pub trait Engine: Send + Sync {
         Ok(())
     }
 
+    /// Free the model's memory; the next request or `load` brings it back. Engines that cannot say so: the server
+    /// answers `/unload` with 501 and refuses `idle_unload_seconds`.
     fn unload(&self) -> Result<(), EngineError> {
-        Ok(())
+        Err(EngineError::Unsupported(
+            "this engine cannot unload".to_string(),
+        ))
+    }
+
+    /// `unload` really frees the engine (and `load` / the next request brings it back).
+    fn supports_lifecycle(&self) -> bool {
+        false
+    }
+
+    /// Crash/restart state. Engines without a process report the default (no crashes).
+    fn health(&self) -> EngineHealth {
+        EngineHealth::default()
+    }
+
+    /// A request is inside the engine right now (holding it; others queue behind). None = not tracked.
+    fn in_flight(&self) -> Option<usize> {
+        None
     }
 
     /// Stop the engine for good and wait until it has exited (its memory is free), before the server replaces
@@ -808,6 +842,13 @@ impl ScriptedMockEngine {
                 continue;
             }
             if let Some(rest) = trimmed.strip_prefix("GEN ") {
+                // crash tests: TALUS_MOCK_CRASH_FILE=<path>: while that file exists, a GEN removes it and exits 3
+                if let Some(f) = std::env::var_os("TALUS_MOCK_CRASH_FILE") {
+                    if std::fs::remove_file(&f).is_ok() {
+                        eprintln!("mock engine: simulated crash on GEN");
+                        std::process::exit(3);
+                    }
+                }
                 let parts: Vec<&str> = rest.split_whitespace().collect();
                 if parts.len() < 2 {
                     writeln!(writer, "ERR malformed GEN command")?;
@@ -958,6 +999,10 @@ impl Engine for ScriptedMockEngine {
     fn unload(&self) -> Result<(), EngineError> {
         self.loaded.store(false, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn supports_lifecycle(&self) -> bool {
+        true
     }
 
     fn supports_json_schema(&self) -> bool {
@@ -1250,8 +1295,55 @@ fn parse_score_cmd(line: &str) -> Result<ScoreRequest, String> {
 
 struct SubprocessHandle {
     child: Child,
-    stdin: Arc<Mutex<ChildStdin>>,
+    stdin: Arc<Mutex<EngineStdin>>,
     stdout: BufReader<ChildStdout>,
+    /// Keeps the engine's keeper thread alive (see [`spawn_kept`]); declared last, so it drops after `child`.
+    _keeper: std::sync::mpsc::Sender<()>,
+}
+
+/// The engine's stdin; `close` sends EOF (the 27B serve loop has no QUIT command and ends at EOF).
+pub(crate) struct EngineStdin(Option<ChildStdin>);
+
+impl EngineStdin {
+    fn close(&mut self) {
+        self.0 = None;
+    }
+
+    fn open(&mut self) -> std::io::Result<&mut ChildStdin> {
+        self.0
+            .as_mut()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+    }
+}
+
+impl Write for EngineStdin {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.open()?.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.open()?.flush()
+    }
+}
+
+/// Spawn `cmd` from a dedicated thread that lives as long as the returned sender. The child is started with
+/// PR_SET_PDEATHSIG, which fires when the spawning THREAD exits, not the process: a respawn from a short-lived HTTP
+/// connection thread got SIGTERM as soon as that request ended. The keeper thread ends when the sender is dropped,
+/// which happens only after the child has been stopped and reaped (or when talus-server exits).
+fn spawn_kept(mut cmd: Command) -> std::io::Result<(Child, std::sync::mpsc::Sender<()>)> {
+    let (child_tx, child_rx) = std::sync::mpsc::channel();
+    let (keep_tx, keep_rx) = std::sync::mpsc::channel::<()>();
+    thread::Builder::new()
+        .name("engine-keeper".to_string())
+        .spawn(move || {
+            let _ = child_tx.send(cmd.spawn());
+            // blocks until the handle (and its sender) is dropped
+            let _ = keep_rx.recv();
+        })?;
+    let child = child_rx
+        .recv()
+        .map_err(|_| std::io::Error::other("engine keeper thread ended before spawning"))??;
+    Ok((child, keep_tx))
 }
 
 /// Subprocess engine that spawns an external executable speaking the Strata/Talus stdio protocol:
@@ -1261,13 +1353,91 @@ pub struct StdioSubprocessEngine {
     args: Vec<String>,
     env: Vec<(String, String)>,
     cwd: Option<PathBuf>,
+    log: Option<PathBuf>,
+    default_ctx: usize,
     tok: ByteTokenizer,
     max_context: usize,
     stop_token: Option<u32>,
     info: HashMap<String, String>,
-    pid: u32,
-    proc: Mutex<SubprocessHandle>,
-    stdin_cancel: Arc<Mutex<ChildStdin>>,
+    /// The running engine process; None after `unload` until the next `load` or request.
+    proc: Mutex<Option<SubprocessHandle>>,
+    /// Pid of the running process, 0 while unloaded.
+    pid: std::sync::atomic::AtomicU32,
+    /// The running process's stdin for `STOP` while a request holds `proc`.
+    stdin_cancel: Mutex<Option<Arc<Mutex<EngineStdin>>>>,
+    /// The engine's last stderr lines (filled by the stderr tee; read when it crashes).
+    stderr_tail: Arc<Mutex<std::collections::VecDeque<String>>>,
+    crash: Mutex<CrashState>,
+    /// Requests holding `proc` (0 or 1): the rest of the server's active requests are queued.
+    busy: AtomicUsize,
+}
+
+/// Prefix of the error a request gets while the engine is down (the server answers 503 `engine_down`).
+pub const ENGINE_DOWN: &str = "the engine is down";
+
+/// At most this many automatic restarts within [`RESTART_WINDOW`]; one more crash and the engine stays down.
+pub const MAX_RESTARTS: usize = 3;
+pub const RESTART_WINDOW: Duration = Duration::from_secs(600);
+/// Stderr lines kept for a crash report.
+const STDERR_TAIL_LINES: usize = 20;
+
+#[derive(Default)]
+struct CrashState {
+    crashes: u64,
+    restarts_total: u64,
+    /// When the automatic restarts within the window happened.
+    restarts: std::collections::VecDeque<Instant>,
+    /// The process crashed and has not been restarted yet.
+    pending_restart: bool,
+    down: Option<String>,
+    last_crash: Option<String>,
+}
+
+impl CrashState {
+    /// Crash-loop cap: with MAX_RESTARTS automatic restarts already used within RESTART_WINDOW, the engine stays down.
+    /// Returns the reason once down.
+    fn trip_if_over_cap(&mut self) -> Option<String> {
+        if let Some(ref why) = self.down {
+            return Some(why.clone());
+        }
+        let now = Instant::now();
+        while self
+            .restarts
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > RESTART_WINDOW)
+        {
+            self.restarts.pop_front();
+        }
+        if self.restarts.len() < MAX_RESTARTS {
+            return None;
+        }
+        let why = format!(
+            "crashed again after {} restarts in {} min, not restarting (POST /load or a server restart tries again); \
+             last crash: {}",
+            self.restarts.len(),
+            RESTART_WINDOW.as_secs() / 60,
+            self.last_crash.as_deref().unwrap_or("?")
+        );
+        eprintln!("[talus-server] engine down: {why}");
+        self.down = Some(why.clone());
+        Some(why)
+    }
+}
+
+/// Holds `busy` up for one request inside the engine.
+struct BusyGuard<'a>(&'a AtomicUsize);
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// What an engine announces before `READY`.
+struct Ready {
+    max_context: usize,
+    stop_token: Option<u32>,
+    info: HashMap<String, String>,
 }
 
 impl StdioSubprocessEngine {
@@ -1302,6 +1472,43 @@ impl StdioSubprocessEngine {
         default_ctx: usize,
     ) -> Result<Self, EngineError> {
         let exe_path = exe.as_ref().to_path_buf();
+        let stderr_tail = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let (handle, ready) =
+            Self::start(&exe_path, args, env, cwd, log, default_ctx, &stderr_tail)?;
+        let mut tok = ByteTokenizer::new();
+        tok.stop_tokens = ready.stop_token.into_iter().collect();
+        let engine = Self {
+            exe: exe_path,
+            args: args.to_vec(),
+            env: env.to_vec(),
+            cwd: cwd.map(|p| p.to_path_buf()),
+            log: log.map(|p| p.to_path_buf()),
+            default_ctx,
+            tok,
+            max_context: ready.max_context,
+            stop_token: ready.stop_token,
+            info: ready.info,
+            proc: Mutex::new(None),
+            pid: std::sync::atomic::AtomicU32::new(0),
+            stdin_cancel: Mutex::new(None),
+            stderr_tail,
+            crash: Mutex::new(CrashState::default()),
+            busy: AtomicUsize::new(0),
+        };
+        engine.install(&mut engine.proc.lock().unwrap(), handle);
+        Ok(engine)
+    }
+
+    /// Start the engine process and read its `INFO` lines up to `READY`.
+    fn start(
+        exe_path: &Path,
+        args: &[String],
+        env: &[(String, String)],
+        cwd: Option<&Path>,
+        log: Option<&Path>,
+        default_ctx: usize,
+        stderr_tail: &Arc<Mutex<std::collections::VecDeque<String>>>,
+    ) -> Result<(SubprocessHandle, Ready), EngineError> {
         let log_file = log.and_then(|p| match open_engine_log(p) {
             Ok(f) => Some(f),
             Err(e) => {
@@ -1312,7 +1519,7 @@ impl StdioSubprocessEngine {
                 None
             }
         });
-        let mut cmd = Command::new(&exe_path);
+        let mut cmd = Command::new(exe_path);
         cmd.args(args);
         if !args
             .iter()
@@ -1328,11 +1535,8 @@ impl StdioSubprocessEngine {
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(if log_file.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::inherit()
-            });
+            // always piped: the tee keeps the last lines for a crash report (and copies to our stderr and the log)
+            .stderr(Stdio::piped());
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::process::CommandExt;
@@ -1349,8 +1553,7 @@ impl StdioSubprocessEngine {
             }
         }
 
-        let mut child = cmd
-            .spawn()
+        let (mut child, keeper) = spawn_kept(cmd)
             .map_err(|e| EngineError::EngineDied(format!("failed to spawn {:?}: {e}", exe_path)))?;
         let stdin = child
             .stdin
@@ -1360,8 +1563,9 @@ impl StdioSubprocessEngine {
             .stdout
             .take()
             .ok_or_else(|| EngineError::EngineDied("missing child stdout".to_string()))?;
-        if let (Some(file), Some(stderr)) = (log_file, child.stderr.take()) {
-            tee_engine_stderr(stderr, file);
+        if let Some(stderr) = child.stderr.take() {
+            stderr_tail.lock().unwrap().clear();
+            tee_engine_stderr(stderr, log_file, Arc::clone(stderr_tail));
         }
         let mut reader = BufReader::new(stdout);
 
@@ -1404,27 +1608,115 @@ impl StdioSubprocessEngine {
             }
         }
 
-        let shared_stdin = Arc::new(Mutex::new(stdin));
-        let mut tok = ByteTokenizer::new();
-        tok.stop_tokens = stop_token.into_iter().collect();
-
-        Ok(Self {
-            exe: exe_path,
-            args: args.to_vec(),
-            env: env.to_vec(),
-            cwd: cwd.map(|p| p.to_path_buf()),
-            tok,
-            max_context,
-            stop_token,
-            info,
-            pid: child.id(),
-            proc: Mutex::new(SubprocessHandle {
+        Ok((
+            SubprocessHandle {
                 child,
-                stdin: shared_stdin.clone(),
+                stdin: Arc::new(Mutex::new(EngineStdin(Some(stdin)))),
                 stdout: reader,
-            }),
-            stdin_cancel: shared_stdin,
-        })
+                _keeper: keeper,
+            },
+            Ready {
+                max_context,
+                stop_token,
+                info,
+            },
+        ))
+    }
+
+    /// Make `handle` the running process.
+    fn install(&self, slot: &mut Option<SubprocessHandle>, handle: SubprocessHandle) {
+        *self.stdin_cancel.lock().unwrap() = Some(handle.stdin.clone());
+        self.pid.store(handle.child.id(), Ordering::SeqCst);
+        *slot = Some(handle);
+    }
+
+    /// The running process, started again first if it was unloaded. A restart must come back with the context and
+    /// stop token it started with: the server sized its requests and tokenizer to them.
+    fn running<'a>(
+        &self,
+        slot: &'a mut Option<SubprocessHandle>,
+    ) -> Result<&'a mut SubprocessHandle, EngineError> {
+        self.reap_if_crashed(slot);
+        if slot.is_none() {
+            {
+                let mut c = self.crash.lock().unwrap();
+                if let Some(ref why) = c.down {
+                    return Err(EngineError::EngineDied(format!("{ENGINE_DOWN}: {why}")));
+                }
+                if c.pending_restart {
+                    if let Some(why) = c.trip_if_over_cap() {
+                        return Err(EngineError::EngineDied(format!("{ENGINE_DOWN}: {why}")));
+                    }
+                    let now = Instant::now();
+                    c.restarts.push_back(now);
+                    c.restarts_total += 1;
+                    c.pending_restart = false;
+                    eprintln!(
+                        "[talus-server] restarting the engine after a crash ({} of {} within {} min)",
+                        c.restarts.len(),
+                        MAX_RESTARTS,
+                        RESTART_WINDOW.as_secs() / 60
+                    );
+                }
+            }
+            let (handle, ready) = Self::start(
+                &self.exe,
+                &self.args,
+                &self.env,
+                self.cwd.as_deref(),
+                self.log.as_deref(),
+                self.default_ctx,
+                &self.stderr_tail,
+            )
+            .inspect_err(|_| {
+                // a restart that does not come up counts as another crash
+                let mut c = self.crash.lock().unwrap();
+                if c.restarts_total > 0 && c.down.is_none() {
+                    c.pending_restart = true;
+                }
+            })?;
+            if ready.max_context != self.max_context || ready.stop_token != self.stop_token {
+                let mut handle = handle;
+                stop_process(&mut handle, Duration::from_secs(15));
+                return Err(EngineError::EngineDied(format!(
+                    "the engine came back with READY {} {:?}, it started with READY {} {:?}",
+                    ready.max_context, ready.stop_token, self.max_context, self.stop_token
+                )));
+            }
+            self.install(slot, handle);
+        }
+        Ok(slot.as_mut().expect("installed above"))
+    }
+
+    /// The engine process exited on its own: log it (exit status, last stderr lines), forget the handle, and mark it
+    /// for a restart on the next request. A live process (or none) is left alone.
+    fn reap_if_crashed(&self, slot: &mut Option<SubprocessHandle>) {
+        let status = match slot.as_mut().map(|h| h.child.try_wait()) {
+            Some(Ok(Some(st))) => st,
+            _ => return,
+        };
+        let pid = slot.as_ref().map(|h| h.child.id()).unwrap_or(0);
+        *slot = None;
+        *self.stdin_cancel.lock().unwrap() = None;
+        self.pid.store(0, Ordering::SeqCst);
+        // the stderr tee may still be draining the pipe: give it a moment
+        std::thread::sleep(Duration::from_millis(100));
+        let tail: Vec<String> = self.stderr_tail.lock().unwrap().iter().cloned().collect();
+        let report = format!(
+            "engine pid {pid} exited ({status}) at unix {}; last stderr: {}",
+            crate::json::unix_timestamp_secs(),
+            if tail.is_empty() {
+                "(none)".to_string()
+            } else {
+                tail.join(" | ")
+            }
+        );
+        eprintln!("[talus-server] engine crash: {report}");
+        let mut c = self.crash.lock().unwrap();
+        c.crashes += 1;
+        c.last_crash = Some(report);
+        c.pending_restart = true;
+        let _ = c.trip_if_over_cap();
     }
 
     pub fn stop_token(&self) -> Option<u32> {
@@ -1452,60 +1744,11 @@ impl StdioSubprocessEngine {
     }
 }
 
-impl Engine for StdioSubprocessEngine {
-    fn max_context(&self) -> usize {
-        self.max_context
-    }
-
-    fn shutdown(&self) {
-        // engines that ignore QUIT while idle (GLM was seen to) are killed after a short grace; the GPU driver frees
-        // their memory either way
-        self.quit_and_wait(Duration::from_secs(15));
-    }
-
-    fn build_version(&self) -> Option<&str> {
-        self.info.get("version").map(|s| s.as_str())
-    }
-
-    fn pid(&self) -> Option<u32> {
-        Some(self.pid)
-    }
-
-    fn info_value(&self, key: &str) -> Option<String> {
-        self.info.get(key).cloned()
-    }
-
-    fn supports_json_schema(&self) -> bool {
-        self.info
-            .get("grammar")
-            .is_some_and(|v| v.split(',').any(|g| g == "json_schema"))
-    }
-
-    fn generate(
-        &self,
-        req: &GenerateRequest,
-        cancel: Arc<AtomicBool>,
-        on_token: &mut dyn FnMut(u32) -> bool,
-        on_progress: &mut dyn FnMut(usize, usize),
-    ) -> Result<EngineTimings, EngineError> {
-        self.generate_with_logprobs(req, cancel, &mut |t, _| on_token(t), on_progress)
-    }
-
-    fn supports_logprobs(&self) -> bool {
-        self.info.get("logprobs").map(|v| v == "1").unwrap_or(false)
-    }
-
-    fn supports_score(&self) -> bool {
-        self.info.get("score").map(|v| v == "1").unwrap_or(false)
-    }
-
-    fn score(&self, req: &ScoreRequest) -> Result<ScoreResult, EngineError> {
-        if !self.supports_score() {
-            return Err(EngineError::Unsupported(
-                "scoring not supported by this engine".to_string(),
-            ));
-        }
-        let mut handle = self.proc.lock().unwrap();
+impl StdioSubprocessEngine {
+    fn score_on(
+        handle: &mut SubprocessHandle,
+        req: &ScoreRequest,
+    ) -> Result<ScoreResult, EngineError> {
         let csv = |ids: &[u32]| {
             ids.iter()
                 .map(|id| id.to_string())
@@ -1565,14 +1808,14 @@ impl Engine for StdioSubprocessEngine {
         }
     }
 
-    fn generate_with_logprobs(
+    fn generate_on(
         &self,
+        handle: &mut SubprocessHandle,
         req: &GenerateRequest,
         cancel: Arc<AtomicBool>,
         on_token: &mut dyn FnMut(u32, Option<TokenLogprob>) -> bool,
         on_progress: &mut dyn FnMut(usize, usize),
     ) -> Result<EngineTimings, EngineError> {
-        let mut handle = self.proc.lock().unwrap();
         let keys = req.sampling.to_gen_keys();
         let csv_ids: String = req
             .prompt_ids
@@ -1700,6 +1943,160 @@ impl Engine for StdioSubprocessEngine {
         }
     }
 
+    /// A request failed with `EngineDied`: the engine usually just exited, but its stdout closes a moment before it
+    /// can be waited for. Wait briefly, so the crash is recorded now and the next request restarts it.
+    fn settle_after_error(&self, slot: &mut Option<SubprocessHandle>, err: Option<&EngineError>) {
+        if !matches!(err, Some(EngineError::EngineDied(_))) {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while let Some(h) = slot.as_mut() {
+            if !matches!(h.child.try_wait(), Ok(None)) || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.reap_if_crashed(slot);
+    }
+}
+
+impl Engine for StdioSubprocessEngine {
+    fn max_context(&self) -> usize {
+        self.max_context
+    }
+
+    fn shutdown(&self) {
+        // engines that ignore QUIT while idle (GLM was seen to) are killed after a short grace; the GPU driver frees
+        // their memory either way
+        self.quit_and_wait(Duration::from_secs(15));
+    }
+
+    fn build_version(&self) -> Option<&str> {
+        self.info.get("version").map(|s| s.as_str())
+    }
+
+    fn pid(&self) -> Option<u32> {
+        Some(self.pid.load(Ordering::SeqCst)).filter(|&p| p != 0)
+    }
+
+    fn is_loaded(&self) -> bool {
+        self.pid.load(Ordering::SeqCst) != 0
+    }
+
+    /// Start the engine if it is not running. Also the manual override after the crash-loop cap: it clears the
+    /// "down" state and the restart window.
+    fn load(&self) -> Result<(), EngineError> {
+        let mut slot = self.proc.lock().unwrap();
+        {
+            let mut c = self.crash.lock().unwrap();
+            if c.down.take().is_some() {
+                eprintln!(
+                    "[talus-server] engine was down after a crash loop; POST /load starts it again"
+                );
+                c.restarts.clear();
+                c.pending_restart = false;
+            }
+        }
+        self.running(&mut slot).map(|_| ())
+    }
+
+    fn health(&self) -> EngineHealth {
+        // notice a crash while idle (the lock is free then); a busy engine is alive
+        if let Ok(mut slot) = self.proc.try_lock() {
+            self.reap_if_crashed(&mut slot);
+        }
+        let c = self.crash.lock().unwrap();
+        EngineHealth {
+            crashes: c.crashes,
+            restarts: c.restarts_total,
+            down: c.down.clone(),
+            last_crash: c.last_crash.clone(),
+            restart_pending: c.pending_restart && c.down.is_none(),
+        }
+    }
+
+    fn in_flight(&self) -> Option<usize> {
+        Some(self.busy.load(Ordering::SeqCst))
+    }
+
+    /// Stop the engine process (QUIT, then a kill after a grace period) and wait for it, so its GPU memory is free.
+    /// Waits for a running request (it holds the process lock). The next request or `load` starts it again.
+    fn unload(&self) -> Result<(), EngineError> {
+        let mut slot = self.proc.lock().unwrap();
+        self.reap_if_crashed(&mut slot);
+        // a deliberate unload: no automatic restart is owed
+        self.crash.lock().unwrap().pending_restart = false;
+        if let Some(mut handle) = slot.take() {
+            *self.stdin_cancel.lock().unwrap() = None;
+            self.pid.store(0, Ordering::SeqCst);
+            stop_process(&mut handle, Duration::from_secs(15));
+        }
+        Ok(())
+    }
+
+    fn supports_lifecycle(&self) -> bool {
+        true
+    }
+
+    fn info_value(&self, key: &str) -> Option<String> {
+        self.info.get(key).cloned()
+    }
+
+    fn supports_json_schema(&self) -> bool {
+        self.info
+            .get("grammar")
+            .is_some_and(|v| v.split(',').any(|g| g == "json_schema"))
+    }
+
+    fn generate(
+        &self,
+        req: &GenerateRequest,
+        cancel: Arc<AtomicBool>,
+        on_token: &mut dyn FnMut(u32) -> bool,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<EngineTimings, EngineError> {
+        self.generate_with_logprobs(req, cancel, &mut |t, _| on_token(t), on_progress)
+    }
+
+    fn supports_logprobs(&self) -> bool {
+        self.info.get("logprobs").map(|v| v == "1").unwrap_or(false)
+    }
+
+    fn supports_score(&self) -> bool {
+        self.info.get("score").map(|v| v == "1").unwrap_or(false)
+    }
+
+    fn score(&self, req: &ScoreRequest) -> Result<ScoreResult, EngineError> {
+        if !self.supports_score() {
+            return Err(EngineError::Unsupported(
+                "scoring not supported by this engine".to_string(),
+            ));
+        }
+        let mut slot = self.proc.lock().unwrap();
+        self.busy.fetch_add(1, Ordering::SeqCst);
+        let _busy = BusyGuard(&self.busy);
+        let handle = self.running(&mut slot)?;
+        let res = Self::score_on(handle, req);
+        self.settle_after_error(&mut slot, res.as_ref().err());
+        res
+    }
+
+    fn generate_with_logprobs(
+        &self,
+        req: &GenerateRequest,
+        cancel: Arc<AtomicBool>,
+        on_token: &mut dyn FnMut(u32, Option<TokenLogprob>) -> bool,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<EngineTimings, EngineError> {
+        let mut slot = self.proc.lock().unwrap();
+        self.busy.fetch_add(1, Ordering::SeqCst);
+        let _busy = BusyGuard(&self.busy);
+        let handle = self.running(&mut slot)?;
+        let res = self.generate_on(handle, req, cancel, on_token, on_progress);
+        self.settle_after_error(&mut slot, res.as_ref().err());
+        res
+    }
+
     fn tokenize(&self, text: &str, parse_special: bool) -> Vec<u32> {
         self.tok.encode(text, parse_special)
     }
@@ -1709,14 +2106,20 @@ impl Engine for StdioSubprocessEngine {
     }
 
     fn cancel(&self) {
-        if let Ok(mut stdin) = self.stdin_cancel.lock() {
-            let _ = stdin.write_all(b"STOP\n");
-            let _ = stdin.flush();
+        let stdin = self.stdin_cancel.lock().ok().and_then(|s| s.clone());
+        if let Some(stdin) = stdin {
+            if let Ok(mut stdin) = stdin.lock() {
+                let _ = stdin.write_all(b"STOP\n");
+                let _ = stdin.flush();
+            }
         }
     }
 
     fn save_slot(&self, _slot_id: usize, path: &Path) -> Result<(usize, usize, f64), EngineError> {
-        let mut handle = self.proc.lock().unwrap();
+        let mut slot = self.proc.lock().unwrap();
+        self.busy.fetch_add(1, Ordering::SeqCst);
+        let _busy = BusyGuard(&self.busy);
+        let handle = self.running(&mut slot)?;
         let cmd = format!("SAVE {}\n", path.display());
         {
             let mut stdin = handle.stdin.lock().unwrap();
@@ -1739,7 +2142,10 @@ impl Engine for StdioSubprocessEngine {
         _slot_id: usize,
         path: &Path,
     ) -> Result<(usize, usize, f64), EngineError> {
-        let mut handle = self.proc.lock().unwrap();
+        let mut slot = self.proc.lock().unwrap();
+        self.busy.fetch_add(1, Ordering::SeqCst);
+        let _busy = BusyGuard(&self.busy);
+        let handle = self.running(&mut slot)?;
         let cmd = format!("RESTORE {}\n", path.display());
         {
             let mut stdin = handle.stdin.lock().unwrap();
@@ -1758,7 +2164,10 @@ impl Engine for StdioSubprocessEngine {
     }
 
     fn erase_slot(&self, _slot_id: usize) -> Result<usize, EngineError> {
-        let mut handle = self.proc.lock().unwrap();
+        let mut slot = self.proc.lock().unwrap();
+        self.busy.fetch_add(1, Ordering::SeqCst);
+        let _busy = BusyGuard(&self.busy);
+        let handle = self.running(&mut slot)?;
         {
             let mut stdin = handle.stdin.lock().unwrap();
             stdin
@@ -1832,23 +2241,33 @@ fn read_session_reply<R: BufRead>(
 impl StdioSubprocessEngine {
     /// Send QUIT, wait up to `grace` for the engine to exit, then kill it. Idempotent.
     pub fn quit_and_wait(&self, grace: Duration) {
-        if let Ok(mut handle) = self.proc.lock() {
-            if let Ok(mut stdin) = handle.stdin.lock() {
-                let _ = stdin.write_all(b"QUIT\n");
-                let _ = stdin.flush();
+        if let Ok(mut slot) = self.proc.lock() {
+            if let Some(mut handle) = slot.take() {
+                self.pid.store(0, Ordering::SeqCst);
+                stop_process(&mut handle, grace);
             }
-            let deadline = Instant::now() + grace;
-            loop {
-                match handle.child.try_wait() {
-                    Ok(Some(_)) | Err(_) => return,
-                    Ok(None) if Instant::now() >= deadline => break,
-                    Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                }
-            }
-            let _ = handle.child.kill();
-            let _ = handle.child.wait();
         }
     }
+}
+
+/// Send QUIT, wait up to `grace` for the process to exit, then kill it and reap it.
+fn stop_process(handle: &mut SubprocessHandle, grace: Duration) {
+    if let Ok(mut stdin) = handle.stdin.lock() {
+        let _ = stdin.write_all(b"QUIT\n");
+        let _ = stdin.flush();
+        // and EOF: the 27B serve loop has no QUIT command (it waited out the whole grace period, then the kill)
+        stdin.close();
+    }
+    let deadline = Instant::now() + grace;
+    loop {
+        match handle.child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) if Instant::now() >= deadline => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    let _ = handle.child.kill();
+    let _ = handle.child.wait();
 }
 
 /// Open the engine log for append, creating it (and its parent directory) if missing.
@@ -1864,24 +2283,43 @@ fn open_engine_log(path: &Path) -> std::io::Result<std::fs::File> {
 
 /// Copy the engine's stderr to talus-server's stderr and to `log` until the engine closes it (exits). Write errors
 /// on either side are ignored so the engine never blocks on a full stderr pipe.
-fn tee_engine_stderr(mut src: std::process::ChildStderr, mut log: std::fs::File) {
+fn tee_engine_stderr(
+    mut src: std::process::ChildStderr,
+    mut log: Option<std::fs::File>,
+    tail: Arc<Mutex<std::collections::VecDeque<String>>>,
+) {
     let spawned = thread::Builder::new()
         .name("engine-stderr".to_string())
         .spawn(move || {
             use std::io::Read;
             let mut buf = [0u8; 8192];
+            let mut line: Vec<u8> = Vec::new();
             loop {
                 match src.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let _ = log.write_all(&buf[..n]);
+                        if let Some(f) = log.as_mut() {
+                            let _ = f.write_all(&buf[..n]);
+                        }
                         let mut err = std::io::stderr().lock();
                         let _ = err.write_all(&buf[..n]);
                         let _ = err.flush();
+                        drop(err);
+                        for &b in &buf[..n] {
+                            if b == b'\n' {
+                                push_tail(&tail, &line);
+                                line.clear();
+                            } else if line.len() < 512 {
+                                line.push(b);
+                            }
+                        }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(_) => break,
                 }
+            }
+            if !line.is_empty() {
+                push_tail(&tail, &line);
             }
         });
     if let Err(e) = spawned {
@@ -1889,9 +2327,21 @@ fn tee_engine_stderr(mut src: std::process::ChildStderr, mut log: std::fs::File)
     }
 }
 
+fn push_tail(tail: &Mutex<std::collections::VecDeque<String>>, line: &[u8]) {
+    let text = String::from_utf8_lossy(line).trim_end().to_string();
+    if text.is_empty() {
+        return;
+    }
+    let mut t = tail.lock().unwrap();
+    if t.len() == STDERR_TAIL_LINES {
+        t.pop_front();
+    }
+    t.push_back(text);
+}
+
 impl Drop for StdioSubprocessEngine {
     fn drop(&mut self) {
-        if let Ok(mut handle) = self.proc.lock() {
+        if let Some(handle) = self.proc.get_mut().ok().and_then(Option::as_mut) {
             if let Ok(mut stdin) = handle.stdin.lock() {
                 let _ = stdin.write_all(b"QUIT\n");
                 let _ = stdin.flush();

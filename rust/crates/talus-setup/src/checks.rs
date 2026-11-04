@@ -567,6 +567,99 @@ pub fn check_rocm(st: Option<&SetupState>, paths: &Paths) -> Check {
     }
 }
 
+/// A distribution's ROCm next to the SDK (talus-public#2): Fedora's rocm-hip-devel puts older HIP headers in
+/// /usr/include/hip, which clang searched before the SDK's in source builds up to v0.1.3 (build.sh now passes
+/// `-isystem <SDK>/include`). Present on its own that is information; a path variable that holds ROCm files from
+/// outside the SDK still comes first (CPATH & co. in a build, LD_LIBRARY_PATH before the programs' RUNPATH) and warns.
+/// `fs_root` is `/` (tests: a temporary tree); `env` the variables' values.
+pub fn check_system_rocm(
+    fs_root: &Path,
+    env: &[(&str, Option<String>)],
+    sdk: Option<&Path>,
+) -> Check {
+    const ID: &str = "system_rocm";
+    const TITLE: &str = "System ROCm";
+    let has_rocm = |d: &Path| {
+        d.join("hip/hip_runtime.h").is_file()
+            || std::fs::read_dir(d).is_ok_and(|rd| {
+                rd.flatten().any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("libamdhip64.so")
+                })
+            })
+    };
+    let sdk_real = sdk.and_then(|p| std::fs::canonicalize(p).ok());
+    let mut shadow = vec![];
+    for (var, val) in env {
+        for d in val
+            .as_deref()
+            .unwrap_or("")
+            .split(':')
+            .filter(|d| !d.is_empty())
+        {
+            let dp = Path::new(d);
+            if !has_rocm(dp) {
+                continue;
+            }
+            let real = std::fs::canonicalize(dp).unwrap_or_else(|_| dp.to_path_buf());
+            if sdk_real.as_ref().is_some_and(|s| real.starts_with(s)) {
+                continue;
+            }
+            shadow.push(format!("{var} has {d}"));
+        }
+    }
+    if !shadow.is_empty() {
+        let vars: Vec<&str> = env
+            .iter()
+            .map(|(v, _)| *v)
+            .filter(|v| shadow.iter().any(|s| s.starts_with(&format!("{v} "))))
+            .collect();
+        return Check::new(
+            ID,
+            TITLE,
+            Verdict::Warn,
+            format!("{} (ROCm files outside the SDK come first)", shadow.join("; ")),
+        )
+        .advice(format!(
+            "Unset {} for Talus (its programs and builds use the SDK in ~/.local/share/talus/rocm-sdk).",
+            vars.join(", ")
+        ));
+    }
+    let mut found = vec![];
+    for d in ["usr/include/hip", "usr/local/include/hip"] {
+        if fs_root.join(d).join("hip_runtime.h").is_file() {
+            found.push(format!("/{d}"));
+        }
+    }
+    for d in [
+        "usr/lib64",
+        "usr/lib/x86_64-linux-gnu",
+        "usr/lib",
+        "usr/local/lib",
+        "opt/rocm/lib",
+    ] {
+        let dp = fs_root.join(d);
+        let real = std::fs::canonicalize(&dp).ok();
+        if has_rocm(&dp)
+            && !(real.is_some()
+                && real.as_ref() == sdk_real.as_ref().map(|s| s.join("lib")).as_ref())
+        {
+            found.push(format!("/{d}/libamdhip64.so"));
+        }
+    }
+    if found.is_empty() {
+        return Check::new(ID, TITLE, Verdict::Pass, "none outside the SDK");
+    }
+    Check::new(
+        ID,
+        TITLE,
+        Verdict::Info,
+        format!("{} (distribution packages); Talus uses its SDK ahead of them", found.join(", ")),
+    )
+    .advice("A source build of Talus v0.1.3 or older can fail on these headers (talus-public#2): use a newer release, or the prebuilt one.")
+}
+
 pub fn check_binaries(paths: &Paths) -> Check {
     let bin = paths.bin();
     let need = [
@@ -1235,6 +1328,20 @@ pub fn run(ctx: &Ctx) -> Vec<Check> {
     let need_pool = ctx.models.iter().any(|m| m.needs_big_gtt);
     let mut out = hardware(ctx.sys, need_pool);
     out.push(check_rocm(ctx.state, ctx.paths));
+    let sdk = ctx
+        .state
+        .and_then(|s| s.rocm_sdk.clone())
+        .or_else(|| std::fs::canonicalize(ctx.paths.rocm_link()).ok());
+    let env: Vec<(&str, Option<String>)> = [
+        "LD_LIBRARY_PATH",
+        "CPATH",
+        "C_INCLUDE_PATH",
+        "CPLUS_INCLUDE_PATH",
+    ]
+    .into_iter()
+    .map(|v| (v, std::env::var(v).ok()))
+    .collect();
+    out.push(check_system_rocm(Path::new("/"), &env, sdk.as_deref()));
     out.push(check_binaries(ctx.paths));
     out.push(check_tuning(ctx.sys, ctx.state, ctx.paths));
     let Some(st) = ctx.state else {
@@ -1461,6 +1568,69 @@ mod tests {
 
     /// itest18: an SDK copy given through ROCM_SDK reports plain "10.2.0" (.info/version); with the pin's HIP version it
     /// is the release's SDK, while another nightly, another HIP or another release still warns.
+    #[test]
+    fn system_rocm_check() {
+        let d = crate::testutil::tempdir("sysrocm");
+        let sdk = d.join("sdk");
+        std::fs::create_dir_all(sdk.join("include/hip")).unwrap();
+        std::fs::create_dir_all(sdk.join("lib")).unwrap();
+        std::fs::write(sdk.join("include/hip/hip_runtime.h"), "").unwrap();
+        std::fs::write(sdk.join("lib/libamdhip64.so"), "").unwrap();
+        let root = d.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let none: Vec<(&str, Option<String>)> = vec![("LD_LIBRARY_PATH", None), ("CPATH", None)];
+        // nothing outside the SDK
+        assert_eq!(
+            check_system_rocm(&root, &none, Some(&sdk)).verdict,
+            Verdict::Pass
+        );
+        // the SDK's own dirs in the variables: fine
+        let own = vec![
+            (
+                "LD_LIBRARY_PATH",
+                Some(format!("{}:/nonexistent", sdk.join("lib").display())),
+            ),
+            ("CPATH", Some(sdk.join("include").display().to_string())),
+        ];
+        assert_eq!(
+            check_system_rocm(&root, &own, Some(&sdk)).verdict,
+            Verdict::Pass
+        );
+        // Fedora's rocm-hip-devel / rocm-hip: information
+        std::fs::create_dir_all(root.join("usr/include/hip")).unwrap();
+        std::fs::write(root.join("usr/include/hip/hip_runtime.h"), "").unwrap();
+        std::fs::create_dir_all(root.join("usr/lib64")).unwrap();
+        std::fs::write(root.join("usr/lib64/libamdhip64.so.7"), "").unwrap();
+        let c = check_system_rocm(&root, &none, Some(&sdk));
+        assert_eq!(c.verdict, Verdict::Info, "{c:?}");
+        assert!(
+            c.detail.contains("/usr/include/hip") && c.detail.contains("/usr/lib64/libamdhip64.so"),
+            "{}",
+            c.detail
+        );
+        // a system ROCm in LD_LIBRARY_PATH / CPATH comes first: warn and name the variables
+        let bad = vec![
+            (
+                "LD_LIBRARY_PATH",
+                Some(root.join("usr/lib64").display().to_string()),
+            ),
+            (
+                "CPATH",
+                Some(root.join("usr/include").display().to_string()),
+            ),
+        ];
+        let c = check_system_rocm(&root, &bad, Some(&sdk));
+        assert_eq!(c.verdict, Verdict::Warn, "{c:?}");
+        assert!(
+            c.advice
+                .as_deref()
+                .unwrap()
+                .contains("LD_LIBRARY_PATH, CPATH"),
+            "{c:?}"
+        );
+        std::fs::remove_dir_all(d).ok();
+    }
+
     #[test]
     fn rocm_check_accepts_release_sdk_copy() {
         let pin = "10.2.0a20261014";

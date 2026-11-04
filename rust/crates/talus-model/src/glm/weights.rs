@@ -363,6 +363,9 @@ pub struct GlmWeights {
     pub layers: Vec<LayerW>,
     pub allocs: Vec<*mut c_void>,
     pub bytes: usize,
+    /// Set when the NextN (MTP) layer was requested but did not fit in GPU memory (the hipMalloc error): the
+    /// weights then hold the trunk only and the engine must run without MTP.
+    pub mtp_dropped: Option<String>,
 }
 
 unsafe impl Send for GlmWeights {}
@@ -394,6 +397,9 @@ struct Uploader<'a> {
     names: Vec<String>,
     total: u64,
     floor: u64,
+    /// TALUS_GLM_DEV_LIMIT_GIB: refuse (as hipErrorOutOfMemory) a weight allocation that would take the loaded
+    /// weights past this many GiB. Test knob for the out-of-memory paths (talus-public#6); unset = no limit.
+    dev_limit: Option<u64>,
     t_read: f64,
     t_alloc: f64,
     t_sync: f64,
@@ -431,6 +437,11 @@ impl<'a> Uploader<'a> {
             names: vec![],
             total: total_weight_bytes(g),
             floor: floor_bytes(),
+            dev_limit: std::env::var("TALUS_GLM_DEV_LIMIT_GIB")
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|g| *g > 0.0)
+                .map(|g| (g * (1u64 << 30) as f64) as u64),
             t_read: 0.0,
             t_alloc: 0.0,
             t_sync: 0.0,
@@ -495,7 +506,17 @@ impl<'a> Uploader<'a> {
             });
         }
         let ta = std::time::Instant::now();
-        let dev = dev_alloc(bytes)?;
+        if self
+            .dev_limit
+            .is_some_and(|l| (self.bytes + bytes) as u64 > l)
+        {
+            let e = CoreError::KernelError {
+                code: 2,
+                message: format!("hipMalloc({bytes}): out of memory (TALUS_GLM_DEV_LIMIT_GIB)"),
+            };
+            return Err(self.alloc_context(name, e));
+        }
+        let dev = dev_alloc(bytes).map_err(|e| self.alloc_context(name, e))?;
         self.t_alloc += ta.elapsed().as_secs_f64();
         self.allocs.push(dev);
         let fd = self.files[si].as_raw_fd();
@@ -551,6 +572,31 @@ impl<'a> Uploader<'a> {
         }))
     }
 
+    /// Say which tensor failed, how far the load got and what the kernel allows (talus-public#6: a bare
+    /// `hipMalloc(N): out of memory` named neither the tensor nor the limit).
+    fn alloc_context(&self, name: &str, e: CoreError) -> CoreError {
+        let CoreError::KernelError { code, message } = e else {
+            return e;
+        };
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        let (free, total) = ffi::mem_get_info();
+        let kfd = talus_mem::kfd::KfdLimits::read()
+            .map(|l| l.describe())
+            .unwrap_or_else(|| "KFD limit unknown".into());
+        CoreError::KernelError {
+            code,
+            message: format!(
+                "{message} loading {name} after {:.2} of {:.2} GiB of weights; hipMemGetInfo free {:.2} of {:.2} GiB; \
+                 MemAvailable {:.2} GiB; {kfd}",
+                gib(self.bytes as u64),
+                gib(self.total),
+                gib(free),
+                gib(total),
+                gib(mem_available_bytes()),
+            ),
+        }
+    }
+
     fn finish(mut self) -> Result<(Vec<*mut c_void>, usize)> {
         ffi::sync(self.stream)?;
         for f in &self.files {
@@ -581,9 +627,122 @@ pub fn ggml_type_id(e: &TensorEntry) -> u32 {
     e.qtype as u32
 }
 
+/// Bytes of the NextN (MTP) layers' tensors (blk.{n_layer}.. ), loaded last.
+pub fn mtp_weight_bytes(g: &GgufModel, hp: &GlmHparams) -> u64 {
+    g.tensors()
+        .filter(|(_, e)| {
+            e.name
+                .strip_prefix("blk.")
+                .and_then(|r| r.split('.').next())
+                .and_then(|i| i.parse::<usize>().ok())
+                .is_some_and(|i| i >= hp.n_layer)
+        })
+        .map(|(_, e)| e.byte_size)
+        .sum()
+}
+
 /// Sum of the tensor payloads (for the Budget, before any allocation).
 pub fn total_weight_bytes(g: &GgufModel) -> u64 {
     g.tensors().map(|(_, e)| e.byte_size).sum()
+}
+
+/// Tensors of trunk or NextN layer `il` (one device allocation each).
+fn load_layer(
+    up: &mut Uploader,
+    hp: &GlmHparams,
+    il: usize,
+    output_norm: Tensor,
+) -> Result<LayerW> {
+    let b = |s: &str| format!("blk.{il}.{s}");
+    let mut l = LayerW {
+        attn_norm: up.load(&b("attn_norm.weight"))?,
+        ffn_norm: up.load(&b("ffn_norm.weight"))?,
+        recr: hp.is_recr[il],
+        moe: il >= hp.n_dense_lead,
+        ..Default::default()
+    };
+    if il < hp.n_layer {
+        l.hc_attn = HcW {
+            fn_: up.load(&b("hc_attn_fn.weight"))?,
+            base: up.load(&b("hc_attn_base.weight"))?,
+            scale: up.load(&b("hc_attn_scale.weight"))?,
+        };
+        l.hc_ffn = HcW {
+            fn_: up.load(&b("hc_ffn_fn.weight"))?,
+            base: up.load(&b("hc_ffn_base.weight"))?,
+            scale: up.load(&b("hc_ffn_scale.weight"))?,
+        };
+    }
+    if l.recr {
+        l.kda = KdaW {
+            conv_q: up.load(&b("ssm_conv1d_q.weight"))?,
+            conv_k: up.load(&b("ssm_conv1d_k.weight"))?,
+            conv_v: up.load(&b("ssm_conv1d_v.weight"))?,
+            wq: up.load(&b("attn_q.weight"))?,
+            wk: up.load(&b("attn_k.weight"))?,
+            wv: up.load(&b("attn_v.weight"))?,
+            f_a: up.load(&b("ssm_f_a.weight"))?,
+            f_b: up.load(&b("ssm_f_b.weight"))?,
+            beta: up.load(&b("ssm_beta.weight"))?,
+            a: up.load(&b("ssm_a"))?,
+            dt_b: up.load(&b("ssm_dt.bias"))?,
+            g_a: up.load(&b("ssm_g_a.weight"))?,
+            g_b: up.load(&b("ssm_g_b.weight"))?,
+            o_norm: up.load(&b("ssm_norm.weight"))?,
+            wo: up.load(&b("attn_output.weight"))?,
+        };
+    } else {
+        l.mla = MlaW {
+            q_a_norm: up.load(&b("attn_q_a_norm.weight"))?,
+            kv_a_norm: up.load(&b("attn_kv_a_norm.weight"))?,
+            wq_a: up.load(&b("attn_q_a.weight"))?,
+            wq_b: up.load(&b("attn_q_b.weight"))?,
+            wkv_a: up.load(&b("attn_kv_a_mqa.weight"))?,
+            wk_b: up.load(&b("attn_k_b.weight"))?,
+            wv_b: up.load(&b("attn_v_b.weight"))?,
+            wo: up.load(&b("attn_output.weight"))?,
+            idx_k_norm: up.load(&b("indexer.k_norm.weight"))?,
+            idx_k_norm_b: up.load(&b("indexer.k_norm.bias"))?,
+            idx_proj: up.load(&b("indexer.proj.weight"))?,
+            idx_k: up.load(&b("indexer.attn_k.weight"))?,
+            idx_q_b: up.load(&b("indexer.attn_q_b.weight"))?,
+            idx_gate: up.load(&b("indexer_compressor_gate.weight"))?,
+            idx_ape: up.load(&b("indexer_compressor_ape.weight"))?,
+        };
+    }
+    if l.moe {
+        l.ffn = FfnW {
+            gate: up.load(&b("ffn_gate_shexp.weight"))?,
+            up: up.load(&b("ffn_up_shexp.weight"))?,
+            down: up.load(&b("ffn_down_shexp.weight"))?,
+            gate_inp: up.load(&b("ffn_gate_inp.weight"))?,
+            probs_b: up.load(&b("exp_probs_b.bias"))?,
+            gate_exps: up.load(&b("ffn_gate_exps.weight"))?,
+            up_exps: up.load(&b("ffn_up_exps.weight"))?,
+            down_exps: up.load(&b("ffn_down_exps.weight"))?,
+        };
+    } else {
+        l.ffn = FfnW {
+            gate: up.load(&b("ffn_gate.weight"))?,
+            up: up.load(&b("ffn_up.weight"))?,
+            down: up.load(&b("ffn_down.weight"))?,
+            ..Default::default()
+        };
+    }
+    if il >= hp.n_layer {
+        l.eh_proj = up.load(&b("nextn.eh_proj.weight"))?;
+        l.enorm = up.load(&b("nextn.enorm.weight"))?;
+        l.hnorm = up.load(&b("nextn.hnorm.weight"))?;
+        l.head_norm = up
+            .load_opt(&b("nextn.shared_head_norm.weight"))?
+            .unwrap_or(output_norm);
+    }
+    Ok(l)
+}
+
+/// hipErrorOutOfMemory (2) from a device allocation.
+fn is_oom(e: &CoreError) -> bool {
+    matches!(e, CoreError::KernelError { code: 2, .. })
 }
 
 impl GlmWeights {
@@ -602,91 +761,24 @@ impl GlmWeights {
         let output = up.load("output.weight")?;
         let n_load = if load_mtp { hp.n_layer_all } else { hp.n_layer };
         let mut layers = Vec::with_capacity(n_load);
+        let mut mtp_dropped = None;
         for il in 0..n_load {
-            let b = |s: &str| format!("blk.{il}.{s}");
-            let mut l = LayerW {
-                attn_norm: up.load(&b("attn_norm.weight"))?,
-                ffn_norm: up.load(&b("ffn_norm.weight"))?,
-                recr: hp.is_recr[il],
-                moe: il >= hp.n_dense_lead,
-                ..Default::default()
+            // the NextN (MTP) layer is optional: when it does not fit (hipMalloc out of memory), free what of it was
+            // loaded and continue without speculative decoding instead of failing the whole load (talus-public#6)
+            let mark = (up.allocs.len(), up.bytes, up.names.len());
+            let l = match load_layer(&mut up, hp, il, output_norm) {
+                Ok(l) => l,
+                Err(e) if il >= hp.n_layer && is_oom(&e) => {
+                    for p in up.allocs.drain(mark.0..) {
+                        ffi::dev_free(p);
+                    }
+                    up.bytes = mark.1;
+                    up.names.truncate(mark.2);
+                    mtp_dropped = Some(e.to_string());
+                    break;
+                }
+                Err(e) => return Err(e),
             };
-            if il < hp.n_layer {
-                l.hc_attn = HcW {
-                    fn_: up.load(&b("hc_attn_fn.weight"))?,
-                    base: up.load(&b("hc_attn_base.weight"))?,
-                    scale: up.load(&b("hc_attn_scale.weight"))?,
-                };
-                l.hc_ffn = HcW {
-                    fn_: up.load(&b("hc_ffn_fn.weight"))?,
-                    base: up.load(&b("hc_ffn_base.weight"))?,
-                    scale: up.load(&b("hc_ffn_scale.weight"))?,
-                };
-            }
-            if l.recr {
-                l.kda = KdaW {
-                    conv_q: up.load(&b("ssm_conv1d_q.weight"))?,
-                    conv_k: up.load(&b("ssm_conv1d_k.weight"))?,
-                    conv_v: up.load(&b("ssm_conv1d_v.weight"))?,
-                    wq: up.load(&b("attn_q.weight"))?,
-                    wk: up.load(&b("attn_k.weight"))?,
-                    wv: up.load(&b("attn_v.weight"))?,
-                    f_a: up.load(&b("ssm_f_a.weight"))?,
-                    f_b: up.load(&b("ssm_f_b.weight"))?,
-                    beta: up.load(&b("ssm_beta.weight"))?,
-                    a: up.load(&b("ssm_a"))?,
-                    dt_b: up.load(&b("ssm_dt.bias"))?,
-                    g_a: up.load(&b("ssm_g_a.weight"))?,
-                    g_b: up.load(&b("ssm_g_b.weight"))?,
-                    o_norm: up.load(&b("ssm_norm.weight"))?,
-                    wo: up.load(&b("attn_output.weight"))?,
-                };
-            } else {
-                l.mla = MlaW {
-                    q_a_norm: up.load(&b("attn_q_a_norm.weight"))?,
-                    kv_a_norm: up.load(&b("attn_kv_a_norm.weight"))?,
-                    wq_a: up.load(&b("attn_q_a.weight"))?,
-                    wq_b: up.load(&b("attn_q_b.weight"))?,
-                    wkv_a: up.load(&b("attn_kv_a_mqa.weight"))?,
-                    wk_b: up.load(&b("attn_k_b.weight"))?,
-                    wv_b: up.load(&b("attn_v_b.weight"))?,
-                    wo: up.load(&b("attn_output.weight"))?,
-                    idx_k_norm: up.load(&b("indexer.k_norm.weight"))?,
-                    idx_k_norm_b: up.load(&b("indexer.k_norm.bias"))?,
-                    idx_proj: up.load(&b("indexer.proj.weight"))?,
-                    idx_k: up.load(&b("indexer.attn_k.weight"))?,
-                    idx_q_b: up.load(&b("indexer.attn_q_b.weight"))?,
-                    idx_gate: up.load(&b("indexer_compressor_gate.weight"))?,
-                    idx_ape: up.load(&b("indexer_compressor_ape.weight"))?,
-                };
-            }
-            if l.moe {
-                l.ffn = FfnW {
-                    gate: up.load(&b("ffn_gate_shexp.weight"))?,
-                    up: up.load(&b("ffn_up_shexp.weight"))?,
-                    down: up.load(&b("ffn_down_shexp.weight"))?,
-                    gate_inp: up.load(&b("ffn_gate_inp.weight"))?,
-                    probs_b: up.load(&b("exp_probs_b.bias"))?,
-                    gate_exps: up.load(&b("ffn_gate_exps.weight"))?,
-                    up_exps: up.load(&b("ffn_up_exps.weight"))?,
-                    down_exps: up.load(&b("ffn_down_exps.weight"))?,
-                };
-            } else {
-                l.ffn = FfnW {
-                    gate: up.load(&b("ffn_gate.weight"))?,
-                    up: up.load(&b("ffn_up.weight"))?,
-                    down: up.load(&b("ffn_down.weight"))?,
-                    ..Default::default()
-                };
-            }
-            if il >= hp.n_layer {
-                l.eh_proj = up.load(&b("nextn.eh_proj.weight"))?;
-                l.enorm = up.load(&b("nextn.enorm.weight"))?;
-                l.hnorm = up.load(&b("nextn.hnorm.weight"))?;
-                l.head_norm = up
-                    .load_opt(&b("nextn.shared_head_norm.weight"))?
-                    .unwrap_or(output_norm);
-            }
             if verbose && (il % 4 == 3 || il + 1 == n_load) {
                 eprintln!(
                     "glm: loaded layer {il} ({:.1} GiB, {:.1} s; read {:.1} s, alloc {:.1} s, sync {:.1} s; MemAvailable {:.1} GiB)",
@@ -710,6 +802,7 @@ impl GlmWeights {
             layers,
             allocs,
             bytes,
+            mtp_dropped,
         };
         // fold the indexer weight scale 1/sqrt(idx_dim * idx_heads) (= 1/64, exact) into idx_proj
         let sc = 1.0 / ((hp.idx_dim * hp.idx_heads) as f32).sqrt();

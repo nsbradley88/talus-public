@@ -161,6 +161,14 @@ The server owns tokenization, chat templates, tool-call parsing and thinking con
 `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/models`, the Anthropic `/v1/messages`, and
 llama.cpp's `/tokenize`, `/detokenize` and `/completion`. It also serves `/health` and `/metrics`.
 
+From v0.1.4, if the engine process exits on its own, the next request restarts it. After a crash `/health` answers 503
+with the status `crashed` until the next request or `POST /load` restarts the engine. At most 3 automatic restarts happen
+in 10 minutes, so a fourth crash leaves the engine down until `POST /load` or a server restart, and requests get HTTP 503
+with the code `engine_down` and the reason. A crash during a streamed reply ends the stream early with no error event.
+`/health` reports the state (`ok`, `crashed`, `down` or `unloaded`) with the crash and restart counts and the last crash;
+`/metrics` and `talus-tui` show the same. `POST /unload` stops the engine process and
+frees its memory; the next request or `POST /load` starts it again.
+
 Streaming uses server-sent events. Auth is `Authorization: Bearer` or `x-api-key`, with the key from
 `TALUS_API_KEY` (or `STRATA_API_KEY`) or `--api-key`.
 

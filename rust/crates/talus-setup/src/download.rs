@@ -37,8 +37,8 @@ pub fn token() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-pub fn resolve_url(endpoint: &str, repo: &str, path: &str) -> String {
-    format!("{endpoint}/{repo}/resolve/main/{path}")
+pub fn resolve_url(endpoint: &str, repo: &str, revision: &str, path: &str) -> String {
+    format!("{endpoint}/{repo}/resolve/{revision}/{path}")
 }
 
 /// The curl arguments for a transfer (the token, if any, is fed on stdin and is not in here).
@@ -171,14 +171,14 @@ pub fn published_sha256(f: &FileSpec, cache: &mut BTreeMap<String, String>) -> O
     let (key, url) = if f.has_sha256sums() {
         (
             format!("sums:{}", f.repo),
-            resolve_url(&ep, f.repo, "SHA256SUMS"),
+            resolve_url(&ep, f.repo, f.revision(), "SHA256SUMS"),
         )
     } else {
         let dir = f.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         let url = if dir.is_empty() {
-            format!("{ep}/api/models/{}/tree/main", f.repo)
+            format!("{ep}/api/models/{}/tree/{}", f.repo, f.revision())
         } else {
-            format!("{ep}/api/models/{}/tree/main/{dir}", f.repo)
+            format!("{ep}/api/models/{}/tree/{}/{dir}", f.repo, f.revision())
         };
         (format!("tree:{}:{dir}", f.repo), url)
     };
@@ -448,7 +448,7 @@ pub fn fetch(
     }
     let have = have.min(f.size);
     if have < f.size {
-        let url = resolve_url(&endpoint(), f.repo, f.path);
+        let url = resolve_url(&endpoint(), f.repo, f.revision(), f.path);
         let tok = token();
         let args = curl_args(&url, &part, true, tok.is_some(), curl_supports_retry_all());
         let mut pr = Progress::new(f.local_name(), f.size, have, opts.quiet);
@@ -585,9 +585,10 @@ mod tests {
             resolve_url(
                 "https://huggingface.co",
                 "j2ipper/draft-vocab",
+                "71cda55",
                 "glm-dv-65536.bin"
             ),
-            "https://huggingface.co/j2ipper/draft-vocab/resolve/main/glm-dv-65536.bin"
+            "https://huggingface.co/j2ipper/draft-vocab/resolve/71cda55/glm-dv-65536.bin"
         );
     }
 
@@ -621,7 +622,60 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
-    /// Every manifest hash equals what its repository publishes now (SHA256SUMS or LFS oid). Network; run with
+    #[test]
+    fn every_repository_in_the_manifest_is_pinned() {
+        for m in crate::manifest::MODELS {
+            for f in m.files {
+                let r = f.revision();
+                assert!(
+                    r.len() == 40 && r.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "{} has no pinned commit",
+                    f.repo
+                );
+                let url = resolve_url("https://huggingface.co", f.repo, r, f.path);
+                assert!(!url.contains("/resolve/main/"), "{url}");
+            }
+        }
+    }
+
+    /// A real ranged download from every repository through the same URL and curl arguments a fetch uses: the first
+    /// MiB of the repository's smallest file; a file under 1 MiB is whole and checked. Network; run with
+    /// `cargo test -p talus-setup -- --ignored ranged`.
+    #[test]
+    #[ignore]
+    fn ranged_download_from_every_pinned_repository() {
+        let dir = crate::testutil::tempdir("ranged");
+        let mut smallest: BTreeMap<&str, &FileSpec> = BTreeMap::new();
+        for m in crate::manifest::MODELS {
+            for f in m.files {
+                let e = smallest.entry(f.repo).or_insert(f);
+                if f.size < e.size {
+                    *e = f;
+                }
+            }
+        }
+        for (repo, f) in smallest {
+            let url = resolve_url(&endpoint(), f.repo, f.revision(), f.path);
+            let out = dir.join("part");
+            std::fs::remove_file(&out).ok();
+            let mut a = vec!["-r".to_string(), "0-1048575".to_string()];
+            a.extend(curl_args(
+                &url,
+                &out,
+                false,
+                false,
+                curl_supports_retry_all(),
+            ));
+            let st = Command::new("curl").args(&a).status().unwrap();
+            assert!(st.success(), "{url}");
+            let got = std::fs::metadata(&out).unwrap().len();
+            assert_eq!(got, f.size.min(1 << 20), "{url}");
+            eprintln!("ok {repo} @ {} {} {got} B", &f.revision()[..10], f.path);
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Every manifest hash equals what its repository publishes at the pinned commit (SHA256SUMS or LFS oid). Network; run with
     /// `cargo test -p talus-setup -- --ignored published`.
     #[test]
     #[ignore]

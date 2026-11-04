@@ -201,8 +201,8 @@ pub fn status_json(state: &ServiceState) -> JsonValue {
     // bench extensions: hash the small build files and start the energy sampler on the first status request
     let _ = state.fingerprint.start_hashing(false);
     state.energy.start();
-    let running = state.running_requests.load(Ordering::Relaxed);
-    let waiting = state.waiting_requests.load(Ordering::Relaxed);
+    let (running, waiting) = state.queue_counts();
+    let health = state.engine.health();
     let loaded = state.engine.is_loaded();
     let m = state.metrics.lock().unwrap();
     let in_use = if running > 0 {
@@ -225,6 +225,10 @@ pub fn status_json(state: &ServiceState) -> JsonValue {
     drop(m);
     let st = if state.control.restarting.load(Ordering::Relaxed) {
         "restarting"
+    } else if health.down.is_some() {
+        "down"
+    } else if health.restart_pending {
+        "crashed"
     } else if !loaded {
         "unloaded"
     } else if running > 0 {
@@ -280,6 +284,7 @@ pub fn status_json(state: &ServiceState) -> JsonValue {
         (
             "engine",
             JsonValue::obj(vec![
+                ("health", state.engine_health_json(&health)),
                 (
                     "pid",
                     state

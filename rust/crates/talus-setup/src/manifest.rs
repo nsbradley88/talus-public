@@ -8,7 +8,7 @@
 //!
 //! The SHA-256 values are the ones Hugging Face publishes for each file (the LFS object id), and for our own
 //! repositories (j2ipper/*) also the repositories' SHA256SUMS files; `download::published_sha256` checks them again
-//! online before each download.
+//! online before each download. Files are read at a pinned commit of each repository (`HF_REVISIONS`), not at `main`.
 
 use talus_presets::ModelSpec;
 
@@ -79,6 +79,15 @@ impl FileSpec {
     /// The file's name in the model's directory (the repository path without its folders).
     pub fn local_name(&self) -> &'static str {
         self.path.rsplit('/').next().unwrap_or(self.path)
+    }
+
+    /// The commit this file is read at (`HF_REVISIONS`; a test keeps every repository in `MODELS` pinned).
+    pub fn revision(&self) -> &'static str {
+        HF_REVISIONS
+            .iter()
+            .find(|(r, _)| *r == self.repo)
+            .map(|(_, c)| *c)
+            .unwrap_or("main")
     }
 
     /// Our own repositories publish a SHA256SUMS file next to the files.
@@ -226,6 +235,57 @@ impl Choices {
 const GB: u64 = 1_000_000_000;
 
 const DRAFT_VOCAB: &str = "j2ipper/draft-vocab";
+
+/// The commit each repository is read at. A repository's `main` can change under a release: Unsloth replaced every
+/// Qwen3.8-Flash-Next UD quant in place on 2026-11-04 (new weights, new shard layout), and ggml-org replaced the MiMo
+/// drafter on 2026-11-01. Every number Talus publishes applies to the files below, whose sizes and LFS hashes at these
+/// commits equal `MODELS` (`scripts/release/check-hf-pins.py` checks them against Hugging Face).
+pub const HF_REVISIONS: &[(&str, &str)] = &[
+    (
+        "unsloth/Qwen3.8-27B-GGUF",
+        "4ca720788d1e01f1bff70c033e0d0028fd02e502",
+    ),
+    (
+        "unsloth/Qwen3.8-Flash-Next-GGUF",
+        "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+    ),
+    (
+        "z-lab/Qwen3.8-27B-DFlash2-GGUF",
+        "2d9571f8ce46e151f61c6499c99dee6079e1d610",
+    ),
+    (
+        "ggml-org/MiMo-V2.6-Flash-MOPD-GGUF",
+        "0522c706471508d8b7e36ae7040922563c477358",
+    ),
+    (
+        "j2ipper/draft-vocab",
+        "71cda5503006214ce63c8d8b1674f8b1b63dc1e9",
+    ),
+    (
+        "j2ipper/GLM-5.3-Flash-a4e3s",
+        "5716e4835f5063722d031a5b5c3323b6a9283307",
+    ),
+    (
+        "j2ipper/MiMo-V2.6-Flash-MOPD-a4-x",
+        "7c9ba384e973d410c2f9ca6c873b15a888dee9f0",
+    ),
+    (
+        "j2ipper/Laguna-S-2.1-Q4-lean",
+        "23609f26ee4de121aae6bc59764052a56ccd097e",
+    ),
+    (
+        "j2ipper/Laguna-S-2.1-DFlash-GGUF",
+        "0db718bf50dc2659a9e1df8e944f3ab5d374324c",
+    ),
+    (
+        "j2ipper/Qwen3.8-27B-W4A4-prompt",
+        "ea39c6b1b19fca772d3a2e42324b654371c13656",
+    ),
+    (
+        "j2ipper/Qwen3.8-27B-W4A4-prompt-v3",
+        "63e641fff6fc004fe90ad8edddf53662150766d7",
+    ),
+];
 
 pub const MODELS: &[ModelInstall] = &[
     ModelInstall {

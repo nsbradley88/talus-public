@@ -977,6 +977,16 @@ pub fn dev_free(p: *mut c_void) {
     }
 }
 
+/// `hipMemGetInfo` (free, total) in bytes; (0, 0) if the call fails.
+pub fn mem_get_info() -> (u64, u64) {
+    let (mut f, mut t) = (0usize, 0usize);
+    // SAFETY: out-pointers valid.
+    if unsafe { hip_sys::hipMemGetInfo(&mut f, &mut t) } != hipSuccess {
+        return (0, 0);
+    }
+    (f as u64, t as u64)
+}
+
 /// Pinned, device-mapped host memory (unified memory on Strix Halo: kernels read it directly).
 pub fn host_alloc_mapped(bytes: usize) -> Result<*mut c_void> {
     let mut p = ptr::null_mut();

@@ -76,6 +76,11 @@ pub struct Snapshot {
     pub selection: Option<AppliedSelection>,
     /// The last applied settings that failed to start (the server went back to the previous ones).
     pub last_error: Option<String>,
+    /// Engine crashes and automatic restarts (status `engine.health`).
+    pub engine_crashes: u64,
+    pub engine_restarts: u64,
+    /// Why the engine stays down (crash-loop cap); None while it may restart.
+    pub engine_down: Option<String>,
 }
 
 fn u(v: &Value, k: &str) -> u64 {
@@ -119,6 +124,10 @@ pub fn parse_status(v: &Value) -> Snapshot {
     let tot = v.get("totals").unwrap_or(&null);
     let srv = v.get("server").unwrap_or(&null);
     let ctl = v.get("control").unwrap_or(&null);
+    let eh = v
+        .get("engine")
+        .and_then(|e| e.get("health"))
+        .unwrap_or(&null);
     let recent = v
         .get("recent")
         .and_then(Value::as_array)
@@ -178,6 +187,12 @@ pub fn parse_status(v: &Value) -> Snapshot {
                 .unwrap_or("the new settings");
             Some(format!("{model} did not start: {msg}"))
         }),
+        engine_crashes: u(eh, "crashes"),
+        engine_restarts: u(eh, "restarts"),
+        engine_down: eh
+            .get("down_reason")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     }
 }
 

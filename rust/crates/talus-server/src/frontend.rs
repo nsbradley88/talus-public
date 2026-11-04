@@ -1293,7 +1293,16 @@ impl OutputParser {
                     if self.recover {
                         if let Some(end_pos) = self.buf.find(FUNC_CLOSE) {
                             let after = &self.buf[end_pos + FUNC_CLOSE.len()..];
-                            if !after.trim_start().starts_with(TOOL_CLOSE) && after.contains('\n') {
+                            // A call whose `</tool_call>` the model left out is recovered only once something other
+                            // than that closer follows `</function>`. Streamed, the newline before `</tool_call>`
+                            // often arrives in an earlier piece than the closer; deciding on the newline alone ended
+                            // the call early and sent the closer on as content. A call that ends the stream without
+                            // its closer is still recovered by `finish_with_reason`.
+                            let rest = after.trim_start();
+                            if !rest.is_empty()
+                                && !TOOL_CLOSE.starts_with(rest)
+                                && after.contains('\n')
+                            {
                                 let raw_call = self.buf[..end_pos + FUNC_CLOSE.len()].to_string();
                                 self.buf.drain(..end_pos + FUNC_CLOSE.len());
                                 if let Some(call) =
@@ -1465,5 +1474,190 @@ mod content_part_tests {
             Ok(_) => panic!("an Anthropic image block was accepted"),
         };
         assert_eq!(e, "image input is not supported by this model");
+    }
+}
+
+#[cfg(test)]
+mod stream_tool_call_tests {
+    use super::*;
+
+    const CALL: &str =
+        "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>";
+
+    /// Feed `pieces` one at a time to a parser with tool-call recovery on (the default), then finish.
+    fn run(pieces: &[&str]) -> Vec<Event> {
+        let mut p = OutputParser::new(false, None, false, true, false);
+        let mut out = Vec::new();
+        for piece in pieces {
+            out.extend(p.feed(piece));
+        }
+        out.extend(p.finish());
+        out
+    }
+
+    fn calls(events: &[Event]) -> Vec<&ToolCall> {
+        events
+            .iter()
+            .filter(|e| e.kind == EventKind::ToolCall)
+            .filter_map(|e| e.call.as_ref())
+            .collect()
+    }
+
+    fn content(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter(|e| e.kind == EventKind::Content)
+            .map(|e| e.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn closer_streamed_after_the_newline_is_not_content() {
+        // The model's own format, streamed as it decodes: the newline after `</function>` lands in an earlier
+        // piece than `</tool_call>`.
+        for pieces in [
+            vec![CALL, "\n", "</tool_call>"],
+            vec![CALL, "\n", "</tool", "_call>"],
+        ] {
+            let events = run(&pieces);
+            let calls = calls(&events);
+            assert_eq!(calls.len(), 1, "pieces {pieces:?}");
+            assert_eq!(calls[0].name, "read");
+            assert_eq!(calls[0].arguments.get_str("path"), Some("a.txt"));
+            assert_eq!(
+                content(&events).trim(),
+                "",
+                "pieces {pieces:?} leaked content"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_closer_is_still_recovered_once_text_follows() {
+        let events = run(&[CALL, "\n", "Done."]);
+        assert_eq!(calls(&events).len(), 1);
+        assert_eq!(content(&events).trim(), "Done.");
+    }
+
+    #[test]
+    fn missing_closer_is_still_recovered_at_the_end_of_the_stream() {
+        let events = run(&[CALL, "\n"]);
+        assert_eq!(calls(&events).len(), 1);
+        assert_eq!(content(&events).trim(), "");
+    }
+
+    #[test]
+    fn closer_split_in_every_place() {
+        for cut in 1..TOOL_CLOSE.len() {
+            let (a, b) = TOOL_CLOSE.split_at(cut);
+            let events = run(&[CALL, "\n", a, b]);
+            assert_eq!(calls(&events).len(), 1, "cut {cut}");
+            assert_eq!(content(&events).trim(), "", "cut {cut} leaked content");
+        }
+    }
+
+    #[test]
+    fn whitespace_after_function_at_the_end_of_the_stream() {
+        for tail in ["\n", "\n\n", "  \n", "\n  \n\t"] {
+            let events = run(&[CALL, tail]);
+            assert_eq!(calls(&events).len(), 1, "tail {tail:?}");
+            assert_eq!(content(&events).trim(), "", "tail {tail:?}");
+        }
+    }
+
+    #[test]
+    fn stream_cut_inside_the_closer_still_gives_the_call() {
+        let events = run(&[CALL, "\n", "</tool"]);
+        assert_eq!(calls(&events).len(), 1);
+        assert_eq!(content(&events).trim(), "");
+    }
+
+    #[test]
+    fn text_starting_like_the_closer_is_kept() {
+        let events = run(&[CALL, "\n", "</tool", "_x> done"]);
+        assert_eq!(calls(&events).len(), 1);
+        assert_eq!(content(&events).trim(), "</tool_x> done");
+    }
+
+    #[test]
+    fn several_calls_in_one_reply() {
+        let second = CALL.replace("read", "write");
+        // both closed, streamed with the newline apart from the closer
+        let events = run(&[
+            CALL,
+            "\n",
+            "</tool_call>",
+            "\n",
+            &second,
+            "\n",
+            "</tool_call>",
+        ]);
+        let c = calls(&events);
+        assert_eq!(c.len(), 2);
+        assert_eq!((c[0].name.as_str(), c[1].name.as_str()), ("read", "write"));
+        assert_eq!(content(&events).trim(), "");
+        // the first closer missing: the next call's opening recovers it, also split
+        let events = run(&[
+            CALL,
+            "\n",
+            "<",
+            "tool_call>",
+            &second[TOOL_OPEN.len()..],
+            "\n",
+            "</tool_call>",
+        ]);
+        let c = calls(&events);
+        assert_eq!(c.len(), 2);
+        assert_eq!(content(&events).trim(), "");
+        // a bare <function= (no <tool_call>) after a missing closer
+        let bare = second[TOOL_OPEN.len()..].trim_start().to_string();
+        let events = run(&[CALL, "\n", &bare, "\n"]);
+        assert_eq!(calls(&events).len(), 2);
+        assert_eq!(content(&events).trim(), "");
+    }
+
+    #[test]
+    fn thinking_on_gives_the_same_call() {
+        for pieces in [
+            vec![
+                "<think>",
+                "hm",
+                "</think>",
+                "\n",
+                CALL,
+                "\n",
+                "</tool_call>",
+            ],
+            vec![
+                "<think>", "hm", "</think>", "\n", CALL, "\n", "</tool", "_call>",
+            ],
+            vec!["<think>", "hm", "</think>", "\n", CALL, "\n"],
+        ] {
+            let mut p = OutputParser::new(true, None, false, true, false);
+            let mut out = Vec::new();
+            for piece in &pieces {
+                out.extend(p.feed(piece));
+            }
+            out.extend(p.finish());
+            assert_eq!(calls(&out).len(), 1, "pieces {pieces:?}");
+            assert_eq!(content(&out).trim(), "", "pieces {pieces:?} leaked content");
+            let thought: String = out
+                .iter()
+                .filter(|e| e.kind == EventKind::Reasoning)
+                .map(|e| e.text.as_str())
+                .collect();
+            assert_eq!(thought, "hm");
+        }
+    }
+
+    #[test]
+    fn recovery_off_is_unchanged() {
+        let mut p = OutputParser::new(false, None, false, false, false);
+        let mut out = p.feed(CALL);
+        out.extend(p.feed("\n"));
+        out.extend(p.feed("</tool_call>"));
+        out.extend(p.finish());
+        assert_eq!(calls(&out).len(), 1);
+        assert_eq!(content(&out).trim(), "");
     }
 }

@@ -7,12 +7,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 H=$(mktemp -d)
 trap 'rm -rf "$H"' EXIT
 ESC=$(printf '\033')
+# The caller's colour settings must not leak in: an inherited NO_COLOR turned the "tty" case (escapes wanted) into a
+# failure, and some CI shells have TERM unset or dumb. Each case starts from a clean colour
+# environment and sets only what it tests.
+CLEAN_ENV=(-u NO_COLOR -u CLICOLOR -u CLICOLOR_FORCE -u FORCE_COLOR -u TALUS_NO_COLOR TERM=xterm-256color)
 banner() {  # $1: "pipe" or "tty"; the rest: env assignments
   local how=$1; shift
   if [ "$how" = pipe ]; then
-    (cd "$H" && env HOME="$H" "$@" timeout 30 bash "$ROOT/install.sh" --dry-run --yes 2>&1 </dev/null | head -n 2)
+    (cd "$H" && env "${CLEAN_ENV[@]}" HOME="$H" "$@" timeout 30 bash "$ROOT/install.sh" --dry-run --yes 2>&1 </dev/null | head -n 2)
   else
-    (cd "$H" && env HOME="$H" "$@" timeout 30 script -qec "bash '$ROOT/install.sh' --dry-run --yes" /dev/null 2>&1 </dev/null | head -n 2)
+    (cd "$H" && env "${CLEAN_ENV[@]}" HOME="$H" "$@" timeout 30 script -qec "bash '$ROOT/install.sh' --dry-run --yes" /dev/null 2>&1 </dev/null | head -n 2)
   fi
 }
 fail=0

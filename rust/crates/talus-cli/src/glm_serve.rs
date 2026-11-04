@@ -395,7 +395,7 @@ impl EngineProtocolBackend for GlmBackend {
 
 /// GLM entry from talus-cli: serve mode here (needs talus-sched), other modes in talus_model::glm::cli.
 pub fn run(argv: &[String]) -> i32 {
-    let c = match gcli::parse(argv) {
+    let mut c = match gcli::parse(argv) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("talus-glm: {e}");
@@ -406,7 +406,7 @@ pub fn run(argv: &[String]) -> i32 {
         return gcli::run(argv);
     }
     talus_model::glm::weights::spawn_watchdog((c.minavail_gib * (1u64 << 30) as f64) as u64);
-    let mut eng = match gcli::load_engine(&c) {
+    let mut eng = match gcli::load_engine(&mut c) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("talus-glm: {e}");

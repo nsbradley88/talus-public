@@ -169,6 +169,23 @@ impl ByteTokenizer {
         self
     }
 
+    /// Vocabulary size of the model tokenizer; None in byte mode (mock/test).
+    pub fn vocab_size(&self) -> Option<usize> {
+        self.real.as_ref().map(|t| t.vocab_size())
+    }
+
+    /// A token ID taken from a request: an integer in `0..vocab_size` (the `u32` range in byte mode). Checked, never
+    /// cast: a wrapping cast could turn an out-of-range ID into a valid token.
+    pub fn checked_id(&self, n: i64) -> Result<u32, String> {
+        let id = u32::try_from(n).map_err(|_| format!("token id {n} is out of range"))?;
+        match self.vocab_size() {
+            Some(v) if id as usize >= v => Err(format!(
+                "token id {n} is out of range (vocabulary size {v})"
+            )),
+            _ => Ok(id),
+        }
+    }
+
     pub fn stop_ids(&self) -> &[u32] {
         &self.stop_tokens
     }

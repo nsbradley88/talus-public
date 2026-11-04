@@ -104,6 +104,16 @@ pub fn parse(args: &[String]) -> std::result::Result<GlmCli, String> {
             "--draft-vocab" | "--spec-draft-vocab" => c.draft_vocab = Some(PathBuf::from(val()?)),
             "--minavail" => c.minavail_gib = val()?.parse().map_err(|e| format!("{a}: {e}"))?,
             "serve" | "--serve" | "--engine-protocol" => c.serve = true,
+            // talus-public#5: the GLM cache is the MLA latent (+ indexer) cache with one format; --kv was
+            // swallowed into `extra` without a word
+            "--kv" => {
+                let v = val()?;
+                if v != "f16" {
+                    eprintln!(
+                        "talus-glm: WARN: --kv {v} is ignored: GLM keeps its MLA latent KV cache in 16-bit (no int8 format)"
+                    );
+                }
+            }
             _ => c.extra.push(a.to_string()),
         }
         i += 1;
@@ -122,7 +132,14 @@ fn mem_available_gib() -> f64 {
 }
 
 /// Load the model once, refusing configurations that would leave MemAvailable below the floor (8 GiB; TALUS_MEM_FLOOR_GIB).
-pub fn load_engine(c: &GlmCli) -> Result<GlmEngine> {
+pub fn load_engine(c: &mut GlmCli) -> Result<GlmEngine> {
+    if !c.extra.is_empty() {
+        eprintln!(
+            "talus-glm: ignoring arguments GLM-5.3-Flash does not use: {} (all GLM weights stay in GPU memory, so \
+             --resident-budget-gib and --expert-cache do not apply; --ctx sizes only the KV cache)",
+            c.extra.join(" ")
+        );
+    }
     let avail = mem_available_gib();
     if avail < c.minstart_gib {
         return Err(CoreError::InvalidArgument {
@@ -178,8 +195,17 @@ pub fn load_engine(c: &GlmCli) -> Result<GlmEngine> {
             weights::floor_bytes() as f64 / GIB as f64
         );
     }
+    let mtp_bytes = weights::mtp_weight_bytes(&g, &hp);
+    preflight_gpu_memory(c, wbytes, (kv + rec) as u64 + acts + snaps, mtp_bytes, &hp)?;
     let w = GlmWeights::load(&g, &hp, c.mtp, c.verbose)?;
     drop(g);
+    if let Some(e) = &w.mtp_dropped {
+        eprintln!(
+            "talus-glm: WARNING: the MTP (NextN) layer did not fit in GPU memory and was dropped; running without \
+             speculative decoding (slower decode, same model). {e}"
+        );
+        c.mtp = false;
+    }
     if c.verbose {
         eprintln!(
             "glm: weights resident; MemAvailable {:.2} GiB",
@@ -205,6 +231,78 @@ pub fn load_engine(c: &GlmCli) -> Result<GlmEngine> {
         );
     }
     Ok(eng)
+}
+
+/// Headroom kept above the engine's own estimate for the HIP runtime, kernel library and page tables.
+const GPU_SLACK: u64 = 768 << 20;
+
+/// Compare what the engine will allocate with what amdgpu's KFD lets this process allocate (hipMemGetInfo and the
+/// kernel's system/TTM limits, see `talus_mem::kfd`). Too little room for MTP only: MTP off, with a warning. Too little
+/// for the trunk: a clear error naming the limit, instead of a bare hipMalloc failure deep in the load
+/// (talus-public#6).
+fn preflight_gpu_memory(
+    c: &mut GlmCli,
+    wbytes: u64,
+    state: u64,
+    mtp_bytes: u64,
+    hp: &GlmHparams,
+) -> Result<()> {
+    let gib = |b: u64| b as f64 / GIB as f64;
+    let (free, total) = super::ffi::mem_get_info();
+    let lim = talus_mem::kfd::KfdLimits::read();
+    let mut room = if free > 0 { free } else { u64::MAX };
+    if let Some(eff) = lim.and_then(|l| l.effective()) {
+        room = room.min(eff);
+    }
+    if room == u64::MAX {
+        return Ok(());
+    }
+    let need = wbytes + state + GPU_SLACK;
+    let lim_s = lim
+        .map(|l| l.describe())
+        .unwrap_or_else(|| "KFD limit unknown".into());
+    if c.verbose {
+        eprintln!(
+            "glm: GPU memory: need {:.2} GiB (weights {:.2} incl. MTP {:.2}, state {:.2}, slack {:.2}); room {:.2} GiB \
+             (hipMemGetInfo free {:.2} of {:.2} GiB; {lim_s})",
+            gib(need),
+            gib(wbytes),
+            gib(mtp_bytes),
+            gib(state),
+            gib(GPU_SLACK),
+            gib(room),
+            gib(free),
+            gib(total)
+        );
+    }
+    if need <= room {
+        return Ok(());
+    }
+    let (kv_nomtp, rec_nomtp) = engine::state_bytes(hp, c.ctx, false);
+    let (kv_mtp, rec_mtp) = engine::state_bytes(hp, c.ctx, true);
+    let mtp_state = ((kv_mtp + rec_mtp) - (kv_nomtp + rec_nomtp)) as u64;
+    if c.mtp && need - mtp_bytes - mtp_state <= room {
+        eprintln!(
+            "talus-glm: WARNING: GPU memory room {:.2} GiB < {:.2} GiB needed with MTP; loading without the MTP layer \
+             ({:.2} GiB): no speculative decoding. {lim_s}",
+            gib(room),
+            gib(need),
+            gib(mtp_bytes + mtp_state)
+        );
+        c.mtp = false;
+        return Ok(());
+    }
+    Err(CoreError::InvalidArgument {
+        reason: format!(
+            "GLM-5.3-Flash needs {:.2} GiB of GPU memory but this process may allocate only {:.2} GiB \
+             (hipMemGetInfo free {:.2} GiB; {lim_s}). Stop other ROCm processes, or raise the limit: ttm.pages_limit \
+             (kernel parameter) and the KFD system limit (15/16 of RAM - 1.5 GiB; amdgpu.no_system_mem_limit=1 lifts \
+             it). A smaller --ctx saves only the KV cache.",
+            gib(if c.mtp { need - mtp_bytes - mtp_state } else { need }),
+            gib(room),
+            gib(free)
+        ),
+    })
 }
 
 fn read_tokens(p: &Path) -> Result<Vec<u32>> {
@@ -485,7 +583,7 @@ fn run_gen(c: &GlmCli, eng: &mut GlmEngine) -> Result<()> {
 
 /// Entry point from talus-cli (argv including the program name).
 pub fn run(args: &[String]) -> i32 {
-    let c = match parse(args) {
+    let mut c = match parse(args) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("talus-glm: {e}");
@@ -493,7 +591,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
     weights::spawn_watchdog((c.minavail_gib * GIB as f64) as u64);
-    let mut eng = match load_engine(&c) {
+    let mut eng = match load_engine(&mut c) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("talus-glm: {e}");

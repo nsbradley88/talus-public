@@ -146,7 +146,7 @@ server is still started once, in the background, unless you add `--no-start`. Th
 It checks: the operating system and kernel; the GPU and your access to it (the `render` and `video` groups); the
 ROCm SDK and its version; the Talus programs and kernel library; the kernel parameters against what your models
 need; free memory for each model; every model file (present, size, SHA-256; `--deep` hashes the large ones too);
-the drafters, draft vocabularies and prompt-weight files; each run config; the server on its port (and whether
+any distribution ROCm files that could shadow the SDK; the drafters, draft vocabularies and prompt-weight files; each run config; the server on its port (and whether
 another program holds the port); the API key file; the service; free disk; and whether a newer Talus exists.
 
 - `talus doctor --fix` applies the fixes: downloads a missing or corrupt file again, writes a run config again,
@@ -159,8 +159,9 @@ another program holds the port); the API key file; the service; free disk; and w
 
 ## talus update
 
-`talus update` fetches the new release, shows what changed, rebuilds, rewrites the run configs (a changed one is
-backed up next to it), offers to restart the server, and runs the doctor. `talus update --check` only says whether
+`talus update` fetches the new release, shows what changed, installs its programs, rewrites the run configs (a changed
+one is backed up next to it), offers to restart the server, and runs the doctor. An install from a prebuilt release takes
+the new release's prebuilt programs, with no compiler; an install from source compiles them. `talus update --check` only says whether
 there is one. Your models are not downloaded again.
 
 ## Adding and removing models
@@ -222,9 +223,16 @@ installer prints them.
 
 ## Troubleshooting
 
+- **A source build on Fedora with distribution ROCm packages** (`rocm-hip-devel`, `hipcc`): from v0.1.4 `build.sh`
+  puts the SDK's HIP headers ahead of the system's in `/usr/include/hip`, and `talus doctor` reports distribution ROCm
+  files. It warns when `CPATH`, `C_INCLUDE_PATH`, `CPLUS_INCLUDE_PATH` or `LD_LIBRARY_PATH` point at ROCm files outside
+  the SDK; unset them for the build. The prebuilt programs are not affected.
 - **"no AMD GPU compute device"**: the amdgpu driver is not loaded, or this is not a Strix Halo machine.
 - **"you are not in the render group"**: `sudo usermod -aG render,video $USER`, then log out and back in.
 - **A download stopped**: run the same command again; it resumes.
+- **A Qwen3.8-Flash-Next download fails with 404, or the MiMo-V2.6-Flash drafter is refused, on v0.1.3 or older**: the
+  upstream repositories changed those files. Update to v0.1.4 or newer, which downloads
+  [pinned commits](MODELS.md#pinned-model-files).
 - **"changed upstream since this Talus release"**: a model file on Hugging Face no longer matches the checksum this
   release expects. Nothing was downloaded; run `talus update`, or report it.
 - **The ROCm version this release was built with cannot be downloaded**: the installer tries AMD's nightly index,

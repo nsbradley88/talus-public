@@ -5,6 +5,7 @@
 pub mod arena;
 pub mod budget;
 pub mod error;
+pub mod kfd;
 pub mod placement;
 pub mod pressure;
 pub mod probe;

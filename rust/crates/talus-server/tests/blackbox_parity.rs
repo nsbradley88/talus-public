@@ -112,7 +112,9 @@ fn test_blackbox_all_12_endpoint_checks_in_process() {
 
     let scratch_slots = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("talus-slots-{}", std::process::id()));
+    // port 0: any free port (8000, the default, may be taken on the machine running the tests)
     let cfg = ServerConfig {
+        port: 0,
         model_name: "qwen3.8-27b".to_string(),
         model_aliases: vec!["qwen27".to_string()],
         slot_save_path: scratch_slots.to_string_lossy().to_string(),
@@ -419,6 +421,7 @@ fn test_blackbox_all_12_endpoint_checks_in_process() {
     let tok2 = ByteTokenizer::new();
     let engine2 = Arc::new(ScriptedMockEngine::new(tok2.clone()));
     let cfg2 = ServerConfig {
+        port: 0,
         api_key: Some("secret-token".to_string()),
         ..Default::default()
     };
@@ -574,6 +577,8 @@ for line in sys.stdin:
             ),
             ("log".to_string(), JsonValue::Str(log.display().to_string())),
             ("port".to_string(), JsonValue::Int(0)),
+            // the stub engine has no model: byte tokens on purpose (a real engine needs a tokenizer)
+            ("byte_tokenizer".to_string(), JsonValue::Bool(true)),
         ]);
         ServerConfig::from_json(&raw).expect("ServerConfig::from_json")
     };

@@ -186,10 +186,10 @@ fn ids_of(
         return arr
             .iter()
             .map(|x| {
-                x.as_i64()
-                    .filter(|&n| n >= 0 && n <= u32::MAX as i64)
-                    .map(|n| n as u32)
-                    .ok_or_else(|| format!("{ids_key}: token ids must be non-negative integers"))
+                let n = x
+                    .as_i64()
+                    .ok_or_else(|| format!("{ids_key}: token ids must be non-negative integers"))?;
+                tok.checked_id(n).map_err(|e| format!("{ids_key}: {e}"))
             })
             .collect();
     }

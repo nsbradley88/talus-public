@@ -251,6 +251,8 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, url: &str) {
         "generating" => ("● generating", ACCENT),
         "restarting" => ("◌ restarting: serving pauses", WARN),
         "unloaded" => ("○ unloaded", DIM),
+        "crashed" => ("✕ engine crashed: restarts on the next request", WARN),
+        "down" => ("✕ engine down (crash loop)", BAD),
         other => (other, DIM),
     };
     let spec = s.preset.as_deref().and_then(talus_presets::model);
@@ -313,13 +315,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, url: &str) {
                 key
             ))],
         ),
-        kv(
-            "Requests",
-            vec![Span::raw(format!(
-                "{} served · {} running · {} waiting",
-                s.totals.requests, s.running, s.queued
-            ))],
-        ),
+        kv("Requests", requests_line(s)),
     ];
     let block = Block::bordered().title(" Serving ");
     let inner = block.inner(top);
@@ -1049,4 +1045,28 @@ fn draw_bench(f: &mut Frame, area: Rect, app: &App) {
             .block(Block::bordered().title(title)),
         bottom,
     );
+}
+
+/// "N served · R running · W waiting", plus engine crashes/restarts and why it is down, when there were any.
+fn requests_line(s: &Snapshot) -> Vec<Span<'static>> {
+    let mut v = vec![Span::raw(format!(
+        "{} served · {} running · {} waiting",
+        s.totals.requests, s.running, s.queued
+    ))];
+    if s.engine_crashes > 0 {
+        v.push(Span::styled(
+            format!(
+                "   engine crashes {} · restarts {}",
+                s.engine_crashes, s.engine_restarts
+            ),
+            Style::new().fg(WARN),
+        ));
+    }
+    if let Some(why) = &s.engine_down {
+        v.push(Span::styled(
+            format!("   down: {why}"),
+            Style::new().fg(BAD),
+        ));
+    }
+    v
 }

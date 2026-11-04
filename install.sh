@@ -25,6 +25,8 @@
 # Environment: TALUS_HOME, ROCM_SDK (use an SDK you have), TALUS_ROCM_VERSION / TALUS_ROCM_INDEX (override the pin
 #              in rocm.version / AMD's nightly index), TALUS_ROCM_STABLE, TALUS_REPO, TALUS_BRANCH (default: the newest release tag),
 #              TALUS_RELEASE=<tag> or TALUS_PREBUILT_URL=<tar.gz> (a release tarball instead of compiling),
+#              TALUS_RELEASES_URL (another copy of the release files), TALUS_NO_PREBUILT=1 (--build-only compiles even
+#              on an install from a release tarball),
 #              HF_TOKEN (optional, never stored).
 
 # Everything is inside main(), so a download cut short runs nothing.
@@ -124,8 +126,23 @@ printf '\n%s Talus %s %sinstaller%s%s\n' "$BN" "$N" "$B" "$N" "$( [ "$DRY" = 1 ]
 # a release tarball instead of compiling: TALUS_PREBUILT_URL, or the GitHub release asset of TALUS_RELEASE=<tag>.
 # Known before step 2: a prebuilt install needs no compiler, CMake, Ninja or Rust (talus#18 itest18).
 PREBUILT=${TALUS_PREBUILT_URL:-}
+RELEASES=${TALUS_RELEASES_URL:-https://github.com/nsbradley88/talus-public/releases/download}
 if [ -z "$PREBUILT" ] && [ -n "${TALUS_RELEASE:-}" ]; then
-  PREBUILT="https://github.com/nsbradley88/talus-public/releases/download/$TALUS_RELEASE/talus-$TALUS_RELEASE-linux-x86_64-gfx1151.tar.gz"
+  PREBUILT="$RELEASES/$TALUS_RELEASE/talus-$TALUS_RELEASE-linux-x86_64-gfx1151.tar.gz"
+fi
+# `talus update` (--build-only) on an install that came from a release tarball (it left MANIFEST.json): the new release's
+# tarball again, not a compile (that machine has no compiler, and the tarball is the build we tested). A source
+# install has no MANIFEST.json and compiles. TALUS_NO_PREBUILT=1 compiles anyway.
+if [ -z "$PREBUILT" ] && [ "$BUILD_ONLY" = 1 ] && [ -z "${TALUS_NO_PREBUILT:-}" ] && [ -f "$DATA/MANIFEST.json" ]; then
+  tag=$(git -C "${SRC:-$DATA/src}" describe --tags --exact-match HEAD 2>/dev/null || true)
+  case $tag in
+    v[0-9]*.[0-9]*.[0-9]*-*|"") ;;
+    v[0-9]*.[0-9]*.[0-9]*)
+      PREBUILT="$RELEASES/$tag/talus-$tag-linux-x86_64-gfx1151.tar.gz"
+      if [ "$DRY" = 0 ] && ! curl -fsIL --retry 2 "$PREBUILT.sha256" >/dev/null 2>&1; then
+        die "the prebuilt programs of $tag are not available yet ($PREBUILT). Your programs were not changed: run \`talus update --rebuild\` again later (TALUS_NO_PREBUILT=1 compiles from source instead)."
+      fi ;;
+  esac
 fi
 
 # ---- 1. this computer
@@ -314,10 +331,40 @@ else
   ok "ROCm SDK" "$ROCM_VERSION in $ROCM_ROOT"
 fi
 
+# sysrocm_env VAR...: warn about directories in these path variables that hold ROCm files from outside the SDK (a
+# system ROCm). CPATH & co. come before the SDK's headers in a build, LD_LIBRARY_PATH before its libraries at run time.
+sysrocm_env() {
+  [ "$DRY" = 0 ] || return 0
+  sdk_real=$(cd "$ROCM_ROOT" 2>/dev/null && pwd -P) || sdk_real=$ROCM_ROOT
+  for v in "$@"; do
+    eval "val=\${$v:-}"
+    old_ifs=$IFS; IFS=:; set -f
+    for d in $val; do
+      [ -n "$d" ] && { [ -r "$d/hip/hip_runtime.h" ] || [ -e "$d/libamdhip64.so" ] || ls "$d"/libamdhip64.so.* >/dev/null 2>&1; } || continue
+      dr=$(cd "$d" 2>/dev/null && pwd -P) || dr=$d
+      case $dr/ in "$sdk_real"/*) continue ;; esac
+      wrn "System ROCm" "$v has $d (ROCm files outside the SDK; they can shadow it): unset $v for Talus"
+    done
+    set +f; IFS=$old_ifs
+  done
+}
+sysrocm_env LD_LIBRARY_PATH
+
 # ---- 4. build and install
 step 4 "Build"
 BIN="$DATA/bin"
 build_kernels() {
+  # a system ROCm's headers (Fedora's rocm-hip-devel: /usr/include/hip) came before the SDK's in builds up to v0.1.3
+  # and broke them (talus-public#2); build.sh now puts the SDK's first (-isystem)
+  for d in /usr/include/hip /usr/local/include/hip; do
+    [ -r "$d/hip_runtime.h" ] || continue
+    if grep -q -- '-isystem $SDK/include' "$SRC/build.sh" 2>/dev/null; then
+      note "System ROCm headers in $d (a distribution package): the build uses the SDK's ahead of them."
+    else
+      wrn "System ROCm" "headers in $d can shadow the SDK's and fail this build; TALUS_RELEASE=<tag> installs prebuilt"
+    fi
+  done
+  sysrocm_env CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH
   JOBS=$(nproc 2>/dev/null || echo 8)
   # the kernel compile needs ~2 GB of memory per job
   MAXJ=$(( MEM_GIB / 2 )); [ "$MAXJ" -ge 1 ] || MAXJ=1; [ "$JOBS" -le "$MAXJ" ] || JOBS=$MAXJ
@@ -388,6 +435,7 @@ if [ -z "$PREBUILT" ]; then
   build_kernels
   build_rust talus-cli talus-server talus-tui talus-setup
   run install -m 0755 "$SRC/build/libtalus_kernels.so" "$BIN/libtalus_kernels.so"
+  run rm -f "$DATA/MANIFEST.json"   # these programs did not come from a release tarball any more
 fi
 # the hipBLASLt prefill tuning tables next to the kernel library ($BIN/hip, where it finds them without
 # STRATA_HIPBLASLT_TUNING; talus#50): a release tarball brings them, a source build (or an older tarball) copies them

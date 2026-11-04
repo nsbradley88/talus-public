@@ -95,6 +95,9 @@ pub struct PrometheusSnapshot {
     pub max_context: usize,
     pub running: usize,
     pub waiting: usize,
+    pub engine_crashes: u64,
+    pub engine_restarts: u64,
+    pub engine_down: bool,
     pub active_prompt_tokens: usize,
     pub active_generated_tokens: usize,
     pub requests_total: u64,
@@ -299,7 +302,9 @@ pub fn render_prometheus(snap: &PrometheusSnapshot) -> String {
         &snap.histograms.e2e,
     );
 
-    let live_state = if !snap.loaded {
+    let live_state = if snap.engine_down {
+        "down"
+    } else if !snap.loaded {
         "unloaded"
     } else if snap.running > 0 {
         "generating"
@@ -311,7 +316,7 @@ pub fn render_prometheus(snap: &PrometheusSnapshot) -> String {
         "strata:live_state",
         "gauge",
         "1 for what the engine is doing (live.state).",
-        &["unloaded", "idle", "reading", "generating"]
+        &["unloaded", "idle", "reading", "generating", "down"]
             .iter()
             .map(|st| {
                 format!(
@@ -349,6 +354,36 @@ pub fn render_prometheus(snap: &PrometheusSnapshot) -> String {
         &[format!(
             "strata:totals_decode_seconds_total{{model_name=\"{m}\"}} {:.3}",
             snap.decode_ms_total / 1000.0
+        )],
+    );
+    metric(
+        &mut out,
+        "talus:engine_crashes_total",
+        "counter",
+        "Engine processes that exited on their own.",
+        &[format!(
+            "talus:engine_crashes_total{{model_name=\"{m}\"}} {}",
+            snap.engine_crashes
+        )],
+    );
+    metric(
+        &mut out,
+        "talus:engine_restarts_total",
+        "counter",
+        "Automatic engine restarts after a crash.",
+        &[format!(
+            "talus:engine_restarts_total{{model_name=\"{m}\"}} {}",
+            snap.engine_restarts
+        )],
+    );
+    metric(
+        &mut out,
+        "talus:engine_down",
+        "gauge",
+        "1 when the crash-loop cap stopped automatic restarts (POST /load starts the engine again).",
+        &[format!(
+            "talus:engine_down{{model_name=\"{m}\"}} {}",
+            u8::from(snap.engine_down)
         )],
     );
 

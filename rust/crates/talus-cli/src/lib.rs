@@ -161,6 +161,8 @@ pub struct CliConfig {
     pub generate: i32,
     /// Laguna: KV cache format (`--kv <f16|q8>`, default `true` = `q8`).
     pub kv_q8: bool,
+    /// `--kv` was passed (the engines that have no int8 KV say so instead of ignoring it).
+    pub kv_explicit: bool,
     /// Laguna: teacher-forced decode tokens at end of prompt (`--force-decode <F>`, default `0`).
     pub force_decode: i32,
     /// Laguna: dump only forced-decode rows to `--dump-logits` (`--dump-decode-only`).
@@ -267,6 +269,7 @@ impl Default for CliConfig {
             ubatch: 0,
             generate: 0,
             kv_q8: true,
+            kv_explicit: false,
             force_decode: 0,
             dump_decode_only: false,
             verify_test: 0,
@@ -677,6 +680,7 @@ where
                     "f16" => cfg.kv_q8 = false,
                     _ => return Err("talus-laguna: --kv takes f16 or q8".to_string()),
                 }
+                cfg.kv_explicit = true;
             }
             "--force-decode" => {
                 let v = next_val(&mut i, a)?;
@@ -1878,7 +1882,32 @@ pub fn is_mimo_model(path: &Path) -> bool {
 }
 
 /// Runs the MiMo-V2.6-Flash (`mimo2`) CLI / server path (WP-3.3, Phase H).
+/// talus-public#5: `--kv q8` / `--kv int8` given to an engine whose KV cache has no int8 format. The flag
+/// was accepted and ignored without a word (and MiMo's INFO line even said `kv=q8`); say what runs instead.
+/// `engine`: `"mimo"` or `"qwen35"` (27B). Laguna honours the flag (q8 is its default) and Flash-Next / GLM parse
+/// their own flags.
+pub fn kv_flag_warning(engine: &str, cfg: &CliConfig) -> Option<&'static str> {
+    if !cfg.kv_explicit || !cfg.kv_q8 {
+        return None;
+    }
+    match engine {
+        "mimo" => Some(
+            "talus-mimo: WARN: --kv int8/q8 is not supported by the MiMo engine and is ignored: the KV cache is F16 \
+             (the 8 full-attention layers grow with --max-context; the 40 sliding-window layers keep a fixed ring)",
+        ),
+        "qwen35" => Some(
+            "talus-cli: WARN: --kv int8/q8 does not change this engine's KV cache and is ignored: the 27B keeps F16 \
+             KV cells. Its int8 decode/verify copy is TALUS_Q27_KV8 (on by default for the quantized dense 27B since \
+             v0.1.3); it speeds up deep decode and adds memory rather than halving the KV cache",
+        ),
+        _ => None,
+    }
+}
+
 pub fn run_mimo_cli(cfg: &CliConfig, model_path: &Path) -> i32 {
+    if let Some(w) = kv_flag_warning("mimo", cfg) {
+        eprintln!("{w}");
+    }
     let ctx = if cfg.ctx_explicit {
         cfg.max_context.max(256) as usize
     } else {
@@ -1950,7 +1979,8 @@ pub fn run_mimo_cli(cfg: &CliConfig, model_path: &Path) -> i32 {
         },
         draft_max,
         ubatch,
-        kv_q8: cfg.kv_q8,
+        // the engine has F16 KV only: the config must not claim q8 (the serve INFO line prints it)
+        kv_q8: false,
     };
 
     let is_hdr_only = model_path.to_string_lossy().ends_with(".hdr");
@@ -2509,6 +2539,10 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
 
     if is_mimo_model(Path::new(model_path)) {
         return run_mimo_cli(cfg, Path::new(model_path));
+    }
+
+    if let Some(w) = kv_flag_warning("qwen35", cfg) {
+        eprintln!("{w}");
     }
 
     let prompt_tokens = match cfg.tokens.as_deref() {
@@ -3474,6 +3508,23 @@ where
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn kv_flag_warning_k15() {
+        let cfg = parse_cli_args(["--model", "m.gguf", "--kv", "int8"]).unwrap();
+        assert!(cfg.kv_explicit && cfg.kv_q8);
+        assert!(kv_flag_warning("mimo", &cfg).unwrap().contains("F16"));
+        assert!(kv_flag_warning("qwen35", &cfg)
+            .unwrap()
+            .contains("TALUS_Q27_KV8"));
+        assert!(kv_flag_warning("laguna", &cfg).is_none());
+        // the default (q8, not passed) and an explicit f16 say nothing
+        let cfg = parse_cli_args(["--model", "m.gguf"]).unwrap();
+        assert!(!cfg.kv_explicit && cfg.kv_q8);
+        assert!(kv_flag_warning("mimo", &cfg).is_none());
+        let cfg = parse_cli_args(["--model", "m.gguf", "--kv", "f16"]).unwrap();
+        assert!(kv_flag_warning("qwen35", &cfg).is_none());
+    }
 
     #[test]
     fn crate_identity() {

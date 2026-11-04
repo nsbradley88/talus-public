@@ -58,6 +58,7 @@ choose at run time either way.
 ```sh
 scripts/release-build.sh --ref <commit|tag> --tag vX.Y.Z --rocm-sdk <...>/site-packages/_rocm_sdk_devel [--jobs 16]
 scripts/release/verify-tarball.sh build-release/out-vX.Y.Z/talus-vX.Y.Z-linux-x86_64-gfx1151.tar.gz --rocm-sdk <sdk>
+scripts/release/check-hf-pins.py --ranged                     # manifest vs Hugging Face at the pinned commits (network)
 scripts/release/gh-release.sh build-release/out-vX.Y.Z          # prints the gh commands + renders RELEASE-NOTES.md
 ```
 

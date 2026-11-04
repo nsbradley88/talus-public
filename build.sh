@@ -12,15 +12,36 @@ BC=$SDK/amdgcn/bitcode
 [ -d "$BC" ] || BC=$SDK/lib/llvm/amdgcn/bitcode
 CXX_HIP=$SDK/lib/llvm/bin/clang++
 [ -x "$CXX_HIP" ] || CXX_HIP=$SDK/llvm/bin/clang++
+[ -r "$SDK/include/hip/hip_runtime.h" ] || { echo "build.sh: $SDK/include/hip/hip_runtime.h not found (ROCM_SDK must be the SDK root)" >&2; exit 1; }
 export ROCM_PATH=$SDK HIP_PATH=$SDK HIP_PLATFORM=amd
 export PATH=$SDK/bin:$SDK/lib/llvm/bin:$PATH
 export LD_LIBRARY_PATH=$SDK/lib:$SDK/lib/rocm_sysdeps/lib:$SDK/lib/llvm/lib:${LD_LIBRARY_PATH:-}
+# A system ROCm's headers (Fedora's rocm-hip-devel: older ones in /usr/include/hip) shadow the SDK's: clang adds
+# --rocm-path's include dir with -idirafter, i.e. AFTER /usr/include (talus-public#2). Then -isystem $SDK/include puts
+# the SDK's first. Only when such headers exist: the flag changes every TU's CUID (a hash of the command line), so the
+# library's symbol names; without a system ROCm the command line and the library stay byte-identical.
+HIPFLAGS="--rocm-path=$SDK --rocm-device-lib-path=$BC"
+for d in /usr/include/hip /usr/local/include/hip; do
+  if [ -e "$d" ]; then
+    echo "build.sh: $d (a system ROCm) found: the SDK's headers go first (-isystem $SDK/include)"
+    HIPFLAGS="$HIPFLAGS -isystem $SDK/include"; break
+  fi
+done
+# An existing cache that spells the compiler's path differently (a venv's lib64 -> lib link, `talus update`) makes CMake
+# delete the cache and configure again WITHOUT the options below: no HIP, "unknown target talus_kernels". Start fresh.
+if [ -f "$BUILD/CMakeCache.txt" ]; then
+  OLD_HIP=$(sed -n 's/^CMAKE_HIP_COMPILER:[A-Z]*=//p' "$BUILD/CMakeCache.txt" | head -n 1)
+  if [ -n "$OLD_HIP" ] && [ "$OLD_HIP" != "$CXX_HIP" ]; then
+    echo "build.sh: the HIP compiler path changed ($OLD_HIP -> $CXX_HIP): configuring from scratch"
+    rm -rf "$BUILD/CMakeCache.txt" "$BUILD/CMakeFiles"
+  fi
+fi
 cmake -S . -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_PREFILL_MMQ=ON -DSTRATA_MMQ_KQUANTS=ON \
   -DCMAKE_HIP_ARCHITECTURES=gfx1151 -DGPU_TARGETS=gfx1151 -DAMDGPU_TARGETS=gfx1151 \
   -DCMAKE_HIP_COMPILER=$CXX_HIP -DCMAKE_HIP_COMPILER_ROCM_ROOT=$SDK \
   "-DCMAKE_PREFIX_PATH=$SDK;$SDK/lib/rocm_sysdeps;$SDK/lib/llvm" \
-  "-DCMAKE_HIP_FLAGS=--rocm-path=$SDK --rocm-device-lib-path=$BC" ${CMAKE_EXTRA:-}
+  "-DCMAKE_HIP_FLAGS=$HIPFLAGS" ${CMAKE_EXTRA:-}
 cmake --build "$BUILD" --target ${TARGETS:-talus_kernels talus-pf-bench talus-attn-bench hip_laguna_mmvq_check} \
   -j ${JOBS:-12} 2>&1 | { grep -v "^\[" || [ $? -eq 1 ]; }
 

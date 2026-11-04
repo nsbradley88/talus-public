@@ -213,6 +213,7 @@ impl JsonValue {
         let mut parser = Parser {
             bytes: input.as_bytes(),
             pos: 0,
+            depth: 0,
         };
         let val = parser.parse_value()?;
         parser.skip_ws();
@@ -417,9 +418,18 @@ pub fn write_escaped_str(out: &mut String, s: &str) {
     out.push('"');
 }
 
+/// Deepest array/object nesting [`JsonValue::parse`] accepts (serde_json's default). The parser recurses once per
+/// level, so the depth is bounded.
+pub const MAX_JSON_DEPTH: usize = 128;
+
+/// Objects with more keys than this look duplicates up in a hash index instead of a linear scan (a body of a
+/// million distinct keys was O(n^2): minutes of CPU per request).
+const OBJECT_INDEX_AFTER: usize = 16;
+
 struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -550,7 +560,33 @@ impl<'a> Parser<'a> {
         Ok(v)
     }
 
+    /// Enter one array/object level; an error past [`MAX_JSON_DEPTH`].
+    fn descend(&mut self) -> Result<(), String> {
+        if self.depth >= MAX_JSON_DEPTH {
+            return Err(format!(
+                "JSON nested too deeply (more than {MAX_JSON_DEPTH} levels) at byte {}",
+                self.pos
+            ));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
     fn parse_array(&mut self) -> Result<JsonValue, String> {
+        self.descend()?;
+        let v = self.parse_array_items();
+        self.depth -= 1;
+        v
+    }
+
+    fn parse_object(&mut self) -> Result<JsonValue, String> {
+        self.descend()?;
+        let v = self.parse_object_entries();
+        self.depth -= 1;
+        v
+    }
+
+    fn parse_array_items(&mut self) -> Result<JsonValue, String> {
         self.pos += 1; // '['
         self.skip_ws();
         let mut items = Vec::new();
@@ -575,10 +611,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_object(&mut self) -> Result<JsonValue, String> {
+    fn parse_object_entries(&mut self) -> Result<JsonValue, String> {
         self.pos += 1; // '{'
         self.skip_ws();
         let mut entries: Vec<(String, JsonValue)> = Vec::new();
+        // key -> position in `entries`, built once the object outgrows a linear scan
+        let mut index: Option<std::collections::HashMap<String, usize>> = None;
         if self.peek() == Some(b'}') {
             self.pos += 1;
             return Ok(JsonValue::Object(entries));
@@ -592,10 +630,27 @@ impl<'a> Parser<'a> {
             }
             self.pos += 1;
             let val = self.parse_value()?;
-            if let Some((_, existing)) = entries.iter_mut().find(|(k, _)| *k == key) {
-                *existing = val;
+            // a repeated key keeps its first position and takes the last value
+            let found = match index.as_ref() {
+                Some(ix) => ix.get(&key).copied(),
+                None => entries.iter().position(|(k, _)| *k == key),
+            };
+            if let Some(i) = found {
+                entries[i].1 = val;
             } else {
+                if let Some(ix) = index.as_mut() {
+                    ix.insert(key.clone(), entries.len());
+                }
                 entries.push((key, val));
+                if index.is_none() && entries.len() > OBJECT_INDEX_AFTER {
+                    index = Some(
+                        entries
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (k, _))| (k.clone(), i))
+                            .collect(),
+                    );
+                }
             }
             self.skip_ws();
             match self.peek() {
@@ -821,6 +876,55 @@ mod string_tests {
         assert_eq!(v.get_str("prompt"), Some(body.as_str()));
         assert!(
             t.elapsed().as_secs_f64() < 3.0,
+            "parse took {:?}",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn nesting_limit() {
+        use super::MAX_JSON_DEPTH;
+        let deep = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
+        assert!(JsonValue::parse(&deep(MAX_JSON_DEPTH)).is_ok());
+        let e = JsonValue::parse(&deep(MAX_JSON_DEPTH + 1)).unwrap_err();
+        assert!(e.contains("nested too deeply"), "{e}");
+        // mixed objects and arrays count together; siblings do not add depth
+        let mixed = format!(
+            "{}0{}",
+            "{\"a\":[".repeat(MAX_JSON_DEPTH / 2),
+            "]}".repeat(MAX_JSON_DEPTH / 2)
+        );
+        assert!(JsonValue::parse(&mixed).is_ok());
+        let wide = format!("[{}]", vec!["[[1]]"; 10_000].join(","));
+        assert!(JsonValue::parse(&wide).is_ok());
+        // past the limit is an error, not a stack overflow, even far past it
+        assert!(JsonValue::parse(&deep(1_000_000)).is_err());
+    }
+
+    #[test]
+    fn duplicate_keys_last_wins_first_position_kept() {
+        for n in [3usize, 40] {
+            let mut body: Vec<String> = (0..n).map(|i| format!("\"k{i}\":{i}")).collect();
+            body.push("\"k1\":\"late\"".to_string());
+            let v = JsonValue::parse(&format!("{{{}}}", body.join(","))).unwrap();
+            let o = v.as_object().unwrap();
+            assert_eq!(o.len(), n);
+            assert_eq!(o[1].0, "k1");
+            assert_eq!(v.get_str("k1"), Some("late"));
+            assert_eq!(v.get_i64(&format!("k{}", n - 1)), Some(n as i64 - 1));
+        }
+    }
+
+    #[test]
+    fn wide_object_parses_in_linear_time() {
+        // 200k distinct keys: the per-key linear duplicate scan was ~2e10 compares
+        let body: Vec<String> = (0..200_000).map(|i| format!("\"k{i}\":0")).collect();
+        let json = format!("{{{}}}", body.join(","));
+        let t = std::time::Instant::now();
+        let v = JsonValue::parse(&json).unwrap();
+        assert_eq!(v.as_object().unwrap().len(), 200_000);
+        assert!(
+            t.elapsed().as_secs_f64() < 5.0,
             "parse took {:?}",
             t.elapsed()
         );
