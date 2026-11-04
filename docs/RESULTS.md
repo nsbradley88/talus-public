@@ -179,7 +179,94 @@ BF16 GGUF to `--model`): it shows what the quantization costs, it is not a way t
   within measurement noise (about 1.7 standard errors), not a gain over BF16; KL and top-1 measure how far each quant
   is from BF16.
 
-## Comparison with other engines (laptop, v0.1.0)
+## Comparison with other engines (desktop, Talus v0.1.3)
+
+These rows were measured on the desktop (GMKtec EVO-X2, about 120 W) with the **published v0.1.3 tarball**, in one
+session per model on 2026-11-03 to 2026-11-04. In each session the engines ran one after another with Talus before
+and after them (`Talus -> other engine(s) -> Talus`); the Talus row is the mean of those Talus runs, which agreed within
+1.3% of each other. Every engine ran the same HTTP client, prompts and cells as the speed
+tables above (12 prompts at about 2K and 8 at about 32K for `tg2k` / `tg32k`, median per prompt; `pp2k` / `pp32k` the
+first prompt of each depth), so these rows can be compared with the desktop speed tables, but not with the laptop rows
+of earlier releases.
+
+- The llama.cpp rows are **our patched build of llama.cpp ("halo4")** with the best configuration we found per model,
+  not stock llama.cpp.
+- gufo and tubo cannot load our `UD-IQ4_XS` files, so they ran on their documented `UD-Q4_K_XL` files. On Qwen3.8-27B
+  the second Talus row runs that same file, which separates the engines from the weight-size difference.
+- Package power was the same for every engine (about 117-120 W socket while busy); see "Reference engine conditions".
+
+### Qwen3.8-27B
+
+Speeds in tokens per second.
+
+| Engine | chat | code | edit | pp2k | pp32k | tg2k | tg32k | TTFT a / b / c | MemAvailable min |
+|---|---|---|---|---|---|---|---|---|---|
+| Talus v0.1.3 | 49.7 | 66.7 | 123 | 601 | 542 | 54.1 | 37.2 | 3.34 s / 59.05 s / 1.63 s | 32 GiB |
+| Talus v0.1.3 (`UD-Q4_K_XL`, the same file as gufo and tubo) | 42.8 | 57.5 | 101 | 487 | 481 | 37.0 | 36.3 | 4.12 s / 66.61 s / 1.82 s | 28 GiB |
+| llama.cpp, our patched build (halo4) | 38.7 | 45.5 | 69.2 ¹ | 402 | 329 | 36.2 | 32.8 | 4.99 s / 97.24 s / 1.41 s | 100 GiB |
+| gufo (`82c62b4`, `UD-Q4_K_XL` + DFlash2 `Q4_K_M`) | 35.9 | 48.9 | 72.5 | 605 | 572 | 33.6 | 30.2 | 3.34 s / 56.02 s / 1.11 s | 93 GiB |
+| tubo (`2a258b9`, `UD-Q4_K_XL` + DFlash2 `Q4_K_M`) | 40.2 | 53.0 | 58.6 | 625 | 576 | 33.9 | 32.7 | 3.23 s / 55.56 s / 1.06 s | 93 GiB |
+
+¹ Host-specific, cause unknown: with the same binaries, Vulkan driver, configuration and generated text, this cell measures 82.4 on the laptop (70 W) and 69.2 on the desktop; every other llama.cpp cell is faster on the desktop.
+
+### Qwen3.8-Flash-Next
+
+Speeds in tokens per second.
+
+| Engine | chat | code | edit | pp2k | pp32k | tg2k | tg32k | TTFT a / b / c | MemAvailable min |
+|---|---|---|---|---|---|---|---|---|---|
+| Talus v0.1.3 | 62.9 | 74.2 | 144 | 1,110 | 1,475 | 64.7 | 66.8 | 1.70 s / 19.30 s / 942 ms | 51 GiB |
+| gufo (`82c62b4`, `UD-Q4_K_XL` + shared-`Q8_0` MTP) | 54.9 | 65.6 | 105 | 1,627 | 1,710 | 55.3 | 55.1 | 1.15 s / 16.64 s / 431 ms | 35 GiB |
+
+### GLM-5.3-Flash
+
+Speeds in tokens per second.
+
+| Engine | chat | code | edit | pp2k | pp32k | tg2k | tg32k | TTFT a / b / c | MemAvailable min |
+|---|---|---|---|---|---|---|---|---|---|
+| Talus v0.1.3 | 33.9 | 34.5 | 36.5 | 563 | 564 | 35.1 | 36.5 | 3.57 s / 56.82 s / 1.88 s | 9 GiB |
+| llama.cpp, our patched build (halo4) | 30.2 | 31.6 | 31.6 | 291 | 265 | 30.8 | 28.8 | 6.90 s / 120.93 s / 2.06 s | 8 GiB |
+
+### MiMo-V2.6-Flash
+
+Speeds in tokens per second.
+
+| Engine | chat | code | edit | pp2k | pp32k | tg2k | tg32k | TTFT a / b / c | MemAvailable min |
+|---|---|---|---|---|---|---|---|---|---|
+| Talus v0.1.3 | 39.9 | 49.2 | 64.4 | 735 | 661 | 43.0 | 42.6 | 2.73 s / 48.45 s / 988 ms | 14 GiB |
+| llama.cpp, our patched build (halo4) | 33.9 | 43.0 | 53.0 | 376 | 341 | 36.4 | 36.0 | 5.34 s / 93.99 s / 2.19 s | 21 GiB |
+
+### Laguna-S-2.1
+
+Speeds in tokens per second.
+
+| Engine | chat | code | edit | pp2k | pp32k | tg2k | tg32k | TTFT a / b / c | MemAvailable min |
+|---|---|---|---|---|---|---|---|---|---|
+| Talus v0.1.3 | 43.8 | 54.6 | 122 | 1,149 | 1,003 | 65.3 | 35.0 | 1.75 s / 31.96 s / 652 ms | 38 GiB |
+| llama.cpp, our patched build (halo4) | 39.5 | 47.9 | 89.9 | 732 | 621 | 37.2 | 33.6 | 2.75 s / 51.58 s / 1.14 s | 34 GiB |
+
+## Reference engine conditions (desktop comparison)
+
+Every row in the desktop comparison tables was measured on the same GMKtec EVO-X2 (Ryzen AI Max+ 395 / Radeon 8060S,
+128 GB, BIOS in its highest sustained power mode, about 120 W) with the same HTTP client and corpus, one engine at a
+time:
+
+- **Talus v0.1.3**: the published tarball, served by its own `talus-server` with the run configs `talus setup` writes.
+- **llama.cpp (`halo4`)**: our patched build of llama.cpp (Vulkan + speculative-decoding patches), the same binaries
+  as in the v0.1.0 comparison, with the best configuration we found for each model, on the same GGUF files as Talus
+  (MiMo-V2.6-Flash: the `a4-x` file Talus ships). The Vulkan driver is the pinned RADV build from the Strix Halo
+  llama.cpp toolbox, as on the laptop.
+- **gufo** ([gufo-org/gufo](https://github.com/gufo-org/gufo), MIT, commit `82c62b4`, the same image as in the v0.1.0
+  comparison, built from its Nix flake with ROCm 7.2.3) and **tubo** ([BonkusCheemus/tubo](https://github.com/BonkusCheemus/tubo),
+  MIT, a gufo fork, commit `2a258b9`, built the same way, with its documented `tubo.env` minus the TurboQuant KV, NPU and
+  SSD-embedding settings, and `--draft-tokens 7 --min-draft-tokens 1 --draft-policy fixed`): run in network-isolated
+  containers (`--network none`, read-only, all capabilities dropped) on their documented `UD-Q4_K_XL` quants
+  (`serve llm --context 65536`: 27B with `DFlash2 Q4_K_M` and a 4 GiB RAM cache; Flash-Next with the shared-`Q8_0` MTP
+  and a 2 GiB RAM cache). Chat sampling defaults differ (gufo and tubo use `top_k 20, min_p 0`; Talus uses
+  `top_k 40, min_p 0.05`); `code`, `edit` and the depth cells are greedy. Talus's long-copy verify-window drafting
+  (`THIRD_PARTY_NOTICES.md` §6) was prompted by gufo's speculative-decoding notes.
+
+## Comparison with other engines (laptop, v0.1.0, earlier)
 
 These rows were not re-measured for v0.1.2 or v0.1.3. They come from the v0.1.0 release runs on the 70 W laptop: each model's
 own freeze run (Talus rows) and reference runs of the other engines recorded on the same laptop on
@@ -247,7 +334,7 @@ Speeds in tokens per second.
 | Talus C++ (previous engine) | 32.6 | 33.6 | 42.0 | 211 | 194 | 47.6 | 30.5 | 9.51 s / 155.00 s / 2.71 s | 41 GiB |
 | llama.cpp, our patched build (halo4) | 36.6 | 44.6 | 79.7 | 604 | 514 | 34.5 | 30.4 | 3.33 s / 62.28 s / 1.43 s | 34 GiB |
 
-## Reference engine conditions
+## Reference engine conditions (laptop comparison)
 
 Every reference row in the comparison tables was measured on the same 70 W HP ZBook Ultra G1a with the same HTTP
 client and corpus:

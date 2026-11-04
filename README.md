@@ -10,17 +10,17 @@ serves each model through an OpenAI-compatible HTTP API.
 
 Tokens per second for Talus v0.1.3 (its release candidate 1) on a Ryzen AI Max+ 395 desktop (GMKtec
 EVO-X2, 128 GB, about 120 W sustained), end to end through the HTTP server, each model in its shipped configuration.
-`chat` is the sampled chat mix, `code` the coding-prompt mix, `pp32k` prompt processing and `tg32k` generation at about
-32K tokens of context. In brackets: the change from the published v0.1.2 tarball, measured in the same session on the
-same desktop.
+`chat` is the sampled chat mix, `code` the coding-prompt mix, `edit` the code-editing mix, `pp2k` / `pp32k` prompt
+processing and `tg32k` generation at about 2K / 32K tokens of context. In brackets: the change from the published
+v0.1.2 tarball, measured in the same session on the same desktop.
 
-| Model | chat | code | pp32k | tg32k |
-|---|---|---|---|---|
-| Qwen3.8-27B | 49.8 (−2.9 %) | 66.7 (−1.8 %) | 544 (−0.2 %) | 39.0 (+7.7 %) |
-| Qwen3.8-Flash-Next | 63.9 (+4.4 %) | 73.9 (+0.1 %) | 1,484 (+0.2 %) | 66.3 (+0.8 %) |
-| GLM-5.3-Flash | 34.1 (+0.3 %) | 34.7 (+0.3 %) | 567 (0.0 %) | 35.4 (0.0 %) |
-| MiMo-V2.6-Flash | 40.0 (+4.2 %) | 49.3 (0.0 %) | 664 (+0.3 %) | 42.5 (0.0 %) |
-| Laguna-S-2.1 | 44.2 (+16.3 %) | 54.6 (+4.4 %) | 1,009 (+0.4 %) | 36.7 (+1.4 %) |
+| Model | chat | code | edit | pp2k | pp32k | tg32k |
+|---|---|---|---|---|---|---|
+| Qwen3.8-27B | 49.8 (−2.9 %) | 66.7 (−1.8 %) | 122.9 (−0.1 %) | 595 | 544 (−0.2 %) | 39.0 (+7.7 %) |
+| Qwen3.8-Flash-Next | 63.9 (+4.4 %) | 73.9 (+0.1 %) | 144.3 (−0.3 %) | 1,102 | 1,484 (+0.2 %) | 66.3 (+0.8 %) |
+| GLM-5.3-Flash | 34.1 (+0.3 %) | 34.7 (+0.3 %) | 36.6 (0.0 %) | 561 | 567 (0.0 %) | 35.4 (0.0 %) |
+| MiMo-V2.6-Flash | 40.0 (+4.2 %) | 49.3 (0.0 %) | 64.6 (0.0 %) | 734 | 664 (+0.3 %) | 42.5 (0.0 %) |
+| Laguna-S-2.1 | 44.2 (+16.3 %) | 54.6 (+4.4 %) | 122.4 (+20.9 %) | 1,154 | 1,009 (+0.4 %) | 36.7 (+1.4 %) |
 
 The quality gates (long-context recall, an agentic smoke test on five coding tasks, KL divergence against a reference, a 45-minute soak
 test) ran mostly on our 70 W laptop (HP ZBook Ultra G1a); [docs/RESULTS.md](docs/RESULTS.md) says where each ran. The
@@ -39,26 +39,35 @@ Lower KL and higher top-1 = closer to BF16. `code` is served with speculative de
 decode without it. Details, wiki text and all speed cells:
 [docs/RESULTS.md](docs/RESULTS.md#qwen38-27b-our-4-bit-weights-against-bf16).
 
-Against other engines, on the 70 W laptop with the v0.1.0 builds (not re-measured since):
+Against other engines on the same desktop, with the published v0.1.3 tarball (2026-11-03/04, one engine at a time,
+the same HTTP client and prompts; package power about 117-120 W for every engine):
 
-| Model | Engine | code | pp32k | tg32k |
-|---|---|---|---|---|
-| Qwen3.8-27B | **Talus v0.1.0** | 59.9 | 416 | 34.3 |
-| | llama.cpp (our patched build) | 46.8 | 270 | 30.6 |
-| | gufo | 41.9 | 452 | 24.0 |
-| Qwen3.8-Flash-Next | **Talus v0.1.0** | 69.9 | 1,262 | 66.1 |
-| | gufo | 63.1 | 1,387 | 55.6 |
-| GLM-5.3-Flash | **Talus v0.1.0** | 33.1 | 465 | 33.2 |
-| | llama.cpp (our patched build) | 30.1 | 217 | 27.0 |
-| MiMo-V2.6-Flash | **Talus v0.1.0** | 43.0 | 526 | 32.8 |
-| | llama.cpp (our patched build) | 39.9 | 287 | 30.1 |
-| Laguna-S-2.1 | **Talus v0.1.0** | 43.7 | 783 | 33.4 |
-| | llama.cpp (our patched build) | 44.6 | 514 | 30.4 |
+| Model | Engine | code | edit | pp32k | tg32k |
+|---|---|---|---|---|---|
+| Qwen3.8-27B | **Talus v0.1.3** | 66.7 | 123 | 542 | 37.2 |
+| | **Talus v0.1.3** on `UD-Q4_K_XL` (the file gufo and tubo use) | 57.5 | 101 | 481 | 36.3 |
+| | llama.cpp (our patched build) | 45.5 | 69.2 ¹ | 329 | 32.8 |
+| | gufo (`82c62b4`, `UD-Q4_K_XL`) | 48.9 | 72.5 | 572 | 30.2 |
+| | tubo (`2a258b9`, `UD-Q4_K_XL`) | 53.0 | 58.6 | 576 | 32.7 |
+| Qwen3.8-Flash-Next | **Talus v0.1.3** | 74.2 | 144 | 1,475 | 66.8 |
+| | gufo (`82c62b4`, `UD-Q4_K_XL`) | 65.6 | 105 | 1,710 | 55.1 |
+| GLM-5.3-Flash | **Talus v0.1.3** | 34.5 | 36.5 | 564 | 36.5 |
+| | llama.cpp (our patched build) | 31.6 | 31.6 | 265 | 28.8 |
+| MiMo-V2.6-Flash | **Talus v0.1.3** | 49.2 | 64.4 | 661 | 42.6 |
+| | llama.cpp (our patched build) | 43.0 | 53.0 | 341 | 36.0 |
+| Laguna-S-2.1 | **Talus v0.1.3** | 54.6 | 122 | 1,003 | 35.0 |
+| | llama.cpp (our patched build) | 47.9 | 89.9 | 621 | 33.6 |
+
+¹ Host-specific, cause unknown: the same llama.cpp build and settings give 82.4 on our laptop.
+
+Prompt processing is where Talus still trails: gufo and tubo prefill the 27B's `UD-Q4_K_XL` file faster, and gufo
+prefills Flash-Next 16 % faster at 32K (47 % at 2K). That is the focus of the next release.
 
 Full tables (edit, 2K cells, time to first token, memory, the v0.1.2 figures from the same session, quality gates):
 [docs/RESULTS.md](docs/RESULTS.md). Every figure there names its machine and build. A model whose release run has not
-passed shows "pending". The comparison rows are our own patched build of llama.cpp ("halo4"), not stock llama.cpp, and
-other engines measured on the same laptop under stated conditions. How everything is measured:
+passed shows "pending". The llama.cpp rows are our own patched build ("halo4"), not stock llama.cpp; gufo and tubo
+cannot load our `UD-IQ4_XS` files, so they ran their documented `UD-Q4_K_XL` files. Conditions for every engine:
+[docs/RESULTS.md](docs/RESULTS.md#reference-engine-conditions-desktop-comparison). How everything is measured:
 [docs/METHODOLOGY.md](docs/METHODOLOGY.md).
 
 Talus is a fork of [Strata](https://github.com/Niko1221/Strata) (MIT). Strata runs Qwen3.8-Flash-Next on consumer
