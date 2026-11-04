@@ -181,6 +181,8 @@ pub fn gen_value_encode(v: &str) -> String {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenerateRequest {
     pub prompt_ids: Vec<u32>,
+    /// Combined image-embeddings file for GENI; None sends the plain GEN line.
+    pub embeddings: Option<String>,
     pub max_new_tokens: usize,
     pub sampling: SamplingParams,
     pub stop_tokens: Vec<u32>,
@@ -878,6 +880,7 @@ impl ScriptedMockEngine {
                     .collect();
                 let req = GenerateRequest {
                     prompt_ids: prompt_ids.clone(),
+                    embeddings: None,
                     max_new_tokens,
                     sampling,
                     stop_tokens: self.tok.stop_tokens.clone(),
@@ -1580,7 +1583,10 @@ impl Engine for StdioSubprocessEngine {
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        let cmd = format!("GEN {}{} {}\n", req.max_new_tokens, keys, csv_ids);
+        let cmd = match req.embeddings.as_deref() {
+            Some(path) => format!("GENI {}{} {} {}\n", req.max_new_tokens, keys, path, csv_ids),
+            None => format!("GEN {}{} {}\n", req.max_new_tokens, keys, csv_ids),
+        };
         {
             let mut stdin = handle.stdin.lock().unwrap();
             stdin
