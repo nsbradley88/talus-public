@@ -1293,7 +1293,16 @@ impl OutputParser {
                     if self.recover {
                         if let Some(end_pos) = self.buf.find(FUNC_CLOSE) {
                             let after = &self.buf[end_pos + FUNC_CLOSE.len()..];
-                            if !after.trim_start().starts_with(TOOL_CLOSE) && after.contains('\n') {
+                            // A call whose `</tool_call>` the model left out is recovered only once something other
+                            // than that closer follows `</function>`. Streamed, the newline before `</tool_call>`
+                            // often arrives in an earlier piece than the closer; deciding on the newline alone ended
+                            // the call early and sent the closer on as content. A call that ends the stream without
+                            // its closer is still recovered by `finish_with_reason`.
+                            let rest = after.trim_start();
+                            if !rest.is_empty()
+                                && !TOOL_CLOSE.starts_with(rest)
+                                && after.contains('\n')
+                            {
                                 let raw_call = self.buf[..end_pos + FUNC_CLOSE.len()].to_string();
                                 self.buf.drain(..end_pos + FUNC_CLOSE.len());
                                 if let Some(call) =
@@ -1465,5 +1474,75 @@ mod content_part_tests {
             Ok(_) => panic!("an Anthropic image block was accepted"),
         };
         assert_eq!(e, "image input is not supported by this model");
+    }
+}
+
+#[cfg(test)]
+mod stream_tool_call_tests {
+    use super::*;
+
+    const CALL: &str =
+        "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>";
+
+    /// Feed `pieces` one at a time to a parser with tool-call recovery on (the default), then finish.
+    fn run(pieces: &[&str]) -> Vec<Event> {
+        let mut p = OutputParser::new(false, None, false, true, false);
+        let mut out = Vec::new();
+        for piece in pieces {
+            out.extend(p.feed(piece));
+        }
+        out.extend(p.finish());
+        out
+    }
+
+    fn calls(events: &[Event]) -> Vec<&ToolCall> {
+        events
+            .iter()
+            .filter(|e| e.kind == EventKind::ToolCall)
+            .filter_map(|e| e.call.as_ref())
+            .collect()
+    }
+
+    fn content(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter(|e| e.kind == EventKind::Content)
+            .map(|e| e.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn closer_streamed_after_the_newline_is_not_content() {
+        // The model's own format, streamed as it decodes: the newline after `</function>` lands in an earlier
+        // piece than `</tool_call>`.
+        for pieces in [
+            vec![CALL, "\n", "</tool_call>"],
+            vec![CALL, "\n", "</tool", "_call>"],
+        ] {
+            let events = run(&pieces);
+            let calls = calls(&events);
+            assert_eq!(calls.len(), 1, "pieces {pieces:?}");
+            assert_eq!(calls[0].name, "read");
+            assert_eq!(calls[0].arguments.get_str("path"), Some("a.txt"));
+            assert_eq!(
+                content(&events).trim(),
+                "",
+                "pieces {pieces:?} leaked content"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_closer_is_still_recovered_once_text_follows() {
+        let events = run(&[CALL, "\n", "Done."]);
+        assert_eq!(calls(&events).len(), 1);
+        assert_eq!(content(&events).trim(), "Done.");
+    }
+
+    #[test]
+    fn missing_closer_is_still_recovered_at_the_end_of_the_stream() {
+        let events = run(&[CALL, "\n"]);
+        assert_eq!(calls(&events).len(), 1);
+        assert_eq!(content(&events).trim(), "");
     }
 }
