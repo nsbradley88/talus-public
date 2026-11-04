@@ -28,7 +28,16 @@ pub const DEFERRED_FEATURES: &[(&str, &str)] = &[
 ];
 
 #[derive(Clone, Debug)]
+pub struct VisionBlock {
+    pub exe: String,
+    pub mmproj: String,
+    pub model: String,
+    pub max_tokens: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ServerConfig {
+    pub vision: Option<VisionBlock>,
     pub host: String,
     pub port: u16,
     pub model_name: String,
@@ -81,6 +90,7 @@ impl Default for ServerConfig {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         Self {
+            vision: None,
             host: "127.0.0.1".to_string(),
             port: 8000,
             model_name: "qwen3.8-27b".to_string(),
@@ -155,6 +165,17 @@ impl ServerConfig {
             raw_config: val.clone(),
             ..Self::default()
         };
+
+        if let Some(v) = val.get("vision") {
+            let (exe, mmproj, model) = (
+                v.get_str("exe").unwrap_or("").to_string(),
+                v.get_str("mmproj").unwrap_or("").to_string(),
+                v.get_str("model").unwrap_or("").to_string(),
+            );
+            if !exe.is_empty() && !mmproj.is_empty() && !model.is_empty() {
+                cfg.vision = Some(VisionBlock { exe, mmproj, model, max_tokens: None });
+            }
+        }
 
         if let Some(h) = val.get_str("host").filter(|s| !s.trim().is_empty()) {
             cfg.host = h.trim().to_string();

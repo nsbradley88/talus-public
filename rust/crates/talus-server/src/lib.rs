@@ -14,6 +14,7 @@ pub mod prometheus;
 pub mod responses;
 pub mod server;
 pub mod tokenizer;
+pub mod vision;
 
 pub use config::{ServerConfig, DEFERRED_FEATURES, DROPPED_FEATURES};
 pub use engine::{
