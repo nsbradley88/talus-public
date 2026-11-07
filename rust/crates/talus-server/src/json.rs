@@ -214,8 +214,13 @@ impl JsonValue {
             bytes: input.as_bytes(),
             pos: 0,
             depth: 0,
+            values: REQUEST_VALUES.get().unwrap_or(0),
         };
-        let val = parser.parse_value()?;
+        let val = parser.parse_value();
+        if REQUEST_VALUES.get().is_some() {
+            REQUEST_VALUES.set(Some(parser.values));
+        }
+        let val = val?;
         parser.skip_ws();
         if parser.pos < parser.bytes.len() {
             return Err(format!("trailing characters at byte {}", parser.pos));
@@ -426,10 +431,36 @@ pub const MAX_JSON_DEPTH: usize = 128;
 /// million distinct keys was O(n^2): minutes of CPU per request).
 const OBJECT_INDEX_AFTER: usize = 16;
 
+/// Most JSON values one [`JsonValue::parse`], or all the parses of one [`RequestValues`], build. Each costs memory well
+/// above the bytes that spell it, so this bounds a request whatever the shape of its text.
+pub const MAX_JSON_VALUES: usize = 1 << 20;
+
+thread_local! {
+    static REQUEST_VALUES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// While this lives, every parse on this thread counts against one [`MAX_JSON_VALUES`], so JSON text inside a request's
+/// strings shares the request's limit.
+pub struct RequestValues(());
+
+impl RequestValues {
+    pub fn start() -> Self {
+        REQUEST_VALUES.set(Some(0));
+        Self(())
+    }
+}
+
+impl Drop for RequestValues {
+    fn drop(&mut self) {
+        REQUEST_VALUES.set(None);
+    }
+}
+
 struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
     depth: usize,
+    values: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -447,6 +478,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_value(&mut self) -> Result<JsonValue, String> {
+        self.values += 1;
+        if self.values > MAX_JSON_VALUES {
+            return Err(format!("more than {MAX_JSON_VALUES} JSON values"));
+        }
         self.skip_ws();
         let b = self
             .peek()
@@ -604,6 +639,8 @@ impl<'a> Parser<'a> {
                 }
                 Some(b']') => {
                     self.pos += 1;
+                    // a Vec starts at 4 entries: without this, small lists hold several times what they use
+                    items.shrink_to_fit();
                     return Ok(JsonValue::Array(items));
                 }
                 _ => return Err(format!("expected ',' or ']' at byte {}", self.pos)),
@@ -659,6 +696,7 @@ impl<'a> Parser<'a> {
                 }
                 Some(b'}') => {
                     self.pos += 1;
+                    entries.shrink_to_fit();
                     return Ok(JsonValue::Object(entries));
                 }
                 _ => return Err(format!("expected ',' or '}}' at byte {}", self.pos)),
@@ -851,7 +889,27 @@ pub fn base64_url_decode(s: &str) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod string_tests {
-    use super::JsonValue;
+    use super::{JsonValue, MAX_JSON_VALUES};
+
+    #[test]
+    fn value_limit() {
+        let list = |n: usize| format!("[{}]", vec!["1"; n].join(","));
+        // the list itself and its items
+        assert!(JsonValue::parse(&list(MAX_JSON_VALUES - 1)).is_ok());
+        let e = JsonValue::parse(&list(MAX_JSON_VALUES)).unwrap_err();
+        assert!(e.contains("JSON values"), "{e}");
+        // JSON text inside one request shares its limit
+        let half = list(MAX_JSON_VALUES / 2 + 1);
+        assert!(JsonValue::parse(&half).is_ok());
+        assert!(JsonValue::parse(&half).is_ok());
+        let one = super::RequestValues::start();
+        assert!(JsonValue::parse(&half).is_ok());
+        assert!(JsonValue::parse(&half).is_err());
+        drop(one);
+        assert!(JsonValue::parse(&half).is_ok());
+        // a long string is one value
+        assert!(JsonValue::parse(&format!("\"{}\"", "x".repeat(4 << 20))).is_ok());
+    }
 
     #[test]
     fn strings_with_multibyte_and_escapes() {

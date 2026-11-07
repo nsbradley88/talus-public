@@ -18,15 +18,22 @@
 //! item text (exact for strings without escapes and for integers).
 
 use serde_json::{Map, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 /// Whitespace bytes allowed between two JSON tokens (bounds the "endless newlines" failure of constrained decoding).
 pub const WS_MAX: u8 = 16;
 const NUM_MAX: usize = 24;
+const TOO_COMPLEX: &str = "json_schema: too complex to compile: use fewer anyOf/oneOf/allOf alternatives, fewer properties shared with them, or shorter enum and const values";
+/// Encoded literal and key bytes one compiled schema may hold. Twice the largest request body, so a schema compiled once
+/// always fits.
+const MAX_RETAINED_BYTES: usize = 64 << 20;
 const MAX_CFGS: usize = 64;
 const MAX_PROPS: usize = 64;
 const MAX_DEPTH: usize = 32;
+/// Work one schema may cost to compile: subschemas compiled plus JSON values copied or compared. Compiling is linear in
+/// this, so the limit also bounds time and memory.
+const MAX_COMPILE_WORK: u64 = 1 << 21;
 const NONE: u32 = u32::MAX;
 /// Masks kept per compiled schema (each is n_vocab bits).
 const MEMO_CAP: usize = 128;
@@ -156,6 +163,8 @@ fn compile_value(v: &Value) -> Result<Grammar, String> {
     let mut c = Compiler {
         nodes: Vec::new(),
         any: None,
+        work: 0,
+        retained: 0,
     };
     let root = c.schema(v, 0)?;
     if matches!(c.nodes[root as usize], Node::Never) {
@@ -171,6 +180,26 @@ fn compile_value(v: &Value) -> Result<Grammar, String> {
 struct Compiler {
     nodes: Vec<Node>,
     any: Option<u32>,
+    /// Spent so far, against [`MAX_COMPILE_WORK`].
+    work: u64,
+    /// Encoded bytes held in nodes so far, against [`MAX_RETAINED_BYTES`].
+    retained: usize,
+}
+
+/// Bytes of text that cost one unit of work.
+const WORK_BYTES: usize = 64;
+
+/// What copying `v` costs: its JSON values, plus its text.
+fn value_cost(v: &Value) -> usize {
+    1 + match v {
+        Value::Array(a) => a.iter().map(value_cost).sum(),
+        Value::Object(o) => o
+            .iter()
+            .map(|(k, x)| k.len() / WORK_BYTES + value_cost(x))
+            .sum(),
+        Value::String(s) => s.len() / WORK_BYTES,
+        _ => 0,
+    }
 }
 
 fn json_eq(a: &Value, b: &Value) -> bool {
@@ -224,7 +253,8 @@ fn type_list(v: &Value) -> Result<Vec<String>, String> {
 }
 
 /// allOf-style merge of two schemas (the subset that has a clean intersection).
-fn merge(a: &Value, b: &Value) -> Result<Value, String> {
+fn merge(c: &mut Compiler, a: &Value, b: &Value) -> Result<Value, String> {
+    c.spend(value_cost(a).saturating_add(value_cost(b)))?;
     let (ao, bo) = match (a, b) {
         (Value::Bool(true), x) | (x, Value::Bool(true)) => return Ok(x.clone()),
         (Value::Bool(false), _) | (_, Value::Bool(false)) => return Ok(Value::Bool(false)),
@@ -241,6 +271,7 @@ fn merge(a: &Value, b: &Value) -> Result<Value, String> {
             "type" => {
                 let ta = type_list(va)?;
                 let tb = type_list(vb)?;
+                c.spend(ta.len().saturating_mul(tb.len()))?;
                 let mut t = Vec::new();
                 for x in &ta {
                     for y in &tb {
@@ -265,6 +296,7 @@ fn merge(a: &Value, b: &Value) -> Result<Value, String> {
                 let (Some(ea), Some(eb)) = (va.as_array(), vb.as_array()) else {
                     return Err("json_schema: enum must be a list".into());
                 };
+                c.spend(ea.len().saturating_mul(eb.len()))?;
                 Value::Array(
                     ea.iter()
                         .filter(|x| eb.iter().any(|y| json_eq(x, y)))
@@ -285,7 +317,7 @@ fn merge(a: &Value, b: &Value) -> Result<Value, String> {
                 let mut m = pa.clone();
                 for (pk, pv) in pb {
                     let nv = match pa.get(pk) {
-                        Some(x) => merge(x, pv)?,
+                        Some(x) => merge(c, x, pv)?,
                         None => pv.clone(),
                     };
                     m.insert(pk.clone(), nv);
@@ -294,6 +326,8 @@ fn merge(a: &Value, b: &Value) -> Result<Value, String> {
             }
             "required" => {
                 let mut r = va.as_array().cloned().unwrap_or_default();
+                let added = vb.as_array().map_or(0, Vec::len);
+                c.spend(r.len().saturating_add(added).saturating_mul(added))?;
                 for x in vb.as_array().into_iter().flatten() {
                     if !r.contains(x) {
                         r.push(x.clone());
@@ -301,7 +335,7 @@ fn merge(a: &Value, b: &Value) -> Result<Value, String> {
                 }
                 Value::Array(r)
             }
-            "items" => merge(va, vb)?,
+            "items" => merge(c, va, vb)?,
             "additionalProperties" => {
                 if json_eq(va, vb) {
                     va.clone()
@@ -360,6 +394,29 @@ fn as_u32(v: Option<&Value>, dflt: u32) -> Result<u32, String> {
 }
 
 impl Compiler {
+    fn spend(&mut self, n: usize) -> Result<(), String> {
+        self.work = self.work.saturating_add(n as u64);
+        if self.work > MAX_COMPILE_WORK {
+            return Err(TOO_COMPLEX.into());
+        }
+        Ok(())
+    }
+
+    /// Call before storing `n` encoded bytes in a node.
+    fn retain(&mut self, n: usize) -> Result<(), String> {
+        self.retained = self.retained.saturating_add(n);
+        if self.retained > MAX_RETAINED_BYTES {
+            return Err(TOO_COMPLEX.into());
+        }
+        Ok(())
+    }
+
+    fn key(&mut self, k: &str) -> Result<Vec<u8>, String> {
+        let b = key_bytes(k);
+        self.retain(b.len())?;
+        Ok(b)
+    }
+
     fn push(&mut self, n: Node) -> u32 {
         self.nodes.push(n);
         (self.nodes.len() - 1) as u32
@@ -420,6 +477,7 @@ impl Compiler {
         if depth > MAX_DEPTH {
             return Err("json_schema: nested too deeply".into());
         }
+        self.spend(1)?;
         let o = match s {
             Value::Bool(true) => return Ok(self.any()),
             Value::Bool(false) => return Ok(self.push(Node::Never)),
@@ -440,7 +498,7 @@ impl Compiler {
             base.remove("allOf");
             let mut m = Value::Object(base);
             for x in arr {
-                m = merge(&m, x)?;
+                m = merge(self, &m, x)?;
             }
             return self.schema(&m, depth + 1);
         }
@@ -455,7 +513,7 @@ impl Compiler {
                 let base = Value::Object(base);
                 let mut ids = Vec::new();
                 for a in arr {
-                    let m = merge(&base, a)?;
+                    let m = merge(self, &base, a)?;
                     ids.push(self.schema(&m, depth + 1)?);
                 }
                 return Ok(self.union(ids));
@@ -469,6 +527,7 @@ impl Compiler {
             Some(t) => type_list(t)?,
             None => ALL_TYPES.iter().map(|s| s.to_string()).collect(),
         };
+        self.spend(types.len())?;
         if types.iter().any(|t| t == "number") {
             types.retain(|t| t != "integer");
         }
@@ -499,6 +558,7 @@ impl Compiler {
         // enum / const: a literal set, filtered by the declared type(s) and the scalar bounds
         let mut lits: Option<Vec<Value>> = None;
         if let Some(e) = o.get("enum") {
+            self.spend(value_cost(e))?;
             lits = Some(
                 e.as_array()
                     .ok_or("json_schema: enum must be a list")?
@@ -506,6 +566,7 @@ impl Compiler {
             );
         }
         if let Some(c) = o.get("const") {
+            self.spend(value_cost(c))?;
             lits = Some(match lits {
                 Some(l) => l.into_iter().filter(|x| json_eq(x, c)).collect(),
                 None => vec![c.clone()],
@@ -513,8 +574,12 @@ impl Compiler {
         }
         if let Some(l) = lits {
             let mut out = Vec::new();
+            let mut seen = HashSet::new();
+            let mut distinct = types.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
             for v in l {
-                let t_ok = types.iter().any(|t| type_matches(t, &v));
+                let t_ok = distinct.iter().any(|t| type_matches(t, &v));
                 if !t_ok {
                     continue;
                 }
@@ -530,7 +595,9 @@ impl Compiler {
                     }
                 }
                 let enc = serde_json::to_vec(&v).map_err(|e| e.to_string())?;
-                if !out.contains(&enc) {
+                if !seen.contains(&enc) {
+                    self.retain(enc.len())?;
+                    seen.insert(enc.clone());
                     out.push(enc);
                 }
             }
@@ -615,9 +682,10 @@ impl Compiler {
                 .as_object()
                 .ok_or("json_schema: properties must be an object")?;
             for (k, v) in p {
+                self.spend(k.len() / WORK_BYTES)?;
                 let id = self.schema(v, depth + 1)?;
                 names.push(k.clone());
-                props.push((key_bytes(k), id));
+                props.push((self.key(k)?, id));
             }
         }
         let mut required = 0u64;
@@ -629,6 +697,7 @@ impl Compiler {
                 let k = x
                     .as_str()
                     .ok_or("json_schema: required must be a list of strings")?;
+                self.spend(names.len().saturating_add(k.len() / WORK_BYTES))?;
                 let i = match names.iter().position(|n| n == k) {
                     Some(i) => i,
                     None => {
@@ -636,7 +705,7 @@ impl Compiler {
                             return Ok(self.push(Node::Never));
                         }
                         names.push(k.to_string());
-                        props.push((key_bytes(k), additional));
+                        props.push((self.key(k)?, additional));
                         names.len() - 1
                     }
                 };
@@ -1672,6 +1741,54 @@ mod tests {
     fn prefix_ok(schema: &Value, text: &str) -> bool {
         let g = compile_value(schema).unwrap();
         !g.feed_bytes(&g.start(), text.as_bytes()).0.is_empty()
+    }
+
+    fn lits(schema: &Value) -> Vec<Vec<u8>> {
+        let g = compile_value(schema).unwrap();
+        match &g.nodes[g.root as usize] {
+            Node::Lit(l) => l.clone(),
+            n => panic!("not a literal set: {n:?}"),
+        }
+    }
+
+    #[test]
+    fn enum_keeps_first_seen_order() {
+        let s = json!({"enum":["b","a","b",1,1.0,null,"a",[1],[1],{"k":1}]});
+        let want: Vec<Vec<u8>> = ["\"b\"", "\"a\"", "1", "1.0", "null", "[1]", "{\"k\":1}"]
+            .iter()
+            .map(|x| x.as_bytes().to_vec())
+            .collect();
+        assert_eq!(lits(&s), want);
+        let s =
+            json!({"type":["number","number","string","number"],"enum":[1,null,"a",true,1,"a"]});
+        let want: Vec<Vec<u8>> = ["1", "\"a\""]
+            .iter()
+            .map(|x| x.as_bytes().to_vec())
+            .collect();
+        assert_eq!(lits(&s), want);
+    }
+
+    /// What people send stays well inside the limit: a wide union over a large shared base, deep nesting.
+    #[test]
+    fn large_ordinary_schemas_still_compile() {
+        let props: serde_json::Map<String, Value> = (0..60)
+            .map(|i| {
+                (format!("p{i}"), json!({"type":"object","properties":{"a":{"type":"string"},"b":{"enum":["x","y","z"]},
+                    "c":{"type":"array","items":{"anyOf":[{"type":"integer"},{"type":"null"}]}}},"required":["a"]}))
+            })
+            .collect();
+        let alts: Vec<Value> = (0..200)
+            .map(|i| json!({"properties":{"kind":{"const":format!("k{i}")}},"required":["kind"]}))
+            .collect();
+        let s = json!({"type":"object","properties":props,"anyOf":alts});
+        let mut c = Compiler {
+            nodes: Vec::new(),
+            any: None,
+            work: 0,
+            retained: 0,
+        };
+        c.schema(&s, 0).unwrap();
+        assert!(c.work < MAX_COMPILE_WORK / 2, "{}", c.work);
     }
 
     #[test]

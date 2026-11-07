@@ -8,10 +8,10 @@ serves each model through an OpenAI-compatible HTTP API.
 
 ## How fast is it?
 
-The current release is **v0.1.4**, a patch release on v0.1.3: server hardening, engine auto-restart, GLM-5.3-Flash load
-diagnostics, `--kv` warnings and an installer fix ([release notes](https://github.com/nsbradley88/talus-public/releases)).
-Its GPU kernel library is byte-identical to v0.1.3's and its greedy output is identical on all five models, so the figures
-below, measured on v0.1.3, stand for it too.
+The current release is **v0.1.5**, a security patch on v0.1.4
+([release notes](https://github.com/nsbradley88/talus-public/releases)). Its GPU kernel library is byte-identical to
+v0.1.3's and v0.1.4's and its greedy output is identical on all five models, so the figures below, measured on v0.1.3,
+stand for it too.
 
 Tokens per second for Talus v0.1.3 (its release candidate 1) on a Ryzen AI Max+ 395 desktop (GMKtec
 EVO-X2, 128 GB, about 120 W sustained), end to end through the HTTP server, each model in its shipped configuration.
@@ -66,7 +66,7 @@ the same HTTP client and prompts; package power about 117-120 W for every engine
 ¹ Host-specific, cause unknown: the same llama.cpp build and settings give 82.4 on our laptop.
 
 Prompt processing is where Talus still trails: gufo and tubo prefill the 27B's `UD-Q4_K_XL` file faster, and gufo
-prefills Flash-Next 16 % faster at 32K (47 % at 2K). That is the focus of v0.1.5.
+prefills Flash-Next 16 % faster at 32K (47 % at 2K). That is the focus of v0.1.6.
 
 Full tables (edit, 2K cells, time to first token, memory, the v0.1.2 figures from the same session, quality gates):
 [docs/RESULTS.md](docs/RESULTS.md). Every figure there names its machine and build. A model whose release run has not

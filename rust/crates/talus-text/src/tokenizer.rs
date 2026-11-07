@@ -169,7 +169,35 @@ pub struct Tokenizer {
     all_special_matcher: Option<SpecialMatcher>,
     byte_to_char: [char; 256],
     token_raw_bytes: Vec<Vec<u8>>,
-    bpe_cache: RwLock<HashMap<String, Vec<u32>>>,
+    bpe_cache: RwLock<BpeCache>,
+}
+
+/// Most memory the BPE cache may hold, counted per entry. It only stores results: clearing it can't change any encoding.
+const BPE_CACHE_MAX_BYTES: usize = 64 << 20;
+/// Bookkeeping per entry, roughly: the map's slot and the allocators' overhead.
+const BPE_CACHE_ENTRY_OVERHEAD: usize = 96;
+
+#[derive(Default)]
+struct BpeCache {
+    map: HashMap<String, Vec<u32>>,
+    bytes: usize,
+}
+
+impl BpeCache {
+    fn insert(&mut self, key: String, ids: &[u32]) {
+        let cost = key.len() + std::mem::size_of_val(ids) + BPE_CACHE_ENTRY_OVERHEAD;
+        if cost > BPE_CACHE_MAX_BYTES {
+            return;
+        }
+        if self.bytes + cost > BPE_CACHE_MAX_BYTES {
+            self.map.clear();
+            self.map.shrink_to_fit();
+            self.bytes = 0;
+        }
+        if self.map.insert(key, ids.to_vec()).is_none() {
+            self.bytes += cost;
+        }
+    }
 }
 
 impl std::fmt::Debug for Tokenizer {
@@ -277,7 +305,7 @@ impl Tokenizer {
             all_special_matcher,
             byte_to_char,
             token_raw_bytes,
-            bpe_cache: RwLock::new(HashMap::new()),
+            bpe_cache: RwLock::new(BpeCache::default()),
         })
     }
 
@@ -574,7 +602,7 @@ impl Tokenizer {
             return self.vocab.get(&mapped).copied().into_iter().collect();
         }
         if let Ok(cache) = self.bpe_cache.read() {
-            if let Some(hit) = cache.get(&mapped) {
+            if let Some(hit) = cache.map.get(&mapped) {
                 return hit.clone();
             }
         }
@@ -611,7 +639,7 @@ impl Tokenizer {
             .filter_map(|w| self.vocab.get(w).copied())
             .collect();
         if let Ok(mut cache) = self.bpe_cache.write() {
-            cache.insert(mapped, ids.clone());
+            cache.insert(mapped, &ids);
         }
         ids
     }
@@ -681,7 +709,7 @@ impl Tokenizer {
             k = nxt[k];
         }
         if let Ok(mut cache) = self.bpe_cache.write() {
-            cache.insert(mapped, ids.clone());
+            cache.insert(mapped, &ids);
         }
         ids
     }
@@ -1039,4 +1067,64 @@ pub fn read_gguf_tokenizer_metadata<R: Read>(
         }
     }
     Ok(meta)
+}
+
+#[cfg(test)]
+mod bpe_cache_tests {
+    use super::*;
+
+    fn tok() -> Tokenizer {
+        let (b2u, _) = bytes_to_unicode();
+        let mut tokens: Vec<String> = b2u.iter().map(|c| c.to_string()).collect();
+        tokens.push("ab".to_string());
+        let mut special = HashMap::new();
+        special.insert("eos".to_string(), None);
+        Tokenizer::new(tokens, vec!["a b".to_string()], None, "qwen35", special).unwrap()
+    }
+
+    fn word(mut i: usize) -> String {
+        let mut w = String::from("ab");
+        for _ in 0..8 {
+            w.push(char::from(b'a' + (i % 26) as u8));
+            i /= 26;
+        }
+        w
+    }
+
+    /// The cache stays within the limit, and encodings are the same after the cache has been cleared.
+    #[test]
+    fn stays_bounded_and_clearing_changes_nothing() {
+        let t = tok();
+        let probe = "abcab abab hello ab";
+        let before = t.encode(probe, false);
+        let n = BPE_CACHE_MAX_BYTES / (10 + 40 + BPE_CACHE_ENTRY_OVERHEAD) + 1000;
+        let mut c = t.bpe_cache.write().unwrap();
+        for i in 0..n {
+            c.insert(word(i), &[0; 10]);
+            assert!(c.bytes <= BPE_CACHE_MAX_BYTES);
+        }
+        assert!(c.map.len() < n, "it cleared at least once");
+        drop(c);
+        assert_eq!(t.encode(probe, false), before);
+        let fresh = tok();
+        assert_eq!(fresh.encode(probe, false), before);
+    }
+
+    #[test]
+    fn real_encoding_goes_through_the_limit() {
+        let t = tok();
+        let text = (0..2000).map(word).collect::<Vec<_>>().join(" ");
+        let first = t.encode(&text, false);
+        assert!(t.bpe_cache.read().unwrap().bytes > 0);
+        assert_eq!(t.encode(&text, false), first, "cached");
+        assert_eq!(tok().encode(&text, false), first, "uncached");
+    }
+
+    #[test]
+    fn a_huge_entry_is_not_cached() {
+        let mut c = BpeCache::default();
+        c.insert("x".repeat(BPE_CACHE_MAX_BYTES + 1), &[1]);
+        assert!(c.map.is_empty());
+        assert_eq!(c.bytes, 0);
+    }
 }

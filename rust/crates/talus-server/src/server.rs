@@ -32,6 +32,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+/// Default of [`HttpLimits::max_body_in_flight`].
+pub const MAX_BODY_IN_FLIGHT: usize = 128 * 1024 * 1024;
+/// Bodies up to this size are never held back by [`HttpLimits::max_body_in_flight`].
+pub const BODY_CHARGED_FROM: usize = 1024 * 1024;
+const BODY_BUSY_RETRY_SECS: &str = "5";
 
 #[derive(Clone, Debug, Default)]
 pub struct MetricsState {
@@ -61,6 +66,8 @@ pub struct ServiceState {
     pub metrics: Mutex<MetricsState>,
     pub shared_defaults: Mutex<JsonValue>,
     pub running_requests: AtomicUsize,
+    /// Charged against [`HttpLimits::max_body_in_flight`].
+    pub body_bytes_in_flight: AtomicUsize,
     pub waiting_requests: AtomicUsize,
     pub active_prompt_tokens: AtomicUsize,
     pub active_generated_tokens: AtomicUsize,
@@ -97,6 +104,7 @@ impl ServiceState {
             metrics: Mutex::new(MetricsState::default()),
             shared_defaults: Mutex::new(JsonValue::empty_obj()),
             running_requests: AtomicUsize::new(0),
+            body_bytes_in_flight: AtomicUsize::new(0),
             waiting_requests: AtomicUsize::new(0),
             active_prompt_tokens: AtomicUsize::new(0),
             active_generated_tokens: AtomicUsize::new(0),
@@ -516,6 +524,9 @@ pub struct HttpLimits {
     pub max_header_count: usize,
     /// Request body, after de-chunking (more: 413).
     pub max_body: usize,
+    /// Bytes of bodies over [`BODY_CHARGED_FROM`] held at once, until their requests end (more: 503). What a request
+    /// costs in memory follows its body, so this bounds large requests together.
+    pub max_body_in_flight: usize,
     /// Simultaneous connections; one more gets a 503 at accept, without a thread.
     pub max_connections: usize,
     /// Longest wait for any one read.
@@ -539,6 +550,7 @@ impl Default for HttpLimits {
             max_header_bytes: 64 * 1024,
             max_header_count: 100,
             max_body: MAX_REQUEST_BYTES,
+            max_body_in_flight: MAX_BODY_IN_FLIGHT,
             max_connections: crate::config::DEFAULT_MAX_CONNECTIONS,
             read_idle: Duration::from_secs(30),
             header_deadline: Duration::from_secs(30),
@@ -571,7 +583,7 @@ fn run_accept_loop(listener: TcpListener, state: Arc<ServiceState>, shutdown: Ar
                 let max = state.http_limits.max_connections.max(1);
                 if state.open_connections.fetch_add(1, Ordering::SeqCst) >= max {
                     state.open_connections.fetch_sub(1, Ordering::SeqCst);
-                    refuse_connection(stream, max);
+                    refuse_connection(stream, max, &state.http_limits);
                     continue;
                 }
                 let slot = ConnSlot(Arc::clone(&state));
@@ -596,8 +608,9 @@ fn run_accept_loop(listener: TcpListener, state: Arc<ServiceState>, shutdown: Ar
     }
 }
 
-/// Over the connection cap: a short 503 from the accept thread (bounded write, no read), then close.
-fn refuse_connection(mut stream: TcpStream, max: usize) {
+/// Over the connection cap: a short 503 from the accept thread (bounded write, no read), then close, or, for a few at
+/// a time, discard what the client is sending first so it can read the reply.
+fn refuse_connection(mut stream: TcpStream, max: usize, lim: &HttpLimits) {
     let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
     let body = format!(
         "{{\"error\":{{\"type\":\"server_busy\",\"message\":\"too many open connections (max {max})\"}}}}"
@@ -609,6 +622,31 @@ fn refuse_connection(mut stream: TcpStream, max: usize) {
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(body.as_bytes());
     let _ = stream.shutdown(std::net::Shutdown::Write);
+
+    static DISCARDING: AtomicUsize = AtomicUsize::new(0);
+    struct Discarding;
+    impl Drop for Discarding {
+        fn drop(&mut self) {
+            DISCARDING.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    if DISCARDING.fetch_add(1, Ordering::SeqCst) >= MAX_REFUSED_DISCARDING {
+        DISCARDING.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+    let held = Discarding;
+    let limit = discard_limit(None, lim);
+    let _ = thread::Builder::new()
+        .name("talus-refused".to_string())
+        .spawn(move || {
+            let _held = held;
+            let mut reader = DeadlineReader {
+                stream,
+                deadline: Instant::now() + DISCARD_TIME,
+                idle: DISCARD_IDLE,
+            };
+            discard_incoming(&mut reader, limit);
+        });
 }
 
 struct HttpRequest {
@@ -678,7 +716,50 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// One request's share of [`HttpLimits::max_body_in_flight`]; returned when the request ends, however it ends.
+struct BodyCharge<'a> {
+    in_flight: &'a AtomicUsize,
+    limit: usize,
+    held: usize,
+}
+
+impl<'a> BodyCharge<'a> {
+    fn new(in_flight: &'a AtomicUsize, limit: usize) -> Self {
+        Self {
+            in_flight,
+            limit,
+            held: 0,
+        }
+    }
+
+    /// Make room for a body of `total` bytes. False: no room now, and nothing more is held.
+    fn reserve(&mut self, total: usize) -> bool {
+        if total <= BODY_CHARGED_FROM || total <= self.held {
+            return true;
+        }
+        let more = total - self.held;
+        let got = self
+            .in_flight
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |now| {
+                now.checked_add(more).filter(|n| *n <= self.limit)
+            })
+            .is_ok();
+        if got {
+            self.held = total;
+        }
+        got
+    }
+}
+
+impl Drop for BodyCharge<'_> {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(self.held, Ordering::SeqCst);
+    }
+}
+
 enum ReadRequestError {
+    /// No room for this body right now ([`HttpLimits::max_body_in_flight`]).
+    Busy,
     /// Closed (or silent until a deadline) before the first byte: close without a reply.
     Eof,
     BadRequest(u16, String),
@@ -896,6 +977,7 @@ fn read_http_body(
     req: &HttpRequest,
     lim: &HttpLimits,
     budget: &mut HeaderBudget,
+    charge: &mut BodyCharge,
 ) -> Result<Vec<u8>, ReadRequestError> {
     let io_err = |e: std::io::Error, what: &str| {
         if is_timeout(&e) {
@@ -906,7 +988,7 @@ fn read_http_body(
     };
     match req.body_framing() {
         None => Ok(Vec::new()),
-        Some(None) => read_chunked_body(reader, lim, budget),
+        Some(None) => read_chunked_body(reader, lim, budget, charge),
         Some(Some(cl)) => {
             if cl > lim.max_body {
                 return Err(bad(
@@ -930,6 +1012,7 @@ fn read_chunked_body(
     reader: &mut ClientReader,
     lim: &HttpLimits,
     budget: &mut HeaderBudget,
+    charge: &mut BodyCharge,
 ) -> Result<Vec<u8>, ReadRequestError> {
     let io_err = |e: std::io::Error, what: &str| {
         if is_timeout(&e) {
@@ -963,6 +1046,9 @@ fn read_chunked_body(
         }
         if out.len().saturating_add(chunk_size) > lim.max_body {
             return Err(bad(413, "chunked request body too large"));
+        }
+        if !charge.reserve(out.len() + chunk_size) {
+            return Err(ReadRequestError::Busy);
         }
         let start = out.len();
         out.resize(start + chunk_size, 0);
@@ -1211,7 +1297,7 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServiceState>) -> std::io
         Err(e) => {
             // the client may still be sending (an oversized header): reply, then close without a reset
             let res = reply_read_error(&mut stream, e);
-            close_unread(&stream, &mut reader);
+            close_unread(&stream, &mut reader, discard_limit(None, &lim));
             return res;
         }
     };
@@ -1219,10 +1305,19 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServiceState>) -> std::io
     // Host, CORS preflight, health and the API key are settled on the headers alone: an unauthenticated client
     // never gets its body buffered.
     if let Some(res) = early_reply(&mut stream, &req, &state) {
-        if req.body_framing().is_some() {
-            close_unread(&stream, &mut reader);
+        if let Some(framing) = req.body_framing() {
+            close_unread(&stream, &mut reader, discard_limit(framing, &lim));
         }
         return res;
+    }
+
+    let mut charge = BodyCharge::new(&state.body_bytes_in_flight, lim.max_body_in_flight);
+    if let Some(Some(n)) = req.body_framing() {
+        if n <= lim.max_body && !charge.reserve(n) {
+            let res = reply_read_error(&mut stream, ReadRequestError::Busy);
+            close_unread(&stream, &mut reader, discard_limit(Some(n), &lim));
+            return res;
+        }
     }
 
     reader.get_mut().deadline = accepted + lim.request_deadline;
@@ -1244,11 +1339,13 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServiceState>) -> std::io
             Instant::now() + lim.write_stall,
         )?;
     }
-    match read_http_body(&mut reader, &req, &lim, &mut budget) {
+    match read_http_body(&mut reader, &req, &lim, &mut budget, &mut charge) {
         Ok(body) => req.body = body,
         Err(e) => {
             let res = reply_read_error(&mut stream, e);
-            close_unread(&stream, &mut reader);
+            // what was read is gone: it no longer counts while the rest is discarded
+            drop(charge);
+            close_unread(&stream, &mut reader, discard_limit(None, &lim));
             return res;
         }
     }
@@ -1272,6 +1369,21 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServiceState>) -> std::io
 }
 
 fn reply_read_error(stream: &mut TcpStream, e: ReadRequestError) -> std::io::Result<()> {
+    if matches!(e, ReadRequestError::Busy) {
+        let err = JsonValue::obj(vec![(
+            "error",
+            JsonValue::obj(vec![
+                ("type", JsonValue::from("server_busy")),
+                (
+                    "message",
+                    JsonValue::from(
+                        "too many large requests in progress: retry shortly, or send a smaller request",
+                    ),
+                ),
+            ]),
+        )]);
+        return write_json(stream, 503, &err, &[("Retry-After", BODY_BUSY_RETRY_SECS)]);
+    }
     let ReadRequestError::BadRequest(code, msg) = e else {
         return Ok(());
     };
@@ -1285,19 +1397,42 @@ fn reply_read_error(stream: &mut TcpStream, e: ReadRequestError) -> std::io::Res
     write_json(stream, code, &err, &[])
 }
 
-/// After a reply sent without reading the request body: finish our side, then discard what the client is still
-/// sending for a moment, so it reads the reply instead of a connection reset.
-fn close_unread(stream: &TcpStream, reader: &mut ClientReader) {
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-    reader.get_mut().deadline = Instant::now() + Duration::from_secs(1);
+/// How long, in all, a client that got its reply early may keep sending before the connection closes.
+const DISCARD_TIME: Duration = Duration::from_secs(5);
+/// How long it may stay silent meanwhile.
+const DISCARD_IDLE: Duration = Duration::from_secs(1);
+/// Connections refused at accept that may be discarding at once; the ones past this close right away.
+const MAX_REFUSED_DISCARDING: usize = 8;
+
+/// Bytes a client may still send after a reply: what it announced (`body`, when known), at most twice the largest body.
+fn discard_limit(body: Option<usize>, lim: &HttpLimits) -> usize {
+    let cap = lim.max_body.saturating_mul(2);
+    body.map_or(cap, |n| n.min(cap))
+}
+
+/// Read and drop what the client is still sending, within [`DISCARD_TIME`] and `limit` bytes. A client blocked writing
+/// its body only reads the reply once the body is gone; closing on unread data would reset the connection instead.
+/// Nothing is kept: a small buffer, overwritten.
+fn discard_incoming<R: Read>(reader: &mut R, limit: usize) {
     let mut sink = [0u8; 16 * 1024];
-    let mut left = 1usize << 20;
+    let mut left = limit;
     while left > 0 {
-        match reader.read(&mut sink) {
+        let want = left.min(sink.len());
+        match reader.read(&mut sink[..want]) {
             Ok(0) | Err(_) => break,
-            Ok(n) => left = left.saturating_sub(n),
+            Ok(n) => left -= n,
         }
     }
+}
+
+/// After a reply sent without reading the request body: finish our side, then discard what the client is still
+/// sending, so it reads the reply instead of a connection reset.
+fn close_unread(stream: &TcpStream, reader: &mut ClientReader, limit: usize) {
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let r = reader.get_mut();
+    r.deadline = Instant::now() + DISCARD_TIME;
+    r.idle = DISCARD_IDLE;
+    discard_incoming(reader, limit);
 }
 
 /// Replies decided by the request head: Host check, CORS preflight, health, API key. None = go on to the body.
@@ -1813,6 +1948,7 @@ fn handle_post(
         return handle_unload(stream, req, state);
     }
 
+    let _values = crate::json::RequestValues::start();
     let body_str = match std::str::from_utf8(&req.body) {
         Ok(s) => s,
         Err(_) => {
@@ -3474,12 +3610,45 @@ where
     })
 }
 
+const MAX_RESPONSE_FORMAT_VALUES: usize = 1 << 20;
+
+/// Does `v` hold more than `max` JSON values? Stops counting there.
+fn json_values_over(v: &JsonValue, max: usize) -> bool {
+    fn count(v: &JsonValue, left: &mut usize) -> bool {
+        if *left == 0 {
+            return false;
+        }
+        *left -= 1;
+        match v {
+            JsonValue::Array(a) => a.iter().all(|x| count(x, left)),
+            JsonValue::Object(o) => o.iter().all(|(_, x)| count(x, left)),
+            _ => true,
+        }
+    }
+    let mut left = max;
+    !count(v, &mut left)
+}
+
+/// One schema compile at a time. A request that panicked while holding it leaves nothing to protect, so poison is ignored.
+fn schema_compile_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// E6: the schema of `response_format` (`json_schema`, or `json_object` as `{"type":"object"}`), checked and
 /// compacted by `talus_text::json_grammar::prepare`. `Ok(None)` = no constraint requested (absent, null, `text`).
 pub fn response_format_schema(req: &JsonValue) -> Result<Option<String>, String> {
     let Some(rf) = req.get("response_format").filter(|v| !v.is_null()) else {
         return Ok(None);
     };
+    // before the copies below
+    if json_values_over(rf, MAX_RESPONSE_FORMAT_VALUES) {
+        return Err(format!(
+            "response_format: too large (more than {MAX_RESPONSE_FORMAT_VALUES} JSON values)"
+        ));
+    }
+    // held for the copy and the compile only: this function returns before any engine work
+    let _one = schema_compile_lock();
     let rf = crate::frontend::to_serde_value(rf);
     let kind = rf.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let schema = match kind {
@@ -4504,8 +4673,51 @@ fn anthropic_collect(events: &[(String, JsonValue)]) -> JsonValue {
 }
 
 #[cfg(test)]
+mod body_charge_tests {
+    use super::*;
+
+    #[test]
+    fn small_bodies_are_free_and_large_ones_share_the_limit() {
+        let n = AtomicUsize::new(0);
+        let limit = 3 * BODY_CHARGED_FROM;
+        let mut small = BodyCharge::new(&n, limit);
+        assert!(small.reserve(BODY_CHARGED_FROM));
+        assert_eq!(n.load(Ordering::SeqCst), 0);
+        let mut a = BodyCharge::new(&n, limit);
+        assert!(a.reserve(2 * BODY_CHARGED_FROM));
+        let mut b = BodyCharge::new(&n, limit);
+        assert!(!b.reserve(2 * BODY_CHARGED_FROM));
+        assert_eq!(n.load(Ordering::SeqCst), 2 * BODY_CHARGED_FROM);
+        // growing only charges the difference
+        assert!(a.reserve(3 * BODY_CHARGED_FROM));
+        assert_eq!(n.load(Ordering::SeqCst), 3 * BODY_CHARGED_FROM);
+        drop(a);
+        assert_eq!(n.load(Ordering::SeqCst), 0);
+        assert!(b.reserve(2 * BODY_CHARGED_FROM));
+        drop(b);
+        assert_eq!(n.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
 mod mempr_tests {
     use super::engine_err_code;
+
+    #[test]
+    fn schema_compile_lock_survives_a_panic() {
+        use super::{response_format_schema, schema_compile_lock, JsonValue};
+        let t = std::thread::spawn(|| {
+            let _held = schema_compile_lock();
+            panic!("while holding the lock");
+        });
+        assert!(t.join().is_err());
+        drop(schema_compile_lock());
+        let req = JsonValue::parse(
+            r#"{"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object"}}}}"#,
+        )
+        .unwrap();
+        assert!(response_format_schema(&req).unwrap().is_some());
+    }
 
     #[test]
     fn engine_memory_refusal_has_its_code() {
