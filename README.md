@@ -69,9 +69,9 @@ the same HTTP client and prompts; package power about 117-120 W for every engine
 ¹ Host-specific, cause unknown: the same llama.cpp build and settings give 82.4 on our laptop.
 
 Prompt processing is where Talus v0.1.3 trailed: gufo and tubo prefill the 27B's `UD-Q4_K_XL` file faster, and gufo
-prefilled Flash-Next 16 % faster at 32K (47 % at 2K). This release
-speeds up Flash-Next's prompt processing (the first table above, against v0.1.5); the other engines have not been
-re-measured against it, so this table still shows v0.1.3.
+prefilled Flash-Next 16 % faster at 32K (47 % at 2K). Those gaps are
+v0.1.3's: Talus's Flash-Next prompt processing has been faster in each release since (v0.1.6 against v0.1.5 is in the
+first table above), which narrows them. The other engines have not been re-measured, so this table still shows v0.1.3.
 
 Full tables (edit, 2K cells, time to first token, memory, the v0.1.2 figures from the same session, quality gates):
 [docs/RESULTS.md](docs/RESULTS.md). Every figure there names its machine and build. A model whose release run has not
