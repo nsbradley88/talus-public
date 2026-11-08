@@ -1373,6 +1373,7 @@ impl Q36Engine {
             .unwrap_or(15.max(self.ng_kmin));
 
         self.dl.init(&self.tk)?;
+        self.dl.kv8 = self.kv8;
         self.dl.init_arch("gfx1151", self.mtp_d);
         let df_path = if !self.opts.dflash_path.is_empty() {
             Some(self.opts.dflash_path.clone())
@@ -1397,14 +1398,34 @@ impl Q36Engine {
                 self.draft_map,
                 self.max_batch,
             )?;
+            // w2 (BF16 drafter): the drafter's head runs on the quantized mat-vec only (tk_mmvq). A 16-bit target
+            // head (rd-bf16 BF16 / F16 weights) has no such kernel: its logits were never written and DFlash2 drafted
+            // from a stale buffer (~1% accepted). Keep the init head (the quantized draft-vocabulary head) then, or
+            // turn DFlash2 off when there is none.
+            let head_ok = |h: &Mat| !h.is_null() && tk_q36_mmvq_supported(h.raw_qtype());
+            if self.use_dflash && !self.df.mdl.has_own_head && !head_ok(&self.df.shared_head) {
+                eprintln!(
+                    "talus-cli: DFlash2 off: the drafter head (GGML type {}) has no quantized mat-vec; pass --spec-draft-vocab or use the MTP",
+                    self.df.shared_head.raw_qtype()
+                );
+                self.use_dflash = false;
+            }
             if self.use_dflash {
-                self.df.configure_target_head(&model.head, &model.dv_ids)?;
+                if self.df.mdl.has_own_head || head_ok(&model.head) {
+                    self.df.configure_target_head(&model.head, &model.dv_ids)?;
+                } else {
+                    eprintln!(
+                        "talus-cli: DFlash2 drafts through the quantized draft-vocabulary head (the target head, GGML type {}, has no quantized mat-vec)",
+                        model.head.raw_qtype()
+                    );
+                }
                 self.dctx
                     .init(self.df.window(), self.df.ring(), self.df.block());
                 self.dp.init("gfx1151", model.has_mtp && self.mtp_d > 0, "");
                 if self.mtp_d == 0 {
                     self.mtp_d = self.df.n_draft();
                 }
+                self.dl.kv8 = self.kv8;
                 self.dl.init_arch("gfx1151", 0);
                 self.dfl_sample = self.dl.dfl_sample();
             }

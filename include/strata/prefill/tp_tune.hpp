@@ -53,8 +53,13 @@ inline constexpr TpTune kTpTune[] = {
     // moe 73 (bitwise): v72 + the odd last token tile shared by both wave halves (helps at skewed
     // routing, neutral at uniform); Q2_K keeps the v72 body
     // i8 modes 1 / 2 v117 (bitwise MMQ): v106 with the epilogue's fmas emitted diagonally (VOPD pairs) under an
-    // occupancy-6 register budget; the fused swq8 up GEMM follows. Mode 0 stays v106 (its epilogue already pairs).
-    {"gfx1151", 3, 6, 128, 128, 64, {106, 117, 117}, 73, 1, 8, 32, 2, 2, 0, 0, 0},
+    // occupancy-6 register budget;
+    // the fused swq8 up GEMM follows. Mode 0 stays v106 (its epilogue already pairs; v119 / v108 measured equal).
+    // v116 (v106 + mode-2 diagonal runs + fences per tile pair, bitwise) for every
+    // mode: faster than {106, 117, 117} over the 27B shapes in the kernel and in served prompts;
+    // tokens + logprob rows bitwise (the fused swq8 up GEMM then
+    // runs its plain v106-shape body, as with TP_I8_VARIANT=116).
+    {"gfx1151", 3, 6, 128, 128, 64, {116, 116, 116}, 73, 1, 8, 32, 2, 2, 0, 0, 0},
 };
 
 /// The row for `gcn` ("gfx1151" or "gfx1151:sramecc-:xnack-"), else the defaults.

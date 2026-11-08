@@ -227,6 +227,9 @@ pub fn status_json(state: &ServiceState) -> JsonValue {
         "restarting"
     } else if health.down.is_some() {
         "down"
+    } else if health.restarting {
+        // not "restarting": that is talus-tui's own apply, which the TUI waits on
+        "engine_restarting"
     } else if health.restart_pending {
         "crashed"
     } else if !loaded {

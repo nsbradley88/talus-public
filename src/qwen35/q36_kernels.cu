@@ -755,6 +755,208 @@ __global__ void __launch_bounds__(128) k_attn_wmma(const float* __restrict__ q, 
         pl[row * n_chunk + c] = l_run[tid];
     }
 }
+/// w2 (wave 2, 27B stream): a workgroup barrier that orders LDS only (as q36_kv8.cu kv8_lds_barrier).  __syncthreads()
+/// is a release / acquire fence on all memory, so the compiler drains every global load in flight (s_waitcnt vmcnt(0))
+/// before it, including the prefetched K / V operands; the reader's waves exchange data through LDS only.
+__device__ __forceinline__ void att_lds_barrier() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+/// w2: k_attn_wmma<1, 3> (the default f16 decode / verify reader: 1-tile row groups, transposed DPP reductions) with
+/// the (talus#61) load structure.  Same arithmetic per row, in the same order (bitwise; talus-q27-attn-red pf
+/// checks it):
+///   PF & 1: the tile's 8 K operand loads issued together up front (64 VGPRs as f16) instead of one load -> WMMA step
+///           at a time;
+///   PF & 8: (instead of 1) a ring of 4 K operands: 4 loads up front, each WMMA step issues the load 4 steps ahead;
+///   PF & 2: the tile's V operands (4 dim tiles x 2 cell blocks, 64 VGPRs) loaded right after S, so they land during
+///           the softmax; PF & 16 (instead of 2): only the first 2 dim tiles' V (32 VGPRs);
+///   PF & 32: __syncthreads() instead of the LDS-only barriers (A/B);
+///   no zeroing of the K operand of a cell past the window (it reads cell 0; its score is masked for every row, and a
+///   WMMA output element depends on its own cell's column only).
+/// WPE: waves per SIMD hint.  grid (n_chunk * ngrp, HKV), block 128.
+template <int PF, int WPE>
+__global__ void __launch_bounds__(128) __attribute__((amdgpu_waves_per_eu(WPE)))
+k_attn_wmma_pf(const float* __restrict__ q, const __half* __restrict__ kc, const __half* __restrict__ vt,
+               const int32_t* pos0, int T, int H, int HKV, int ctx, int vt_ctx, float scale, int chunk, int n_chunk,
+               float* __restrict__ pacc, float* __restrict__ pm, float* __restrict__ pl, int r0 = 0, int ngrp = 1) {
+    constexpr int HD = 256, QP = HD + 8, PP = kAttTile + 8, MR = 16, RED = 3;
+    constexpr bool KALL = (PF & 1) != 0, KRING = !KALL && (PF & 8) != 0;
+    constexpr int VPF = (PF & 2) != 0 ? 4 : (PF & 16) != 0 ? 2 : 0;   // V dim tiles prefetched before the softmax
+    __shared__ _Float16 Q16[MR * QP];
+    __shared__ _Float16 P16[MR * PP];
+    __shared__ float Sp[MR][kAttTile + 1];
+    __shared__ float mxw[2][MR], smw[2][MR], m_run[MR], l_run[MR], alf[MR];
+    auto bar = [] {
+        if constexpr ((PF & 32) != 0) __syncthreads();
+        else att_lds_barrier();
+    };
+    const int kvh = blockIdx.y, c = (int) blockIdx.x / ngrp, tid = threadIdx.x;
+    r0 += ((int) blockIdx.x % ngrp) * MR;
+    const int w = tid >> 5, lane = tid & 31, l16 = lane & 15, hi = lane >> 4;
+    const int G = H / HKV, R = min(T * G - r0, MR);
+    if (R <= 0) return;
+    const int p0 = *pos0, nmax = p0 + T;
+    int cbeg, clen;
+    att_chunk_range(c, chunk, cbeg, clen);
+    if (cbeg >= nmax) return;
+    const int cend = min(cbeg + clen, nmax);
+    for (int i = tid; i < MR * HD; i += 128) {
+        const int r = i / HD, d = i % HD;
+        float v = 0.f;
+        if (r < R) v = q[((size_t) ((r + r0) / G) * H + kvh * G + (r + r0) % G) * HD + d];
+        Q16[r * QP + d] = (_Float16) v;
+    }
+    if (tid < MR) {
+        m_run[tid] = -INFINITY;
+        l_run[tid] = 0.f;
+    }
+    tq_f8 oacc[4];
+#pragma unroll
+    for (int dt = 0; dt < 4; ++dt)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) oacc[dt][i] = 0.f;
+    bar();
+    const _Float16* kbase = (const _Float16*) kc + (size_t) kvh * ctx * HD;
+    const _Float16* vbase = (const _Float16*) vt + (size_t) kvh * vt_ctx * HD;
+    const int ct = w & 1, kh = w >> 1;
+    auto tile = [&](int base, auto tailc) {
+        tq_f8 sacc;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) sacc[i] = 0.f;
+        const int cell = base + ct * 16 + l16;
+        const bool cv = cell < nmax;
+        const _Float16* kp = kbase + (size_t) (cv ? cell : 0) * HD + kh * 8 * 16;
+        if constexpr (KALL) {
+            tq_h16 kr[8];
+#pragma unroll
+            for (int k8 = 0; k8 < 8; ++k8) kr[k8] = *(const tq_h16*) (kp + k8 * 16);
+            __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+            for (int k8 = 0; k8 < 8; ++k8) sacc = tq_wmma(tq_lds16(&Q16[l16 * QP + (kh * 8 + k8) * 16]), kr[k8], sacc);
+        } else if constexpr (KRING) {
+            tq_h16 kr[4];
+#pragma unroll
+            for (int k8 = 0; k8 < 4; ++k8) kr[k8] = *(const tq_h16*) (kp + k8 * 16);
+#pragma unroll
+            for (int k8 = 0; k8 < 8; ++k8) {
+                const tq_h16 b = kr[k8 & 3];
+                if (k8 + 4 < 8) kr[k8 & 3] = *(const tq_h16*) (kp + (k8 + 4) * 16);
+                sacc = tq_wmma(tq_lds16(&Q16[l16 * QP + (kh * 8 + k8) * 16]), b, sacc);
+            }
+        } else {
+#pragma unroll 2
+            for (int k8 = 0; k8 < 8; ++k8)
+                sacc = tq_wmma(tq_lds16(&Q16[l16 * QP + (kh * 8 + k8) * 16]), *(const tq_h16*) (kp + k8 * 16), sacc);
+        }
+        // the V operands of the first VPF dim tiles, in flight during the softmax
+        tq_h16 vr[VPF > 0 ? VPF : 1][2];
+#pragma unroll
+        for (int dt = 0; dt < VPF; ++dt)
+#pragma unroll
+            for (int cs = 0; cs < 2; ++cs)
+                vr[dt][cs] = *(const tq_h16*) (vbase + (size_t) (w * 64 + dt * 16 + l16) * 16 + (size_t) ((base >> 4) + cs) * HD * 16);
+        if (kh == 1) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) Sp[2 * i + hi][ct * 16 + l16] = sacc[i];
+        }
+        bar();
+        if (kh == 0) {   // the scores (masked per row: token t sees the cells < p0 + t + 1), the tile's row maxima
+            float sv[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int r = 2 * i + hi;
+                const bool ok = r < R && cell < p0 + (r + r0) / G + 1;
+                sv[i] = ok ? (sacc[i] + Sp[r][ct * 16 + l16]) * scale : -INFINITY;
+                sacc[i] = sv[i];
+            }
+            att_rowmax<RED>(sv, mxw[ct], 0, hi, l16, R);
+        }
+        bar();
+        if (kh == 0) {   // P = exp(S - the new running max) as FP16, the tile's row sums
+            float pv[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int r = 2 * i + hi;
+                const float mn = fmaxf(m_run[r], fmaxf(mxw[0][r], mxw[1][r]));
+                pv[i] = sacc[i] == -INFINITY ? 0.f : expf(sacc[i] - mn);
+                P16[r * PP + ct * 16 + l16] = (_Float16) pv[i];
+            }
+            att_rowsum<RED>(pv, smw[ct], 0, hi, l16, R);
+        }
+        bar();
+        if (tid < MR) {
+            const float mo = m_run[tid], mn = fmaxf(mo, fmaxf(mxw[0][tid], mxw[1][tid]));
+            const float a = mn == -INFINITY ? 1.f : expf(mo - mn);
+            l_run[tid] = l_run[tid] * a + (smw[0][tid] + smw[1][tid]);
+            m_run[tid] = mn;
+            alf[tid] = a;
+        }
+        bar();
+        // O = O * alpha + P V over this wave's 64 dims, with k_attn_wmma's own-tile rule (see there)
+        constexpr bool tail = decltype(tailc)::value;
+#pragma unroll
+        for (int dt = 0; dt < 4; ++dt) {
+            const int d = w * 64 + dt * 16 + l16;
+            const _Float16* vd = vbase + (size_t) d * 16;   // + (cell / 16) * HD * 16 + cell % 16
+            tq_h16 b[2];
+#pragma unroll
+            for (int cs = 0; cs < 2; ++cs) {
+                if (dt < VPF) b[cs] = vr[dt < VPF ? dt : 0][cs];
+                else b[cs] = *(const tq_h16*) (vd + (size_t) ((base >> 4) + cs) * HD * 16);
+            }
+            tq_f8 dacc;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) dacc[i] = 0.f;
+#pragma unroll
+            for (int cs = 0; cs < 2; ++cs) dacc = tq_wmma(tq_lds16(&P16[l16 * PP + cs * 16]), b[cs], dacc);
+            if constexpr (tail) {
+                float own[8];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) own[i] = 0.f;
+#pragma unroll 1
+                for (int cc = 0; cc < kAttTile; ++cc) {
+                    const float v = (float) vd[(size_t) ((base + cc) >> 4) * HD * 16 + ((base + cc) & 15)];
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const int r = 2 * i + hi;
+                        const int pr = p0 + (r + r0) / G;
+                        if (r < R && pr >= base + cc && pr < base + kAttTile - 1)
+                            own[i] = fmaf((float) P16[r * PP + cc], v, own[i]);
+                    }
+                }
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int r = 2 * i + hi;
+                    const int pr = p0 + (r + r0) / G;
+                    if (r < R && pr < base + kAttTile - 1) dacc[i] = own[i];
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int r = 2 * i + hi;
+                if (r < R && p0 + (r + r0) / G >= base) oacc[dt][i] = fmaf(oacc[dt][i], alf[r], dacc[i]);
+            }
+        }
+        bar();   // P16 / Sp / the row stats are rewritten by the next tile
+    };
+    const int tail_start = max(cbeg, ((p0 + 1) / kAttTile) * kAttTile);
+    for (int base = cbeg; base < min(cend, tail_start); base += kAttTile) tile(base, std::false_type());
+    for (int base = tail_start; base < cend; base += kAttTile) tile(base, std::true_type());
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int r = 2 * i + hi;
+        if (r >= R) continue;
+        const size_t row = (size_t) ((r + r0) / G) * H + kvh * G + (r + r0) % G;
+#pragma unroll
+        for (int dt = 0; dt < 4; ++dt) pacc[(row * n_chunk + c) * HD + w * 64 + dt * 16 + l16] = oacc[dt][i];
+    }
+    if (tid < R) {
+        const size_t row = (size_t) ((tid + r0) / G) * H + kvh * G + (tid + r0) % G;
+        pm[row * n_chunk + c] = m_run[tid];
+        pl[row * n_chunk + c] = l_run[tid];
+    }
+}
 /// k_attn_wmma with 8 waves and the next tile's K / V operands loaded while the current tile computes: S over 2 cell
 /// tiles x 4 quarters of the head dim (the quarters summed in order), O over 8 x 32 dims.  The same per-row
 /// independence (a verify row is the decode row bitwise); its sums differ from k_attn_wmma's (another split of the
@@ -1643,6 +1845,32 @@ __global__ void k_flush_read(const float4* p, size_t n, float* out) {
 
 namespace talus::q36 {
 
+// w2: TALUS_ATTN_PF picks the f16 reader's load structure: 0 = k_attn_wmma (serialized K loads, __syncthreads),
+// N > 0 = k_attn_wmma_pf variant N (bitwise the same; talus-q27-attn-red pf / time-pf); default 11 = 1 or 5 by width.
+int g_attn_pf = [] { const char* e = std::getenv("TALUS_ATTN_PF"); const int v = e ? std::atoi(e) : 11; return v >= 0 && v <= kAttPfMax ? v : 11; }();
+void launch_attn_wmma_pf(int var, dim3 grid, cudaStream_t st, const float* q, const __half* kc, const __half* vt,
+                         const int32_t* pos0, int T, int H, int HKV, int ctx, int vt_ctx, float sc, int chunk,
+                         int n_chunk, float* pacc, float* pm, float* pl, int r0, int ngrp) {
+#define TQ_PF(PF, WPE) k_attn_wmma_pf<PF, WPE><<<grid, 128, 0, st>>>(q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl, r0, ngrp)
+    // 11 (the default, TALUS_ATTN_PF unset): per window width, from talus-q27-attn-red time-pf on the desktop + the laptop (w2):
+    // variant 5 (K loads up front only) for T 3-6, where the V prefetch's live registers cost more than they hide at
+    // 32K-64K (variant 1 there 0.99-1.03x the old kernel, 5 0.96x); variant 1 elsewhere (T 8-16 0.79-0.94x, T 1-2 0.96x)
+    if (var == 11) var = (T >= 3 && T <= 6) ? 5 : 1;
+    switch (var) {
+    case 1: TQ_PF(1 | 2, 8); break;    // K all up front + V before the softmax, 8 waves per SIMD
+    case 2: TQ_PF(1 | 2, 6); break;    // the same at 6 waves
+    case 3: TQ_PF(8 | 2, 8); break;    // K ring of 4 + V
+    case 4: TQ_PF(8 | 16, 8); break;   // K ring of 4 + half the V
+    case 5: TQ_PF(1, 8); break;        // K all up front only
+    case 6: TQ_PF(8, 8); break;        // K ring only
+    case 7: TQ_PF(0, 8); break;        // LDS-only barriers only
+    case 8: TQ_PF(1 | 2 | 32, 8); break;   // 1 with __syncthreads (A/B)
+    case 9: TQ_PF(2, 8); break;        // V only
+    default: TQ_PF(8 | 2, 6); break;   // 10: ring + V at 6 waves
+    }
+#undef TQ_PF
+}
+
 /// k_attn_wmma (4 waves) or k_attn_wmma8 (8 waves, w8) for T rows, RT = ceil(T G / 16) tiles of 16 query rows.
 template <int RED>
 static void launch_attn_wmma_red(bool w8, dim3 grid, cudaStream_t st, const float* q, const __half* kc, const __half* vt,
@@ -1661,6 +1889,13 @@ static void launch_attn_wmma_red(bool w8, dim3 grid, cudaStream_t st, const floa
         // 5 waves); a row's arithmetic does not depend on its tile mates, so the result is bitwise the same.
         // TALUS_ATTN_RT1G=0: revert to 2-tile groups.
         static const int rt1g = [] { const char* e = std::getenv("TALUS_ATTN_RT1G"); return e ? std::atoi(e) : 1; }();
+        // w2: the prefetching reader (k_attn_wmma_pf, bitwise k_attn_wmma<1, 3>) for the 1-tile instances
+        if (RED == 3 && g_attn_pf > 0 && (rt == 1 || rt1g)) {
+            const int ng = (T * (H / HKV) + 15) / 16;
+            launch_attn_wmma_pf(g_attn_pf, dim3(grid.x * ng, grid.y), st, q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk,
+                                n_chunk, pacc, pm, pl, 0, ng);
+            return;
+        }
         if (rt > 1 && rt1g) {
             const int ng = (T * (H / HKV) + 15) / 16;
             k_attn_wmma<1, RED><<<dim3(grid.x * ng, grid.y), 128, 0, st>>>(q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk,

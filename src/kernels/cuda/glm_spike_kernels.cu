@@ -3586,13 +3586,28 @@ hipError_t glm_dsa_lightning_indexer(
 namespace { int g_fa_variant = -1; }
 void glm_set_fa_variant(int v) { g_fa_variant = v; }
 
-// split-K plan shared by the mask and index-list launchers (same targets as glm_dsa_sparse_fa)
+// Split-K plan of the index-list launcher and its buffer query. (glm_dsa_sparse_fa, the mask launcher only the kernel bench
+// calls, keeps its own count.)
+// The split partition changes the rounding of the merged result, so a token's logits must not depend on how many tokens
+// share its window (drafting on or off) or on the launch size its window's end happens to pick. Windows up to the decode
+// tile (8 rows, prefill's short last slices included) therefore all use one partition: the one a single row gets at the
+// largest launch, the same blocks per split at every size. A smaller launch has fewer splits, and at least two keep the
+// same reduce path. Larger windows keep their own count: more splits would multiply the split buffer by the window size.
 static void glm_sparse_fa_split_plan(int H, int N, int n_kv_max, uint32_t& k_num, uint32_t& per_blocks) {
     constexpr uint32_t HG = 32u, BC = 32u, MAX_SLOTS = 2304u;
+    constexpr uint32_t DECODE_ROWS = 8u, DECODE_KV = 2051u;   // GLM-5.3-Flash's largest launch, idx_topk + kpool - 1; the engine passes no more
     const uint32_t total_blocks = (static_cast<uint32_t>(n_kv_max) + BC - 1u) / BC;
-    const uint32_t base_wgs     = (static_cast<uint32_t>(H) / HG) * static_cast<uint32_t>(N);
     static const int fa_occ = [] { const char* e = std::getenv("GLM_FA_WGS_PER_CU"); return e ? std::atoi(e) : 2; }();
     const uint32_t target_wgs = static_cast<uint32_t>(glm_num_cus()) * static_cast<uint32_t>(fa_occ);
+    if (static_cast<uint32_t>(N) <= DECODE_ROWS && static_cast<uint32_t>(n_kv_max) <= DECODE_KV) {
+        const uint32_t plan_blocks = (DECODE_KV + BC - 1u) / BC;
+        const uint32_t plan_k = std::min(std::max(std::max(1u, target_wgs / std::max(1u, static_cast<uint32_t>(H) / HG)),
+                                                  (DECODE_KV + MAX_SLOTS - 1u) / MAX_SLOTS), plan_blocks);
+        per_blocks = (plan_blocks + plan_k - 1u) / plan_k;
+        k_num = std::max(2u, (total_blocks + per_blocks - 1u) / per_blocks);
+        return;
+    }
+    const uint32_t base_wgs = (static_cast<uint32_t>(H) / HG) * static_cast<uint32_t>(N);
     k_num = std::max(std::max(1u, target_wgs / std::max(1u, base_wgs)), (static_cast<uint32_t>(n_kv_max) + MAX_SLOTS - 1u) / MAX_SLOTS);
     k_num = std::min(k_num, total_blocks);
     per_blocks = (total_blocks + k_num - 1u) / k_num;

@@ -407,8 +407,10 @@ pub struct EngineHealth {
     pub down: Option<String>,
     /// The last crash: exit status, time and the engine's last stderr lines.
     pub last_crash: Option<String>,
-    /// Crashed and not restarted yet: the next request restarts it (within the cap).
+    /// Crashed (or on its way out) and not restarted yet: the supervisor restarts it shortly (within the cap).
     pub restart_pending: bool,
+    /// An automatic restart is loading the model now.
+    pub restarting: bool,
 }
 
 /// Core `Engine` trait for `talus-server`.
@@ -462,6 +464,10 @@ pub trait Engine: Send + Sync {
     fn health(&self) -> EngineHealth {
         EngineHealth::default()
     }
+
+    /// Called every moment by the server's supervisor thread: notice a crash and restart right away (within the cap),
+    /// so clients polling `/health` recover without sending a request. Blocks while the model loads.
+    fn supervise(&self) {}
 
     /// A request is inside the engine right now (holding it; others queue behind). None = not tracked.
     fn in_flight(&self) -> Option<usize> {
@@ -846,6 +852,9 @@ impl ScriptedMockEngine {
                 if let Some(f) = std::env::var_os("TALUS_MOCK_CRASH_FILE") {
                     if std::fs::remove_file(&f).is_ok() {
                         eprintln!("mock engine: simulated crash on GEN");
+                        // one token first: a crash mid-request, not one before any answer (those are sent again)
+                        writeln!(writer, "T 97")?;
+                        writer.flush()?;
                         std::process::exit(3);
                     }
                 }
@@ -1372,12 +1381,32 @@ pub struct StdioSubprocessEngine {
     busy: AtomicUsize,
 }
 
+/// Prefix of the error when the command could not be written: the engine never saw the request, so it can be sent again
+/// to the restarted engine. (Later failures are not retried: the engine may have started generating.)
+const STDIN_WRITE_FAILED: &str = "engine stdin write failed";
+/// The pipe took the command and the engine exited at once without a word: it was killed just before, usually (seen on
+/// Flash-Next, whose 91 threads take a moment to go). The client has seen nothing of this request, so it is sent once more.
+/// A prompt that itself crashes the engine this fast must not reach the cap sooner for it: a death on the resend costs no
+/// entry in the restart window (`free_restart`). An exit later than `RESEND_WINDOW` is an ordinary crash, with no resend.
+const ENDED_BEFORE_ANSWERING: &str = "the engine process ended before answering";
+
+const RESEND_WINDOW: Duration = Duration::from_secs(2);
+
+fn never_reached_engine(err: Option<&EngineError>) -> bool {
+    matches!(err, Some(EngineError::EngineDied(m))
+        if m.starts_with(STDIN_WRITE_FAILED) || m == ENDED_BEFORE_ANSWERING)
+}
+
 /// Prefix of the error a request gets while the engine is down (the server answers 503 `engine_down`).
 pub const ENGINE_DOWN: &str = "the engine is down";
 
 /// At most this many automatic restarts within [`RESTART_WINDOW`]; one more crash and the engine stays down.
 pub const MAX_RESTARTS: usize = 3;
 pub const RESTART_WINDOW: Duration = Duration::from_secs(600);
+/// Least time from a crash to its restart, so a crash loop does not spend the whole cap in an instant.
+pub const RESTART_DELAY: Duration = Duration::from_secs(2);
+/// Longest wait for a dying engine to finish exiting (its GPU memory is torn down before it can be waited for).
+const EXIT_WAIT: Duration = Duration::from_secs(60);
 /// Stderr lines kept for a crash report.
 const STDERR_TAIL_LINES: usize = 20;
 
@@ -1389,6 +1418,14 @@ struct CrashState {
     restarts: std::collections::VecDeque<Instant>,
     /// The process crashed and has not been restarted yet.
     pending_restart: bool,
+    crashed_at: Option<Instant>,
+    /// An automatic restart is starting the engine.
+    restarting: bool,
+    /// Stopped for good (`shutdown`): nothing restarts it.
+    stopped: bool,
+    /// The engine died on a request's one resend: that request already paid for a restart, so the next is not counted
+    /// against the cap.
+    free_restart: bool,
     down: Option<String>,
     last_crash: Option<String>,
 }
@@ -1399,6 +1436,9 @@ impl CrashState {
     fn trip_if_over_cap(&mut self) -> Option<String> {
         if let Some(ref why) = self.down {
             return Some(why.clone());
+        }
+        if self.free_restart {
+            return None;
         }
         let now = Instant::now();
         while self
@@ -1636,21 +1676,36 @@ impl StdioSubprocessEngine {
         &self,
         slot: &'a mut Option<SubprocessHandle>,
     ) -> Result<&'a mut SubprocessHandle, EngineError> {
+        self.finish_exit_if_dying(slot);
         self.reap_if_crashed(slot);
         if slot.is_none() {
-            {
+            let delay = {
                 let mut c = self.crash.lock().unwrap();
                 if let Some(ref why) = c.down {
                     return Err(EngineError::EngineDied(format!("{ENGINE_DOWN}: {why}")));
                 }
-                if c.pending_restart {
+                if !c.pending_restart {
+                    Duration::ZERO
+                } else {
                     if let Some(why) = c.trip_if_over_cap() {
                         return Err(EngineError::EngineDied(format!("{ENGINE_DOWN}: {why}")));
                     }
-                    let now = Instant::now();
-                    c.restarts.push_back(now);
+                    c.crashed_at.map_or(Duration::ZERO, |t| {
+                        RESTART_DELAY.saturating_sub(t.elapsed())
+                    })
+                }
+            };
+            std::thread::sleep(delay);
+            let was_restart = {
+                let mut c = self.crash.lock().unwrap();
+                let was = c.pending_restart;
+                if was {
+                    if !std::mem::take(&mut c.free_restart) {
+                        c.restarts.push_back(Instant::now());
+                    }
                     c.restarts_total += 1;
                     c.pending_restart = false;
+                    c.restarting = true;
                     eprintln!(
                         "[talus-server] restarting the engine after a crash ({} of {} within {} min)",
                         c.restarts.len(),
@@ -1658,8 +1713,9 @@ impl StdioSubprocessEngine {
                         RESTART_WINDOW.as_secs() / 60
                     );
                 }
-            }
-            let (handle, ready) = Self::start(
+                was
+            };
+            let started = Self::start(
                 &self.exe,
                 &self.args,
                 &self.env,
@@ -1668,24 +1724,62 @@ impl StdioSubprocessEngine {
                 self.default_ctx,
                 &self.stderr_tail,
             )
-            .inspect_err(|_| {
-                // a restart that does not come up counts as another crash
-                let mut c = self.crash.lock().unwrap();
-                if c.restarts_total > 0 && c.down.is_none() {
-                    c.pending_restart = true;
+            .and_then(|(mut handle, ready)| {
+                if ready.max_context != self.max_context || ready.stop_token != self.stop_token {
+                    stop_process(&mut handle, Duration::from_secs(15));
+                    return Err(EngineError::EngineDied(format!(
+                        "the engine came back with READY {} {:?}, it started with READY {} {:?}",
+                        ready.max_context, ready.stop_token, self.max_context, self.stop_token
+                    )));
                 }
-            })?;
-            if ready.max_context != self.max_context || ready.stop_token != self.stop_token {
-                let mut handle = handle;
-                stop_process(&mut handle, Duration::from_secs(15));
-                return Err(EngineError::EngineDied(format!(
-                    "the engine came back with READY {} {:?}, it started with READY {} {:?}",
-                    ready.max_context, ready.stop_token, self.max_context, self.stop_token
-                )));
+                Ok(handle)
+            });
+            {
+                let mut c = self.crash.lock().unwrap();
+                c.restarting = false;
+                if let (true, Err(e)) = (was_restart, started.as_ref()) {
+                    // a restart that does not come up counts against the cap like a crash
+                    eprintln!("[talus-server] engine restart failed: {e}");
+                    c.last_crash = Some(format!("restart failed: {e}"));
+                    c.pending_restart = true;
+                    c.crashed_at = Some(Instant::now());
+                    let _ = c.trip_if_over_cap();
+                }
             }
+            let handle = started?;
             self.install(slot, handle);
         }
         Ok(slot.as_mut().expect("installed above"))
+    }
+
+    /// The process leader is gone and the rest of the process is being torn down: a killed engine shows this at once,
+    /// but can only be waited for when its GPU memory is free, seconds later. Its stdin is already closed.
+    fn dying(&self) -> bool {
+        let pid = self.pid.load(Ordering::SeqCst);
+        pid != 0
+            && std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit(") ")
+                    .next()
+                    .is_some_and(|rest| rest.starts_with(['Z', 'X']))
+            })
+    }
+
+    /// A request that finds the engine dying waits for its exit instead of writing to a dead pipe (it can then restart
+    /// it and be served; it used to get a 500).
+    fn finish_exit_if_dying(&self, slot: &mut Option<SubprocessHandle>) {
+        if self.dying() {
+            self.wait_for_exit(slot, EXIT_WAIT);
+        }
+    }
+
+    fn wait_for_exit(&self, slot: &mut Option<SubprocessHandle>, limit: Duration) {
+        let deadline = Instant::now() + limit;
+        while let Some(h) = slot.as_mut() {
+            if !matches!(h.child.try_wait(), Ok(None)) || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// The engine process exited on its own: log it (exit status, last stderr lines), forget the handle, and mark it
@@ -1699,6 +1793,8 @@ impl StdioSubprocessEngine {
         *slot = None;
         *self.stdin_cancel.lock().unwrap() = None;
         self.pid.store(0, Ordering::SeqCst);
+        // noted before the pause below, so /health never reads "unloaded" in between
+        self.crash.lock().unwrap().pending_restart = true;
         // the stderr tee may still be draining the pipe: give it a moment
         std::thread::sleep(Duration::from_millis(100));
         let tail: Vec<String> = self.stderr_tail.lock().unwrap().iter().cloned().collect();
@@ -1716,6 +1812,7 @@ impl StdioSubprocessEngine {
         c.crashes += 1;
         c.last_crash = Some(report);
         c.pending_restart = true;
+        c.crashed_at = Some(Instant::now());
         let _ = c.trip_if_over_cap();
     }
 
@@ -1766,7 +1863,7 @@ impl StdioSubprocessEngine {
             stdin
                 .write_all(cmd.as_bytes())
                 .and_then(|_| stdin.flush())
-                .map_err(|e| EngineError::EngineDied(format!("engine stdin write failed: {e}")))?;
+                .map_err(|e| EngineError::EngineDied(format!("{STDIN_WRITE_FAILED}: {e}")))?;
         }
         let mut positions = Vec::with_capacity(req.continuation_ids.len());
         let mut line = String::new();
@@ -1829,7 +1926,7 @@ impl StdioSubprocessEngine {
             stdin
                 .write_all(cmd.as_bytes())
                 .and_then(|_| stdin.flush())
-                .map_err(|e| EngineError::EngineDied(format!("engine stdin write failed: {e}")))?;
+                .map_err(|e| EngineError::EngineDied(format!("{STDIN_WRITE_FAILED}: {e}")))?;
         }
 
         let mut reused = 0usize;
@@ -1837,6 +1934,9 @@ impl StdioSubprocessEngine {
         let mut line = String::new();
         let mut pending_lp: Option<TokenLogprob> = None;
 
+        // nothing from the engine for this request yet
+        let mut answered = false;
+        let written_at = Instant::now();
         loop {
             if cancel.load(Ordering::Relaxed) && !stop_sent {
                 if let Ok(mut stdin) = handle.stdin.lock() {
@@ -1851,14 +1951,19 @@ impl StdioSubprocessEngine {
                 .read_line(&mut line)
                 .map_err(|e| EngineError::EngineDied(format!("engine stdout read failed: {e}")))?;
             if n == 0 {
-                return Err(EngineError::EngineDied(
-                    "the engine process ended unexpectedly".to_string(),
-                ));
+                // no word from the engine right after the write: it was on its way out when the command arrived
+                let resend = !answered && written_at.elapsed() <= RESEND_WINDOW;
+                return Err(EngineError::EngineDied(if resend {
+                    ENDED_BEFORE_ANSWERING.to_string()
+                } else {
+                    "the engine process ended unexpectedly".to_string()
+                }));
             }
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
+            answered = true;
             if let Some(rest) = trimmed.strip_prefix("L ") {
                 pending_lp = TokenLogprob::parse_l(rest);
             } else if let Some(rest) = trimmed.strip_prefix("RESUME ") {
@@ -1943,19 +2048,30 @@ impl StdioSubprocessEngine {
         }
     }
 
+    /// The resend's outcome: if the engine died again, that death costs no entry in the restart window.
+    fn after_resend(&self, slot: &mut Option<SubprocessHandle>, err: Option<&EngineError>) {
+        if matches!(err, Some(EngineError::EngineDied(_))) {
+            self.crash.lock().unwrap().free_restart = true;
+        }
+        self.settle_after_error(slot, err);
+        if slot.is_some() {
+            // the process is alive (a bad reply, not a death): no later crash inherits the pass
+            self.crash.lock().unwrap().free_restart = false;
+        }
+    }
+
     /// A request failed with `EngineDied`: the engine usually just exited, but its stdout closes a moment before it
     /// can be waited for. Wait briefly, so the crash is recorded now and the next request restarts it.
     fn settle_after_error(&self, slot: &mut Option<SubprocessHandle>, err: Option<&EngineError>) {
         if !matches!(err, Some(EngineError::EngineDied(_))) {
             return;
         }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while let Some(h) = slot.as_mut() {
-            if !matches!(h.child.try_wait(), Ok(None)) || Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let limit = if self.dying() || never_reached_engine(err) {
+            EXIT_WAIT
+        } else {
+            Duration::from_secs(2)
+        };
+        self.wait_for_exit(slot, limit);
         self.reap_if_crashed(slot);
     }
 }
@@ -2000,18 +2116,40 @@ impl Engine for StdioSubprocessEngine {
         self.running(&mut slot).map(|_| ())
     }
 
+    fn supervise(&self) {
+        // a request or an unload holds the lock: it deals with a crash itself
+        let Ok(mut slot) = self.proc.try_lock() else {
+            return;
+        };
+        self.reap_if_crashed(&mut slot);
+        let due = {
+            let c = self.crash.lock().unwrap();
+            c.pending_restart
+                && c.down.is_none()
+                && !c.stopped
+                && c.crashed_at.is_none_or(|t| t.elapsed() >= RESTART_DELAY)
+        };
+        if due {
+            if let Err(e) = self.running(&mut slot) {
+                eprintln!("[talus-server] engine not restarted: {e}");
+            }
+        }
+    }
+
     fn health(&self) -> EngineHealth {
         // notice a crash while idle (the lock is free then); a busy engine is alive
         if let Ok(mut slot) = self.proc.try_lock() {
             self.reap_if_crashed(&mut slot);
         }
+        let dying = self.dying();
         let c = self.crash.lock().unwrap();
         EngineHealth {
             crashes: c.crashes,
             restarts: c.restarts_total,
             down: c.down.clone(),
             last_crash: c.last_crash.clone(),
-            restart_pending: c.pending_restart && c.down.is_none(),
+            restart_pending: (c.pending_restart || dying) && c.down.is_none(),
+            restarting: c.restarting,
         }
     }
 
@@ -2025,7 +2163,11 @@ impl Engine for StdioSubprocessEngine {
         let mut slot = self.proc.lock().unwrap();
         self.reap_if_crashed(&mut slot);
         // a deliberate unload: no automatic restart is owed
-        self.crash.lock().unwrap().pending_restart = false;
+        {
+            let mut c = self.crash.lock().unwrap();
+            c.pending_restart = false;
+            c.free_restart = false;
+        }
         if let Some(mut handle) = slot.take() {
             *self.stdin_cancel.lock().unwrap() = None;
             self.pid.store(0, Ordering::SeqCst);
@@ -2076,8 +2218,13 @@ impl Engine for StdioSubprocessEngine {
         self.busy.fetch_add(1, Ordering::SeqCst);
         let _busy = BusyGuard(&self.busy);
         let handle = self.running(&mut slot)?;
-        let res = Self::score_on(handle, req);
+        let mut res = Self::score_on(handle, req);
         self.settle_after_error(&mut slot, res.as_ref().err());
+        if never_reached_engine(res.as_ref().err()) {
+            let handle = self.running(&mut slot)?;
+            res = Self::score_on(handle, req);
+            self.after_resend(&mut slot, res.as_ref().err());
+        }
         res
     }
 
@@ -2092,8 +2239,13 @@ impl Engine for StdioSubprocessEngine {
         self.busy.fetch_add(1, Ordering::SeqCst);
         let _busy = BusyGuard(&self.busy);
         let handle = self.running(&mut slot)?;
-        let res = self.generate_on(handle, req, cancel, on_token, on_progress);
+        let mut res = self.generate_on(handle, req, cancel.clone(), on_token, on_progress);
         self.settle_after_error(&mut slot, res.as_ref().err());
+        if never_reached_engine(res.as_ref().err()) {
+            let handle = self.running(&mut slot)?;
+            res = self.generate_on(handle, req, cancel, on_token, on_progress);
+            self.after_resend(&mut slot, res.as_ref().err());
+        }
         res
     }
 
@@ -2242,6 +2394,11 @@ impl StdioSubprocessEngine {
     /// Send QUIT, wait up to `grace` for the engine to exit, then kill it. Idempotent.
     pub fn quit_and_wait(&self, grace: Duration) {
         if let Ok(mut slot) = self.proc.lock() {
+            {
+                let mut c = self.crash.lock().unwrap();
+                c.stopped = true;
+                c.pending_restart = false;
+            }
             if let Some(mut handle) = slot.take() {
                 self.pid.store(0, Ordering::SeqCst);
                 stop_process(&mut handle, grace);

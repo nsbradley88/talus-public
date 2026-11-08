@@ -907,14 +907,47 @@ fn read_u64<R: Read>(r: &mut R) -> std::io::Result<u64> {
     Ok(u64::from_le_bytes(b))
 }
 
+/// Longest metadata string and largest metadata array accepted (the array limit is talus-gguf's). Length fields come from
+/// the file: nothing is allocated from one before the bytes are there, and arrays nest only so far.
+const MAX_GGUF_STRING: u64 = 1 << 28;
+const MAX_GGUF_ARRAY: u64 = 1 << 24;
+const MAX_GGUF_NESTING: u32 = 3;
+/// Initial capacity of an array read from a file; a true large array grows normally.
+const GGUF_ARRAY_PREALLOC: usize = 1 << 16;
+
 fn read_gguf_string<R: Read>(r: &mut R) -> Result<String, TokenizerError> {
-    let len = read_u64(r)? as usize;
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
+    let len = read_u64(r)?;
+    if len > MAX_GGUF_STRING {
+        return Err(TokenizerError::InvalidGguf(format!(
+            "metadata string of {len} bytes (at most {MAX_GGUF_STRING})"
+        )));
+    }
+    let mut buf = Vec::new();
+    r.take(len).read_to_end(&mut buf)?;
+    if buf.len() as u64 != len {
+        return Err(TokenizerError::InvalidGguf(format!(
+            "metadata string of {len} bytes is cut short at {}",
+            buf.len()
+        )));
+    }
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+fn read_gguf_array_len<R: Read>(r: &mut R) -> Result<usize, TokenizerError> {
+    let count = read_u64(r)?;
+    if count > MAX_GGUF_ARRAY {
+        return Err(TokenizerError::InvalidGguf(format!(
+            "metadata array of {count} items (at most {MAX_GGUF_ARRAY})"
+        )));
+    }
+    Ok(count as usize)
+}
+
 fn skip_gguf_value<R: Read>(r: &mut R, vtype: u32) -> Result<(), TokenizerError> {
+    skip_gguf_value_at(r, vtype, 0)
+}
+
+fn skip_gguf_value_at<R: Read>(r: &mut R, vtype: u32, depth: u32) -> Result<(), TokenizerError> {
     let fixed_size = match vtype {
         0 | 1 | 7 => Some(1usize),
         2 | 3 => Some(2usize),
@@ -934,8 +967,13 @@ fn skip_gguf_value<R: Read>(r: &mut R, vtype: u32) -> Result<(), TokenizerError>
             Ok(())
         }
         9 => {
+            if depth >= MAX_GGUF_NESTING {
+                return Err(TokenizerError::InvalidGguf(format!(
+                    "metadata arrays nested deeper than {MAX_GGUF_NESTING}"
+                )));
+            }
             let elem_type = read_u32(r)?;
-            let count = read_u64(r)?;
+            let count = read_gguf_array_len(r)? as u64;
             let elem_fixed = match elem_type {
                 0 | 1 | 7 => Some(1u64),
                 2 | 3 => Some(2u64),
@@ -947,7 +985,7 @@ fn skip_gguf_value<R: Read>(r: &mut R, vtype: u32) -> Result<(), TokenizerError>
                 std::io::copy(&mut r.take(count * esz), &mut std::io::sink())?;
             } else {
                 for _ in 0..count {
-                    skip_gguf_value(r, elem_type)?;
+                    skip_gguf_value_at(r, elem_type, depth + 1)?;
                 }
             }
             Ok(())
@@ -960,13 +998,13 @@ fn skip_gguf_value<R: Read>(r: &mut R, vtype: u32) -> Result<(), TokenizerError>
 
 fn read_gguf_string_array<R: Read>(r: &mut R) -> Result<Vec<String>, TokenizerError> {
     let elem_type = read_u32(r)?;
-    let count = read_u64(r)? as usize;
+    let count = read_gguf_array_len(r)?;
     if elem_type != 8 {
         return Err(TokenizerError::InvalidGguf(format!(
             "expected string array (type 8), got {elem_type}"
         )));
     }
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count.min(GGUF_ARRAY_PREALLOC));
     for _ in 0..count {
         out.push(read_gguf_string(r)?);
     }
@@ -975,8 +1013,8 @@ fn read_gguf_string_array<R: Read>(r: &mut R) -> Result<Vec<String>, TokenizerEr
 
 fn read_gguf_i32_array<R: Read>(r: &mut R) -> Result<Vec<i32>, TokenizerError> {
     let elem_type = read_u32(r)?;
-    let count = read_u64(r)? as usize;
-    let mut out = Vec::with_capacity(count);
+    let count = read_gguf_array_len(r)?;
+    let mut out = Vec::with_capacity(count.min(GGUF_ARRAY_PREALLOC));
     match elem_type {
         4 => {
             for _ in 0..count {
@@ -1126,5 +1164,93 @@ mod bpe_cache_tests {
         c.insert("x".repeat(BPE_CACHE_MAX_BYTES + 1), &[1]);
         assert!(c.map.is_empty());
         assert_eq!(c.bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod gguf_reader_tests {
+    use super::*;
+
+    fn header(n_kv: u64) -> Vec<u8> {
+        let mut b = b"GGUF".to_vec();
+        b.extend(3u32.to_le_bytes());
+        b.extend(0u64.to_le_bytes());
+        b.extend(n_kv.to_le_bytes());
+        b
+    }
+
+    fn key(b: &mut Vec<u8>, k: &str, vtype: u32) {
+        b.extend((k.len() as u64).to_le_bytes());
+        b.extend(k.as_bytes());
+        b.extend(vtype.to_le_bytes());
+    }
+
+    fn read(b: &[u8]) -> Result<GgufTokenizerMetadata, TokenizerError> {
+        read_gguf_tokenizer_metadata(&mut Cursor::new(b))
+    }
+
+    // Found by rust/fuzz tok_gguf: each of these aborted the process before any error could be reported.
+    #[test]
+    fn huge_key_length_is_an_error() {
+        let mut b = header(1);
+        b.extend(u64::MAX.to_le_bytes());
+        assert!(read(&b).is_err());
+        let mut b = header(1);
+        b.extend((MAX_GGUF_STRING).to_le_bytes());
+        b.extend(b"short");
+        assert!(read(&b).is_err(), "a length past the end of the file");
+    }
+
+    #[test]
+    fn huge_array_counts_are_errors() {
+        for (k, elem) in [
+            ("tokenizer.ggml.tokens", 8u32),
+            ("tokenizer.ggml.token_type", 5),
+            ("x", 0),
+            ("x", 8),
+        ] {
+            for count in [u64::MAX, u64::MAX / 4 + 2, 1u64 << 60, MAX_GGUF_ARRAY + 1] {
+                let mut b = header(1);
+                key(&mut b, k, 9);
+                b.extend(elem.to_le_bytes());
+                b.extend(count.to_le_bytes());
+                assert!(read(&b).is_err(), "{k} elem {elem} count {count}");
+            }
+        }
+    }
+
+    #[test]
+    fn endlessly_nested_arrays_are_an_error() {
+        let mut b = header(1);
+        key(&mut b, "x", 9);
+        for _ in 0..200_000 {
+            b.extend(9u32.to_le_bytes());
+            b.extend(1u64.to_le_bytes());
+        }
+        assert!(read(&b).is_err());
+    }
+
+    #[test]
+    fn real_shapes_still_read() {
+        let mut b = header(3);
+        key(&mut b, "tokenizer.ggml.tokens", 9);
+        b.extend(8u32.to_le_bytes());
+        b.extend(2u64.to_le_bytes());
+        for t in ["a", "b"] {
+            b.extend((t.len() as u64).to_le_bytes());
+            b.extend(t.as_bytes());
+        }
+        key(&mut b, "nested", 9);
+        b.extend(9u32.to_le_bytes());
+        b.extend(1u64.to_le_bytes());
+        b.extend(5u32.to_le_bytes());
+        b.extend(1u64.to_le_bytes());
+        b.extend(7i32.to_le_bytes());
+        key(&mut b, "tokenizer.chat_template", 8);
+        b.extend(3u64.to_le_bytes());
+        b.extend(b"{{}");
+        let m = read(&b).unwrap();
+        assert_eq!(m.tokens, ["a", "b"]);
+        assert_eq!(m.chat_template.as_deref(), Some("{{}"));
     }
 }

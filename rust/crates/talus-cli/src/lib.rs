@@ -869,11 +869,66 @@ pub struct Q36StdioBackend {
     pub ngram_k: i32,
     pub n_spec: i32,
     pub snap_msg: i32,
+    /// : spacing of the prefill snapshot ladder in tokens (`TALUS_PCACHE_LADDER`, 0 = off), see [`ladder_marks`].
+    pub ladder: usize,
     /// Disk tier of the prompt cache (`--prompt-cache-disk`), `None` when off.
     pub disk: Option<talus_state::disk::DiskCache>,
     /// E6: the model file (its tokenizer backs json_schema masks) and the lazily built grammar context.
     pub model_path: Option<std::path::PathBuf>,
     pub grammar: Option<grammar::GrammarCtx>,
+}
+
+/// default ladder spacing (tokens). A long prompt also gets recurrent-state snapshots at these grid points, so a
+/// later request that shares only part of it (another tail, an edited or dropped message past the last boundary,
+/// a sub-agent on the same long prefix) resumes from the deepest point at or before where it diverges instead of
+/// from scratch: the live KV still holds that prefix, so such a restore copies one snapshot and no KV.
+pub const DEFAULT_LADDER_TOKENS: usize = 16384;
+/// Ladder points per request at most; the spacing widens on longer prompts. They share the turn-end snapshot pool
+/// (`--prompt-cache`, LRU), so this keeps a long prompt from evicting every other conversation's snapshot.
+pub const LADDER_MAX_POINTS: usize = 3;
+
+/// `TALUS_PCACHE_LADDER` (tokens, `0` = off), default [`DEFAULT_LADDER_TOKENS`]; off without a snapshot pool.
+pub fn ladder_spacing(max_snaps: usize) -> usize {
+    if max_snaps < 2 {
+        return 0;
+    }
+    std::env::var("TALUS_PCACHE_LADDER")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_LADDER_TOKENS)
+}
+
+/// The prefill stops of one request under the grid-aligned policy: the message-boundary snapshot `cg`, the grid
+/// end `g_end` and ) up to `max_pts` ladder points strictly between `at` (the restored length) and `g_end`, on
+/// multiples of `grid`, at least `ladder` apart and at least half a step from `cg` and `g_end`. Sorted, unique, all `> at`; `cg` is kept even when it is 0
+/// (the caller skips it then, as before).
+pub fn ladder_marks(
+    at: usize,
+    cg: usize,
+    g_end: usize,
+    grid: usize,
+    ladder: usize,
+    max_pts: usize,
+) -> Vec<usize> {
+    let mut marks = vec![cg, g_end];
+    let grid = grid.max(1);
+    if ladder > 0 && max_pts > 0 && g_end > at {
+        let span = g_end - at;
+        let step = ladder.max(span.div_ceil(max_pts + 1)).div_ceil(grid) * grid;
+        let mut m = (at / step + 1) * step;
+        let mut n = 0;
+        while m < g_end && n < max_pts {
+            // not within half a step of another stop (a snapshot there would add little)
+            if m > at && m.abs_diff(cg) >= step / 2 && g_end - m >= step / 2 {
+                marks.push(m);
+                n += 1;
+            }
+            m += step;
+        }
+    }
+    marks.sort_unstable();
+    marks.dedup();
+    marks
 }
 
 /// End tokens of the Q36 decode loop (also the tokens a json_schema request may end with).
@@ -905,6 +960,10 @@ impl Q36StdioBackend {
         pc.max_snaps = max_snaps;
         pc.max_msg = if max_snaps > 0 { 4 } else { 0 };
         pc.stash_budget = stash_budget;
+        // : no new KV stash below the pressure guard's shedding threshold (8 GiB floor + 512 MiB)
+        pc.mem_floor = talus_mem::pressure::global()
+            .map(|p| p.config().threshold())
+            .unwrap_or(talus_state::disk::DEFAULT_MEM_FLOOR_BYTES + (512 << 20));
         eng.cl_pc_init(&mut pc); // talus#47: shard the cache over the cluster stages (no-op on one process)
         let n_spec = if eng.use_dflash && eng.df.ready {
             if eng.dp.uses_mtp() && cfg.mtp > 0 {
@@ -935,6 +994,7 @@ impl Q36StdioBackend {
             ngram_k: cfg.ngram,
             n_spec,
             snap_msg,
+            ladder: ladder_spacing(max_snaps),
             disk: None,
             model_path: cfg.model.as_ref().map(std::path::PathBuf::from),
             grammar: None,
@@ -1142,10 +1202,14 @@ impl Q36StdioBackend {
                 self.eng.cl_pc_stash(&self.live, lcp, self.live_pf);
             }
             if self.disk.is_some() {
-                disk_tier::restore_into_ram(self, &view, ids, gridc);
+                disk_tier::restore_into_ram(self, &mut view, ids, gridc);
             }
+            // (restore split): a live cell is only cold-exact when its whole 512-grid chunk matches: a chunk's cells can
+            // depend, in the last bits, on later tokens of that chunk. Keep live cells up to the last grid point inside
+            // the common prefix; the rest comes from the stash (bench27 edit,edit replay: 17 common tokens kept in place
+            // changed the restored prompt's first logits; with this, warm is bitwise cold).
             let (live_pf, pf_only) = if gridc {
-                (self.live_pf, true)
+                (self.live_pf.min(lcp) / grid * grid, true)
             } else {
                 (usize::MAX, false)
             };
@@ -1222,7 +1286,8 @@ impl Q36StdioBackend {
             let mut at = reuse;
             let g_end = (ids.len() / grid) * grid;
             let cg = (cut / grid) * grid;
-            for mk in [cg, g_end] {
+            let ladder = if cache_enabled { self.ladder } else { 0 };
+            for mk in ladder_marks(at, cg, g_end, grid, ladder, LADDER_MAX_POINTS) {
                 if mk <= at || (mk == cg && mk == g_end && cut == 0) {
                     continue;
                 }
@@ -1586,6 +1651,11 @@ impl Q36StdioBackend {
         let _save_guard =
             (self.disk.is_some() && cache_enabled).then(talus_state::disk::SaveGuard::new);
         write_done_line(out, &done)?;
+        // w2: read the reply up to its last grid point with the prompt kernels, so the next turn restores past it
+        if gridc && cache_enabled && cmd.use_cache && finish != "cancel" && catch_up_enabled() {
+            out.flush()?;
+            self.catch_up_after_turn(&hist);
+        }
         if self.disk.is_some() && cache_enabled {
             // The reply is complete: let the client have it before the state is copied off the GPU.
             out.flush()?;
@@ -1593,6 +1663,117 @@ impl Q36StdioBackend {
         }
         Ok(())
     }
+
+    /// w2 (27B agentic follow-ups): after the reply, read `full` (prompt + reply) from the last grid point at or before
+    /// the prompt end up to the reply's last grid point with the prompt kernels, in 512-grid chunks, and snapshot there.
+    /// The next turn of the conversation then restores past the reply instead of re-reading it (rc1 agentic gate: 56
+    /// of 57 follow-ups restored before the previous prompt end). Exact: the cells are written by prompt chunks on the
+    /// grid and the snapshot is the state a cold prompt reaches at that grid point (the livecold rule: no decoded cell
+    /// is kept). Runs after DONE; stops at a chunk boundary when the next request is waiting (the state stays at a grid
+    /// point, snapshotted). `TALUS_Q27_CATCHUP=0` turns it off; `TALUS_Q27_CATCHUP_MAX` caps the tokens read (4096).
+    fn catch_up_after_turn(&mut self, full: &[i32]) {
+        let grid = self.eng.max_batch.max(1) as usize;
+        let target = (full.len() / grid) * grid;
+        if target <= (self.live_pf / grid) * grid
+            || self.live_pf > full.len()
+            || full[..self.live_pf] != self.live[..self.live_pf.min(self.live.len())]
+        {
+            return; // the reply did not cross a grid point (or the live sequence is not this turn's)
+        }
+        let r = self
+            .pc
+            .peek_with_pf(&full[..target], &self.live, self.live_pf, true);
+        if r == 0 || r % grid != 0 || target - r > catch_up_max() {
+            return;
+        }
+        if talus_sched::requests_waiting() {
+            eprintln!("talus-serve: catch-up skipped (next request waiting)");
+            return;
+        }
+        let t0 = Instant::now();
+        let mut view = make_layer_state_view(&mut self.eng);
+        let in_cache = self.live_pf.min(
+            self.live
+                .iter()
+                .zip(full.iter())
+                .take_while(|(a, b)| a == b)
+                .count(),
+        );
+        let (r2, from) =
+            self.pc
+                .restore_with_pf(&mut view, &full[..target], &self.live, self.live_pf, true);
+        self.eng
+            .cl_pc_restore(&full[..target], &self.live, self.live_pf, true, r2);
+        if r2 != r {
+            // cannot happen (peek and restore pick the same point); leave a clean state
+            self.eng.reset();
+            self.live.clear();
+            self.live_pf = 0;
+            return;
+        }
+        if r2 > in_cache {
+            sync_layer_state_view_back(&mut self.eng, &view); // KV came from a stash: rebuild the int8 copy too
+        } else {
+            // the live cells below r2 are the prompt's own: only the recurrent state moved back
+            self.eng.n_past = view.pos as i32;
+            self.eng.gdn_pending = view.gdn_pending;
+            self.eng.gdn_valid = true;
+            self.eng.dctx.set_bounds(view.dctx_lo, view.dctx_hi);
+        }
+        self.live.clear();
+        self.live.extend_from_slice(&full[..r2]);
+        self.live_pf = r2;
+        let mut at = r2;
+        let mut stopped = false;
+        while at < target {
+            if at > r2 && talus_sched::requests_waiting() {
+                stopped = true;
+                break;
+            }
+            let mk = (at + grid).min(target);
+            self.eng.process_with_callback(&full[at..mk], true, |_| {});
+            self.live.extend_from_slice(&full[at..mk]);
+            at = mk;
+        }
+        self.live_pf = self.live.len();
+        if at > r2 && (self.eng.n_past as usize) == self.live.len() {
+            let mut view = make_layer_state_view(&mut self.eng);
+            self.pc.save(&mut view, &self.live, false);
+            self.eng.cl_pc_save(&self.live, false);
+        }
+        eprintln!(
+            "talus-serve: catch-up {} tokens ({} -> {}, from {}{}) in {:.1} ms",
+            at - r2,
+            r2,
+            at,
+            from,
+            if stopped {
+                ", stopped: next request waiting"
+            } else {
+                ""
+            },
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
+/// w2: `TALUS_Q27_CATCHUP` (default on; `0` / `off` turns the after-reply catch-up off).
+fn catch_up_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("TALUS_Q27_CATCHUP").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("off"))
+    })
+}
+
+/// w2: `TALUS_Q27_CATCHUP_MAX` tokens read at most per catch-up (default 4096).
+fn catch_up_max() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("TALUS_Q27_CATCHUP_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096)
+    })
 }
 
 /// E2 `SCORE` for the Qwen3.8-27B engine: one cold prefill of the prompt (prompt cache off: the live state is
@@ -2126,14 +2307,17 @@ pub fn run_mimo_cli(cfg: &CliConfig, model_path: &Path) -> i32 {
         if let Some(last) = prefill_logits.last() {
             decode_rows.push(last.clone());
         }
+        // TALUS_MIMO_FD_WINDOW=W (release row-parity gate): forced rows through W-row windows, the way serving verifies
+        // drafts, so the dump can be compared bit for bit with the one-row dump. Default 1, the plain path.
+        let fd_window = std::env::var("TALUS_MIMO_FD_WINDOW")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 8);
         let t1 = Instant::now();
-        for &tok in &prompt[n_prefill..] {
-            match eng.forward_batch(&[tok]) {
-                Ok(mut rows) => {
-                    if let Some(r) = rows.pop() {
-                        decode_rows.push(r);
-                    }
-                }
+        for window in prompt[n_prefill..].chunks(fd_window) {
+            match eng.forward_batch(window) {
+                Ok(rows) => decode_rows.extend(rows),
                 Err(e) => {
                     eprintln!("talus-mimo: {e}");
                     return 1;
@@ -2491,6 +2675,10 @@ pub fn run_laguna_cli(cfg: &CliConfig, model_path: &Path) -> i32 {
         };
     }
 
+    // TALUS_LAGUNA_LSRV=1 puts the CLI probes on the served kernels: decode too, as serve_main does (a decode step is
+    // verify(1)). Without this, --verify-test and --force-decode compared the verify kernels with a release check's decode
+    // kernels, which serving never runs (TALUS_LAGUNA_DEC_VERIFY=0: those kernels).
+    eng.set_dec_verify(fast_serve_mode);
     let lcfg = talus_model::laguna::LagunaCliConfig {
         tokens: toks,
         top: cfg.top.max(0) as usize,
@@ -3524,6 +3712,31 @@ mod tests {
         assert!(kv_flag_warning("mimo", &cfg).is_none());
         let cfg = parse_cli_args(["--model", "m.gguf", "--kv", "f16"]).unwrap();
         assert!(kv_flag_warning("qwen35", &cfg).is_none());
+    }
+
+    #[test]
+    fn ladder_marks_k17() {
+        // off: the two stops of before
+        assert_eq!(ladder_marks(0, 4096, 98304, 2048, 0, 3), vec![4096, 98304]);
+        // 96K prompt from scratch: spacing widens to span/4 (24K), 3 points
+        assert_eq!(
+            ladder_marks(0, 0, 98304, 2048, 16384, 3),
+            vec![0, 24576, 49152, 73728, 98304]
+        );
+        // short prompt: spacing 16K; 32768 is too close to the grid end
+        assert_eq!(
+            ladder_marks(0, 0, 36864, 2048, 16384, 3),
+            vec![0, 16384, 36864]
+        );
+        // resumed at 40K: points only past the restored length; one too close to cg is dropped
+        assert_eq!(
+            ladder_marks(40960, 51200, 90112, 2048, 16384, 3),
+            vec![51200, 65536, 81920, 90112]
+        );
+        // every mark is on the grid
+        for m in ladder_marks(2048, 6144, 1 << 20, 2048, 10000, 3) {
+            assert_eq!(m % 2048, 0);
+        }
     }
 
     #[test]

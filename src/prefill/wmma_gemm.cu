@@ -390,6 +390,112 @@ __global__ void __launch_bounds__(256) kernel(const _Float16* __restrict__ X, co
         }
 #endif
 }
+// #11: kernel_bk64 with W read as GGUF Q8_0 blocks (34 bytes per 32 values, row_bytes apart): the loader decodes each
+// staged 8-value piece to the FP16 values dequant_kernel<8, H16> writes (fp16(d * q), the product exact in FP32, rounded
+// once), so no dequantized scratch; every accumulator takes the same WMMAs in the same k order as kernel_bk64.
+// K a multiple of 64 and W 4-byte aligned; the 12-byte code load may read 4 bytes past the last block.
+__global__ void __launch_bounds__(256) kernel_bk64q8(const _Float16* __restrict__ X, const uint8_t* __restrict__ W,
+                                                     float* __restrict__ Y, int M, int N, int K, int ldy, int accumulate,
+                                                     int ldx, int row_bytes) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
+    constexpr int BN = 256, WN = 64, BK64 = 64, LDK64 = BK64 + 8;
+    typedef uint32_t u3 __attribute__((ext_vector_type(3)));
+    struct RQ { u3 c; uint32_t d; };
+    __shared__ __align__(16) _Float16 sA[BM][LDK64];
+    __shared__ __align__(16) _Float16 sB[BN][LDK64];
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, l16 = lane & 15, hi = lane >> 4;
+    const int wm = wave & 1, wn = wave >> 1;
+    const int num_m = (M + BM - 1) / BM, num_n = (N + BN - 1) / BN, b = blockIdx.x;
+    const int group = b / (GM * num_n), first_m = group * GM, gsize = min(GM, num_m - first_m);
+    const int m0 = (first_m + (b % (GM * num_n)) % gsize) * BM, n0 = ((b % (GM * num_n)) / gsize) * BN;
+    const int sr = tid >> 3, sq = tid & 7;            // 32 rows per pass, 8 x 8 halves per row
+    const uint32_t csh = (sq >> 2) ? 0u : 16u;        // the code bytes' offset in their dword: block g even 2, odd 0
+    auto ldA = [&](int k0, int r) -> uint4 {
+        return *reinterpret_cast<const uint4*>(X + (size_t) min(m0 + r, M - 1) * ldx + k0 + 8 * sq);
+    };
+    auto ldB = [&](int k0, int r) -> RQ {
+        const int vi = k0 + 8 * sq, g = vi >> 5, p = (vi >> 3) & 3;
+        const uint8_t* bl = W + (size_t) min(n0 + r, N - 1) * row_bytes + (size_t) g * 34;
+        const uint8_t* c = reinterpret_cast<const uint8_t*>((reinterpret_cast<uintptr_t>(bl) + 2 + 8 * p) & ~(uintptr_t) 3);
+        RQ o;
+        o.c = *reinterpret_cast<const u3*>(c);
+        o.d = *reinterpret_cast<const uint16_t*>(bl);
+        return o;
+    };
+    auto dec = [&](const RQ& r) -> uint4 {
+        const float d = __half2float(__ushort_as_half((unsigned short) r.d)), nd = -128.0f * d;
+        const uint32_t q0 = __builtin_amdgcn_alignbit(r.c[1], r.c[0], csh) ^ 0x80808080u;
+        const uint32_t q1 = __builtin_amdgcn_alignbit(r.c[2], r.c[1], csh) ^ 0x80808080u;
+        auto pk = [&](uint32_t q, int sh) -> uint32_t {
+            const float a = fmaf((float) ((q >> sh) & 0xffu), d, nd), e = fmaf((float) ((q >> (sh + 8)) & 0xffu), d, nd);
+            return __builtin_bit_cast(uint32_t, __halves2half2(__float2half_rn(a), __float2half_rn(e)));
+        };
+        return make_uint4(pk(q0, 0), pk(q0, 16), pk(q1, 0), pk(q1, 16));
+    };
+    uint4 ra0, ra1, ra2, ra3;
+    RQ rb0, rb1, rb2, rb3, rb4, rb5, rb6, rb7;
+    auto load = [&](int k0) {
+        ra0 = ldA(k0, sr); ra1 = ldA(k0, sr + 32); ra2 = ldA(k0, sr + 64); ra3 = ldA(k0, sr + 96);
+        rb0 = ldB(k0, sr); rb1 = ldB(k0, sr + 32); rb2 = ldB(k0, sr + 64); rb3 = ldB(k0, sr + 96);
+        rb4 = ldB(k0, sr + 128); rb5 = ldB(k0, sr + 160); rb6 = ldB(k0, sr + 192); rb7 = ldB(k0, sr + 224);
+    };
+    auto store = [&]() {
+        *reinterpret_cast<uint4*>(&sA[sr][8 * sq]) = ra0; *reinterpret_cast<uint4*>(&sA[sr + 32][8 * sq]) = ra1;
+        *reinterpret_cast<uint4*>(&sA[sr + 64][8 * sq]) = ra2; *reinterpret_cast<uint4*>(&sA[sr + 96][8 * sq]) = ra3;
+        *reinterpret_cast<uint4*>(&sB[sr][8 * sq]) = dec(rb0); *reinterpret_cast<uint4*>(&sB[sr + 32][8 * sq]) = dec(rb1);
+        *reinterpret_cast<uint4*>(&sB[sr + 64][8 * sq]) = dec(rb2); *reinterpret_cast<uint4*>(&sB[sr + 96][8 * sq]) = dec(rb3);
+        *reinterpret_cast<uint4*>(&sB[sr + 128][8 * sq]) = dec(rb4); *reinterpret_cast<uint4*>(&sB[sr + 160][8 * sq]) = dec(rb5);
+        *reinterpret_cast<uint4*>(&sB[sr + 192][8 * sq]) = dec(rb6); *reinterpret_cast<uint4*>(&sB[sr + 224][8 * sq]) = dec(rb7);
+    };
+    f8 acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = f8{0, 0, 0, 0, 0, 0, 0, 0};
+    load(0);
+    store();
+    __syncthreads();
+    const int ar = 64 * wm + l16, br = WN * wn + l16;
+    for (int k0 = 0; k0 < K; k0 += BK64) {
+        const bool more = k0 + BK64 < K;
+        if (more) load(k0 + BK64);
+#pragma unroll
+        for (int ks = 0; ks < BK64; ks += 16) {
+            const h16 a0 = frag(&sA[ar][ks]), a1 = frag(&sA[ar + 16][ks]), a2 = frag(&sA[ar + 32][ks]),
+                      a3 = frag(&sA[ar + 48][ks]);
+            const h16 b0 = frag(&sB[br][ks]), b1 = frag(&sB[br + 16][ks]), b2 = frag(&sB[br + 32][ks]),
+                      b3 = frag(&sB[br + 48][ks]);
+#define PFG_ROW(i, a)                                                                                                 \
+    acc[i][0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b0, acc[i][0]);                                         \
+    acc[i][1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b1, acc[i][1]);                                         \
+    acc[i][2] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b2, acc[i][2]);                                         \
+    acc[i][3] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b3, acc[i][3]);
+            PFG_ROW(0, a0) PFG_ROW(1, a1) PFG_ROW(2, a2) PFG_ROW(3, a3)
+#undef PFG_ROW
+        }
+        if (more) {
+            __syncthreads();   // every wave is done reading the tile
+            store();
+            __syncthreads();
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int n = n0 + WN * wn + 16 * j + l16;
+            if (n >= N) continue;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int m = m0 + 64 * wm + 16 * i + 2 * e + hi;
+                if (m < M) {
+                    float* y = Y + (size_t) m * ldy + n;
+                    *y = accumulate ? *y + acc[i][j][e] : acc[i][j][e];
+                }
+            }
+        }
+#endif
+}
 // The 128 x 256 kernel with a 64-k LDS tile (single buffer, the next tile in 12 named staging registers, 2 barriers
 // per tile: half the loop trips and barriers per k of the BK 32 double buffer). Each accumulator takes the same
 // WMMAs in the same k order as `kernel`: the same bits (s23/gemm_probe11.hip, memcmp). gfx1151, M 16384, both
@@ -678,6 +784,21 @@ bool strata_pf_gemm_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t 
     return strata_pf_gemm_f16_ld(X, K, W, K, Y, T, N, K, ldy, beta, stream);
 }
 
+bool strata_pf_gemm_q8_ld(const uint16_t* X, int64_t ldx, const void* Wq8, float* Y, int64_t T, int64_t N, int64_t K,
+                          int64_t ldy, float beta, void* stream) {
+    if (!X || !Wq8 || !Y || T < 64 || N < 1024 || K % 64 != 0 || (reinterpret_cast<uintptr_t>(Wq8) & 3) != 0) return false;
+    if (beta != 0.0f && beta != 1.0f) return false;
+    if (ldy <= 0) ldy = N;
+    if (ldx < K || ldx % 8 != 0 || ldx > (1LL << 30) || ldy < N || T > (1LL << 30) || N > (1LL << 30) || K > (1LL << 30)) return false;
+    if (!strata_wmma_gfx11_device()) return false;
+    hipStream_t s = static_cast<hipStream_t>(stream);
+    const int64_t mt = (T + pfg::BM - 1) / pfg::BM;
+    const unsigned grid = (unsigned) (mt * ((N + 255) / 256));
+    pfg::kernel_bk64q8<<<grid, 256, 0, s>>>((const _Float16*) X, (const uint8_t*) Wq8, Y, (int) T, (int) N, (int) K, (int) ldy,
+                                            beta == 1.0f ? 1 : 0, (int) ldx, (int) (K / 32 * 34));
+    return hipGetLastError() == hipSuccess;
+}
+
 bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y, int64_t T,
                            int64_t N, int64_t K, int64_t ldy, float beta, void* stream) {
     if (!X || !W || !Y || T < 64 || N < 512 || K % pfg::BK != 0 || K < pfg::BK) return false;
@@ -710,6 +831,9 @@ bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, in
 #else
 // Non-HIP / Non-GFX11 compilation fallback
 bool strata_pf_gemm_f16(const uint16_t*, const uint16_t*, float*, int64_t, int64_t, int64_t, int64_t, float, void*) {
+    return false;
+}
+bool strata_pf_gemm_q8_ld(const uint16_t*, int64_t, const void*, float*, int64_t, int64_t, int64_t, int64_t, float, void*) {
     return false;
 }
 bool strata_pf_gemm_f16_ld(const uint16_t*, int64_t, const uint16_t*, int64_t, float*, int64_t, int64_t, int64_t,

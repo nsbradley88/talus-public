@@ -159,6 +159,9 @@ impl ServiceState {
                 Arc::new(sub)
             }
         };
+        if config.exe_path.is_some() && !config.mock_mode {
+            warm_up(&config, engine.as_ref(), &tokenizer);
+        }
         let mut st = Self::new(config, engine, tokenizer);
         st.chat_template = chat_template;
         Ok(st)
@@ -183,6 +186,7 @@ impl ServiceState {
             ("crashes", JsonValue::from(h.crashes)),
             ("restarts", JsonValue::from(h.restarts)),
             ("restart_pending", JsonValue::from(h.restart_pending)),
+            ("restarting", JsonValue::from(h.restarting)),
             ("down", JsonValue::from(h.down.is_some())),
             ("down_reason", JsonValue::from(h.down.clone())),
             ("last_crash", JsonValue::from(h.last_crash.clone())),
@@ -257,6 +261,10 @@ impl ServiceState {
         let m = self.metrics.lock().unwrap();
         let state = if health.down.is_some() {
             "down"
+        } else if health.restarting {
+            "engine_restarting"
+        } else if health.restart_pending {
+            "crashed"
         } else if !self.engine.is_loaded() {
             "unloaded"
         } else if running > 0 {
@@ -447,6 +455,68 @@ impl Drop for ServerHandle {
     }
 }
 
+/// A paragraph long enough that the repeated prompt isn't a run of one token; its content doesn't matter.
+const WARMUP_TEXT: &str = "fn merge_runs(rows: &mut Vec<(u32, u32)>) -> usize {\n    // Sort by start, then fold every overlapping pair into one run.\n    rows.sort_unstable();\n    let mut out = 0;\n    for i in 1..rows.len() {\n        if rows[i].0 <= rows[out].1 {\n            rows[out].1 = rows[out].1.max(rows[i].1);\n        } else {\n            out += 1;\n            rows[out] = rows[i];\n        }\n    }\n    out + 1\n}\n\nThe harbour office kept its ledgers in a cold back room, where the tide tables hung beside a map of the northern channel. Each morning the clerk copied the night's arrivals, checked the weights against the manifests, and sent a boy up the hill with whatever the customs house had asked for.\n\n";
+
+/// One throwaway request before the port opens: the first request's lazy costs (kernel code, first-touch pages, first
+/// verify window) land here instead of on a user. No prompt cache and no checkpoint, and it fits the K/V the engine
+/// already has. A failure only costs the warm start: the first real request reports it.
+fn warm_up(config: &ServerConfig, engine: &dyn Engine, tokenizer: &ByteTokenizer) {
+    let n = std::env::var("TALUS_WARMUP_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .or(config.warmup_tokens)
+        .unwrap_or_else(|| crate::config::default_warmup_tokens(&config.model_name));
+    // A small max_context can't take the prompt plus the 16 generated tokens.
+    let n = n.min(engine.max_context().saturating_sub(32));
+    if n == 0 {
+        return;
+    }
+    let mut ids = Vec::with_capacity(n + 64);
+    while ids.len() < n {
+        let piece = tokenizer.encode(WARMUP_TEXT, false);
+        if piece.is_empty() {
+            return;
+        }
+        ids.extend(piece);
+    }
+    ids.truncate(n);
+    let req = GenerateRequest {
+        prompt_ids: ids,
+        max_new_tokens: 16,
+        sampling: SamplingParams {
+            temperature: 0.0,
+            ignore_eos: true,
+            cache_prompt: false,
+            checkpoint: false,
+            ..SamplingParams::default()
+        },
+        stop_tokens: Vec::new(),
+        stop_strings: Vec::new(),
+    };
+    let t0 = Instant::now();
+    let r = engine.generate(
+        &req,
+        Arc::new(AtomicBool::new(false)),
+        &mut |_| true,
+        &mut |_, _| {},
+    );
+    // MiMo resumes from its token history even after cache_prompt=false (seen: 61 tokens of the warm-up's text reused,
+    // and the reply changed). The other two warm-up models keep nothing here (kv-prefix A/B: 0 cached, same reply).
+    if config.model_name == "mimo-v2.6-flash" {
+        if let Err(e) = engine.erase_slot(0) {
+            eprintln!("[talus-server] warm-up: clear failed: {e}");
+        }
+    }
+    match r {
+        Ok(_) => eprintln!(
+            "[talus-server] warm-up: {n} tokens in {:.0} ms",
+            t0.elapsed().as_secs_f64() * 1000.0
+        ),
+        Err(e) => eprintln!("[talus-server] warm-up failed: {e}"),
+    }
+}
+
 pub struct TalusServer {
     listener: TcpListener,
     addr: SocketAddr,
@@ -489,6 +559,7 @@ impl TalusServer {
         let shutdown_bg = Arc::clone(&shutdown);
         let listener = self.listener;
         spawn_idle_unloader(Arc::clone(&state), Arc::clone(&shutdown));
+        spawn_engine_supervisor(Arc::clone(&state), Arc::clone(&shutdown));
 
         let thread = thread::spawn(move || {
             run_accept_loop(listener, state, shutdown_bg);
@@ -505,6 +576,7 @@ impl TalusServer {
     pub fn run_blocking(self) {
         let shutdown = Arc::new(AtomicBool::new(false));
         spawn_idle_unloader(Arc::clone(&self.state), Arc::clone(&shutdown));
+        spawn_engine_supervisor(Arc::clone(&self.state), Arc::clone(&shutdown));
         run_accept_loop(self.listener, self.state, shutdown);
     }
 }
@@ -971,6 +1043,41 @@ fn read_http_head(
     ))
 }
 
+/// Bytes of a body read and charged at a time.
+const BODY_READ_STEP: usize = 256 * 1024;
+
+fn body_read_error(e: std::io::Error, what: &str) -> ReadRequestError {
+    if is_timeout(&e) {
+        bad(408, "timed out reading the request body")
+    } else {
+        bad(400, what.to_string())
+    }
+}
+
+/// Append `n` bytes of body to `out`. A body is charged as it arrives, not as announced: a client holds a share of
+/// [`HttpLimits::max_body_in_flight`], and this memory, only for what it has really sent, plus one step.
+fn read_charged<R: Read>(
+    reader: &mut R,
+    out: &mut Vec<u8>,
+    n: usize,
+    charge: &mut BodyCharge,
+    what: &str,
+) -> Result<(), ReadRequestError> {
+    let end = out.len() + n;
+    while out.len() < end {
+        let next = end.min(out.len() + BODY_READ_STEP);
+        if !charge.reserve(next) {
+            return Err(ReadRequestError::Busy);
+        }
+        let start = out.len();
+        out.resize(next, 0);
+        reader
+            .read_exact(&mut out[start..])
+            .map_err(|e| body_read_error(e, what))?;
+    }
+    Ok(())
+}
+
 /// The body announced by `req`'s headers (Content-Length or chunked), at most `lim.max_body` bytes.
 fn read_http_body(
     reader: &mut ClientReader,
@@ -979,13 +1086,6 @@ fn read_http_body(
     budget: &mut HeaderBudget,
     charge: &mut BodyCharge,
 ) -> Result<Vec<u8>, ReadRequestError> {
-    let io_err = |e: std::io::Error, what: &str| {
-        if is_timeout(&e) {
-            bad(408, "timed out reading the request body")
-        } else {
-            bad(400, what.to_string())
-        }
-    };
     match req.body_framing() {
         None => Ok(Vec::new()),
         Some(None) => read_chunked_body(reader, lim, budget, charge),
@@ -996,10 +1096,8 @@ fn read_http_body(
                     format!("request body exceeds maximum of {} bytes", lim.max_body),
                 ));
             }
-            let mut buf = vec![0u8; cl];
-            reader
-                .read_exact(&mut buf)
-                .map_err(|e| io_err(e, "incomplete request body"))?;
+            let mut buf = Vec::with_capacity(cl);
+            read_charged(reader, &mut buf, cl, charge, "incomplete request body")?;
             Ok(buf)
         }
     }
@@ -1014,19 +1112,12 @@ fn read_chunked_body(
     budget: &mut HeaderBudget,
     charge: &mut BodyCharge,
 ) -> Result<Vec<u8>, ReadRequestError> {
-    let io_err = |e: std::io::Error, what: &str| {
-        if is_timeout(&e) {
-            bad(408, "timed out reading the request body")
-        } else {
-            bad(400, what.to_string())
-        }
-    };
     let mut out = Vec::new();
     loop {
         let size_line = match read_line_bounded(reader, MAX_CHUNK_LINE) {
             Ok(l) => l,
             Err(LineError::TooLong) => return Err(bad(400, "chunk header too long")),
-            Err(LineError::Io(e)) => return Err(io_err(e, "invalid chunked body")),
+            Err(LineError::Io(e)) => return Err(body_read_error(e, "invalid chunked body")),
         };
         if !size_line.ends_with(b"\r\n") {
             return Err(bad(400, "malformed chunk header"));
@@ -1047,18 +1138,11 @@ fn read_chunked_body(
         if out.len().saturating_add(chunk_size) > lim.max_body {
             return Err(bad(413, "chunked request body too large"));
         }
-        if !charge.reserve(out.len() + chunk_size) {
-            return Err(ReadRequestError::Busy);
-        }
-        let start = out.len();
-        out.resize(start + chunk_size, 0);
-        reader
-            .read_exact(&mut out[start..])
-            .map_err(|e| io_err(e, "truncated chunk data"))?;
+        read_charged(reader, &mut out, chunk_size, charge, "truncated chunk data")?;
         let mut crlf = [0u8; 2];
         reader
             .read_exact(&mut crlf)
-            .map_err(|e| io_err(e, "missing CRLF after chunk"))?;
+            .map_err(|e| body_read_error(e, "missing CRLF after chunk"))?;
         if &crlf != b"\r\n" {
             return Err(bad(400, "expected CRLF after chunk"));
         }
@@ -1312,13 +1396,6 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServiceState>) -> std::io
     }
 
     let mut charge = BodyCharge::new(&state.body_bytes_in_flight, lim.max_body_in_flight);
-    if let Some(Some(n)) = req.body_framing() {
-        if n <= lim.max_body && !charge.reserve(n) {
-            let res = reply_read_error(&mut stream, ReadRequestError::Busy);
-            close_unread(&stream, &mut reader, discard_limit(Some(n), &lim));
-            return res;
-        }
-    }
 
     reader.get_mut().deadline = accepted + lim.request_deadline;
     // a client waiting for 100-continue (curl does above 1 MiB) sends the body now instead of after its own timeout;
@@ -1480,9 +1557,11 @@ fn early_reply(
         let health = state.engine.health();
         let loaded = state.engine.is_loaded();
         let busy = state.running_requests.load(Ordering::Relaxed) > 0;
-        // down (crash-loop cap) > crashed (restarts on the next request) > unloaded
+        // down (crash-loop cap) > restarting > crashed (about to restart) > unloaded
         let status = if health.down.is_some() {
             "down"
+        } else if health.restarting {
+            "restarting"
         } else if health.restart_pending {
             "crashed"
         } else if loaded {
@@ -1511,7 +1590,7 @@ fn early_reply(
         ]);
         return Some(write_json(
             stream,
-            if loaded { 200 } else { 503 },
+            if status == "ok" { 200 } else { 503 },
             &body,
             &[],
         ));
@@ -1984,6 +2063,14 @@ fn handle_post(
         }
     };
 
+    if json_body.contains_key("reasoning_budget_tokens")
+        && !BUDGET_WARNED.swap(true, Ordering::Relaxed)
+    {
+        eprintln!(
+            "[talus-server] warning: a request set reasoning_budget_tokens: this server does not implement it and ignores it"
+        );
+    }
+
     if req.path.starts_with("/v1/responses/") {
         let body = responses_error_body(
             "this server keeps no responses (stateless); send the whole conversation to POST /v1/responses",
@@ -2173,6 +2260,21 @@ fn handle_unload(
     }
 }
 
+/// Restart a crashed engine right away, within its cap: clients that only poll `/health` recover on their own.
+fn spawn_engine_supervisor(state: Arc<ServiceState>, shutdown: Arc<AtomicBool>) {
+    let spawned = thread::Builder::new()
+        .name("talus-supervisor".to_string())
+        .spawn(move || {
+            while !shutdown.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(250));
+                state.engine.supervise();
+            }
+        });
+    if let Err(e) = spawned {
+        eprintln!("[talus-server] warning: cannot start the engine supervisor: {e}");
+    }
+}
+
 /// `idle_unload_seconds` > 0: unload the engine after that long without a request; the next request loads it again.
 fn spawn_idle_unloader(state: Arc<ServiceState>, shutdown: Arc<AtomicBool>) {
     let secs = state.config.idle_unload_seconds;
@@ -2210,6 +2312,41 @@ pub fn engine_err_code(msg: &str) -> Option<&'static str> {
     }
     msg.contains("insufficient_memory")
         .then_some("insufficient_memory")
+}
+
+/// `reasoning_budget_tokens` in a request is warned about once per server run.
+static BUDGET_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// What a streaming client is told when generation fails after the 200 went out.
+fn stream_error_message(e: &EngineError) -> String {
+    let msg = e.to_string();
+    if matches!(e, EngineError::EngineDied(_)) && engine_err_code(&msg).is_none() {
+        format!("{msg}; the engine restarts automatically")
+    } else {
+        msg
+    }
+}
+
+/// The OpenAI/llama.cpp form of that: an `error` data event, then `[DONE]` on the routes that end with it. Best effort:
+/// the client may be gone. (A stream that just closed looked like a short answer to clients that don't require `[DONE]`.)
+fn write_stream_error(stream: &mut TcpStream, e: &EngineError, done: bool) {
+    let msg = stream_error_message(e);
+    let code = engine_err_code(&msg).unwrap_or("server_error");
+    let err = JsonValue::obj(vec![(
+        "error",
+        JsonValue::obj(vec![
+            ("type", JsonValue::from("server_error")),
+            ("message", JsonValue::from(msg)),
+            ("param", JsonValue::Null),
+            ("code", JsonValue::from(code)),
+        ]),
+    )]);
+    let mut text = format!("data: {}\n\n", err.to_json_string());
+    if done {
+        text.push_str("data: [DONE]\n\n");
+    }
+    let _ = stream.write_all(text.as_bytes());
+    let _ = stream.flush();
 }
 
 fn send_post_error(
@@ -2415,6 +2552,18 @@ fn handle_slot_action(
     }
 }
 
+/// Longest stop string accepted; matching costs up to its length per generated token.
+const MAX_STOP_BYTES: usize = 64 * 1024;
+
+fn check_stop_len(key: &str, st: &str) -> Result<(), String> {
+    if st.len() > MAX_STOP_BYTES {
+        return Err(format!(
+            "{key}: a stop string may be at most {MAX_STOP_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
 fn parse_sampling_from_req(
     req: &JsonValue,
     defaults: &SamplingParams,
@@ -2529,6 +2678,7 @@ fn parse_sampling_from_req(
                 continue;
             }
             if let Some(st) = v.as_str() {
+                check_stop_len(key, st)?;
                 if !st.is_empty() {
                     stops.push(st.to_string());
                 }
@@ -2540,6 +2690,7 @@ fn parse_sampling_from_req(
                     let Some(st) = item.as_str() else {
                         return Err(format!("{key}: must be strings"));
                     };
+                    check_stop_len(key, st)?;
                     if !st.is_empty() {
                         stops.push(st.to_string());
                     }
@@ -2905,7 +3056,10 @@ fn handle_llama_completion(
         }
         let mut timings = match res {
             Ok(t) => t,
-            Err(_) => return Ok(()),
+            Err(e) => {
+                write_stream_error(stream, &e, false);
+                return Ok(());
+            }
         };
         if stopped_by_word {
             timings.finish_reason = "stop".to_string();
@@ -3191,7 +3345,10 @@ fn handle_openai_completions(
         }
         let mut timings = match res {
             Ok(t) => t,
-            Err(_) => return Ok(()),
+            Err(e) => {
+                write_stream_error(stream, &e, true);
+                return Ok(());
+            }
         };
         if stopped_by_word {
             timings.finish_reason = "stop".to_string();
@@ -3417,9 +3574,10 @@ where
         prep.thinking,
         prep.tools.clone(),
         true,
-        state.config.reasoning_recovery,
-        false,
-    );
+        state.config.tool_call_recovery,
+        true,
+    )
+    .with_reasoning_rescue(state.config.reasoning_recovery);
     let mut detok = Detokenizer::new(&state.tokenizer);
     let mut stop_matcher = if prep.stops.is_empty() {
         None
@@ -4075,7 +4233,12 @@ fn handle_openai_chat(
             true
         }) {
             Ok(o) => o,
-            Err(_) => return Ok(()),
+            Err(e) => {
+                if !stream_err {
+                    write_stream_error(stream, &e, true);
+                }
+                return Ok(());
+            }
         };
 
         if stream_err {
@@ -4228,7 +4391,15 @@ fn handle_responses(
             true
         }) {
             Ok(o) => o,
-            Err(_) => return Ok(()),
+            Err(e) => {
+                if !stream_err {
+                    let msg = stream_error_message(&e);
+                    let code = engine_err_code(&msg).unwrap_or("server_error");
+                    let ev = asm.failed(&msg, code);
+                    let _ = write_ev(stream, &ev);
+                }
+                return Ok(());
+            }
         };
 
         if stream_err {
@@ -4516,6 +4687,21 @@ fn handle_anthropic_messages(
         Ok(o) => o,
         Err(e) => {
             if want_stream {
+                if !stream_err {
+                    let err = JsonValue::obj(vec![
+                        ("type", JsonValue::from("error")),
+                        (
+                            "error",
+                            JsonValue::obj(vec![
+                                ("type", JsonValue::from("api_error")),
+                                ("message", JsonValue::from(stream_error_message(&e))),
+                            ]),
+                        ),
+                    ]);
+                    let line = format!("event: error\ndata: {}\n\n", err.to_json_string());
+                    let _ = stream.write_all(line.as_bytes());
+                    let _ = stream.flush();
+                }
                 return Ok(());
             }
             return send_post_error(stream, "/v1/messages", 503, &e.to_string(), None, None);

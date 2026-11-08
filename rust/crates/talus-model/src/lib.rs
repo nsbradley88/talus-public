@@ -27,6 +27,7 @@ pub mod laguna;
 pub mod mimo;
 pub mod qwen35;
 pub mod qwen4exp;
+pub mod rowpad;
 pub mod tail_prune;
 
 pub use laguna::{

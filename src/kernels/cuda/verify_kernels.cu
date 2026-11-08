@@ -994,6 +994,11 @@ void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv
         std::fprintf(stderr, "gdn_conv_ab_multi: invalid arguments\n");
         std::exit(1);
     }
+    if (n_tok > kVerifyMaxTCopy16) {   // 17..32 rows: conv and a/b in their own launches (no wider register array)
+        gdn_conv_l2_multi(history, qkv, conv_w, h, channels, qk_heads, eps, n_tok, stream, t_begin, commit);
+        gdn_ab_multi(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok, stream);
+        return;
+    }
     const int conv_blocks = channels / S, ab_blocks = (2 * h_v + 1) / 2;
     const dim3 grid((unsigned) (conv_blocks + ab_blocks), (unsigned) n_tok);
     cudaStream_t st = (cudaStream_t) stream;
@@ -1007,7 +1012,7 @@ void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv
         case 6: gdn_conv_ab_kernel<6, true><<<grid, S, 0, st>>>(conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps, t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
         case 7: case 8: gdn_conv_ab_kernel<kVerifyMaxTBase, false><<<grid, S, 0, st>>>(conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps, t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
         // a copy window of 9..16 rows (the same per-token arithmetic in a wider register array)
-        default: gdn_conv_ab_kernel<kVerifyMaxT, false><<<grid, S, 0, st>>>(conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps, t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+        default: gdn_conv_ab_kernel<kVerifyMaxTCopy16, false><<<grid, S, 0, st>>>(conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps, t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
     }
     check("gdn_conv_ab_multi");
 }
@@ -1047,6 +1052,13 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
         std::fprintf(stderr, "gdn_ab_multi: invalid arguments\n");
         std::exit(1);
     }
+    if (n_tok > kVerifyMaxTCopy16) {   // two calls of <= 16 rows (row-wise)
+        const int a = (n_tok + 1) / 2;
+        gdn_ab_multi(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, a, stream);
+        gdn_ab_multi(x + (size_t) a * n_embd, w_alpha, w_beta, dt, ssm_a, gate + (size_t) a * h_v, beta + (size_t) a * h_v, n_embd, h_v,
+                     n_tok - a, stream);
+        return;
+    }
     const unsigned blocks = (unsigned) ((2 * h_v + 1) / 2);
     cudaStream_t st = (cudaStream_t) stream;
     switch (n_tok) {
@@ -1058,7 +1070,7 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
         case 6: gdn_ab_multi_kernel<6, true><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
         case 7: case 8: gdn_ab_multi_kernel<kVerifyMaxTBase, false><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
         // a copy window of 9..16 rows
-        default: gdn_ab_multi_kernel<kVerifyMaxT, false><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+        default: gdn_ab_multi_kernel<kVerifyMaxTCopy16, false><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
     }
     check("gdn_ab_multi");
 }
@@ -1081,7 +1093,10 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
             if (n_tok <= kVerifyMaxTBase)
                 gdn_state_replay_kernel<kVerifyMaxTBase><<<grid, block, 0, (cudaStream_t) stream>>>(
                     state, h, conv_channels, gate, beta, h_k, h_v, n_tok, n_keep);
-            else   // a copy window of 9..16 rows
+            else if (n_tok <= kVerifyMaxTCopy16)   // a copy window of 9..16 rows
+                gdn_state_replay_kernel<kVerifyMaxTCopy16><<<grid, block, 0, (cudaStream_t) stream>>>(
+                    state, h, conv_channels, gate, beta, h_k, h_v, n_tok, n_keep);
+            else   // 17..32 rows (only with the opt-in STRATA_GDN_SPLIT=1)
                 gdn_state_replay_kernel<kVerifyMaxT><<<grid, block, 0, (cudaStream_t) stream>>>(
                     state, h, conv_channels, gate, beta, h_k, h_v, n_tok, n_keep);
         } else {
@@ -1137,8 +1152,9 @@ namespace {
 // calls (n > 128) take the same kernel at 256 threads (8 warps), the 128-thread instantiation is unchanged.
 constexpr int kResidentPlanMax = 128;
 constexpr int kResidentPlanWide = 256;
+constexpr int kResidentPlanWide2 = 512;   // 26..32 tokens (a kernel instantiation of its own)
 static_assert(kVerifyMaxTBase * 10 <= kResidentPlanMax, "resident_plan: one thread per entry");
-static_assert(kVerifyMaxT * 10 <= kResidentPlanWide, "resident_plan (wide): one thread per entry");
+static_assert(kVerifyMaxT * 10 <= kResidentPlanWide2, "resident_plan (wide): one thread per entry");
 // the parallel scan keeps one partial sum per warp in s_wsum[NT / 32] and packs (entries << 16 | groups) in an int
 static_assert(kResidentPlanWide <= 1024 && kResidentPlanWide % 32 == 0, "resident_plan: whole warps");
 static_assert(kResidentPlanWide < 32768, "resident_plan: the packed entry count must stay below 2^15");
@@ -1341,8 +1357,11 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
     else if (n_entries <= kResidentPlanWide)   // a copy window of 13..16 tokens
         resident_plan_kernel<kResidentPlanWide><<<1, kResidentPlanWide, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
                                                                     blob, plan, capx, skip, ring, plan_err);
+    else if (n_entries <= kResidentPlanWide2)
+        resident_plan_kernel<kResidentPlanWide2><<<1, kResidentPlanWide2, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base, slot_off,
+                                                                    blob, plan, capx, skip, ring, plan_err);
     else {
-        std::fprintf(stderr, "resident_plan: %d entries (at most %d)\n", n_entries, kResidentPlanWide);
+        std::fprintf(stderr, "resident_plan: %d entries (at most %d)\n", n_entries, kResidentPlanWide2);
         std::exit(1);
     }
     check("resident_plan");

@@ -240,6 +240,22 @@ impl Policy {
         if is_copy {
             out.push(("target_copy_read", p.to_string()));
         }
+        // the mini-SWE-agent bundle's own copy of the target: a harness dependency (requests for litellm, at a
+        // later release than any requests task), so the harness's imports are fine but a model command opening it
+        // is a leak; the strace audit judges it for tool processes only (`bundle_copy_read` -> target_copy_read)
+        let bundle_seg = p
+            .strip_prefix("/agent/mini/site/")
+            .and_then(|r| r.split('/').next())
+            .map(str::to_lowercase);
+        if !self.target_module.is_empty()
+            && bundle_seg.as_deref().is_some_and(|seg| {
+                seg == self.target_module.to_lowercase()
+                    || (versioned(seg)
+                        && (seg.ends_with(".dist-info") || seg.ends_with(".egg-info")))
+            })
+        {
+            out.push(("bundle_copy_read", p.to_string()));
+        }
         // ancestor directories of the repo and of allowed prefixes (path resolution, e.g. python's /opt while
         // finding /opt/miniconda3) and the allowlist
         let anc = format!("{}/", p.trim_end_matches('/'));
@@ -481,6 +497,15 @@ pub fn audit_strace(log: &str, policy: &Policy, start_cwd: &str, a: &mut Audit) 
 }
 
 /// The agent harness's own executable: opencode, or the mini-SWE-agent bundle's interpreter.
+/// `bundle_copy_read` counts as `target_copy_read` for the model's own processes and is ignored for the harness's.
+fn bundle_kind(k: &'static str, tool: bool) -> Option<&'static str> {
+    match k {
+        "bundle_copy_read" if tool => Some("target_copy_read"),
+        "bundle_copy_read" => None,
+        _ => Some(k),
+    }
+}
+
 fn is_harness_exe(path: &str, policy: &Policy) -> bool {
     path == policy.harness_exe
         || path.ends_with("/opencode")
@@ -697,6 +722,9 @@ fn audit_pass<I, S>(
                     }
                 }
                 for (k, d) in policy.check_path(&join(&here, &path)) {
+                    let Some(k) = bundle_kind(k, tool) else {
+                        continue;
+                    };
                     if k != "outside_repo" {
                         a.flag(k, d, "strace");
                     }
@@ -709,6 +737,9 @@ fn audit_pass<I, S>(
                     }
                     // changing directory is not reading: what is opened there is checked
                     for (k, d) in policy.check_path(&join(&here, &p)) {
+                        let Some(k) = bundle_kind(k, tool) else {
+                            continue;
+                        };
                         if k != "outside_repo" {
                             a.flag(k, d, "strace");
                         }
@@ -797,6 +828,9 @@ fn audit_pass<I, S>(
                         .contains(&name.as_str())
                         && !args.contains("O_DIRECTORY");
                     for (k, d) in policy.check_path(&abs) {
+                        let Some(k) = bundle_kind(k, tool) else {
+                            continue;
+                        };
                         // the harness's own probing outside the repo (its runtime, certificates, config lookups)
                         // is not the model's doing; opencode's tools are audited from its event stream
                         if k != "outside_repo" || (tool && opens_file) {
@@ -858,6 +892,10 @@ pub fn audit_events(events: &str, policy: &Policy, a: &mut Audit) {
             if let Some(p) = input[key].as_str() {
                 if p.starts_with('/') {
                     for (k, d) in policy.check_path(p) {
+                        // every event is the model's own action
+                        let Some(k) = bundle_kind(k, true) else {
+                            continue;
+                        };
                         a.flag(k, d, "events");
                     }
                 }
@@ -1249,6 +1287,49 @@ true"#
             !details.iter().any(|d| d.contains("rel.txt")),
             "{details:?}"
         );
+    }
+
+    #[test]
+    fn mini_bundle_copy_of_the_target_is_a_leak_for_tools_only() {
+        // the mini harness (bundle python) imports its own requests from /agent/mini/site: not judged; a model
+        // command reading that copy is target_copy_read (requests tasks: a later release than the snapshot)
+        let log = r#"100   execve("/agent/mini/python/cpython-3.12.13-linux-x86_64-gnu/bin/python3.12", ["python3.12", "mini_run.py"], 0x1 /* 1 vars */) = 0
+100   openat(AT_FDCWD, "/agent/mini/site/demolib/__init__.py", O_RDONLY|O_CLOEXEC) = 3
+100   newfstatat(AT_FDCWD, "/agent/mini/site/demo_lib-2.34.2.dist-info", {st_mode=S_IFDIR|0755, st_size=4096, ...}, 0) = 0
+100   vfork() = 200
+200   execve("/bin/sh", ["/bin/sh", "-c", "cat /agent/mini/site/demolib/models.py"], 0x2 /* 1 vars */) = 0
+200   clone(child_stack=NULL, flags=SIGCHLD) = 201
+201   execve("/usr/bin/cat", ["cat", "/agent/mini/site/demolib/models.py"], 0x3 /* 1 vars */) = 0
+201   openat(AT_FDCWD, "/agent/mini/site/demolib/models.py", O_RDONLY) = 3
+"#;
+        let mut a = Audit::default();
+        audit_strace(log, &policy("/testbed"), "/", &mut a);
+        let copies: Vec<&str> = a
+            .flags
+            .iter()
+            .filter(|f| f.kind == "target_copy_read")
+            .map(|f| f.detail.as_str())
+            .collect();
+        assert!(
+            copies.contains(&"/agent/mini/site/demolib/models.py"),
+            "{:#?}",
+            a.flags
+        );
+        assert!(
+            !copies
+                .iter()
+                .any(|d| d.contains("__init__.py") || d.contains("dist-info")),
+            "{copies:?}"
+        );
+        assert!(!a.flags.iter().any(|f| f.kind == "bundle_copy_read"));
+        // other bundle packages are the harness's business, the model's reads of them are not copies of the target
+        let p = policy("/testbed");
+        let kinds =
+            |x: &str| -> Vec<&'static str> { p.check_path(x).into_iter().map(|k| k.0).collect() };
+        assert!(!kinds("/agent/mini/site/litellm/main.py")
+            .iter()
+            .any(|k| *k == "bundle_copy_read" || *k == "target_copy_read"));
+        assert!(kinds("/agent/mini/site/demolib/api.py").contains(&"bundle_copy_read"));
     }
 
     #[test]

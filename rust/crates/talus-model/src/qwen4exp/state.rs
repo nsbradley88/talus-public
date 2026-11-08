@@ -44,6 +44,10 @@ pub fn message_checkpoint_boundary(
 /// a longer one, or a `/slots` restore of it reused 0 tokens. Returns `n - 1`, or -1 when one of this request's
 /// checkpoints is within `short_read` tokens of the end already (a chat prompt: its turn checkpoint) or there is no
 /// conversation cache.
+///
+/// `resumed_checkpoint`: the checkpoint this request mounted (0 = none, or it resumed from the live state, which is not
+/// kept): it counts as near too. A chat prompt sent again resumes at its turn checkpoint with no turn left to read, and
+/// an extra checkpoint at `n - 1` would move where the next turn of that chat resumes, and so change that turn's output.
 #[allow(clippy::too_many_arguments)]
 pub fn prompt_end_checkpoint(
     n: i64,
@@ -54,12 +58,13 @@ pub fn prompt_end_checkpoint(
     prompt_cache: i32,
     req_ckpt: bool,
     short_read: i64,
+    resumed_checkpoint: i64,
 ) -> i64 {
     let end = n - 1;
     if prompt_cache <= 0 || !req_ckpt || end < 1 {
         return -1;
     }
-    let nearest = [turn_at, root_at, message_at, pin_at]
+    let nearest = [turn_at, root_at, message_at, pin_at, resumed_checkpoint]
         .into_iter()
         .filter(|&c| c <= end)
         .fold(0, i64::max);
@@ -244,6 +249,7 @@ mod tests {
             6,
             true,
             64,
+            0,
         );
         assert_eq!(end, 2762);
         // resumed from the live state at 2762 (nothing left to read): still the end, so a re-send finds it
@@ -260,7 +266,8 @@ mod tests {
                 -1,
                 6,
                 true,
-                64
+                64,
+                0
             ),
             2762
         );
@@ -270,31 +277,89 @@ mod tests {
     fn prompt_end_checkpoint_skips_when_a_checkpoint_is_near_the_end() {
         // a chat prompt: the turn checkpoint is 3 tokens before the end (<|im_start|>assistant\n)
         assert_eq!(
-            prompt_end_checkpoint(10000, 9996, -1, -1, -1, 6, true, 64),
+            prompt_end_checkpoint(10000, 9996, -1, -1, -1, 6, true, 64, 0),
             -1
         );
         // the turn is far from the end (a raw continuation after a chat): the end gets one too
         assert_eq!(
-            prompt_end_checkpoint(10000, 5000, -1, -1, -1, 6, true, 64),
+            prompt_end_checkpoint(10000, 5000, -1, -1, -1, 6, true, 64, 0),
             9999
         );
         // a pin near the end counts like any checkpoint of the request
         assert_eq!(
-            prompt_end_checkpoint(10000, -1, -1, -1, 9990, 6, true, 64),
+            prompt_end_checkpoint(10000, -1, -1, -1, 9990, 6, true, 64, 0),
             -1
         );
         // short prompts are cheaper to read again
-        assert_eq!(prompt_end_checkpoint(60, -1, -1, -1, -1, 6, true, 64), -1);
-        assert_eq!(prompt_end_checkpoint(66, -1, -1, -1, -1, 6, true, 64), 65);
+        assert_eq!(
+            prompt_end_checkpoint(60, -1, -1, -1, -1, 6, true, 64, 0),
+            -1
+        );
+        assert_eq!(
+            prompt_end_checkpoint(66, -1, -1, -1, -1, 6, true, 64, 0),
+            65
+        );
         // no conversation cache, or ckpt=0: none
         assert_eq!(
-            prompt_end_checkpoint(10000, -1, -1, -1, -1, 0, true, 64),
+            prompt_end_checkpoint(10000, -1, -1, -1, -1, 0, true, 64, 0),
             -1
         );
         assert_eq!(
-            prompt_end_checkpoint(10000, -1, -1, -1, -1, 6, false, 64),
+            prompt_end_checkpoint(10000, -1, -1, -1, -1, 6, false, 64, 0),
             -1
         );
-        assert_eq!(prompt_end_checkpoint(1, -1, -1, -1, -1, 6, true, 0), -1);
+        assert_eq!(prompt_end_checkpoint(1, -1, -1, -1, -1, 6, true, 0, 0), -1);
+    }
+
+    #[test]
+    fn prompt_end_checkpoint_counts_the_checkpoint_the_request_resumed_from() {
+        // a chat prompt sent again: resumed at its turn checkpoint, no turn left to read, so turn_at is -1. Before this,
+        // nearest was 0 and the end took a checkpoint, which moved where the next turn of the chat resumed
+        let im_start = 248045i64;
+        let mut ids = vec![42i64; 3736];
+        ids[3731] = im_start;
+        let plan = compute_prompt_cuts(
+            &ids, 3731, 3731, false, -1, 6, im_start, -1, 0, true, false, false, -1,
+        );
+        assert_eq!(plan.turn_at, -1);
+        assert_eq!(
+            prompt_end_checkpoint(
+                3736,
+                plan.turn_at,
+                plan.root_at,
+                plan.message_at,
+                -1,
+                6,
+                true,
+                64,
+                3731
+            ),
+            -1
+        );
+        // the same resume position from the live state keeps the end checkpoint: the live state is not kept
+        assert_eq!(
+            prompt_end_checkpoint(
+                3736,
+                plan.turn_at,
+                plan.root_at,
+                plan.message_at,
+                -1,
+                6,
+                true,
+                64,
+                0
+            ),
+            3735
+        );
+        // a raw prompt extended past a checkpoint by more than --short-read still gets one at its new end
+        assert_eq!(
+            prompt_end_checkpoint(10000, -1, -1, -1, -1, 6, true, 64, 9000),
+            9999
+        );
+        // and by no more than that it does not
+        assert_eq!(
+            prompt_end_checkpoint(10000, -1, -1, -1, -1, 6, true, 64, 9950),
+            -1
+        );
     }
 }

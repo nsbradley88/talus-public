@@ -529,7 +529,11 @@ constexpr int MQ_XB = 144;   // block_q8_1_mmq
 // chunk)), the item found before the LDS tables are built (blocks past the last item exit at once), the table init
 // unrolled (its global loads in flight together), and the rows' range scale read with all threads in flight (the max
 // of the same values: order-independent).
-template <int WT, bool GU, int BM, bool H = true, int DIAG = 0, bool MQ = false, bool U2 = false, bool CMP = false>
+// V  #9, native path; bitwise V = 0): bit 0 LB: the next stage's weights stay in flight past the stage barrier (LDS-only
+// fence, as CMP); bit 1 CS: IQ3_S sign masks computed in registers, no LDS table; bit 2 XR: 128-byte staged rows, their
+// 16-byte slots XOR-permuted by the row (the same bank spread as the 144-byte rows, 4 KB less LDS per buffer pair at BM 128)
+// and amax / csum in the free staging buffer, so a BM 128 gate/up item fits 3 workgroups per WGP.
+template <int WT, bool GU, int BM, bool H = true, int DIAG = 0, bool MQ = false, bool U2 = false, bool CMP = false, int V = 0>
 __global__ void __launch_bounds__(256) w16_kernel(const Batch b, const NativeGeom geo, const Tables tb,
                                                   const uint8_t* __restrict__ act, const int32_t* __restrict__ src,
                                                   uint8_t* __restrict__ out, float* __restrict__ dm, const MqArgs mq) {
@@ -542,12 +546,15 @@ __global__ void __launch_bounds__(256) w16_kernel(const Batch b, const NativeGeo
     constexpr int BT = BM / 16;                 // token tiles
     const int ACT_LD = (K / 64) * AB;           // (native) bytes per activation row
     constexpr int UPT = BM * 4 / 256;           // 16-value staging units per thread (1 or 2)
-    __shared__ __attribute__((aligned(16))) __bf16 abuf[2][BM][ASTR];
-    __shared__ uint32_t amax[GU && !MQ ? BM : 1][4];
-    __shared__ int csum[GU && !MQ ? BM : 1][4];
+    constexpr bool LB = (V & 1) != 0, CSV = (V & 2) != 0, XR = (V & 4) != 0;
+    __shared__ __attribute__((aligned(16))) __bf16 abuf[2][BM][XR ? 64 : ASTR];
+    __shared__ uint32_t amax_s[GU && !MQ && !XR ? BM : 1][4];
+    __shared__ int csum_s[GU && !MQ && !XR ? BM : 1][4];
+    uint32_t (*amax)[4] = XR ? (uint32_t (*)[4]) &abuf[1][0][0] : amax_s;
+    int (*csum)[4] = XR ? (int (*)[4]) ((uint8_t*) &abuf[1][0][0] + BM * 16) : csum_s;
     __shared__ float rsc[H ? BM : 1], rinv[H ? BM : 1];   // fp16: per routed row a power of two that keeps it in range
     __shared__ __attribute__((aligned(8))) uint32_t sgrid[F::NGRID > 0 ? F::NGRID : 1];
-    __shared__ uint4 ssgn[F::NGRID > 0 ? 256 : 1];
+    __shared__ uint4 ssgn[F::NGRID > 0 && !CSV ? 256 : 1];
     const int tid = threadIdx.x, lane = tid & 31, wv = tid >> 5, l16 = lane & 15, hi = lane >> 4;
     static_assert(!CMP || MQ, "CMP: tp_moe contract only");
     __shared__ int citem[CMP ? 3 : 1];
@@ -582,7 +589,7 @@ __global__ void __launch_bounds__(256) w16_kernel(const Batch b, const NativeGeo
     if constexpr (F::NGRID > 0) {
         if constexpr (CMP) F::init_lds_u(sgrid, tid);
         else F::init_lds(sgrid, tid);
-        {   // sign masks: value v of entry (v < 4: low nibble) flips bit 15 / 31 of its bf16 pair dword; the
+        if constexpr (!CSV) {   // sign masks: value v of entry (v < 4: low nibble) flips bit 15 / 31 of its bf16 pair dword; the
             // ksigns formats (IQ2_XXS, IQ3_XXS) index them by the 7-bit code (ggml's ksigns_iq2xs)
             const int s = w16_ksigns<WT>() ? (tid < 128 ? (int) ksigns_iq2xs[tid] : 0) : tid;
             uint32_t m[4] = {0, 0, 0, 0};
@@ -674,7 +681,7 @@ __global__ void __launch_bounds__(256) w16_kernel(const Batch b, const NativeGeo
             if constexpr (MQ) arow[u] = mq.xq + (size_t) (CMP && mq.src ? mq.src[r] : r) * MQ_XB;
             else arow[u] = act + (size_t) (GU ? src[r] : r) * ACT_LD;
         }
-        if constexpr (GU && !MQ) {
+        if constexpr (GU && !MQ && !XR) {
             for (int i = tid; i < BM * 4; i += 256) { ((uint32_t*) amax)[i] = 0u; ((int*) csum)[i] = 0; }
         }
         float rs[UPT];
@@ -769,9 +776,16 @@ __global__ void __launch_bounds__(256) w16_kernel(const Batch b, const NativeGeo
                     o[2 * j] = pk16<H>(fmaf((float) (q[j] & 0xffu), d, nd), fmaf((float) ((q[j] >> 8) & 0xffu), d, nd));
                     o[2 * j + 1] = pk16<H>(fmaf((float) ((q[j] >> 16) & 0xffu), d, nd), fmaf((float) (q[j] >> 24), d, nd));
                 }
-                uint4* dst = (uint4*) &abuf[buf][urow[u]][16 * uq[u]];
-                dst[0] = make_uint4(o[0], o[1], o[2], o[3]);
-                dst[1] = make_uint4(o[4], o[5], o[6], o[7]);
+                if constexpr (XR) {
+                    uint4* slots = (uint4*) &abuf[buf][urow[u]][0];
+                    const int x = urow[u] & 7;
+                    slots[(2 * uq[u]) ^ x] = make_uint4(o[0], o[1], o[2], o[3]);
+                    slots[(2 * uq[u] + 1) ^ x] = make_uint4(o[4], o[5], o[6], o[7]);
+                } else {
+                    uint4* dst = (uint4*) &abuf[buf][urow[u]][16 * uq[u]];
+                    dst[0] = make_uint4(o[0], o[1], o[2], o[3]);
+                    dst[1] = make_uint4(o[4], o[5], o[6], o[7]);
+                }
             }
         };
         f32x8 acc[2][BT];
@@ -792,7 +806,7 @@ __global__ void __launch_bounds__(256) w16_kernel(const Batch b, const NativeGeo
                 typename F::R& cur = rw[ST & 1];
                 // the next stage's raw bytes (this group's or the next group's first). CMP: the activation loads
                 // first, so the stage-end wait for them (vmcnt is in order) leaves the weight prefetch in flight
-                if constexpr (CMP) {
+                if constexpr (CMP || LB) {
                     // this stage's weights (the previous stage's prefetch: the only loads in flight here) waited for
                     // explicitly before the next loads are issued (vmcnt counts in order; after the divergent aload
                     // branches the compiler would otherwise wait for everything): gfx11 s_waitcnt vmcnt(0)
@@ -802,7 +816,7 @@ __global__ void __launch_bounds__(256) w16_kernel(const Batch b, const NativeGeo
                 }
                 if constexpr (ST + 1 < F::GS) wfetch.template operator()<ST + 1>(go, rw[(ST + 1) & 1]);
                 else if (gi + 1 < NG) wfetch.template operator()<0>(go + F::GB, rw[0]);
-                if constexpr (!CMP) {
+                if constexpr (!(CMP || LB)) {
                     F::template prep<ST>(cur, go);
                     if (s + 1 < NST) aload(s + 1);
                 }
@@ -814,7 +828,7 @@ __global__ void __launch_bounds__(256) w16_kernel(const Batch b, const NativeGeo
 #pragma unroll
                         for (int d = 0; d < 8; ++d) own[d] = 0x3c003c00u + (uint32_t) (d + lane);
                     } else {
-                        F::template values<ST, KK, CMP && W16_CS>(cur, lds, tab, own);
+                        F::template values<ST, KK, (CMP && W16_CS) || CSV>(cur, lds, tab, own);
                     }
                     u32x8 a0, a1;
 #pragma unroll
@@ -829,7 +843,16 @@ __global__ void __launch_bounds__(256) w16_kernel(const Batch b, const NativeGeo
 #pragma unroll
                     for (int t = 0; t < BT; ++t) {
                         if ((!FULL && t >= ntt) || DIAG == 2) break;
-                        const V16 B = *(const V16*) &abuf[cb][16 * t + l16][16 * KK];
+                        V16 B;
+                        if constexpr (XR) {
+                            const uint4* slots = (const uint4*) &abuf[cb][16 * t + l16][0];
+                            const int x = l16 & 7;
+                            const uint4 b0 = slots[(2 * KK) ^ x], b1 = slots[(2 * KK + 1) ^ x];
+                            const u32x8 bb = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+                            B = __builtin_bit_cast(V16, bb);
+                        } else {
+                            B = *(const V16*) &abuf[cb][16 * t + l16][16 * KK];
+                        }
                         if constexpr (H) {
                             acc[0][t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(A0, B, acc[0][t]);
                             acc[1][t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(A1, B, acc[1][t]);
@@ -844,7 +867,7 @@ __global__ void __launch_bounds__(256) w16_kernel(const Batch b, const NativeGeo
                 sub.template operator()<2>();
                 sub.template operator()<3>();
                 if (s + 1 < NST) astore(cb ^ 1);
-                if constexpr (CMP) {
+                if constexpr (CMP || LB) {
                     // LDS-only barrier: the staged activations are the only memory shared across waves here, so the
                     // in-flight global / buffer loads (the next stage's weights) stay in flight past it (a
                     // __syncthreads() fence at workgroup scope waits for every outstanding load)
@@ -941,6 +964,11 @@ __global__ void __launch_bounds__(256) w16_kernel(const Batch b, const NativeGeo
                 }
             }
         } else if constexpr (GU) {
+            if constexpr (XR) {   // (amax / csum live in staging buffer 1: free only now)
+                __syncthreads();
+                for (int i = tid; i < BM * 4; i += 256) { ((uint32_t*) amax)[i] = 0u; ((int*) csum)[i] = 0; }
+                __syncthreads();
+            }
             // SwiGLU in registers: acc[0] gate, acc[1] up of features wv*16 + 2i + hi (local), token 16 t + l16
             const int q = wv >> 1;   // 32-feature block of the item (0..3)
             auto& h = acc[0];   // h overwrites the gate accumulators
@@ -1025,6 +1053,9 @@ int sms() {
 
 }  // namespace
 
+static int g_w16v = [] { const char* v = std::getenv("TALUS_PF_W16_V"); return v ? std::atoi(v) & 7 : 0; }();
+void w16_bench_set_v(int v) { g_w16v = v & 7; }
+
 void w16_host_iq3s_grid(uint32_t* out) {
     if (hipMemcpyFromSymbol(out, HIP_SYMBOL(iq3s_grid), 512 * sizeof(uint32_t)) != hipSuccess) std::memset(out, 0, 2048);
 }
@@ -1078,6 +1109,7 @@ bool experts_native_w16(const Batch& b, const NativeGeom& g, int n_expert, int64
     // decode / no WMMA (BM 128)
     static const bool bf = [] { const char* v = std::getenv("STRATA_PF_W16_BF16"); return v && v[0] == '1'; }();
     static const int diag = [] { const char* v = std::getenv("STRATA_PF_W16_DIAG"); return v ? std::atoi(v) : 0; }();
+    const int w16v = g_w16v;
     const uint8_t* xa8 = (const uint8_t*) xa;
     uint8_t* ha8 = (uint8_t*) ha;
 #define W16_GU(BM, H, DG) w16_kernel<T_IQ3_S, true, BM, H, DG><<<g_gu, 256, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr, MqArgs{})
@@ -1088,6 +1120,23 @@ bool experts_native_w16(const Batch& b, const NativeGeom& g, int n_expert, int64
     } else if (bf) {
         if (phase != 2) { if (bm_gu == 128) W16_GU(128, false, 0); else W16_GU(64, false, 0); }
         if (phase != 1) { if (bm_d == 128) W16_D(128, false, 0); else W16_D(64, false, 0); }
+    } else if (w16v != 0) {
+#define W16_GUV(BM, VV) w16_kernel<T_IQ3_S, true, BM, true, 0, false, false, false, VV><<<g_gu, 256, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr, MqArgs{})
+#define W16_DV(BM, VV) w16_kernel<T_IQ4_NL, false, BM, true, 0, false, false, false, VV><<<g_d, 256, 0, s>>>(b, g, tb, ha8, src, nullptr, dm, MqArgs{})
+#define W16_GUB(VV) { if (bm_gu == 128) W16_GUV(128, VV); else W16_GUV(64, VV); }
+#define W16_DB(VV) { if (bm_d == 128) W16_DV(128, VV); else W16_DV(64, VV); }
+        if (phase != 2) switch (w16v) {
+            case 1: W16_GUB(1); break; case 2: W16_GUB(2); break; case 3: W16_GUB(3); break;
+            case 4: W16_GUB(4); break; case 5: W16_GUB(5); break; case 6: W16_GUB(6); break; default: W16_GUB(7); break;
+        }
+        // (CS is gate/up only: down has no signs)
+        if (phase != 1) switch (w16v & 5) {
+            case 0: W16_DB(0); break; case 1: W16_DB(1); break; case 4: W16_DB(4); break; default: W16_DB(5); break;
+        }
+#undef W16_GUV
+#undef W16_DV
+#undef W16_GUB
+#undef W16_DB
     } else {
         if (phase != 2) { if (bm_gu == 128) W16_GU(128, true, 0); else W16_GU(64, true, 0); }
         if (phase != 1) { if (bm_d == 128) W16_D(128, true, 0); else W16_D(64, true, 0); }

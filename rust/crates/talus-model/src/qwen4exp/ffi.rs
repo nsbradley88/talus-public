@@ -293,6 +293,7 @@ pub type FnServeBeginRequest = unsafe extern "C" fn(
     out_resumed_from0: *mut c_int,
     out_reread_to: *mut i64,
     out_pin_at: *mut i64,
+    out_resumed_checkpoint: *mut i64,
 ) -> c_int;
 pub type FnServePrefillSegment = unsafe extern "C" fn(
     ctx: *mut TkQwen4ExpServeCtx,
@@ -1679,6 +1680,7 @@ p2_ffi_table! {
     gr_silu: fn(Ef, Mh, i64, Vp, Mh);
     gr_write: fn(Mf, Ef, Ef, i64, i64, Vp);
     gr_write_norm_rs: fn(Mf, Ef, Ef, i64, Ef, f32, Mf, Mh, i64, Vp, Mh, i64);
+    moe_write_norm_rs: fn(Ef, Ei, Ef, Ef, Ef, Mf, Ef, i64, Ef, f32, Mf, Mh, i64, Vp, Mh, i64);
     gr_write_cvec_norm_rs: fn(Mf, Ef, Ef, i64, Ef, Ef, *const c_int, i32, Ef, f32, Mf, Mh, i64, Vp, Mh, i64);
     gr16_broadcast: fn(Ef, Mh, i64, i32, Vp);
     gr16_norm_rs: fn(Eh, Ef, f32, Mf, Mh, i64, i32, Vp, Mh, i64);
@@ -1718,6 +1720,7 @@ p2_ffi_table! {
     block_topk: fn(Ef, Ei, i64, i64, i64, Shp, Mi, Vp, i64);
     fnp_tile_attn: fn(Ef, Atp, Ei, Ei, i64, Shp, Mf, i64, Vp) -> c_int;
     prompt_attn_batch: fn(Ef, Atp, Ei, Ei, i64, Shp, Mf, i64, Vp) -> c_int;
+    prompt_attn_gated: fn(Ef, Atp, Ei, Ei, i64, Shp, Ef, Mh, i64, i64, Vp) -> c_int;
     decode_attn_batch: fn(Ef, Atp, Ei, Ei, i64, Shp, Mf, Mf, i64, Vp);
     route: fn(Ef, Mi, Mf, i64, i64, Vp);
     swiglu_pair: fn(Ef, Ef, Mh, i64, Vp);
@@ -1740,6 +1743,8 @@ p2_ffi_table! {
     mmq_gather_native_group: fn(*const *const u8, i32, i32, u64, u64, u64, u64, Vp, u64, Vp, u64, Vp, u64, Vp, u64) -> c_int;
     mmq_gather_strata_q2: fn(*const u8, Vp, Vp, Vp);
     mmq_product: fn(Vp, Cvp, i32, i64, i64, u64, i32, Cvp, Ei, Ei, i64, i64, Mf, i64, Ef, i32, Vp);
+    mmq_inplace_ok: fn(i32, i64, i64) -> c_int;
+    mmq_product_each: fn(*const Cvp, i32, i64, i64, i32, Cvp, Ei, Ei, i64, i64, Mf, i64, Vp) -> c_int;
     mmq_swiglu: fn(Ef, Mf, i64, i64, i32, Vp);
     mmq_swiglu_scaled: fn(Ef, Mf, i64, i64, Ei, i32, Ef, i64, Vp);
     mmq_down_row_scales: fn(Mf, Ei, i32, Ef, i64, Vp);
@@ -1752,6 +1757,7 @@ p2_ffi_table! {
     src_pinned: fn(Vp, i64, i64) -> c_int;
     src_blob_stable: fn(Vp, i64, i64) -> *const u8;
     cache_device_slot: fn(Vp, i32) -> *const u8;
+    cache_device_end: fn(Vp) -> *const u8;
     mtp_info: fn(Vp, *mut TkP2MtpInfo) -> c_int;
     mtp_idle: fn(Vp, *mut c_char, usize) -> c_int;
     mtp_add_ms_prefill: fn(Vp, f64);

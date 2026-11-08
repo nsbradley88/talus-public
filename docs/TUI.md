@@ -86,7 +86,7 @@ requests:
 ┌ Serving ─────────────────────────────────────────────────────────────────────────────────────────┐
 │ Model      MiMo-V2.6-Flash   ● generating   up 0s                                                │
 │ Accuracy   Balanced (our tuned defaults)                                                         │
-│ Memory     16.1 GiB free of 125 GiB   (keep at least 11 GiB free)                                │
+│ Memory     16.1 GiB free of 125 GiB   (keep at least 9 GiB free)                                │
 │ Server     127.0.0.1:8000 · This computer only · no API key                                      │
 │ Context    ██                       5,128 of 192K tokens (last request)                          │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -132,7 +132,7 @@ arrow keys and press Enter to open a model's tuning panel. Applying there switch
 │                                                                                                  │
 │Drafter    DFlash (Q8_0)                                                                          │
 │Weights    about 92 GB with the drafter                                                           │
-│Memory     keep at least 11 GiB free while serving                                                │
+│Memory     keep at least 9 GiB free while serving                                                │
 │License    MIT                                                                                    │
 │Fast       Turns on the low-bit expert prompt kernel: faster prompts, output quality may drop     │
 │slightly.                                                                                         │

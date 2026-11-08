@@ -31,22 +31,28 @@ Press Enter to accept each suggested answer. The installer:
 
 1. **Checks this computer**: one line per check (operating system, GPU, memory, disk, GPU access). On a computer
    without a gfx1151 GPU it stops here; `--force` continues anyway (for example to prepare a disk).
-2. **Installs the build tools**: a C/C++ compiler, git, curl and Python from your distribution (it shows the
-   command and asks first), then CMake, Ninja and Rust (rustup, with the version this release pins) in your
-   home directory. Your shell configuration is not changed. With a prebuilt release (`TALUS_RELEASE=<tag>`) it
-   installs only git, curl and Python: no compiler, CMake, Ninja or Rust.
+2. **Installs what it needs**: git, curl and Python from your distribution (it shows the command and asks first). With
+   `--from-source` also a C/C++ compiler, then CMake, Ninja and Rust (rustup, with the version this release pins) in your
+   home directory. Your shell configuration is not changed.
 3. **Gets Talus and the ROCm SDK**: the source into `~/.local/share/talus/src` and AMD's ROCm SDK (TheRock wheels,
    the exact version this release was built and measured with, named in the repository's `rocm.version`) into
    `~/.local/share/talus/rocm`, a download of several GB from AMD's index
    (`https://nightly.repo.amd.com/rocm/whl-next/`). If you already have a ROCm SDK, point at it with
    `ROCM_SDK=/path/to/rocm`.
-4. **Builds Talus**: the GPU kernel library (this takes a while the first time) and the Rust programs. They go to
-   `~/.local/share/talus/bin`, with the `talus` and `talus-tui` commands in `~/.local/bin`. With a published release
-   you can skip the compile: `TALUS_RELEASE=<tag>` takes that release's prebuilt programs from GitHub
-   (`talus-<tag>-linux-x86_64-gfx1151.tar.gz`, checked against its `.sha256`; `TALUS_PREBUILT_URL=<url>` for
-   another copy). They find ROCm through the link `~/.local/share/talus/rocm-sdk`, so no `LD_LIBRARY_PATH` is needed.
-   The releases and their assets are listed at `https://github.com/nsbradley88/talus-public/releases`; for example
-   `curl -fsSL https://raw.githubusercontent.com/nsbradley88/talus-public/main/install.sh | TALUS_RELEASE=<tag> bash`.
+4. **Installs Talus**: the latest release's prebuilt programs from GitHub (`talus-<tag>-linux-x86_64-gfx1151.tar.gz`, checked
+   against its `.sha256`). They go to `~/.local/share/talus/bin`, with the `talus` and `talus-tui` commands in `~/.local/bin`,
+   and find ROCm through the link `~/.local/share/talus/rocm-sdk`, so no `LD_LIBRARY_PATH` is needed.
+   `TALUS_RELEASE=<tag>` takes a particular release and `TALUS_PREBUILT_URL=<url>` another copy.
+   To compile instead (about 40 minutes), use `--from-source` or `TALUS_FROM_SOURCE=1`. The installer also compiles when you
+   point it at source (`TALUS_BRANCH`, `--src`, running `./install.sh` from a checkout), when this install was already built
+   The compile runs one job per CPU thread, at most one per 2 GiB of *available* memory; `TALUS_JOBS=<n>` sets the
+   number. When the build fails, the installer shows the first error from `~/.local/share/talus/logs/build-kernels.log`
+   (a compiler killed for lack of memory gets the hint to run again with fewer jobs), and the next run starts the
+   kernel build from scratch (also when the build directory was set up for another source path or ROCm SDK;
+   `TALUS_KEEP_BUILD=1` keeps it).
+   from source, and, after saying so, when a machine has no prebuilt programs. If it cannot reach GitHub it stops without
+   changing anything.
+   The releases and their assets are listed at `https://github.com/nsbradley88/talus-public/releases`.
 5. **Runs `talus setup`**, below.
 
 Run the same command again at any time: finished steps are skipped and a stopped download resumes.
@@ -179,8 +185,8 @@ talus setup --remove glm
   `--allow-system-changes`, and it installs the user service only with `--service` (before v0.1.3 `--yes`
   installed it by default).
 - `install.sh` passes `--models-dir DIR`, `--no-power-profile`, `--service` and `--no-service` on to `talus setup`.
-- With a prebuilt release (`TALUS_RELEASE=<tag>` or `TALUS_PREBUILT_URL`), `install.sh` installs no compiler, CMake,
-  Ninja or Rust: it needs only git, curl and Python 3. The first `talus update` that compiles installs them then.
+- A prebuilt install needs no compiler, CMake, Ninja or Rust: only git, curl and Python 3. `talus update` stays prebuilt on it,
+  and keeps compiling on an install built from source (`TALUS_FROM_SOURCE=1` makes it compile on a prebuilt one).
 - `--dry-run` prints every action (downloads with their URL, size and checksum, files it would write, commands it
   would run) and changes nothing. It works for `install.sh`, `talus setup`, `talus doctor --fix` and `talus update`.
 
@@ -216,7 +222,7 @@ file, if setup wrote one, as shown under System settings).
 |---|---|
 | Tested | Ubuntu 24.04, 26.04 (and their derivatives) |
 | Handled | Ubuntu 22.04, Debian 12 and 13, Fedora 41 and newer, Arch and its derivatives, openSUSE Tumbleweed |
-| Other | the installer asks you to install a C/C++ compiler, git, curl and Python 3 with venv yourself, then continues |
+| Other | the installer asks you to install git, curl and Python 3 with venv (with `--from-source`, also a C/C++ compiler) yourself, then continues |
 
 Kernel parameters are applied for you on Debian and Ubuntu (GRUB drop-in) and Fedora (`grubby`); elsewhere the
 installer prints them.

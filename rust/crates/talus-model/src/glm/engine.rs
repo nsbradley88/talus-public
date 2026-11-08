@@ -264,6 +264,8 @@ struct Ctl {
 }
 
 pub struct GlmEngine {
+    /// padded router rows (TALUS_ROUTER_PAD; released on drop, after the graphs)
+    _rowpad: crate::rowpad::RowPad,
     /// prompt-cache snapshot inside a sliced prefill window: (absolute position, destination); the KDA / conv state
     /// of every layer is copied when its attention slice ending there completes (`snap_save` layout)
     pub snap_mid: Option<(usize, Buf)>,
@@ -869,8 +871,22 @@ impl GlmEngine {
             );
         }
         let hc16 = hc16_env(&lib.g);
+        // padded router rows (TALUS_ROUTER_PAD; f32 gate_inp of the MoE layers)
+        let rowpad = crate::rowpad::RowPad::register(
+            &lib.tk,
+            &w.layers
+                .iter()
+                .filter(|l| l.moe && !l.ffn.gate_inp.ptr.is_null() && l.ffn.gate_inp.ty == 0)
+                .map(|l| {
+                    let t = &l.ffn.gate_inp;
+                    (t.p(), t.n_out() as i64, t.n_in() as i64 * 4)
+                })
+                .collect::<Vec<_>>(),
+            false,
+        );
         Ok(Self {
             snap_mid: None,
+            _rowpad: rowpad,
             lib,
             w,
             cfg: GlmConfig { ctx, ..cfg },

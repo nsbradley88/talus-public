@@ -75,6 +75,12 @@ impl Link {
         self.t.closer()
     }
 
+    /// The handshake is done and the engine is built: from now on this thread receives the pipeline steps (starts
+    /// the transport's latency mode, e.g. `TALUS_CLUSTER_SPIN_US`).
+    pub fn steady(&mut self) {
+        self.t.steady()
+    }
+
     pub fn set_read_timeout(&self, t: Option<Duration>) -> io::Result<()> {
         self.t.set_read_timeout(t)
     }
@@ -116,7 +122,7 @@ impl Link {
 
     pub fn recv_header(&mut self) -> io::Result<Header> {
         let mut b = [0u8; HDR_BYTES];
-        self.t.read_exact(&mut b)?;
+        self.t.read_header(&mut b)?;
         self.t.after_recv();
         Header::decode(&b).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }

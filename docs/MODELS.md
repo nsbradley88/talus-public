@@ -110,7 +110,7 @@ the choice and the reason in one line; an explicit `--max-context` is always hon
 speculative decoding runs.
 
 **Drafting.** With both the MTP head and DFlash2 loaded, the drafter is chosen by context depth (`--drafter auto`,
-the default when both are given). DFlash2 drafts while the window starts below 16K tokens (32K for sampled
+the default when both are given). DFlash2 drafts while the window starts below 12K tokens (32K for sampled
 requests), and the MTP head drafts above that. DFlash2 sees a window of about 2K tokens, which is why it is not used
 deep in a conversation. The MTP draft length adapts to the draft's confidence (up to `--mtp N` drafts). `--ngram 24`
 adds n-gram drafts from repeated text. Long copies (see **Long copies** under Laguna) are opt-in here
@@ -124,7 +124,7 @@ the sampled text differs; we keep it off by default.
 | Default | Kill switch | Notes |
 |---|---|---|
 | Prompt flash attention | `TALUS_PF_FA=0` | Rounds differently from the legacy prompt attention (checked with the KLD gate before it became the default). `STRATA_FATTN=0` turns off every flash-attention prompt path. |
-| Int8 KV copy for decode and verify attention (from v0.1.3; `UD-IQ4_XS` and the other quantized 27B files; BF16 / F16 weights: opt-in `TALUS_Q27_KV8=1`) | `TALUS_Q27_KV8=0` | Decode and verify attention read an int8 copy of the KV cache through a reader that issues a tile's key loads together. The f16 cache stays for prompts, so the copy adds memory (see **Memory**). Decode at 32K +7.7 % on the desktop (v0.1.3 release candidate vs v0.1.2, same session); served time per verify round -6.4 % at 32K and -9.7 % at 64K (desktop, the change's development build). Greedy text differs slightly from v0.1.2 (attention reads rounded keys and values); the release KLD, needle and agentic smoke test gates pass (RESULTS). With `TALUS_Q27_KV8=0` the greedy output equals v0.1.2's. |
+| Int8 KV copy for decode and verify attention (from v0.1.3; `UD-IQ4_XS` and the other quantized 27B files; BF16 / F16 weights: opt-in `TALUS_Q27_KV8=1`) | `TALUS_Q27_KV8=0` | Decode and verify attention read an int8 copy of the KV cache through a reader that issues a tile's key loads together. The f16 cache stays for prompts, so the copy adds memory (see **Memory**). Decode at 32K +0.3 % on the desktop (v0.1.3 release candidate vs v0.1.2, same session); served time per verify round -6.4 % at 32K and -9.7 % at 64K (desktop, the change's development build). Greedy text differs slightly from v0.1.2 (attention reads rounded keys and values); the release KLD, needle and agentic smoke test gates pass (RESULTS). With `TALUS_Q27_KV8=0` the greedy output equals v0.1.2's. |
 
 **Exact defaults (kill switches)**
 
@@ -142,7 +142,8 @@ the sampled text differs; we keep it off by default.
 | Narrow verify cells (row-per-lane and split tile decode for 5-16-row windows, per weight type and width, measured on gfx1151) and the wave32 mat-vecs' tree-sum epilogue at 2-8 rows, every row bitwise the 1-row result (chat 4.7 %, code 5.4 %, edit 3.2 % faster than the wide tiles alone) | `TALUS_MMVQ_W32_TS=0` (epilogue); `TALUS_MMVQ_WIDE_TAB="13:5-7:0;13:8-10:2;12:6-7:0;12:8-10:2;22:6-11:0;22:12-15:2;21:7:0;21:9:0;21:10-16:2;23:9-11:0;18:9-11:0;18:12-16:2"` (the earlier cell table) |
 | Tile-plane copies of those weights (same bytes, regrouped so a wave reads whole cache lines; 13 GB, placed only when they fit, see **Memory** below) | `TALUS_MMVQ_WIDE_PACK=0` (`=1` forces them) |
 | DPP softmax reductions in decode/verify attention (same pairing order as the shuffle version) | `TALUS_ATTN_RED=0` |
-| GDN commit fused into the next forward pass, and draft/verify rounds on the device | `STRATA_FUSED=0`; `STRATA_NO_DEV_ROUNDS=1` keeps the fusion but runs rounds on the host |
+| f16 decode/verify attention reader with a tile's K loads issued together, V loaded before the softmax and LDS-only barriers (bitwise the old reader; used when the int8 KV copy is off: BF16 / F16 / MoE weights or `TALUS_Q27_KV8=0`) | `TALUS_ATTN_PF=0` |
+| GDN commit fused into the next forward pass, and draft/verify rounds on the device | `STRATA_FUSED=0` (not reliable: with it, a prompt-cache hit can give very different output from the same prompt read cold, so use it only to debug); `STRATA_NO_DEV_ROUNDS=1` keeps the fusion but runs rounds on the host |
 | Depth switch between drafters | `STRATA_DRAFTER=mtp` or `--drafter mtp` (MTP only); `--drafter dflash` (DFlash2 only) |
 | Adaptive draft length | `STRATA_ADRAFT=0` (fixed length) |
 | Cost-table draft depth for greedy MTP windows (from v0.1.3): each round keeps the draft depth with the most expected tokens per millisecond, from a measured cost per verify width | `TALUS_Q27_COSTDEPTH=0` |
@@ -171,7 +172,7 @@ file, `TALUS_Q27_W4I_PLANES` picks the layers (`ffn:48-63` = the default).
 
 **Opt-ins:** `TALUS_Q27_W4I=fast` (needs `Qwen3.8-27B-UD-IQ4_XS.fast.w4i`): 4-bit prompt math in the feed-forward of all
 64 layers, about a third faster on prompts at 2K and 32K. **It failed our quality gate**: divergence to the CPU
-reference on 4K prompts exceeds the gate limit (KL vs llama.cpp CPU reference (UD-IQ4_XS) <= 0.00291 (short prompts) and 4K-prompt KL ratio vs exact <= 1.35). The TUI's Fast level selects it, with a
+reference on 4K prompts exceeds the gate limit (Teacher-forced logit rows on short prompts (UD-IQ4_XS, UD-Q4_K_XL) bitwise equal to a frozen set; any change goes to human review and does not pass by itself. KL vs the llama.cpp CPU reference and the 4K-prompt ratio are recorded, not gated). The TUI's Fast level selects it, with a
 warning. `STRATA_ATTN_W8=1` / `--attn-w8` (8-row attention
 windows). Draft-only variants that cannot change the output (verification is exact): `--mtp-f16`,
 `STRATA_DRAFT_NUCLEUS=1`.
@@ -194,8 +195,8 @@ the tiles read the GGUF rows, somewhat slower. One log line says which and why (
 copies of 387 matrices, 12.0 GiB (auto: they fit with the reserve; ...)`). From v0.1.3 the int8 KV copy for decode and
 verify attention adds 35 KiB per token beside the f16 cache: 2.19 GiB at 64K and
 8.77 GiB at 256K (`TALUS_Q27_KV8=0` frees it); the automatic context counts it. Lowest `MemAvailable`
-in the v0.1.3 release run on our desktop: 27 GiB at the shipped 256K context
-(36 GiB for v0.1.2 in the same session).
+in the v0.1.6 release run on our desktop: 27 GiB at the shipped 256K context
+(27 GiB for v0.1.5 in the same session).
 
 **Context by machine.** Without `--max-context` the engine takes the largest of 256K, 128K and 64K whose KV cache fits
 beside the weights, the int8 prompt weights and a 3 GiB reserve, keeping 8 GiB of `MemAvailable` free, and logs one
@@ -316,11 +317,11 @@ HC-down default above). The table is in `src/core/arch_defaults.cpp`; each entry
 `TALUS_COPY=0` turns off long prompt copies (in every engine). The turn-checkpoint GDN buffer pool omits unused `conv_state` staging to save host/device memory.
 From v0.1.3 each MTP window picks its draft depth from a measured cost per verify width, keeping the depth with the most
 expected tokens per millisecond, instead of fixed confidence thresholds (`TALUS_FN_COSTDEPTH=0` restores the
-thresholds). Verification is unchanged, so output stays exact; chat +4.4 % on the desktop
+thresholds). Verification is unchanged, so output stays exact; chat +1.0 % on the desktop
 (v0.1.3 release candidate vs v0.1.2, same session).
 
 **Memory.** Weights about 88 GB (`UD-IQ4_XS`), read through the expert cache (`--expert-cache` in MiB) and a resident budget
-(`--resident-budget-gib`). Unsloth's `UD-Q4_K_XL` GGUF (the file we measured is at the [pinned commit](#pinned-model-files)) also runs when packed with `tools/iq_pack.py`: its larger `K`-quant experts use more memory and increase expert-cache traffic on long prompts and long-context decode, while reading slightly faster on short cold prompts. Lowest `MemAvailable` in the v0.1.3 release run on our desktop: 51 GiB.
+(`--resident-budget-gib`). Unsloth's `UD-Q4_K_XL` GGUF (the file we measured is at the [pinned commit](#pinned-model-files)) also runs when packed with `tools/iq_pack.py`: its larger `K`-quant experts use more memory and increase expert-cache traffic on long prompts and long-context decode, while reading slightly faster on short cold prompts. Lowest `MemAvailable` in the v0.1.3 release run on our desktop: 44 GiB.
 
 ## GLM-5.3-Flash
 
@@ -402,13 +403,13 @@ Mixture-of-experts model (the MOPD variant). Engine `mimo`.
 | Weights | `MiMo-V2.6-Flash-a4-x` ([j2ipper/MiMo-V2.6-Flash-MOPD-a4-x](https://huggingface.co/j2ipper/MiMo-V2.6-Flash-MOPD-a4-x)), three shards (`88.81 GiB` / `95,359,839,096 B` total: `MiMo-V2.6-Flash-a4-x-00001-of-00003.gguf` `5,949,240 B` sha256 `b31e4530e9d0735bcd98b1f6f647fbec406594e0e4ab77134589d8fb9afd0f49`, `MiMo-V2.6-Flash-a4-x-00002-of-00003.gguf` `48,728,061,760 B` sha256 `8c02693229bde8c7266ac2d06727ca55387024f50c0bb1eb002d044d886d31f1`, `MiMo-V2.6-Flash-a4-x-00003-of-00003.gguf` `46,625,828,096 B` sha256 `9b0243a7901eff27006a8dcb49487d4d5984034e7332048bcbb5a48e0ad4fbe9`): our low-bit quant of `XiaomiMiMo/MiMo-V2.6-Flash-MOPD`, made from Xiaomi's original weights with an importance matrix (`mimo-a4x.imatrix.gguf`, `992,394,624 B`, sha256 `958147270e4e3037bb291cdab64ee2949de95e2c31cdd53e7734e41ccf4f4809`) from public datasets |
 | Drafter | `dflash-MiMo-V2.6-Flash-MOPD-Q8_0.gguf` from [ggml-org/MiMo-V2.6-Flash-MOPD-GGUF](https://huggingface.co/ggml-org/MiMo-V2.6-Flash-MOPD-GGUF), the model's DFlash drafter at Q8_0 (about 2.7 GB) |
 | Draft vocabulary | `mimo-dv-65536.bin` ([j2ipper/draft-vocab](https://huggingface.co/j2ipper/draft-vocab), 64K token ids) |
-| Context / KV | 192K shipped (`--max-context 196608`); KV is f16 (the engine ignores `--kv q8`) |
+| Context / KV | 256K shipped (`--max-context 262144`; 192K is the setup fallback); KV is f16 (`--kv q8` is ignored with a warning); the DFlash drafter keeps its KV in a 19,968-row ring (it attends to 1024 rows) |
 | License | MIT |
 
 Shipped arguments:
 
 ```
---model MiMo-V2.6-Flash-a4-x-00001-of-00003.gguf --max-context 196608 --ubatch 2048
+--model MiMo-V2.6-Flash-a4-x-00001-of-00003.gguf --max-context 262144 --ubatch 2048
 --dflash-gguf dflash-MiMo-V2.6-Flash-MOPD-Q8_0.gguf --spec 4 --spec-draft-vocab mimo-dv-65536.bin
 ```
 
@@ -426,8 +427,9 @@ drafter is found, the engine runs without drafting.
 |---|---|---|
 | Wave32 matvec for routed experts | `STRATA_IDS_W32=0` | The engine sets `STRATA_IDS_W32=1` unless `STRATA_IDS_W32` or `TALUS_MIMO_W32_DENSE` is already set (setting the latter at all, even to 0, keeps the default off). Logit differences are at floating-point rounding level. |
 | WMMA f16 flash attention in prompts | `TALUS_MIMO_FA=0` | `TALUS_MIMO_FA_VER=1` selects the earlier v1 tile. |
-| Confident-prefix verify | `TALUS_MIMO_DF_CONF=0` (greedy), `TALUS_MIMO_DF_CONF_S=0` (sampled) | After the DFlash drafter runs, the round verifies only the longest prefix of its drafts whose running product of the drafter's own confidence in each draft stays at or above 0.6; the rest would mostly be rejected. Greedy output is unchanged (every token is still the model's own argmax); code about 6 % faster. From v0.1.3 sampled requests use it too (threshold 0.6): sampled output keeps the model's distribution, draft acceptance on the sampled chat mix went from 0.60 -> 0.77, and chat is +4.2 % (desktop, v0.1.3 release candidate vs v0.1.2, same session) |
+| Confident-prefix verify | `TALUS_MIMO_DF_CONF=0` (greedy), `TALUS_MIMO_DF_CONF_S=0` (sampled) | After the DFlash drafter runs, the round verifies only the longest prefix of its drafts whose running product of the drafter's own confidence in each draft stays at or above 0.6; the rest would mostly be rejected. Greedy output is unchanged (every token is still the model's own argmax); code about 6 % faster. From v0.1.3 sampled requests use it too (threshold 0.6): sampled output keeps the model's distribution, draft acceptance on the sampled chat mix went from 0.60 -> 0.77, and chat is +0.2 % (desktop, v0.1.3 release candidate vs v0.1.2, same session) |
 | Last-layer tail-row pruning in prompts | `TALUS_MIMO_TAIL_PRUNE=0` | The last layer computes only the rows the output head and the drafter read (about 3 % faster prompts at 32K). Prompt results are bitwise equal; a short request that resumes inside another prompt's pruned rows re-reads up to 1152 rows (1-2 s), so its text can differ from a run without pruning |
+| Padded router rows + streaming router kernel | `TALUS_ROUTER_PAD=0` (`TALUS_F32FEW_STREAM=0`: staged kernel) | A copy of the f32 router weights with rows 512 B apart, skipped when less than 10 GiB would stay free. Output is identical. |
 
 **Exact defaults (kill switches, `=0`):** `TALUS_MIMO_ATT2`, `TALUS_MIMO_ATT2_DRAFT`, `TALUS_MIMO_ATT3` (decode and
 drafter attention kernels), `TALUS_MIMO_ATT_Q8`, `TALUS_MIMO_QKV_MULTI`, `TALUS_MIMO_ROPE_STORE`,
@@ -436,8 +438,8 @@ and layer-0 `Q6_K` FFN), `TP_MOE_IQ1M_ONE` (shared-input `IQ1_M` prompt GEMM), `
 copies), `TALUS_MIMO_GRAPH` (HIP graphs), and the shared prompt switches `TALUS_PF_MOE`, `TALUS_PF_MOE_GU`,
 `TALUS_PF_DENSE_MOE`.
 
-**Memory.** Weights and drafter about 92 GB. The engine keeps a run-time floor of 8 GiB free for this model. Lowest
-`MemAvailable` in the v0.1.3 release run on our desktop: 15 GiB.
+**Memory.** Weights and drafter about 92 GB. The engine starts only with 8.5 GiB left free after its allocations (the 8 GiB run floor plus its measured transient). Lowest
+`MemAvailable` in the v0.1.3 release run on our desktop: 16 GiB.
 
 ## Laguna-S-2.1
 
@@ -492,11 +494,11 @@ is lower. It needs q8 KV.
 | Sparse decode from 32K | omit `--sparse` (dense everywhere); `LAGUNA_SPARSE_32K=0` (start from `MIN`, floored at four times `BS`×`K`); `LAGUNA_SPARSE_MIN=65536` (start later) | Changes numerics past the start. |
 | Tail-row pruning in prompts | `TALUS_LAGUNA_TAIL_PRUNE=0` | Layers 44-47 compute only the rows that the output head, the drafter and later queries read (about 7.5 % faster prompts at 32K). Prompt results are bitwise equal. After four or more requests in a row that each resume about 1,700 tokens further back, the engine prefills the prompt again from the start, so that request's text can differ from a run without pruning |
 
-**Faster expert pass for verify windows (from v0.1.3, exact).** Verify windows read each routed `Q4_K`/`Q5_K` expert once
+**Faster expert pass for verify windows (from v0.1.3, exact).** Verify windows read each routed `Q4_K`/`Q5_K`/`Q6_K` expert once
 per window; the new pass keeps the activations in registers per pass and unrolls the weight loads. Expert mat-vec
 bandwidth 155 -> 208 GB/s (gate+up), 159 -> 198 GB/s (down) (desktop, development build). Bitwise equal to the old pass and to one-row
 decoding (greedy 9/9, teacher-forced KL 0 at 2K against v0.1.2). With the sampled confident-prefix verify above:
-chat +16.3 %, code +4.4 %, edit +20.9 % (desktop, v0.1.3
+chat +0.2 %, code +0.7 %, edit +1.4 % (desktop, v0.1.3
 release candidate vs v0.1.2, same session). `STRATA_EGROUP_V2=0` restores the old pass.
 
 **Exact defaults (kill switches):** `LAGUNA_EXPERT_MAJOR=0` (expert-major routed matvec), `STRATA_MMVQ_XT=0` (wide
@@ -511,7 +513,7 @@ decode matvec without wave32 to match its reference.
 survives restarts and model switches (on by default; see [Prompt cache on disk](#prompt-cache-on-disk)).
 
 **Memory.** Weights about 68 GB; 256K of q8 KV for the full-attention layers fits in the rest. Lowest
-`MemAvailable` in the v0.1.3 release run on our desktop: 38 GiB.
+`MemAvailable` in the v0.1.3 release run on our desktop: 37 GiB.
 
 ## Pinned model files
 
@@ -588,6 +590,7 @@ These apply to every engine that uses the shared kernel library paths (all but F
 | `TP_MOE_VER`, `TP_MOE_KTAIL=0` | tuned version, on | Kernel version / tail handling (exact) |
 | `STRATA_MMVQ_W32=0` | on (gfx11) | Wave32 decode matvec off |
 | `STRATA_GFX1151_DEFAULTS=0`, `STRATA_GFX12_DEFAULTS=0` | on | Architecture default tables off (applied by the Flash-Next path) |
+| `TALUS_CLUSTER_SPIN_US=0` | 100000 (two-box cluster mode only) | Stage link receive blocks instead of spinning (exact). The spin costs one busy core and more package power per host while decoding, for faster 27B two-box decode. |
 
 Loader and runtime: `TALUS_KERNELS_LIB` (path of `libtalus_kernels.so`), `TALUS_KERNELS_PREBUILT` (its directory),
 `TALUS_HIP_LIB` (path of `libamdhip64.so`), `ROCM_SDK` / `ROCM_PATH`, and `TALUS_API_KEY` (or `STRATA_API_KEY`) for the server.

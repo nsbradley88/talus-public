@@ -6,6 +6,8 @@
 //   talus-q27-attn-red time [ITERS] [FILLS] [TS] [REDS]   the production launcher (launch_attn_wmma, RT1G rows) per
 //                                          RED, us per call; FILLS / TS / REDS comma lists (default 2048,8192,32768,
 //                                          65536 / 1,2,4,6,8,12,16 / 0,1,2,3), rounds interleaved
+//   talus-q27-attn-red pf [CTX] [VARS]     (w2) every k_attn_wmma_pf variant bitwise k_attn_wmma<1, 3>
+//   talus-q27-attn-red time-pf [ITERS] [FILLS] [TS] [VARS]   (w2) the launcher per TALUS_ATTN_PF value (0 = old)
 // 27B shape: H 24, HKV 4, head dim 256, chunks 512 cells (128-cell chunks below 4K), as the engine sets them.
 // Exit 1 on any bitwise mismatch.  Synthetic inputs; idea from libstrix (asf0/libstrix, MIT), no code from it.
 #include "strata/qwen35/q36_kernels.hpp"
@@ -159,6 +161,7 @@ int timing(int iters, std::vector<int> fills, std::vector<int> ts, std::vector<i
     cudaEvent_t e0, e1;
     ck(cudaEventCreate(&e0), "ev");
     ck(cudaEventCreate(&e1), "ev");
+    talus::q36::g_attn_pf = 0;   // w2: the RED variants of k_attn_wmma itself (the launcher default is k_attn_wmma_pf)
     std::printf("%-7s %-3s", "fill", "T");
     for (int r : reds) std::printf("   RED%d us", r);
     for (size_t i = 1; i < reds.size(); ++i) std::printf("  %d/%d", reds[i], reds[0]);
@@ -193,6 +196,93 @@ int timing(int iters, std::vector<int> fills, std::vector<int> ts, std::vector<i
         }
     return 0;
 }
+// w2: every k_attn_wmma_pf variant bitwise k_attn_wmma<1, 3> (1-tile row groups, as the launcher runs both)
+int exact_pf(int ctx, std::vector<int> vars) {
+    Bufs b;
+    alloc(b, ctx);
+    const std::vector<int> pos = {0, 1, 5, 26, 31, 32, 100, 127, 128, 511, 512, 1000, 4090, 4096, 4133, 8191, ctx / 2 + 17,
+                                  ctx - 16 - 3, ctx - 16};
+    const float sc = 1.0f / 16.0f;
+    long checks = 0, bad = 0;
+    for (int set = 0; set < 4; ++set) {
+        fill(b, set, 1234 + set);
+        for (int p : pos) {
+            if (p + 16 > ctx) continue;
+            ck(cudaMemcpy(b.pos0, &p, 4, cudaMemcpyHostToDevice), "pos");
+            for (int T = 1; T <= 16; ++T) {
+                run_inst(b, 0, 0, 1, 3, T);
+                const int ng = (T * G + 15) / 16;
+                for (int v : vars) {
+                    ck(cudaMemset(b.pacc[1], 0xff, sizeof(float) * b.n_acc), "clr");
+                    ck(cudaMemset(b.pm[1], 0xff, sizeof(float) * b.n_m), "clr");
+                    ck(cudaMemset(b.pl[1], 0xff, sizeof(float) * b.n_m), "clr");
+                    talus::q36::launch_attn_wmma_pf(v, dim3((unsigned) (b.n_chunk * ng), HKV), nullptr, b.q, b.kc, b.vt,
+                                                    b.pos0, T, H, HKV, b.ctx, b.vt_ctx, sc, b.ckc, b.n_chunk, b.pacc[1],
+                                                    b.pm[1], b.pl[1], 0, ng);
+                    ck(cudaGetLastError(), "launch pf");
+                    const unsigned long long d = diff(b, b.pacc[0], b.pacc[1], b.n_acc) + diff(b, b.pm[0], b.pm[1], b.n_m) +
+                                                 diff(b, b.pl[0], b.pl[1], b.n_m);
+                    ++checks;
+                    if (d) {
+                        ++bad;
+                        if (bad < 20) std::printf("MISMATCH set %d pos %d pf %d T %d: %llu words differ\n", set, p, v, T, d);
+                    }
+                }
+            }
+        }
+        std::printf("set %d done: %ld checks, %ld mismatches so far\n", set, checks, bad);
+        std::fflush(stdout);
+    }
+    std::printf("exact-pf ctx %d: %ld checks (set x pos x T x variant), %ld MISMATCH -> %s\n", ctx, checks, bad,
+                bad ? "FAIL" : "PASS");
+    return bad ? 1 : 0;
+}
+// w2: the production launcher per TALUS_ATTN_PF value (0 = k_attn_wmma), RED 3, rounds interleaved
+int timing_pf(int iters, std::vector<int> fills, std::vector<int> ts, std::vector<int> vars) {
+    int mx = 0;
+    for (int f : fills) mx = std::max(mx, f);
+    Bufs b;
+    alloc(b, mx + 512);
+    fill(b, 0, 99);
+    const float sc = 1.0f / 16.0f;
+    cudaEvent_t e0, e1;
+    ck(cudaEventCreate(&e0), "ev");
+    ck(cudaEventCreate(&e1), "ev");
+    talus::q36::g_attn_red = 3;
+    std::printf("%-7s %-3s", "fill", "T");
+    for (int v : vars) std::printf("   PF%-2d us", v);
+    for (size_t i = 1; i < vars.size(); ++i) std::printf(" %d/%d", vars[i], vars[0]);
+    std::printf("\n");
+    for (int f : fills)
+        for (int T : ts) {
+            const int p = f - T;
+            ck(cudaMemcpy(b.pos0, &p, 4, cudaMemcpyHostToDevice), "pos");
+            std::vector<float> best(vars.size(), 1e30f);
+            for (int round = 0; round < 5; ++round)
+                for (size_t vi = 0; vi < vars.size(); ++vi) {
+                    talus::q36::g_attn_pf = vars[vi];
+                    auto call = [&] {
+                        talus::q36::launch_attn_wmma(false, dim3((unsigned) b.n_chunk, HKV), nullptr, b.q, b.kc, b.vt,
+                                                     b.pos0, T, H, HKV, b.ctx, b.vt_ctx, sc, b.ckc, b.n_chunk, b.pacc[0],
+                                                     b.pm[0], b.pl[0]);
+                    };
+                    for (int i = 0; i < 10; ++i) call();
+                    ck(cudaEventRecord(e0), "rec");
+                    for (int i = 0; i < iters; ++i) call();
+                    ck(cudaEventRecord(e1), "rec");
+                    ck(cudaEventSynchronize(e1), "sync");
+                    float ms = 0;
+                    ck(cudaEventElapsedTime(&ms, e0, e1), "el");
+                    best[vi] = std::min(best[vi], ms * 1000.f / iters);
+                }
+            std::printf("%-7d %-3d", f, T);
+            for (float x : best) std::printf(" %9.1f", x);
+            for (size_t i = 1; i < best.size(); ++i) std::printf(" %5.3f", best[i] / best[0]);
+            std::printf("\n");
+            std::fflush(stdout);
+        }
+    return 0;
+}
 }   // namespace
 
 int main(int argc, char** argv) {
@@ -202,6 +292,16 @@ int main(int argc, char** argv) {
         return timing(argc > 2 ? std::atoi(argv[2]) : 200, list(argc > 3 ? argv[3] : nullptr, {2048, 8192, 32768, 65536}),
                       list(argc > 4 ? argv[4] : nullptr, {1, 2, 4, 6, 8, 12, 16}),
                       list(argc > 5 ? argv[5] : nullptr, {0, 1, 2, 3}));
-    std::fprintf(stderr, "usage: talus-q27-attn-red exact [CTX] | time [ITERS] [FILLS] [TS] [REDS]\n");
+    if (mode == "pf") {
+        std::vector<int> all;
+        for (int v = 1; v <= talus::q36::kAttPfMax; ++v) all.push_back(v);
+        return exact_pf(argc > 2 ? std::atoi(argv[2]) : 33280, list(argc > 3 ? argv[3] : nullptr, all));
+    }
+    if (mode == "time-pf")
+        return timing_pf(argc > 2 ? std::atoi(argv[2]) : 200, list(argc > 3 ? argv[3] : nullptr, {2048, 8192, 32768, 65536}),
+                         list(argc > 4 ? argv[4] : nullptr, {1, 2, 4, 6, 8, 12, 16}),
+                         list(argc > 5 ? argv[5] : nullptr, {0, 1, 5, 11}));
+    std::fprintf(stderr, "usage: talus-q27-attn-red exact [CTX] | time [ITERS] [FILLS] [TS] [REDS] | pf [CTX] [VARS] | "
+                         "time-pf [ITERS] [FILLS] [TS] [VARS]\n");
     return 2;
 }

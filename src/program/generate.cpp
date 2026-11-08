@@ -616,7 +616,7 @@ struct Options {
     bool stop_eos = false;
     std::vector<int64_t> eos_ids = {248044, 248046};
     bool spec_split = false;   ///< opt-in split verify window (the overlap study: exact, ~7% slower)
-    /// --serve, multi-GPU layer split: "K" or "K1,K2,.." (the first layer of each later stage) or "auto" (placed
+    /// --serve, multi-GPU layer split: "K" or " .." (the first layer of each later stage) or "auto" (placed
     /// from each GPU's free VRAM); empty = one GPU
     std::string layer_split;
     /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
@@ -1497,6 +1497,8 @@ uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) 
 
 using ConvStateSizes = strata::core::ConversationStateSizes;
 
+void* g_own_early = nullptr;          // w2-fnpf: STRATA_OWN_BUFFERS_EARLY_MIB placeholder (see the expert-cache build)
+uint64_t g_own_early_bytes = 0;
 ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g, const strata::core::SessionState& ss) {
     ConvStateSizes z;
     std::string error;
@@ -1824,7 +1826,7 @@ struct tk_qwen4exp_serve_ctx {
     std::function<void(tk_qwen4exp_serve_info_t*)> get_info;
     std::function<int(const char*, int)> pre_command;
     std::function<void(int)> set_busy;
-    std::function<int(const int64_t*, size_t, int, int, int64_t, int, const tk_qwen4exp_req_sampling_t*, const float*, size_t, int64_t*, int64_t*, int*, int64_t*, int64_t*)> begin_request;
+    std::function<int(const int64_t*, size_t, int, int, int64_t, int, const tk_qwen4exp_req_sampling_t*, const float*, size_t, int64_t*, int64_t*, int*, int64_t*, int64_t*, int64_t*)> begin_request;
     std::function<int(int64_t, int64_t, int, int*, int*)> prefill_segment;
     std::function<int(int64_t, int, int, int64_t)> checkpoint_at;
     std::function<int()> prefill_finish;
@@ -5556,6 +5558,46 @@ static int qwen4exp_engine_main(int argc, char** argv) {
     }
     // ---- qwen4exp-p1 begin ----
     int64_t p1_prefilled = 0;
+    // Reserve the prompt path's own region BEFORE the expert-cache arena.  The region is allocated at
+    // serve start (one GPU, every expert resident: see "keeps its own buffers"); allocated there, AFTER the 55 GiB arena,
+    // the bandwidth-bound HC glue read it slower than the arena tail (the cause is unproven; smaller page
+    // fragments for late allocations is a guess), which cancelled the refill saving at 32K.  A placeholder of the region's size taken here and freed
+    // right before the region is allocated gives it load-time memory, faster than
+    // the loan, output identical.  The placeholder is freed in every case before the
+    // first request, so it costs nothing after load.  Only with an explicit cache size (a native pack capped by its
+    // profile: the cache is not sized from free memory, so the placeholder cannot shrink it), one GPU, --serve, and
+    // host MemAvailable >= the cache + the placeholder + 16 GiB.  STRATA_OWN_BUFFERS_EARLY_MIB=0: off; =N: N MiB.
+    if (o.serve && !multi_gpu && !o.no_prefill_borrow && !auto_cache && o.expert_cache > 0 && native_pack) {
+        const char* ev = std::getenv("STRATA_OWN_BUFFERS_EARLY_MIB");
+        const char* one = std::getenv("STRATA_OWN_BUFFERS_ONE");
+        const bool one_on = one == nullptr || one[0] != '0';
+        uint64_t want = 0;
+        if (ev != nullptr && ev[0] != '\0') {
+            want = (uint64_t) std::max<long long>(0, std::atoll(ev)) << 20;
+        } else if (one_on) {
+            const int64_t c = o.prefill_auto ? (o.prefill_auto_max > 0 ? o.prefill_auto_max : 16384) : o.prefill_chunk;
+            if (c > 0) want = strata::prefill::Prefill::bytes_needed(g, ss, c, srcp != nullptr);
+        }
+        if (want > 0) {
+            const uint64_t n_cache = (uint64_t) std::min<int64_t>(o.expert_cache, profile.empty() ? (int64_t) o.expert_cache
+                                                                                                  : (int64_t) profile.size());
+            const uint64_t cache_b = n_cache * (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+            strata::core::detail::HostMemory hm{};
+            const bool room = !strata::core::detail::host_available_memory(hm) ||
+                              (uint64_t) hm.available >= cache_b + want + (16ull << 30);
+            if (room && cudaMalloc(&g_own_early, (size_t) want) == cudaSuccess) {
+                g_own_early_bytes = want;
+                (void) cudaMemset(g_own_early, 0, (size_t) want);
+                (void) cudaDeviceSynchronize();
+                std::fprintf(stderr, "talus generate: the prompt path's region reserved before the expert cache (%.2f GiB, "
+                                     "freed for it at serve start; STRATA_OWN_BUFFERS_EARLY_MIB=0 turns this off)\n",
+                             (double) want / 1073741824.0);
+            } else {
+                (void) cudaGetLastError();
+                g_own_early = nullptr;
+            }
+        }
+    }
     if (p1_cache && o.expert_cache > 0) {
         tk_qwen4exp_p1_cache_build_in_t bin{};
         bin.n_layers = g.n_layers;
@@ -7598,6 +7640,8 @@ static int qwen4exp_engine_main(int argc, char** argv) {
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
+        void* own_region = nullptr;       // w2-fnpf: one GPU's own prompt buffers as ONE region (no loan; see below)
+        uint64_t own_region_bytes = 0;
         // ---- WHO BORROWS, AND FROM WHOSE CACHE.  One entry per prompt path: CUDA0's (layers [0, split_at[0]),
         // which is the whole model without a split) borrowing the tail of CUDA0's cache, then one per stage
         // borrowing the tail of ITS OWN cache.  A loan is sized by the exact `Prefill::bytes_needed` for the
@@ -7811,6 +7855,95 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                     const char* v = std::getenv("STRATA_SPLIT_OWN_BUFFERS");
                     return v == nullptr || v[0] != '0';
                 }();
+                // (Wave 2 FN prefill, fix 1): the same rule on ONE GPU.  When the cache already holds every
+                // expert (Flash-Next on a 128 GB Strix Halo: 24576 of 24576), a loan only costs: the lent tail's
+                // experts (2882 slots, 6.5 GiB at chunk 16384) become misses that are streamed from the mapped GGUF
+                // during every chunk, and are copied back one hipMemcpyAsync per slot after the prompt (host-bound,
+                // ~70 us a slot) before the header windows can run.  Profiled on the desktop/the laptop (v013-rc1, served cold):
+                // refill 127 / 345 / 655 ms at 2K / 8K / 28K, plus the streamed experts inside the chunk.  Own
+                // buffers cost that memory for the session instead (MemAvailable 51 -> 45 GiB at the shipped
+                // 262K context), which the single-model policy spends.  Same chunk, same per-row kernels: the output
+                // is bitwise the loan's (checked on the gate chunks).  Only when the room is there: the buffers +
+                // 1.5 GiB of device memory, and on a GPU that shares system RAM, the buffers + 16 GiB of host
+                // MemAvailable (STRATA_OWN_BUFFERS_HOST_GIB).  A cache that cannot hold every expert (a 64 GB box)
+                // keeps the loan.  STRATA_OWN_BUFFERS_ONE=0: one GPU borrows as before.
+                static const bool one_own_ok = [] {
+                    const char* v = std::getenv("STRATA_OWN_BUFFERS_ONE");
+                    return v == nullptr || v[0] != '0';
+                }();
+                // host MemAvailable that must stay after the buffers (GiB; STRATA_OWN_BUFFERS_HOST_GIB, default 16)
+                static const uint64_t one_host_gib = [] {
+                    const char* v = std::getenv("STRATA_OWN_BUFFERS_HOST_GIB");
+                    const long long n = v != nullptr ? std::atoll(v) : 16;
+                    return (uint64_t) (n > 0 ? n : 16);
+                }();
+                if (pf_parts.size() == 1 && one_own_ok && own_ok && !o.prefill_head_alias && !host_res.empty() &&
+                    pf_parts[0].first >= 0) {
+                    bool all_resident = true;
+                    for (const int32_t r : host_res)
+                        if (r < 0) { all_resident = false; break; }
+                    PfPart& p = pf_parts[0];
+                    const strata::core::OnDevice on(p.dev);
+                    size_t fb = 0, tb = 0;
+                    if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); fb = 0; }
+                    const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, chunk, srcp != nullptr);
+                    bool host_ok = true;
+                    double host_avail_gib = -1.0;
+                    cudaDeviceProp prop{};
+                    strata::core::detail::HostMemory hm{};
+                    if (cudaGetDeviceProperties(&prop, p.dev < 0 ? 0 : p.dev) == cudaSuccess && prop.integrated) {
+                        host_ok = strata::core::detail::host_available_memory(hm) &&
+                                  (uint64_t) hm.available >= need + (one_host_gib << 30);
+                        host_avail_gib = (double) hm.available / 1073741824.0;
+                    } else {
+                        (void) cudaGetLastError();
+                    }
+                    if (all_resident && (uint64_t) fb >= need + (3ull << 29) && host_ok) {
+                        std::fprintf(stderr, "talus serve: every expert is in the cache: the prompt path keeps its own "
+                                             "buffers (%.2f GiB of %.2f GiB free%s): no loan, no streamed experts, no "
+                                             "refill (STRATA_OWN_BUFFERS_ONE=0 borrows)\n",
+                                     (double) need / 1073741824.0, (double) fb / 1073741824.0,
+                                     host_avail_gib >= 0 ? (", host MemAvailable " +
+                                                            std::to_string((int) host_avail_gib) + " GiB").c_str() : "");
+                        p.first = -1;
+                        p.first_now = -1;
+                        // ONE region laid out exactly as the loan would be (the same bump carving, the same
+                        // offsets), not a cudaMalloc per buffer: with per-buffer allocations the bandwidth-bound
+                        // glue ran slower (gr_upmix, gr_write_norm_rs, hcdown),
+                        // which ate most of the refill saving at 28K.  STRATA_OWN_BUFFERS_REGION=0: per-buffer.
+                        static const bool region_ok = [] {
+                            const char* v = std::getenv("STRATA_OWN_BUFFERS_REGION");
+                            return v == nullptr || v[0] != '0';
+                        }();
+                        if (g_own_early != nullptr) {   // the load-time placeholder makes room for the region
+                            (void) cudaDeviceSynchronize();
+                            (void) cudaFree(g_own_early);
+                            g_own_early = nullptr;
+                        }
+                        if (region_ok) {
+                            const uint64_t nb = strata::prefill::Prefill::bytes_needed(g, *p.ses, chunk, srcp != nullptr);
+                            if (cudaMalloc(&own_region, nb) == cudaSuccess) {
+                                own_region_bytes = nb;
+                                std::fprintf(stderr, "talus serve: the prompt path's own buffers are one %.2f GiB region\n",
+                                             (double) nb / 1073741824.0);
+                            } else {
+                                (void) cudaGetLastError();
+                                own_region = nullptr;
+                            }
+                        }
+                    } else if (all_resident) {
+                        std::fprintf(stderr, "talus serve: the prompt path borrows: its own buffers (%.2f GiB) would "
+                                             "leave too little memory (%.2f GiB device free%s)\n",
+                                     (double) need / 1073741824.0, (double) fb / 1073741824.0,
+                                     host_avail_gib >= 0 ? (", host MemAvailable " +
+                                                            std::to_string((int) host_avail_gib) + " GiB").c_str() : "");
+                    }
+                }
+                if (g_own_early != nullptr) {   // no own region taken: give the placeholder back
+                    (void) cudaDeviceSynchronize();
+                    (void) cudaFree(g_own_early);
+                    g_own_early = nullptr;
+                }
                 if (pf_parts.size() > 1 && own_ok) {
                     for (PfPart& p : pf_parts) {
                         const strata::core::OnDevice on(p.dev);
@@ -7829,6 +7962,10 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                 lend_first = pf_parts[0].first;
                 borrow = lend_first >= 0 ? xcache.device_slot(lend_first) : nullptr;
                 borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], lend_first) : 0;
+                if (own_region != nullptr && lend_first < 0) {   // w2-fnpf: the own region takes the loan's place
+                    borrow = own_region;
+                    borrow_bytes = own_region_bytes;
+                }
             } else if (o.prefill_auto) {
                 o.prefill_chunk = 1024;   // nothing lendable: small buffers of its own
             } else if (pf_parts.size() > 1) {
@@ -7868,7 +8005,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                                  "%lld MiB free\n",
                          (long long) o.prefill_chunk, (long long) (borrow_bytes >> 20), (long long) (free_b >> 20));
         }
-        bool any_loan = borrow != nullptr;
+        bool any_loan = borrow != nullptr && borrow != own_region;
         for (size_t i = 1; i < pf_parts.size(); ++i) any_loan = any_loan || pf_parts[i].first >= 0;
         if (any_loan) {
             if (borrow != nullptr)
@@ -8104,7 +8241,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
         vh.blob = thits.blob;
         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
         vh.n_slots = xcache.slots();
-        // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
+        // Layer split: `ver` runs layers [0, ) and hands its residual to the next stage's verifier, and so on; the
         // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
         // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
         strata::core::Verifier ver_same;
@@ -9865,6 +10002,11 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                 std::fprintf(stderr, "talus trace: %s %lld %lld\n", what, a, b);
             std::fflush(stderr);
         };
+        if (g_own_early != nullptr) {   // w2-fnpf: a load-time reservation no prompt path took (never kept past load)
+            (void) cudaDeviceSynchronize();
+            (void) cudaFree(g_own_early);
+            g_own_early = nullptr;
+        }
         {
             // what is left once everything is allocated: under WDDM a GPU filled to the brim does not fail, it pages -
             // and a page-in while the verify graph spins on a host flag stalls the request for good
@@ -11219,7 +11361,8 @@ static int qwen4exp_engine_main(int argc, char** argv) {
             serve_ctx.begin_request = [&](const int64_t* ids, size_t n_ids, int req_cache, int req_ckpt, int64_t req_pin,
                                           int req_cvec, const tk_qwen4exp_req_sampling_t* sampling, const float* bias,
                                           size_t n_bias, int64_t* out_resume, int64_t* out_read_from,
-                                          int* out_resumed_from0, int64_t* out_reread_to, int64_t* out_pin_at) -> int {
+                                          int* out_resumed_from0, int64_t* out_reread_to, int64_t* out_pin_at,
+                                          int64_t* out_resumed_checkpoint) -> int {
                 cur.assign(ids, ids + n_ids);
                 const int64_t n = (int64_t) cur.size();
                 req_imgs.clear();
@@ -11276,9 +11419,10 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                 int64_t resume = 0;
                 int64_t reread_to = -1;
                 int64_t read_from = 0;
+                int64_t resumed_checkpoint = 0;   // the checkpoint this request mounted (prompt_end_checkpoint)
                 if (p5_hooks.begin != nullptr) {   // ---- qwen4exp-p5: the conversation part runs in Rust
                     if (p5_hooks.begin(p5_hooks.user, cur.data(), cur.size(), req_cache, req_ckpt, req_pin,
-                                       want_cvec ? 1 : 0, &resume, &read_from, &reread_to) < 0)
+                                       want_cvec ? 1 : 0, &resume, &read_from, &reread_to, &resumed_checkpoint) < 0)
                         return -1;
                     if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(want_cvec);
                     tr("request", n, 0);
@@ -11388,6 +11532,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                             return -1;
                         }
                     }
+                    resumed_checkpoint = from_live ? 0 : resume;
                     if (resume == 0) {
                         strata::core::session_zero(ss, g, nullptr, main_cs);
                         cudaStreamSynchronize(main_stream);
@@ -11488,6 +11633,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                 if (out_resumed_from0) *out_resumed_from0 = 0;
                 if (out_reread_to) *out_reread_to = reread_to;
                 if (out_pin_at) *out_pin_at = pin_at;
+                if (out_resumed_checkpoint) *out_resumed_checkpoint = resumed_checkpoint;
                 return 1;
             };
             serve_ctx.prefill_segment = [&](int64_t at, int64_t to, int use_windows, int* out_nf_hit, int* out_cancelled) -> int {
@@ -13799,7 +13945,8 @@ static int qwen4exp_engine_main(int argc, char** argv) {
             // talus#60: the prompt end, when no checkpoint of this request is near it (a raw prompt)
             if (!cancelled) {
                 const int64_t end_at = strata::program::prompt_end_checkpoint(
-                    n, turn_at, root_at, message_at, pin_at, o.prompt_cache, req_ckpt, req_short_read);
+                    n, turn_at, root_at, message_at, pin_at, o.prompt_cache, req_ckpt, req_short_read,
+                    from_live ? 0 : resume);
                 if (end_at > 0 && !checkpoint_at(end_at, nullptr, false)) {
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                     return 1;
@@ -17267,11 +17414,12 @@ extern "C" int tk_qwen4exp_serve_begin_request(
     int64_t* out_read_from,
     int* out_resumed_from0,
     int64_t* out_reread_to,
-    int64_t* out_pin_at
+    int64_t* out_pin_at,
+    int64_t* out_resumed_checkpoint
 ) {
     return (ctx && ctx->begin_request)
         ? ctx->begin_request(ids, n_ids, req_cache, req_ckpt, req_pin, req_cvec, sampling, bias, n_bias,
-                             out_resume, out_read_from, out_resumed_from0, out_reread_to, out_pin_at)
+                             out_resume, out_read_from, out_resumed_from0, out_reread_to, out_pin_at, out_resumed_checkpoint)
         : -1;
 }
 

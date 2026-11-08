@@ -48,6 +48,11 @@ bool strata_pf_hcdown_exact_bf16(const uint16_t* X, int64_t ldx, const uint16_t*
 bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y, int64_t T,
                            int64_t N, int64_t K, int64_t ldy, float beta, void* stream = nullptr);
 
+/// #11: strata_pf_gemm_f16_ld with W given as GGUF Q8_0 blocks, decoded in the GEMM's loader (no dequantized scratch; X.W^T
+/// bitwise the dequant_f16_ld + strata_pf_gemm_f16_ld result). N >= 1024, K a multiple of 64, W 4-byte aligned.
+bool strata_pf_gemm_q8_ld(const uint16_t* X, int64_t ldx, const void* Wq8, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                          float beta, void* stream = nullptr);
+
 bool strata_wmma_gemm_bf16(const uint16_t* X, const uint16_t* W, float* Y,
                            int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
                            void* stream = nullptr);

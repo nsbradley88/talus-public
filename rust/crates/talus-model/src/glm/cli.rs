@@ -3,6 +3,10 @@
 //! Modes:
 //!   --glm-eval TOKFILE [--all-logits] [--out DIR] [--dump]   teacher-forced eval; logits (+ per-layer dumps) to DIR
 //!   serve | --serve | --engine-protocol                      stdio engine protocol (talus-sched)
+//!   --tokens [@]TOKFILE --force-decode N --dump-full-logits PATH  test only (release row gates): the prompt minus its
+//!       last N tokens through the serving prefill, then those N teacher-forced through generation's verify window
+//!       (`GlmEngine::trunk`, the fixed split plan); writes float32 [1 + N, n_vocab]: the last prompt row, then one row
+//!       per forced token. TALUS_GLM_FD_WINDOW=W (1..=GLM_KDA_SLOTS, default 1) forces W rows per window.
 //! Common: --model PATH  --ctx N (default 65536)  --no-mtp  --kernels PATH  --minstart GIB (default 112)  -v
 
 use std::io::Write;
@@ -41,6 +45,10 @@ pub struct GlmCli {
     pub seed: u64,
     pub draft_vocab: Option<PathBuf>,
     pub minavail_gib: f64,
+    /// test only: `--tokens [@]FILE --force-decode N --dump-full-logits PATH` (forced decode rows)
+    pub tokens: Option<PathBuf>,
+    pub force_decode: usize,
+    pub dump_full_logits: Option<PathBuf>,
     pub extra: Vec<String>,
 }
 
@@ -68,6 +76,9 @@ pub fn parse(args: &[String]) -> std::result::Result<GlmCli, String> {
         seed: 0,
         draft_vocab: None,
         minavail_gib: weights::floor_bytes() as f64 / GIB as f64,
+        tokens: None,
+        force_decode: 0,
+        dump_full_logits: None,
         extra: vec![],
     };
     let mut i = 1;
@@ -103,6 +114,12 @@ pub fn parse(args: &[String]) -> std::result::Result<GlmCli, String> {
             "--seed" => c.seed = val()?.parse().map_err(|e| format!("{a}: {e}"))?,
             "--draft-vocab" | "--spec-draft-vocab" => c.draft_vocab = Some(PathBuf::from(val()?)),
             "--minavail" => c.minavail_gib = val()?.parse().map_err(|e| format!("{a}: {e}"))?,
+            "--tokens" => {
+                let v = val()?;
+                c.tokens = Some(PathBuf::from(v.strip_prefix('@').unwrap_or(&v)));
+            }
+            "--force-decode" => c.force_decode = val()?.parse().map_err(|e| format!("{a}: {e}"))?,
+            "--dump-full-logits" => c.dump_full_logits = Some(PathBuf::from(val()?)),
             "serve" | "--serve" | "--engine-protocol" => c.serve = true,
             // talus-public#5: the GLM cache is the MLA latent (+ indexer) cache with one format; --kv was
             // swallowed into `extra` without a word
@@ -581,6 +598,61 @@ fn run_gen(c: &GlmCli, eng: &mut GlmEngine) -> Result<()> {
     Ok(())
 }
 
+/// KDA slots of a `t`-row verify window, as generation picks them: the current slot first, then the others in order.
+fn window_kids(cur: usize, slots: usize, t: usize) -> Vec<i32> {
+    std::iter::once(cur as i32)
+        .chain((0..slots as i32).filter(|&x| x != cur as i32))
+        .take(t)
+        .collect()
+}
+
+/// Test only (release row gates): forced decode rows through generation's verify window. See the module docs.
+fn run_force_decode(c: &GlmCli, eng: &mut GlmEngine) -> Result<()> {
+    use super::engine::kda_slots;
+    use super::spec::{self, SeqPos};
+    let toks = read_tokens(c.tokens.as_ref().unwrap())?;
+    let n = c.force_decode.min(toks.len().saturating_sub(1));
+    if n == 0 {
+        return Err(CoreError::InvalidArgument {
+            reason: "--force-decode needs N >= 1 and a prompt longer than N tokens".into(),
+        });
+    }
+    let slots = kda_slots();
+    let w = std::env::var("TALUS_GLM_FD_WINDOW")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, slots);
+    let n_prefill = toks.len() - n;
+    eng.reset()?;
+    let mut seq = SeqPos::default();
+    let t0 = std::time::Instant::now();
+    let mut rows = spec::prefill(eng, &mut seq, &toks[..n_prefill], c.mtp)?;
+    let prefill_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let t1 = std::time::Instant::now();
+    for win in toks[n_prefill..].chunks(w) {
+        eng.pressure_point()?;
+        let kids = window_kids(eng.st.cur_slot, slots, win.len());
+        eng.trunk(win, seq.n_past, &kids, win.len())?;
+        for r in 0..win.len() {
+            rows.extend_from_slice(eng.logits_row(r));
+        }
+        // every forced token is accepted: KDA state = snapshot after the window's last row
+        eng.st.cur_slot = kids[win.len() - 1] as usize;
+        seq.n_past += win.len();
+    }
+    let decode_ms = t1.elapsed().as_secs_f64() * 1e3;
+    if let Some(p) = &c.dump_full_logits {
+        write_f32(p, &rows)?;
+    }
+    eprintln!(
+        "glm: prefill {n_prefill} tok in {prefill_ms:.1} ms, force_decode {n} tok in {decode_ms:.1} ms ({:.2} tok/s), \
+         window {w}",
+        n as f64 / decode_ms.max(1e-9) * 1e3
+    );
+    Ok(())
+}
+
 /// Entry point from talus-cli (argv including the program name).
 pub fn run(args: &[String]) -> i32 {
     let mut c = match parse(args) {
@@ -603,6 +675,8 @@ pub fn run(args: &[String]) -> i32 {
         Ok(())
     } else if c.kld.is_some() {
         run_kld(&c, &mut eng)
+    } else if c.tokens.is_some() && c.force_decode > 0 {
+        run_force_decode(&c, &mut eng)
     } else if c.gen.is_some() {
         run_gen(&c, &mut eng)
     } else if c.eval.is_some() {
@@ -622,5 +696,48 @@ pub fn run(args: &[String]) -> i32 {
             eprintln!("talus-glm: {e}");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_force_decode() {
+        let c = parse(&argv(&[
+            "talus-cli",
+            "--model",
+            "m.gguf",
+            "--tokens",
+            "@p.tok",
+            "--force-decode",
+            "128",
+            "--dump-full-logits",
+            "x.logits",
+        ]))
+        .unwrap();
+        assert_eq!(c.tokens.as_deref(), Some(Path::new("p.tok")));
+        assert_eq!(c.force_decode, 128);
+        assert_eq!(c.dump_full_logits.as_deref(), Some(Path::new("x.logits")));
+        assert!(c.extra.is_empty());
+        let d = parse(&argv(&["talus-cli", "--model", "m.gguf"])).unwrap();
+        assert_eq!(
+            (d.tokens, d.force_decode, d.dump_full_logits),
+            (None, 0, None)
+        );
+    }
+
+    #[test]
+    fn window_kids_match_generation() {
+        // one-row decode: [cur]; MTP verify (3 rows): cur, then the other two of slots 0..3
+        assert_eq!(window_kids(1, 3, 1), vec![1]);
+        assert_eq!(window_kids(1, 3, 3), vec![1, 0, 2]);
+        assert_eq!(window_kids(0, 8, 5), vec![0, 1, 2, 3, 4]);
+        assert_eq!(window_kids(2, 3, 3), vec![2, 0, 1]);
     }
 }

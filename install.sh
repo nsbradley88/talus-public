@@ -18,15 +18,18 @@
 #
 # Options: --yes (take every default) --dry-run (print the actions, change nothing) --advanced (all choices)
 #          --allow-system-changes (with --yes: apply the kernel parameters too) --force (continue on unsupported
-#          hardware) --build-only (steps 1-4, no setup; what `talus update` runs, so the GPU check only warns) --src DIR (a Talus checkout to build) --no-setup
+#          hardware) --from-source (compile instead of installing the latest release's prebuilt programs)
+#          --build-only (steps 1-4, no setup; what `talus update` runs, so the GPU check only warns) --src DIR (a Talus checkout to build) --no-setup
 #          passed on to `talus setup`: --models-dir DIR (where the models go) --no-power-profile (leave the ACPI
 #          platform profile alone) --service / --no-service (install the user service that starts the server at login;
 #          with --yes it is installed only with --service)
 # Environment: TALUS_HOME, ROCM_SDK (use an SDK you have), TALUS_ROCM_VERSION / TALUS_ROCM_INDEX (override the pin
 #              in rocm.version / AMD's nightly index), TALUS_ROCM_STABLE, TALUS_REPO, TALUS_BRANCH (default: the newest release tag),
 #              TALUS_RELEASE=<tag> or TALUS_PREBUILT_URL=<tar.gz> (a release tarball instead of compiling),
-#              TALUS_RELEASES_URL (another copy of the release files), TALUS_NO_PREBUILT=1 (--build-only compiles even
-#              on an install from a release tarball),
+#              TALUS_RELEASES_URL (another copy of the release files), TALUS_FROM_SOURCE=1 (same as --from-source; also
+#              makes `talus update` compile on an install from a release tarball; TALUS_NO_PREBUILT=1 is the old name),
+#              TALUS_JOBS=N (parallel compile jobs; default: CPU threads, at most one per 2 GiB of available memory),
+#              TALUS_KEEP_BUILD=1 (keep a build directory an earlier attempt left),
 #              HF_TOKEN (optional, never stored).
 
 # Everything is inside main(), so a download cut short runs nothing.
@@ -44,6 +47,7 @@ ROCM_STABLE_INDEX=https://stable.repo.amd.com/rocm/whl-next/
 RUST_FALLBACK=1.99.1
 
 YES=0 DRY=0 ADVANCED=0 ALLOW_SYS=0 FORCE=0 BUILD_ONLY=0 NO_SETUP=0 SRC=""
+FROM_SOURCE=0; [ -z "${TALUS_FROM_SOURCE:-}${TALUS_NO_PREBUILT:-}" ] || FROM_SOURCE=1
 MODELS_DIR="" NO_POWER=0 SERVICE=""   # passed on to talus setup; SERVICE: "", --service or --no-service
 while [ $# -gt 0 ]; do
   case $1 in
@@ -53,6 +57,7 @@ while [ $# -gt 0 ]; do
     --allow-system-changes) ALLOW_SYS=1 ;;
     --force) FORCE=1 ;;
     --build-only) BUILD_ONLY=1 ;;
+    --from-source) FROM_SOURCE=1 ;;
     --no-setup) NO_SETUP=1 ;;
     --src) [ $# -ge 2 ] || { echo "install.sh: --src needs a directory" >&2; return 2; }; SRC=$2; shift ;;
     --models-dir) [ $# -ge 2 ] || { echo "install.sh: --models-dir needs a directory" >&2; return 2; }; MODELS_DIR=$2; shift ;;
@@ -115,7 +120,21 @@ logged() {
   if [ "$DRY" = 1 ]; then run "$@"; return 0; fi
   mkdir -p "$DATA/logs"
   if "$@" >"$DATA/logs/$name.log" 2>&1; then return 0; fi
+  # a parallel build keeps compiling after the first failure, so the tail is often warnings from other files
+  # (talus-public#2): show the first error first
+  first=$(grep -n -m1 -E '^FAILED:|(^|[[:space:]])(fatal )?error(\[E[0-9]+\])?:|Killed|terminated by signal' \
+          "$DATA/logs/$name.log" | cut -d: -f1)
+  if [ -n "$first" ]; then
+    note "first error (line $first of the log):"
+    sed -n "$(( first > 3 ? first - 3 : 1 )),$(( first + 30 ))p" "$DATA/logs/$name.log" | sed 's/^/    /'
+    note "last lines:"
+  fi
   tail -n 30 "$DATA/logs/$name.log" | sed 's/^/    /'
+  # a compiler killed for lack of memory: fewer jobs
+  if grep -q -E 'Killed|terminated by signal|[Oo]ut of memory|Cannot allocate memory' "$DATA/logs/$name.log"; then
+    j=$(( ${JOBS:-2} / 2 )); [ "$j" -ge 1 ] || j=1
+    note "A compiler was killed, most likely out of memory (${JOBS:-?} jobs). Run again with fewer: TALUS_JOBS=$j"
+  fi
   die "$name failed; the whole log is $DATA/logs/$name.log"
 }
 SUDO=""
@@ -132,15 +151,15 @@ if [ -z "$PREBUILT" ] && [ -n "${TALUS_RELEASE:-}" ]; then
 fi
 # `talus update` (--build-only) on an install that came from a release tarball (it left MANIFEST.json): the new release's
 # tarball again, not a compile (that machine has no compiler, and the tarball is the build we tested). A source
-# install has no MANIFEST.json and compiles. TALUS_NO_PREBUILT=1 compiles anyway.
-if [ -z "$PREBUILT" ] && [ "$BUILD_ONLY" = 1 ] && [ -z "${TALUS_NO_PREBUILT:-}" ] && [ -f "$DATA/MANIFEST.json" ]; then
+# install has no MANIFEST.json and compiles. TALUS_FROM_SOURCE=1 compiles anyway.
+if [ -z "$PREBUILT" ] && [ "$BUILD_ONLY" = 1 ] && [ "$FROM_SOURCE" = 0 ] && [ -f "$DATA/MANIFEST.json" ]; then
   tag=$(git -C "${SRC:-$DATA/src}" describe --tags --exact-match HEAD 2>/dev/null || true)
   case $tag in
     v[0-9]*.[0-9]*.[0-9]*-*|"") ;;
     v[0-9]*.[0-9]*.[0-9]*)
       PREBUILT="$RELEASES/$tag/talus-$tag-linux-x86_64-gfx1151.tar.gz"
       if [ "$DRY" = 0 ] && ! curl -fsIL --retry 2 "$PREBUILT.sha256" >/dev/null 2>&1; then
-        die "the prebuilt programs of $tag are not available yet ($PREBUILT). Your programs were not changed: run \`talus update --rebuild\` again later (TALUS_NO_PREBUILT=1 compiles from source instead)."
+        die "the prebuilt programs of $tag are not available yet ($PREBUILT). Your programs were not changed: run \`talus update --rebuild\` again later (TALUS_FROM_SOURCE=1 compiles from source instead)."
       fi ;;
   esac
 fi
@@ -172,6 +191,22 @@ case " $GFX " in
 esac
 MEM_GIB=$(awk '/^MemTotal:/{printf "%d", $2/1048576}' /proc/meminfo)
 if [ "$MEM_GIB" -ge 120 ]; then ok "Memory" "$MEM_GIB GiB"; else wrn "Memory" "$MEM_GIB GiB (Talus is built for 128 GB; only Qwen3.8-27B may fit)"; fi
+# build_jobs: parallel compile jobs. TALUS_JOBS=N wins; otherwise one per CPU thread, at most one per 2 GiB of
+# *available* memory (MemAvailable, not MemTotal: a desktop session, a browser or a running model already hold some;
+# talus-public#2). The kernel files peak at 1.2-2.5 GB each, 38 GiB summed over all 164.
+build_jobs() {
+  if [ -n "${TALUS_JOBS:-}" ]; then
+    case $TALUS_JOBS in *[!0-9]*|0*) die "TALUS_JOBS must be a whole number of 1 or more, not '$TALUS_JOBS'" ;; esac
+    echo "$TALUS_JOBS"; return
+  fi
+  j=$(nproc 2>/dev/null || echo 8)
+  avail=$(awk '/^MemAvailable:/{printf "%d", $2/1048576}' /proc/meminfo 2>/dev/null)
+  [ -n "$avail" ] || avail=$MEM_GIB
+  m=$(( avail / 2 )); [ "$m" -ge 1 ] || m=1
+  [ "$j" -le "$m" ] || j=$m
+  echo "$j"
+}
+JOBS=$(build_jobs) || exit 1
 mkdir_p_parent=$DATA; while [ ! -d "$mkdir_p_parent" ]; do mkdir_p_parent=$(dirname "$mkdir_p_parent"); done
 FREE_GB=$(df -Pk "$mkdir_p_parent" | awk 'NR==2{printf "%d", $4/1000000}')
 if [ "$FREE_GB" -ge 40 ]; then ok "Disk" "$FREE_GB GB free in $mkdir_p_parent"; else wrn "Disk" "$FREE_GB GB free in $mkdir_p_parent (the build needs ~15 GB, models 17-120 GB each)"; fi
@@ -181,6 +216,45 @@ for g in render video; do
     break
   fi
 done
+
+# The default install: the latest release's prebuilt programs. It compiles only when asked (--from-source), when pointed
+# at source (TALUS_BRANCH, --src, running from a checkout), on an install already built from source, or, with a message,
+# when this machine has no tarball. Decided before step 2: a prebuilt install needs no build tools.
+default_install() {
+  [ -z "$PREBUILT" ] && [ "$BUILD_ONLY" = 0 ] || return 0
+  have curl || die "this installer needs curl to find the latest release: install curl and run it again."
+  here=$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)
+  chosen=""
+  if [ "$FROM_SOURCE" = 1 ]; then chosen="you asked for it"
+  elif [ -n "$BRANCH" ]; then chosen="TALUS_BRANCH=$BRANCH"
+  elif [ -n "$SRC" ]; then chosen="--src $SRC"
+  elif [ -n "$here" ] && [ -f "$here/build.sh" ] && [ -f "$here/rust/Cargo.toml" ]; then chosen="running from the checkout $here"
+  elif [ -d "$DATA/src/.git" ] && [ ! -f "$DATA/MANIFEST.json" ]; then chosen="this install was built from source"
+  fi
+  if [ -n "$chosen" ]; then ok "Install" "from source ($chosen)"; return 0; fi
+  if [ "$ARCH" != x86_64 ]; then compile_instead "there are no prebuilt programs for $ARCH"; return 0; fi
+  tag=""
+  if [ -n "${TALUS_REPO:-}" ]; then
+    tag=$(git ls-remote --tags --refs "$REPO" 'v*' 2>/dev/null | sed 's#.*refs/tags/##' \
+        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
+  else
+    url=$(curl -fsSIL --connect-timeout 15 --retry 2 -o /dev/null -w '%{url_effective}' "$REPO/releases/latest") \
+      || die "could not reach $REPO to find the latest release. Nothing was changed: check the network and run this again."
+    case $url in */releases/tag/v*) tag=${url##*/} ;; esac
+  fi
+  if [ -z "$tag" ]; then compile_instead "no release is published yet"; return 0; fi
+  try="$RELEASES/$tag/talus-$tag-linux-x86_64-gfx1151.tar.gz"
+  rc=0; curl -fsIL --connect-timeout 15 --retry 2 "$try.sha256" >/dev/null 2>&1 || rc=$?
+  case $rc in
+    0) TALUS_RELEASE=$tag PREBUILT=$try; ok "Install" "prebuilt programs of $tag (--from-source compiles instead)" ;;
+    22|37) compile_instead "$tag has no prebuilt programs for this machine" ;;
+    *) die "could not reach $try. Nothing was changed: check the network and run this again." ;;
+  esac
+}
+compile_instead() {
+  wrn "Install" "$1: compiling from source instead (about 40 minutes, and it needs a compiler, CMake, Ninja and Rust)"
+}
+default_install
 
 # ---- 2. tools
 step 2 "Tools"
@@ -278,6 +352,13 @@ if [ -n "$SRC" ]; then
   ok "Source" "$SRC"
 elif [ -d "$DATA/src/.git" ]; then
   SRC="$DATA/src"
+  # installing a release over an older one: its source goes with it (data files, tools, update)
+  if [ -n "$PREBUILT" ] && [ -n "${TALUS_RELEASE:-}" ] \
+     && [ "$(git -C "$SRC" describe --tags --exact-match HEAD 2>/dev/null || true)" != "$TALUS_RELEASE" ]; then
+    run git -C "$SRC" fetch --quiet --depth 1 origin tag "$TALUS_RELEASE" \
+      && run git -C "$SRC" -c advice.detachedHead=false checkout --quiet "$TALUS_RELEASE" \
+      || wrn "Source" "$SRC stays where it is; it could not move to $TALUS_RELEASE"
+  fi
   ok "Source" "$SRC ($(git -C "$SRC" log -1 --format=%h 2>/dev/null))"
 else
   SRC="$DATA/src"
@@ -353,7 +434,28 @@ sysrocm_env LD_LIBRARY_PATH
 # ---- 4. build and install
 step 4 "Build"
 BIN="$DATA/bin"
+# clear_stale_build: a build directory left by an earlier attempt starts over. CMake keeps the compiler and SDK of its
+# first configure, so a directory configured for another source path or ROCm SDK, without a CMakeCache.txt, or left by
+# a failed or interrupted build (the marker below) is removed (talus-public#2: a failed first attempt may leave a bad
+# build directory). TALUS_KEEP_BUILD=1 keeps it.
+clear_stale_build() {
+  b="$SRC/build"; c="$b/CMakeCache.txt"; why=""
+  [ -d "$b" ] && [ "${TALUS_KEEP_BUILD:-0}" != 1 ] || return 0
+  if [ -e "$DATA/logs/build-kernels.unfinished" ]; then why="the last build did not finish"
+  elif [ ! -f "$c" ]; then why="it has no CMakeCache.txt"
+  else
+    home=$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$c")
+    root=$(sed -n 's/^CMAKE_HIP_COMPILER_ROCM_ROOT:[A-Z]*=//p' "$c")
+    same() { [ "$1" = "$2" ] || [ "$(cd "$1" 2>/dev/null && pwd -P)" = "$(cd "$2" 2>/dev/null && pwd -P)" ]; }
+    if ! same "$home" "$SRC"; then why="it was configured for $home"
+    elif [ -n "$root" ] && ! same "$root" "$ROCM_ROOT"; then why="it was configured with the ROCm SDK $root"; fi
+  fi
+  [ -n "$why" ] || return 0
+  note "Removing $b from an earlier attempt ($why); the kernel library builds from scratch"
+  run rm -rf "$b"
+}
 build_kernels() {
+  clear_stale_build
   # a system ROCm's headers (Fedora's rocm-hip-devel: /usr/include/hip) came before the SDK's in builds up to v0.1.3
   # and broke them (talus-public#2); build.sh now puts the SDK's first (-isystem)
   for d in /usr/include/hip /usr/local/include/hip; do
@@ -365,12 +467,11 @@ build_kernels() {
     fi
   done
   sysrocm_env CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH
-  JOBS=$(nproc 2>/dev/null || echo 8)
-  # the kernel compile needs ~2 GB of memory per job
-  MAXJ=$(( MEM_GIB / 2 )); [ "$MAXJ" -ge 1 ] || MAXJ=1; [ "$JOBS" -le "$MAXJ" ] || JOBS=$MAXJ
-  say "Compiling the HIP kernel library ($JOBS jobs; the first build takes a while) ..."
+  say "Compiling the HIP kernel library ($JOBS jobs; the first build takes a while; TALUS_JOBS=N sets the number) ..."
   note "log: $DATA/logs/build-kernels.log"
+  [ "$DRY" = 1 ] || { mkdir -p "$DATA/logs"; : > "$DATA/logs/build-kernels.unfinished"; }
   logged build-kernels env ROCM_SDK="$ROCM_ROOT" BUILD="$SRC/build" TARGETS=talus_kernels JOBS="$JOBS" bash "$SRC/build.sh"
+  rm -f "$DATA/logs/build-kernels.unfinished"
   took
 }
 # build_rust CRATE... : release build of these crates, installed into $BIN
@@ -378,7 +479,7 @@ build_rust() {
   say "Compiling the Rust programs ($*) ..."
   note "log: $DATA/logs/build-rust.log"
   pk=""; for c in "$@"; do pk="$pk -p $c"; done
-  logged build-rust sh -c "cd '$SRC/rust' && cargo build --release --locked$pk"
+  logged build-rust sh -c "cd '$SRC/rust' && cargo build --release --locked -j $JOBS$pk"
   run mkdir -p "$BIN"
   for f in "$@"; do run install -m 0755 "$SRC/rust/target/release/$f" "$BIN/$f"; done
 }

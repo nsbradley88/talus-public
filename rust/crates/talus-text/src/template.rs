@@ -21,6 +21,12 @@ use thiserror::Error;
 
 use crate::parser::parse_tool_call;
 
+/// Template instructions per render: a template that does not finish ends with an error instead. The shipped template
+/// on 500K messages (16 MiB) uses about a fifth.
+const MAX_TEMPLATE_FUEL: u64 = 500_000_000;
+/// The same for the capability probes at load, which render a few tiny messages.
+const CAPS_TEMPLATE_FUEL: u64 = 10_000_000;
+
 /// Errors produced when loading or rendering a [`ChatTemplate`] or normalizing a request.
 #[derive(Debug, Error)]
 pub enum TemplateError {
@@ -411,6 +417,23 @@ impl ChatTemplate {
         add_generation_prompt: bool,
         kwargs: Option<&Map<String, Value>>,
     ) -> Result<String, TemplateError> {
+        self.render_fuel(
+            messages,
+            tools,
+            add_generation_prompt,
+            kwargs,
+            MAX_TEMPLATE_FUEL,
+        )
+    }
+
+    fn render_fuel(
+        &self,
+        messages: &[Value],
+        tools: Option<&[Value]>,
+        add_generation_prompt: bool,
+        kwargs: Option<&Map<String, Value>>,
+        fuel: u64,
+    ) -> Result<String, TemplateError> {
         let keep_empty = std::env::var("STRATA_KEEP_EMPTY_TURNS").as_deref() == Ok("1");
         let n = messages.len();
         let filtered: Vec<&Value> = messages
@@ -439,6 +462,7 @@ impl ChatTemplate {
         );
 
         let mut env = Self::build_env();
+        env.set_fuel(Some(fuel));
         env.add_template("chat", &self.stripped_source)
             .map_err(|e| TemplateError::Jinja(e.to_string()))?;
         let tmpl = env
@@ -498,7 +522,8 @@ impl ChatTemplate {
 
     fn detect_caps(&self) -> HashMap<String, bool> {
         let try_render = |msgs: &[Value], tools: Option<&[Value]>| -> String {
-            self.render(msgs, tools, true, None).unwrap_or_default()
+            self.render_fuel(msgs, tools, true, None, CAPS_TEMPLATE_FUEL)
+                .unwrap_or_default()
         };
 
         let user = json!({"role": "user", "content": "strata_caps_user"});

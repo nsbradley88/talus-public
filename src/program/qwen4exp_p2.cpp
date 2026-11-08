@@ -257,6 +257,11 @@ void tk_qwen4exp_p2_gr_write_norm_rs(float* r, const float* bo, const float* inj
                                      uint16_t* xn16_lo, int64_t ldx) {
     pf::gr_write_norm_rs(r, bo, inj, inj_ld, w_next, eps, rs, xn16, t, stream, xn16_lo, ldx);
 }
+void tk_qwen4exp_p2_moe_write_norm_rs(const float* dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                                      float* r, const float* inj, int64_t inj_ld, const float* w_next, float eps, float* rs,
+                                      uint16_t* xn16, int64_t t, void* stream, uint16_t* xn16_lo, int64_t ldx) {
+    pf::moe_write_norm_rs(dm, slot, w, shared, sg, r, inj, inj_ld, w_next, eps, rs, xn16, t, stream, xn16_lo, ldx);
+}
 // rb-num (opt-in TALUS_FN_HC_BF16=1 BF16 / =2 FP16): the hyper-connection kernels on a 16-bit residual R
 void tk_qwen4exp_p2_gr16_broadcast(const float* e, uint16_t* r, int64_t t, int32_t fmt, void* stream) {
     pf::gr16_broadcast(e, r, t, fmt, stream);
@@ -486,6 +491,14 @@ int tk_qwen4exp_p2_prompt_attn_batch(const float* q, const tk_qwen4exp_p2_attn_p
                                      float* attn, int64_t n_q, void* stream) {
     return sk::qsa_prompt_attn_batch(q, attn_of(pools), ids, steps, cap, shapes_of(s), attn, n_q, stream) ? 1 : 0;
 }
+// W2 A7: the prompt attention with the output gate fused (gate_attn's FP32 ops, bitwise); 0 = not applicable (the
+// caller runs prompt_attn_batch + gate_attn)
+int tk_qwen4exp_p2_prompt_attn_gated(const float* q, const tk_qwen4exp_p2_attn_pools_t* pools, const int32_t* ids,
+                                     const int32_t* steps, int64_t cap, const tk_qwen4exp_p2_qsa_shapes_t* s,
+                                     const float* q_full, uint16_t* out16, int64_t ld16, int64_t n_q, void* stream) {
+    return sk::qsa_prompt_attn_gated(q, attn_of(pools), ids, steps, cap, shapes_of(s), q_full, out16, ld16, n_q, stream)
+               ? 1 : 0;
+}
 void tk_qwen4exp_p2_decode_attn_batch(const float* q, const tk_qwen4exp_p2_attn_pools_t* pools, const int32_t* ids,
                                       const int32_t* steps, int64_t cap, const tk_qwen4exp_p2_qsa_shapes_t* s,
                                       float* scratch, float* attn, int64_t n_q, void* stream) {
@@ -634,6 +647,35 @@ void tk_qwen4exp_p2_mmq_product(void* mmq_ctx, const void* w, int32_t type, int6
 #endif
     ((pf::mmq::Context*) mmq_ctx)->run(p, stream);
 }
+// W2 k_moe5: a group's products can read its experts in place (no gather); the bits are the gathered product's
+int tk_qwen4exp_p2_mmq_inplace_ok(int32_t type, int64_t w_rows, int64_t w_cols) {
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+    static const bool use_tp_moe = [] {
+        const char* v = std::getenv("TALUS_PF_MOE");
+        return v == nullptr || v[0] != '0';
+    }();
+    return use_tp_moe && talus::prefill::moe_inplace_ok(type, (int) w_rows, (int) w_cols) ? 1 : 0;
+#else
+    (void) type; (void) w_rows; (void) w_cols;
+    return 0;
+#endif
+}
+int tk_qwen4exp_p2_mmq_product_each(const void* const* w_each, int32_t type, int64_t w_rows, int64_t w_cols, int32_t n,
+                                    const void* xq, const int32_t* bounds, const int32_t* ids, int64_t total_rows,
+                                    int64_t max_rows, float* dst, int64_t ld_dst, void* stream) {
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+    talus::prefill::MoeProduct mp;
+    mp.w_each = w_each;
+    mp.type = type; mp.n = (int) w_rows; mp.k = (int) w_cols; mp.n_experts = n;
+    mp.xq = xq; mp.bounds = bounds; mp.ids = ids; mp.total_rows = total_rows; mp.max_rows = max_rows;
+    mp.dst = dst; mp.ld_dst = ld_dst;
+    return talus::prefill::moe_gemm(mp, stream) ? 1 : 0;
+#else
+    (void) w_each; (void) type; (void) w_rows; (void) w_cols; (void) n; (void) xq; (void) bounds; (void) ids;
+    (void) total_rows; (void) max_rows; (void) dst; (void) ld_dst; (void) stream;
+    return 0;
+#endif
+}
 void tk_qwen4exp_p2_mmq_swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, int32_t interleaved,
                                void* stream) {
     pf::mmq::swiglu(gu, h, rows, n_ff, interleaved != 0, stream);
@@ -669,6 +711,8 @@ const uint8_t* tk_qwen4exp_p2_src_blob_stable(void* src, int64_t l, int64_t e) {
 const uint8_t* tk_qwen4exp_p2_cache_device_slot(void* cache, int32_t slot) {
     return ((const sc::ExpertCache*) cache)->device_slot(slot);
 }
+
+const uint8_t* tk_qwen4exp_p2_cache_device_end(void* cache) { return ((const sc::ExpertCache*) cache)->device_end(); }
 
 // ---------------------------------------------------------------- MTP draft layer
 int tk_qwen4exp_p2_mtp_info(void* mtp, tk_qwen4exp_p2_mtp_info_t* out) {

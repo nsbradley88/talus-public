@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # rust/ci.sh : the repo's CI gate.
 #   CPU stages (always): pinned-toolchain check, cargo fmt --check, clippy -D warnings, cargo test, cargo deny,
-#   install.sh's NO_COLOR / no-terminal output (tests/install/no-color.sh).
+#   install.sh's NO_COLOR / no-terminal output (tests/install/no-color.sh), its build-failure output, job count and
+#   stale build directory handling (tests/install/build-error.sh).
 #   Kernel stage (opt-in): TALUS_CI_KERNELS=1 builds libtalus_kernels with ../build.sh (needs a ROCm SDK:
 #   ROCM_SDK=<sdk root>, BUILD=<dir> default ../build-ci, TARGETS default talus_kernels, CMAKE_EXTRA passed through).
 #   build.sh itself fails if any built target is older than its sources (the stale-build guard).
@@ -45,6 +46,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo deny check licenses
 "$SCRIPT_DIR/../tests/install/no-color.sh"
+"$SCRIPT_DIR/../tests/install/build-error.sh"
 
 if [ "${TALUS_CI_KERNELS:-0}" = 1 ]; then
   echo "ci.sh: kernel build check (build.sh, stale-build guard)"

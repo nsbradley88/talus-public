@@ -30,8 +30,11 @@ pub const KIB: usize = 1024;
 /// Default hard `MemAvailable` floor on Strix Halo (`8 GiB`, Spec §3).
 pub const DEFAULT_FLOOR_BYTES: usize = 8 * GIB;
 
-/// Model-specific `MemAvailable` floor for MiMo (`11 GiB`, Spec §5 WP-3.3).
-pub const MIMO_FLOOR_BYTES: usize = 11 * GIB;
+/// Load-time `MemAvailable` floor for MiMo: the 8 GiB run floor + MiMo's measured transient above its at-ready memory
+/// the desktop, 262144 with the drafter KV ring: 0.06 GiB during load, 0.25 GiB through 8K / 64K / 206K requests, plus
+/// ~0.1 GiB of server growth in the v0.1.2 soak), rounded up. It was 11 GiB: the lowest reading of the llama.cpp
+/// reference run (Spec WP-3.3 exit criterion), not a property of this engine.
+pub const MIMO_FLOOR_BYTES: usize = 8 * GIB + 512 * MIB;
 
 /// Allocation category tracked by [`Budget`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

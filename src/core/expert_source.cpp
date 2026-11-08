@@ -3762,7 +3762,7 @@ namespace {
 // the verify window's per-entry tables in `expert_pool_dispatch_multi` (`kind`, `distinct`, `first_of`)
 // are fixed arrays of this many entries: kVerifyMaxT tokens of the model's 10 routed experts must fit, and a larger k
 // is refused at run time rather than written past them.  (256 for the 16-token copy windows; was 128.)
-constexpr int64_t kMaxWindowEntries = 256;
+constexpr int64_t kMaxWindowEntries = 512;   // 32 tokens
 static_assert(strata::kernels::kVerifyMaxT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
 }  // namespace
 

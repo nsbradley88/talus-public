@@ -24,6 +24,8 @@ bool experts_native_w16(const Batch& b, const NativeGeom& g, int n_expert, int64
                         const void* xa, const int32_t* src, void* ha, float* dm, void* stream, int phase = 0,
                         bool force = false);
 
+/// talus-pf-bench: the w16 kernel variant (TALUS_PF_W16_V), switched in-process for interleaved A/Bs.
+void w16_bench_set_v(int v);
 /// talus-pf-bench: ggml's iq3s_grid (512 words) on the host.
 void w16_host_iq3s_grid(uint32_t* out);
 

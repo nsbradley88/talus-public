@@ -22,7 +22,7 @@ Which figures come from which machine:
 
 | Figures | Machine | Build |
 |---|---|---|
-| Speed of the current release (RESULTS "Speed" tables, the README's first table) | desktop | the v0.1.3 release candidate tarball (rc1; the same engine source as the published tarball, see RESULTS) |
+| Speed of the current release (RESULTS "Speed" tables, the README's first table) | desktop | the v0.1.6 release candidate tarball (rc1; the same engine source as the published tarball, see RESULTS) |
 | The previous release on the same machine (RESULTS "v0.1.2" rows and the change table) | desktop | the published v0.1.2 tarball, interleaved with the current release in the same session |
 | Qwen3.8-27B 4-bit weights against BF16 (RESULTS) | desktop | v0.1.2 (release candidate 2); not re-measured for v0.1.3 |
 | Quality gates of the current release | laptop (some soaks on the desktop; RESULTS names the machine) | the same release (RESULTS says which build each gate ran on) |
@@ -120,7 +120,9 @@ the laptop, with the release candidate tarball and its `talus-server`):
 | Needle 60K | Long-context recall: five codenames hidden at five evenly spaced depths (from a tenth to nine tenths of the way in) of a 60K-token prompt from the corpus; the model must list all five. Three seeds. | every codename in every seed |
 | Needle 81K | The same at 81K tokens, for the models served with more than 64K of context (Flash-Next, MiMo, Laguna) | every codename in every seed |
 | Agentic smoke test | Five SWE-bench-style tasks on the Go library `charmbracelet/bubbles` v0.21.1, driven by the opencode agent against the served model; graded offline by hidden Go tests that the agent never sees. Each task runs once, so this is a smoke test: it catches broken tool use or editing, but cannot distinguish small quality differences (five pass/fail outcomes). Model quality is gated by KL divergence, greedy output identity and long-context recall | all five tasks |
-| KLD | Kullback-Leibler divergence of the model's next-token distribution against a reference, per model (below) | within the model's threshold |
+| KLD | The logit rows a build produces, per model (below): for most models compared bit for bit with a frozen set; KL against an outside reference is recorded beside them | see the table below |
+| Row parity | The rows the KLD gate scores come from one-row decoding. Serving verifies drafts in windows of several rows. On Qwen3.8-27B, GLM-5.3-Flash, MiMo-V2.6-Flash and Laguna-S-2.1 we compare the two bit for bit at each window width serving uses, at 2K and deeper | every row identical; a difference fails, whatever its size |
+| Drafts on vs off | Greedy output with drafts on against drafts off, on prompts that place the reply across each model's kernel and window boundaries, all five models: three fresh engines per run, with a second drafts-off engine as the control. Flash-Next also compares a warm request with and without an earlier resend | every token identical; a difference fails, whatever its size |
 | Greedy identity | The greedy outputs of the `code` and `edit` mixes are byte-identical to the previous gated build, where the change claims to keep numerics unchanged | every output identical |
 | Soak | Continuous mixed traffic on the served configuration (below) | see below |
 
@@ -131,14 +133,19 @@ sampling defaults. 64K-context configurations (GLM-5.3-Flash, and Qwen3.8-27B in
 
 | Model | Reference | Threshold |
 |---|---|---|
-| Qwen3.8-27B | Teacher-forced KL against llama.cpp's CPU backend on the same GGUF | KL vs llama.cpp CPU reference (UD-IQ4_XS) <= 0.00291 (short prompts) and 4K-prompt KL ratio vs exact <= 1.35 |
-| Qwen3.8-Flash-Next | First-token KL over a fixed prompt set (4.5K to 32K tokens) against a reference engine run | first-token KL vs reference (43 prompts 4.5K-32K) <= 0.0275 (ref 0.02623) |
-| GLM-5.3-Flash | llama.cpp's `llama-perplexity` KL method against two references: the logits of the release quant lineage, and the logits of the original FP8 model on a gate text (gated) and on code (recorded) | KLD vs release logits <= 0.0440 (ref 0.04194); FP8 gate-text line <= 0.20 (ref 0.1934); FP8 code recorded |
-| MiMo-V2.6-Flash | Teacher-forced KL from the previous gated build to this build at 2K and 32K | vs original weights: kld-text <= 0.182 (same-top >= 88.5%), wiki2 <= 0.240; vs old release ref: KLD <= 0.10, PPL ratio <= 1.01; teacher-forced KL(previous gated build -> this build) @2K and @32K: bitwise, or mean <= 1e-3 and top-1 >= 0.99 |
-| Laguna-S-2.1 | Teacher-forced KL from the previous gated build to this build at 2K and 32K (with a relaxed threshold for the served-speed decode path's long-context rounding drift) | teacher-forced KL(previous gated build -> this build) @2K and @32K: bitwise, or mean <= 3e-3 and top-1 >= 0.98 (served-speed numerics drift at 32K) |
+| Qwen3.8-27B | Teacher-forced rows on short prompts, UD-IQ4_XS and UD-Q4_K_XL, against a set frozen from this release's first candidate. KL against llama.cpp's CPU backend on the same GGUF is recorded, not gated | Teacher-forced logit rows on short prompts (UD-IQ4_XS, UD-Q4_K_XL) bitwise equal to a frozen set; any change goes to human review and does not pass by itself. KL vs the llama.cpp CPU reference and the 4K-prompt ratio are recorded, not gated |
+| Qwen3.8-Flash-Next | First-token rows over a fixed prompt set (4.5K to 32K tokens) against a frozen set. KL against llama.cpp's CPU backend on the original BF16 weights (below) is the published value and the bar for a changed build | First-token rows (43 prompts 4.5K-32K) bitwise equal to a frozen set. A changed build also needs KL vs llama.cpp CPU on BF16 <= 0.1064 and top-1 >= 79%, then human review |
+| GLM-5.3-Flash | Rows from the generation path (forced decode, one row at a time) at 2K and 16K, against a frozen set. KL with llama.cpp's `llama-perplexity` method against the release quant lineage and the original FP8 model (gate text and code) is recorded, not gated | KLD vs release logits <= 0.0440 (ref 0.04194); FP8 gate-text line <= 0.20 (ref 0.1934); FP8 code recorded |
+| MiMo-V2.6-Flash | Engine: teacher-forced KL from a fixed earlier Talus build (not the previous release) to this build at 2K and 32K. Weights checks, not engine gates: three lines run llama.cpp on the GGUF against the original weights and an old release reference; the build under test does not run in them, so they only show the GGUF hasn't changed | Engine: teacher-forced KL(a fixed earlier Talus build -> this build) @2K and @32K: bitwise, or mean <= 1e-3 and top-1 >= 0.99. Weights checks, not engine gates (llama.cpp on the GGUF, the build does not run): vs original weights kld-text <= 0.182 (same-top >= 88.5%), wiki2 <= 0.240; vs old release ref: KLD <= 0.10, PPL ratio <= 1.01 |
+| Laguna-S-2.1 | Served rows (decode through the verify kernels, as serving runs) teacher-forced at 2K and 32K, against a frozen served set. KL against a fixed earlier Talus build is recorded, not gated | Served rows @2K and @32K bitwise equal to a frozen set; a change needs KL vs frozen <= the rounding floor (8.2e-3 @2K, 1.4e-3 @32K), top-1 >= 0.98 and human review. KL(a fixed earlier Talus build -> this build) recorded, not gated |
 
-The thresholds are provisional: each is the current reference value plus a small margin, and the maintainer confirms
-them before a release.
+**Frozen rows, and what a change means.** Rounding alone moves KL against one fixed reference by about as much as the
+old KL limits allowed, so a limit that close could pass a real change or fail a harmless one. From v0.1.6, Qwen3.8-27B,
+Qwen3.8-Flash-Next and Laguna-S-2.1 compare their rows bit for bit with a set frozen from this release's first candidate,
+and GLM-5.3-Flash with a set frozen after its window fix (its replies changed in this release), each checked by hash.
+Identical rows pass. Any change stops the gate for a person to review, with its KL against the frozen rows in the record;
+it never passes by itself. These limits are checked by people before a release, and the frozen rows say a build hasn't
+moved, not that it is closer to the true model. The KL against an outside reference says that, roughly, and stays in the record.
 
 **Qwen3.8-27B, changes to the prompt path only.** The short-prompt teacher-forced check above runs one row at a time,
 so it exercises the decode matvec (`mmvq`) even when a change only touches the chunked prompt path (`ubatch >= 64`).
@@ -146,7 +153,33 @@ Prompt-only changes on 27B (such as the 4-bit prompt GEMM in [MODELS.md](MODELS.
 checked on four 4,096-token prompts cut from the corpus at offsets 0, 100K, 200K and 300K, processed in 2,048-token
 chunks as in serving and scored over the last 256 positions of each prompt (1,024 positions total) against
 llama.cpp's CPU backend on the same GGUF. In the same run we measure both the exact int8 prompt path
-(`TALUS_Q27_W4I=0`, the default) and the opt-in `.w4i` prompt path (`TALUS_Q27_W4I=auto`) with the same flash attention and dense MMQ settings; the gate requires the `.w4i` path's mean KL to stay within the ratio threshold in the table above (`KL vs llama.cpp CPU reference (UD-IQ4_XS) <= 0.00291 (short prompts) and 4K-prompt KL ratio vs exact <= 1.35`), matching the headroom of the short-prompt gate. We also score the two paths against each other to record their direct divergence (reported in [RESULTS.md](RESULTS.md)).
+(`TALUS_Q27_W4I=0`, the default) and the opt-in `.w4i` prompt path (`TALUS_Q27_W4I=auto`) with the same flash attention and dense MMQ settings; the ratio of the `.w4i` path's mean KL to the exact path's is recorded (it was gated at 1.35 until v0.1.5; history 1.236, 1.160, 1.145). We also score the two paths against each other to record their direct divergence (reported in [RESULTS.md](RESULTS.md)).
+
+**Qwen3.8-Flash-Next reference.** The reference is llama.cpp's CPU backend (b11972, cf24317, the Zen 4 build) running
+the original BF16 weights on the 43 fixed prompts, with one scored row per prompt: the next token after the prompt. The
+previous reference was a slower run of our own engine on the same 4-bit file, which measured only how far a build moved
+from another build of ours.
+
+**Why the published number went from 0.0242 to 0.0967.** The logits didn't change: they are bit for bit the same as in
+earlier releases. The reference changed. 0.0242 was the distance to another build of ours on the same 4-bit file. 0.0967
+is the distance to the original weights on another engine, which also counts what the 4-bit file itself loses. For scale,
+llama.cpp itself measures 0.128 on the same 4-bit file and 0.087 on Q8_0. The new number isn't worse quality, and the old
+one wasn't better.
+
+A build whose rows are identical to the frozen rows passes on that alone. A changed build also has to stay within ten
+percent of the current default's mean KL, and keep top-1 agreement on at most two prompts fewer (the figures are in the table
+above), and then goes to review.
+
+Read this number with its limits:
+
+- It is noisy. The bootstrap interval over prompts for the default's mean is 0.061 to 0.139, so ten percent is inside the sampling noise
+  and a small change can pass or fail by chance. Three prompts carry about a third of the total.
+- The reference is exact only for its own build. Thread count, batch size and repeat runs gave identical first-row logits,
+  but the same BF16 weights on llama.cpp's Haswell CPU build moved the first-token score on five prompts, by 0.004 up to 0.127 (four
+  of them among the gate's hardest). BF16 does not fit on these machines' GPUs, so there is no GPU cross-check as there is
+  for Qwen3.8-27B. So the gate says a build is no further from this reference, not that it is closer to the true model.
+- Smaller sets of prompts are recorded but not gated, because they are too noisy. A prompt-length band has 7 or 8 prompts,
+  and one prompt can double a band's value.
 
 ### Soak
 
@@ -182,15 +215,25 @@ Every kernel change in Talus falls into one of two classes.
   the agentic smoke test, and the maintainer then decides. The defaults that change numerics are listed per model,
   with their kill switches, in [MODELS.md](MODELS.md).
 
-What "exact" covers for the prompt cache: a request that restores cached state gives the same answer as the same
-request read cold. Prompt (prefill) kernels and decode kernels round differently, so the cache restores only state
-that a prefill computed and re-reads the rest; it never restores rows that a decode step wrote.
+What "exact" covers for the prompt cache. A prompt is read in chunks, and an engine may round a row slightly differently
+depending on where the chunks are cut. The cache only restores state at a cut point a cold read of the same text would
+also use, and re-reads the rest; it never restores rows that a decode step wrote. So:
 
-Known exception (Qwen3.8-27B, v0.1.2 and v0.1.3): the restored part and the re-read rest are processed as separate
-prompt chunks, and the 27B's prompt path rounds slightly differently depending on where the chunks split. A warm
-greedy answer can therefore differ from the cold one: in the v0.1.3 soak, one prompt whose first 2,048 tokens came
-from the cache. Both answers are valid, and each is reproducible for the same cache state. Prompt processing that gives
-the same bits wherever the split falls is planned.
+- An exact repeat or resend of a request gives the same answer as the same request read cold, checked on
+  Qwen3.8-27B, Qwen3.8-Flash-Next, MiMo-V2.6-Flash and Laguna-S-2.1 (from v0.1.6; before it, a MiMo-V2.6-Flash resend
+  could differ from cold, and on Qwen3.8-Flash-Next the turn after a resend could differ from the same conversation
+  without the resend). Not yet on GLM-5.3-Flash: a resend resumes from an earlier cut point and re-reads the rest of the
+  prompt in other chunks, so its answer can differ from the cold one (a known issue in v0.1.6).
+- A conversation restored at the same cuts gives the same bits as reading it cold with those cuts.
+- A later turn of a conversation, or a raw prompt that extends an earlier one, is cut at other points than the same
+  text read cold in one go, so its answer can differ from that cold read. Both answers are valid, and the same history
+  gives the same answer every time. The soak gate scores cached requests against their own first cached round for this
+  reason.
+
+Qwen3.8-27B, v0.1.2 to v0.1.5: a restored prefix that ended inside a prompt chunk was not cut where a cold read cuts,
+so even a request whose start came from the cache could differ from the same request read cold (in the v0.1.3 soak,
+one prompt whose first 2,048 tokens came from the cache). From v0.1.6 the cache keeps only the part up to the last cut
+point both reads share, and that case matches cold.
 
 ## Comparisons with other engines
 

@@ -214,6 +214,11 @@ impl InputQueue {
     }
 }
 
+/// the exact-resend logits reuse switch (default on; `0` / `false` / `off` turns it off).
+pub fn resend_logits_on(v: Option<&str>) -> bool {
+    !matches!(v.map(str::trim), Some("0") | Some("false") | Some("off"))
+}
+
 #[inline]
 fn emit(line: &str) {
     let mut out = io::stdout().lock();
@@ -265,6 +270,9 @@ pub fn serve_main(engine: &mut MimoEngine) -> Result<()> {
         });
     }
 
+    // TALUS_MIMO_RESEND_LOGITS=0 restores the n-1 re-read on an exact resend (warm != cold)
+    let resend_reuse = resend_logits_on(std::env::var("TALUS_MIMO_RESEND_LOGITS").ok().as_deref());
+
     let mut rng = Mt19937_64::new(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -284,6 +292,12 @@ pub fn serve_main(engine: &mut MimoEngine) -> Result<()> {
             "RESET" => {
                 engine.reset();
                 emit("OK");
+                continue;
+            }
+            // talus-server's slot erase and its warm-up: drop the token history, so nothing can resume from it
+            "CLEAR" => {
+                engine.reset();
+                emit("CLEARED 0");
                 continue;
             }
             "SEED" | "MTP" => {
@@ -438,6 +452,7 @@ pub fn serve_main(engine: &mut MimoEngine) -> Result<()> {
 
         let tp = Instant::now();
         let mut lcp = 0usize;
+        let mut resend = false;
         if no_cache {
             engine.reset();
         } else {
@@ -445,7 +460,13 @@ pub fn serve_main(engine: &mut MimoEngine) -> Result<()> {
             while lcp < hist.len() && lcp < ids.len() && hist[lcp] == ids[lcp] {
                 lcp += 1;
             }
-            if lcp == ids.len() && lcp > 0 {
+            // an exact resend of a prompt whose own pass wrote the cache resumes at the prompt end with
+            // that pass's last-row logits; re-reading row n-1 alone (below) runs the decode kernels and changes the reply
+            resend = lcp == ids.len()
+                && resend_reuse
+                && engine.prompt_end_logits(lcp).is_some()
+                && engine.exact_resume_floor(lcp, ids.len()) == lcp;
+            if lcp == ids.len() && lcp > 0 && !resend {
                 lcp -= 1;
             }
             // never resume where the DFlash window would read a last-layer tap row that a pruned prefill
@@ -455,6 +476,7 @@ pub fn serve_main(engine: &mut MimoEngine) -> Result<()> {
             if lcp == 0 || engine.n_pos().saturating_sub(lcp) > max_rollback {
                 engine.reset();
                 lcp = 0;
+                resend = false;
             } else if lcp < engine.n_pos() {
                 engine.rollback_kv_to(lcp);
             }
@@ -466,6 +488,12 @@ pub fn serve_main(engine: &mut MimoEngine) -> Result<()> {
         let n_read = ids.len() - lcp;
         let mut done = 0usize;
         let mut last_logits = Vec::new();
+        if resend {
+            last_logits = engine
+                .prompt_end_logits(lcp)
+                .map(<[f32]>::to_vec)
+                .unwrap_or_default();
+        }
         let mut prefill_err: Option<CoreError> = None;
         // the chunk calls below are one prompt ending at ids.len()
         engine.set_prefill_hint(Some(ids.len()), ids.len());
@@ -497,6 +525,9 @@ pub fn serve_main(engine: &mut MimoEngine) -> Result<()> {
             emit(&format!("ERR {e}"));
             continue;
         }
+        if n_read > 0 && resend_reuse {
+            engine.set_prompt_end_logits(ids.len(), &last_logits);
+        }
         let prompt_ms = ms_since(tp);
 
         if max_new == 0 || last_logits.is_empty() {
@@ -517,6 +548,14 @@ pub fn serve_main(engine: &mut MimoEngine) -> Result<()> {
         let mut drafted: i64 = 0;
         let mut accepted_total: i64 = 0;
         let mut finish = "length";
+        if std::env::var_os("TALUS_MIMO_LOGITS_HASH").is_some() {
+            // FNV-1a over the bits of the last prompt token's logits, for bitwise A/Bs. Test only.
+            let mut h = 0xcbf29ce484222325u64;
+            for v in &last_logits {
+                h = (h ^ u64::from(v.to_bits())).wrapping_mul(0x100000001b3);
+            }
+            eprintln!("mimo-serve: logits-hash {h:016x}");
+        }
         let mut next = sample(&mut last_logits, &sp, &recent, &mut rng);
         let fast = sp.greedy_plain();
         let use_dflash = engine.use_dflash();
@@ -952,5 +991,15 @@ mod tests {
         );
         off_svc.reset(&[1, 2, 3]);
         assert_eq!(off_svc.select_draft_len(3, false).min(off_max), 4);
+    }
+
+    #[test]
+    fn test_resend_logits_switch() {
+        assert!(resend_logits_on(None));
+        assert!(resend_logits_on(Some("1")));
+        assert!(resend_logits_on(Some("")));
+        assert!(!resend_logits_on(Some("0")));
+        assert!(!resend_logits_on(Some(" off")));
+        assert!(!resend_logits_on(Some("false")));
     }
 }

@@ -323,6 +323,7 @@ struct Env {
     pf_hcdown_min: i64,
     hcd_exact: bool,
     gr_unfused: bool,
+    moe_fold: bool,
     hc_upmix: bool,
     pf_switch_min_t: i64,
     pf_pad: bool,
@@ -394,6 +395,8 @@ fn env() -> &'static Env {
                 .unwrap_or(16384),
             hcd_exact: env_first_is("STRATA_HCD_EXACT", b'1'),
             gr_unfused: env_first_is("STRATA_GR_UNFUSED", b'1'),
+            // #12: MoE combine + HC write + next norm in one launch (bitwise; =0 two launches)
+            moe_fold: !env_first_is("STRATA_PF_MOE_FOLD", b'0'),
             hc_upmix: env_first_is("STRATA_HC_UPMIX", b'1'),
             pf_switch_min_t: env_str("STRATA_PF_SWITCH_MIN_T")
                 .map(|v| c_atoll(&v))
@@ -1769,6 +1772,7 @@ unsafe fn run_chunks(
                     (f.hc_bf16_release)(cs, 0, 0);
                     (f.hc_bf16_release)(cs, 1, 0);
                 }
+                let mut fold_pending = false;
                 if half == 0 && !is_qsa(l) {
                     // ======================= GDN =======================
                     let wqkv = host.weight(&f, m.wt, l, "attn_qkv.weight")?;
@@ -2173,8 +2177,40 @@ unsafe fn run_chunks(
                     }
                     let pools: TkP2AttnPools = if staged { stage_pools } else { st.attn };
                     c.pt.mark(PF_QSA_ATTN, cs);
+                    let ld_a = if e.pf_pad && t_n >= e.pf_switch_min_t.max(64) {
+                        zv + ZV_PAD
+                    } else {
+                        0
+                    };
                     let mut fnp_done = false;
-                    if !e.prompt_attn_old && e.fnp_tile_attn && t_n >= e.pf_switch_min_t {
+                    // W2 A7: the output gate fused into the attention epilogue (bitwise gate_attn's result); not with
+                    // the FWHT-rotated KV (the output is un-rotated before the gate) nor the other attention paths
+                    let mut gated = false;
+                    if !e.prompt_attn_old
+                        && !(e.fnp_tile_attn && t_n >= e.pf_switch_min_t)
+                        && st.kv_rot == 0
+                        && st.kv_hybrid == 0
+                    {
+                        gated = (f.prompt_attn_gated)(
+                            m.q,
+                            &pools,
+                            m.sel_ids,
+                            m.steps_dev,
+                            m.cap,
+                            &s,
+                            m.qf,
+                            m.attn_h,
+                            ld_a,
+                            t_n,
+                            cs,
+                        ) != 0;
+                        fnp_done = gated;
+                    }
+                    if !fnp_done
+                        && !e.prompt_attn_old
+                        && e.fnp_tile_attn
+                        && t_n >= e.pf_switch_min_t
+                    {
                         fnp_done = (f.fnp_tile_attn)(
                             m.q,
                             &pools,
@@ -2223,12 +2259,9 @@ unsafe fn run_chunks(
                         (f.fwht256)(m.attn, t_n * qh, cs);
                     }
                     c.pt.mark(PF_QSA, cs);
-                    let ld_a = if e.pf_pad && t_n >= e.pf_switch_min_t.max(64) {
-                        zv + ZV_PAD
-                    } else {
-                        0
-                    };
-                    (f.gate_attn)(m.attn, m.qf, m.attn_h, t_n, cs, ld_a);
+                    if !gated {
+                        (f.gate_attn)(m.attn, m.qf, m.attn_h, t_n, cs, ld_a);
+                    }
                     c.native_proj(
                         &wo,
                         m.attn_h,
@@ -2458,7 +2491,16 @@ unsafe fn run_chunks(
                     } else {
                         std::ptr::null_mut()
                     };
-                    (f.moe_combine)(m.dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, t_n, cs, row_sd);
+                    // the combine waits for the write below when the two can share one launch
+                    fold_pending = e.moe_fold
+                        && row_sd.is_null()
+                        && dump_dir.is_none()
+                        && (m.dm as usize | m.shared as usize) & 15 == 0;
+                    if !fold_pending {
+                        (f.moe_combine)(
+                            m.dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, t_n, cs, row_sd,
+                        );
+                    }
                 }
                 // ---- the hyper-connection write, fused with the next half's norm where it can be
                 let nl = if half == 0 { l } else { l + 1 };
@@ -2494,7 +2536,46 @@ unsafe fn run_chunks(
                 } else {
                     None
                 };
+                if fold_pending && (wnn.is_none() || cv_fused || hc16) {
+                    fold_pending = false;
+                    (f.moe_combine)(
+                        m.dm,
+                        m.slot_dev,
+                        m.w,
+                        m.shared,
+                        m.sg,
+                        m.bo,
+                        t_n,
+                        cs,
+                        std::ptr::null(),
+                    );
+                }
                 match wnn {
+                    Some(wnn) if fold_pending => {
+                        static SAID_FOLD: AtomicBool = AtomicBool::new(false);
+                        if !SAID_FOLD.swap(true, Ordering::Relaxed) {
+                            eprintln!("talus: prompt MoE combine + HC write in one launch");
+                        }
+                        (f.moe_write_norm_rs)(
+                            m.dm,
+                            m.slot_dev,
+                            m.w,
+                            m.shared,
+                            m.sg,
+                            m.r,
+                            m.inj,
+                            hc,
+                            wnn.data.cast(),
+                            eps,
+                            m.grs,
+                            m.xn16,
+                            t_n,
+                            cs,
+                            m.xn16_lo,
+                            ldx,
+                        );
+                        normed = true;
+                    }
                     Some(wnn) if cv_fused => {
                         (f.gr_write_cvec_norm_rs)(
                             m.r,
@@ -2889,6 +2970,23 @@ unsafe fn moe_grouped<'b>(
     let mut gg_slots = [0usize; MMQ_GROUP];
     let mut gg_nslots = 0usize;
     let tail = fm.tail_off != 0;
+    // a group whose experts are all resident is read in place instead of gathered (the same bytes: gate + up
+    // contiguous in the blob, and the K tail's blocks past a row's end are skipped). Not with ring slots: their release
+    // events are tied to the gather. Reads stay MMQ_TAIL inside the arena, or the group is gathered.
+    let inplace_layer = group_gather
+        && !tail
+        && !m.cache.is_null()
+        && fm.up_off == gub / 2
+        && (fm.up_off | fm.down_off | gub | db) % 16 == 0
+        && (f.mmq_fp4_activations)(x.gt) == 0
+        && (f.mmq_fp4_activations)(x.dt) == 0
+        && (f.mmq_inplace_ok)(x.gt, 2 * ff, nn) != 0
+        && (f.mmq_inplace_ok)(x.dt, nn, ff) != 0;
+    let arena_end = if inplace_layer {
+        (f.cache_device_end)(m.cache) as usize
+    } else {
+        0
+    };
 
     // the open group's experts gathered in one launch (or one at a time where the group launch declines)
     macro_rules! flush {
@@ -2972,6 +3070,9 @@ unsafe fn moe_grouped<'b>(
                 let q = j % MMQ_GROUP;
                 let last_of_group = q + 1 == MMQ_GROUP || j + 1 == n_ord;
                 let mut gathered = true;
+                let mut in_place = false;
+                let mut each_gu: [*const c_void; MMQ_GROUP] = [std::ptr::null(); MMQ_GROUP];
+                let mut each_d: [*const c_void; MMQ_GROUP] = [std::ptr::null(); MMQ_GROUP];
                 if group_gather {
                     gg_blob[q] = blob_dev;
                     gg_n = q as i32 + 1;
@@ -2982,7 +3083,22 @@ unsafe fn moe_grouped<'b>(
                     if !last_of_group {
                         gathered = false;
                     } else {
-                        flush!(MMQ_TAIL);
+                        in_place = inplace_layer
+                            && gg_nslots == 0
+                            && gg_first == 0
+                            && gg_blob[..gg_n as usize].iter().all(|&b| {
+                                (b as usize) % 16 == 0
+                                    && (b as usize) + (fm.down_off + db + MMQ_TAIL) as usize
+                                        <= arena_end
+                            });
+                        if in_place {
+                            for i in 0..gg_n as usize {
+                                each_gu[i] = gg_blob[i].cast();
+                                each_d[i] = gg_blob[i].add(fm.down_off as usize).cast();
+                            }
+                        } else {
+                            flush!(MMQ_TAIL);
+                        }
                         gg_blob = [std::ptr::null(); MMQ_GROUP];
                         gg_first = 0;
                         gg_n = 0;
@@ -3038,29 +3154,50 @@ unsafe fn moe_grouped<'b>(
                             .max()
                             .unwrap_or(0);
                         c.pt.mark(PF_GEMM_GU, cs);
-                        (f.mmq_product)(
-                            m.mmq_ctx,
-                            m.grp_gu.cast(),
-                            x.gt,
-                            2 * ff,
-                            nn,
-                            gub,
-                            ngx,
-                            m.xq,
-                            m.bounds_dev.add(j0),
-                            m.ids_identity,
-                            tk as i64,
-                            maxr,
-                            m.gu,
-                            2 * ff,
-                            if (f.mmq_fp4_activations)(x.gt) != 0 {
-                                m.xscale
-                            } else {
-                                std::ptr::null()
-                            },
-                            1,
-                            cs,
-                        );
+                        if in_place {
+                            if (f.mmq_product_each)(
+                                each_gu.as_ptr(),
+                                x.gt,
+                                2 * ff,
+                                nn,
+                                ngx,
+                                m.xq,
+                                m.bounds_dev.add(j0),
+                                m.ids_identity,
+                                tk as i64,
+                                maxr,
+                                m.gu,
+                                2 * ff,
+                                cs,
+                            ) == 0
+                            {
+                                return Err("prefill: the in-place gate/up product failed".into());
+                            }
+                        } else {
+                            (f.mmq_product)(
+                                m.mmq_ctx,
+                                m.grp_gu.cast(),
+                                x.gt,
+                                2 * ff,
+                                nn,
+                                gub,
+                                ngx,
+                                m.xq,
+                                m.bounds_dev.add(j0),
+                                m.ids_identity,
+                                tk as i64,
+                                maxr,
+                                m.gu,
+                                2 * ff,
+                                if (f.mmq_fp4_activations)(x.gt) != 0 {
+                                    m.xscale
+                                } else {
+                                    std::ptr::null()
+                                },
+                                1,
+                                cs,
+                            );
+                        }
                         if x.native && tail {
                             (f.mmq_swiglu_scaled)(
                                 m.gu.add((r0 * 2 * ff) as usize),
@@ -3096,29 +3233,50 @@ unsafe fn moe_grouped<'b>(
                             m.hscale,
                         );
                         let dbounds = m.bounds_dev.add(n_ord + 1 + g * (MMQ_GROUP + 1));
-                        (f.mmq_product)(
-                            m.mmq_ctx,
-                            m.grp_d.cast(),
-                            x.dt,
-                            nn,
-                            ff,
-                            db,
-                            ngx,
-                            m.hq,
-                            dbounds,
-                            m.ids_identity,
-                            nr,
-                            maxr,
-                            m.dm.add((r0 * nn) as usize),
-                            nn,
-                            if (f.mmq_fp4_activations)(x.dt) != 0 {
-                                m.hscale
-                            } else {
-                                std::ptr::null()
-                            },
-                            1,
-                            cs,
-                        );
+                        if in_place {
+                            if (f.mmq_product_each)(
+                                each_d.as_ptr(),
+                                x.dt,
+                                nn,
+                                ff,
+                                ngx,
+                                m.hq,
+                                dbounds,
+                                m.ids_identity,
+                                nr,
+                                maxr,
+                                m.dm.add((r0 * nn) as usize),
+                                nn,
+                                cs,
+                            ) == 0
+                            {
+                                return Err("prefill: the in-place down product failed".into());
+                            }
+                        } else {
+                            (f.mmq_product)(
+                                m.mmq_ctx,
+                                m.grp_d.cast(),
+                                x.dt,
+                                nn,
+                                ff,
+                                db,
+                                ngx,
+                                m.hq,
+                                dbounds,
+                                m.ids_identity,
+                                nr,
+                                maxr,
+                                m.dm.add((r0 * nn) as usize),
+                                nn,
+                                if (f.mmq_fp4_activations)(x.dt) != 0 {
+                                    m.hscale
+                                } else {
+                                    std::ptr::null()
+                                },
+                                1,
+                                cs,
+                            );
+                        }
                         if x.native && tail {
                             // s_down: applied by the combine
                             (f.mmq_down_row_scales)(

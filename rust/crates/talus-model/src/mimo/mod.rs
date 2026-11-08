@@ -224,6 +224,19 @@ impl ModelAdapter for MimoAdapter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn df_ring_k18() {
+        use super::engine::mimo_df_ring;
+        // shipped: swa_stride 16512 (16384 + 128), ub 2048, window 1024 -> 19,968 rows, not the context
+        assert_eq!(mimo_df_ring(262144, 16512, 2048, 1024), 19968);
+        assert_eq!(mimo_df_ring(196608, 16512, 2048, 1024), 19968);
+        // never above the context
+        assert_eq!(mimo_df_ring(8192, 8192, 2048, 1024), 8192);
+        // covers rollback + one chunk + window
+        let r = mimo_df_ring(1 << 20, 16512, 4096, 2048);
+        assert!(r >= 16384 + 4096 + 2048 + 128 && r % 256 == 0);
+    }
+
     use super::*;
     use std::io::Cursor;
     use std::sync::Arc;
@@ -420,7 +433,7 @@ mod tests {
         // 1. Verify `Budget::for_mimo_11gib(None)` configures the 11 GiB floor.
         let default_budget = Budget::for_mimo_11gib(None);
         assert_eq!(default_budget.floor_bytes(), MIMO_FLOOR_BYTES);
-        assert_eq!(MIMO_FLOOR_BYTES, 11 * GIB);
+        assert_eq!(MIMO_FLOOR_BYTES, 8 * GIB + 512 * 1024 * 1024);
 
         // 2. Verify reservation ordering: `Weights` and `KvCache` are reserved strictly BEFORE `hipMalloc`.
         let avail_20gib = 20 * GIB;
@@ -453,16 +466,16 @@ mod tests {
         ));
 
         // 3. Verify that attempting to reserve when `MemAvailable` would drop below 11 GiB fails with `OutOfMemory`.
-        let avail_11_5_gib = 11 * GIB + 512 * 1024 * 1024;
+        let avail_11_5_gib = MIMO_FLOOR_BYTES + 512 * 1024 * 1024;
         let tight_budget = Arc::new(Budget::for_mimo_11gib(Some(avail_11_5_gib)));
         let err = MimoBudgetGuard::reserve_before_hip_malloc(
             tight_budget,
-            GIB, // 1 GiB weights -> remaining 10.5 GiB < 11 GiB floor!
+            GIB, // 1 GiB weights -> 0.5 GiB under the floor
             64 * 1024 * 1024,
             0,
             16 * 1024 * 1024,
         )
-        .expect_err("must reject reservation that breaches 11 GiB floor");
+        .expect_err("must reject reservation that breaches the floor");
 
         match err {
             CoreError::OutOfMemory {
@@ -648,5 +661,49 @@ mod tests {
             .capture(gb.key.clone(), &mut gb)
             .expect("capture graph");
         assert_eq!(gb.recorded_nodes, 48);
+    }
+
+    #[test]
+    fn prompt_end_logits_survive_only_a_rollback_to_the_prompt_end() {
+        // an exact resend may reuse the last prompt row's logits only while rows [0, end) are still
+        // the ones the prompt pass wrote.
+        use crate::mimo::engine::GIB;
+        let mut engine = MimoEngine::new_synthetic(
+            MimoHparams::synthetic_tiny(),
+            MimoEngineConfig::default(),
+            Some(24 * GIB),
+        )
+        .expect("create synthetic engine");
+        engine.reset();
+        let prompt: Vec<i32> = (1..=12).collect();
+        let last = engine
+            .forward_prefill_chunk(&prompt, true)
+            .expect("prefill")
+            .expect("last-row logits");
+        assert_eq!(engine.n_pos(), 12);
+        engine.set_prompt_end_logits(12, &last);
+        assert_eq!(engine.prompt_end_logits(12), Some(&last[..]));
+        assert!(engine.prompt_end_logits(11).is_none());
+        // generation past the prompt end, then the rollback an exact resend does
+        engine.forward_prefill_chunk(&[7], true).expect("decode 1");
+        engine
+            .forward_prefill_chunk(&[8, 9], true)
+            .expect("decode 2");
+        assert_eq!(engine.prompt_end_logits(12), Some(&last[..]));
+        engine.rollback_kv_to(12);
+        assert_eq!(engine.n_pos(), 12);
+        assert_eq!(engine.prompt_end_logits(12), Some(&last[..]));
+        // a rollback below the end drops them: row 11 is read again
+        engine.rollback_kv_to(11);
+        assert!(engine.prompt_end_logits(12).is_none());
+        engine.forward_prefill_chunk(&[12], true).expect("re-read");
+        assert!(engine.prompt_end_logits(12).is_none());
+        // only an end equal to n_pos is recorded; reset drops them
+        engine.set_prompt_end_logits(11, &last);
+        assert!(engine.prompt_end_logits(11).is_none());
+        engine.set_prompt_end_logits(12, &last);
+        assert!(engine.prompt_end_logits(12).is_some());
+        engine.reset();
+        assert!(engine.prompt_end_logits(12).is_none());
     }
 }

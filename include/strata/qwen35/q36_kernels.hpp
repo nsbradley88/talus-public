@@ -76,6 +76,12 @@ struct GdnPend {
 
 extern bool g_attn_w8;
 extern int g_attn_red;   // k_attn_wmma softmax reduction (TALUS_ATTN_RED, default 3; same bits)
+// w2: f16 reader load structure (TALUS_ATTN_PF; 0 = k_attn_wmma, 1..kAttPfMax = k_attn_wmma_pf variants, bitwise)
+constexpr int kAttPfMax = 11;   // 11 = the default: variant 5 for T 3-6, else 1
+extern int g_attn_pf;
+void launch_attn_wmma_pf(int var, dim3 grid, cudaStream_t st, const float* q, const __half* kc, const __half* vt,
+                         const int32_t* pos0, int T, int H, int HKV, int ctx, int vt_ctx, float sc, int chunk,
+                         int n_chunk, float* pacc, float* pm, float* pl, int r0, int ngrp);
 
 void launch_rms(int rows, cudaStream_t st, const float* x, const float* w, float* y, int n, float eps,
                 void* q8 = nullptr);

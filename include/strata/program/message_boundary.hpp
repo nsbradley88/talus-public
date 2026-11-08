@@ -23,12 +23,15 @@ inline int64_t message_checkpoint_boundary(const std::vector<int64_t>& ids, int6
 // --prompt-cache-every tokens), so a raw /completion prompt without a turn token kept none: the same prompt again, a
 // longer one, or a /slots restore of it reused 0 tokens.  Returns n - 1, or -1 when a checkpoint of this request is
 // within --short-read tokens of the end already (a chat prompt: its turn checkpoint) or there is no conversation cache.
+// `resumed_checkpoint`: the checkpoint this request mounted (0 = none, or it resumed from the live state, which is not
+// kept): it counts as near too.  A chat prompt sent again resumes at its turn checkpoint with no turn left to read, and
+// an extra checkpoint at n - 1 would move where the next turn of that chat resumes, and so change that turn's output.
 inline int64_t prompt_end_checkpoint(int64_t n, int64_t turn_at, int64_t root_at, int64_t message_at, int64_t pin_at,
-        int prompt_cache, bool req_ckpt, int64_t short_read) {
+        int prompt_cache, bool req_ckpt, int64_t short_read, int64_t resumed_checkpoint) {
     const int64_t end = n - 1;
     if (prompt_cache <= 0 || !req_ckpt || end < 1) return -1;
     int64_t nearest = 0;
-    for (const int64_t c : {turn_at, root_at, message_at, pin_at})
+    for (const int64_t c : {turn_at, root_at, message_at, pin_at, resumed_checkpoint})
         if (c <= end && c > nearest) nearest = c;
     return end - nearest > (short_read > 0 ? short_read : 0) ? end : -1;
 }

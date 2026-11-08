@@ -298,6 +298,8 @@ pub struct Engine {
     tail_hint: Option<usize>,
     // rd-swa-laguna: per layer, positions whose sliding-window K / V a pruned prefill did not write (sorted, disjoint)
     tail_stale: Vec<Vec<(usize, usize)>>,
+    /// padded router rows (TALUS_ROUTER_PAD; released on drop)
+    _rowpad: crate::rowpad::RowPad,
 }
 
 // SAFETY: Engine owns its HIP stream, graphs, and device allocations.
@@ -835,6 +837,24 @@ impl Engine {
                     .unwrap_or(true),
                 tail_hint: None,
                 tail_stale: Vec::new(),
+                _rowpad: crate::rowpad::RowPad::register(
+                    &tk,
+                    &m.layers
+                        .iter()
+                        .filter(|l| {
+                            !l.router_inp.dev.is_null()
+                                && l.router_inp.qtype == talus_core_api::QuantType::F32
+                        })
+                        .map(|l| {
+                            (
+                                l.router_inp.dev as *const c_void,
+                                l.router_inp.n_out,
+                                l.router_inp.n_in * 4,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    true,
+                ),
             })
         })();
 
@@ -1356,6 +1376,17 @@ impl Engine {
     #[inline]
     pub fn is_sparse(&self) -> bool {
         self.sparse
+    }
+
+    /// Widest verify window at `pos` whose rows all take the attention a decode step at their position takes:
+    /// a row is block-sparse from position `sp_min - 1` (`pos + 1 >= sp_min`).
+    pub fn window_before_sparse(&self, pos: usize) -> usize {
+        let first_sparse = (self.sp_min.max(1) - 1) as usize;
+        if self.sparse && pos < first_sparse {
+            (first_sparse - pos).min(K_MAX_VERIFY)
+        } else {
+            K_MAX_VERIFY
+        }
     }
 
     #[inline]

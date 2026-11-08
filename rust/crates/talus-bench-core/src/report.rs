@@ -314,11 +314,11 @@ pub fn report_md(c: &ReportCtx) -> String {
                     "all_pass" => "every case passes".to_string(),
                     "identity" => "every answer byte-identical".to_string(),
                     "kld_topk" => {
+                        // the resolved limits (config, per-model or generic); top-1 and the source are in the notes
                         let k = &c.cfg.quality_gates.kld_topk;
                         format!(
-                            "mean <= {}, top-1 >= {}%{}",
-                            k.max_mean,
-                            k.min_top1_pct,
+                            "mean <= {}{}",
+                            t.target,
                             if k.enforce { "" } else { " (WARN only)" }
                         )
                     }

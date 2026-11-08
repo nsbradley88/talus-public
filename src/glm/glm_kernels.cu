@@ -14,6 +14,7 @@
 
 #include "talus_glm_kernels.h"
 #include "strata/kernels/glm_spike_kernels.hpp"
+#include "strata/kernels/rowpad.hpp"
 
 namespace {
 
@@ -753,11 +754,11 @@ __global__ void k_gather_rows(const uint8_t* __restrict__ src, size_t row_bytes,
 // y[t][r] = W[r] . x[t] for T <= 8 tokens: one wave per row, float4 loads (4 in flight), weights read once
 template <int T, bool PF = false>
 __global__ __launch_bounds__(256) void k_f32mv(const float* __restrict__ W, const float* __restrict__ x,
-                                               float* __restrict__ y, int n_in, int n_out) {
+                                               float* __restrict__ y, int n_in, int n_out, int64_t ld) {
     const int r = blockIdx.x * 8 + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31;
     if (r >= n_out) return;
-    const float4* w4 = reinterpret_cast<const float4*>(W + (size_t) r * n_in);
+    const float4* w4 = reinterpret_cast<const float4*>(W + (size_t) r * ld);   // ld >= n_in (same bits)
     float acc[T];
 #pragma unroll
     for (int t = 0; t < T; ++t) acc[t] = 0.0f;
@@ -3094,22 +3095,24 @@ int tkg_f32_matvec(const float* W, const float* x, float* y, int n_in, int n_out
     }
     if (n_in % 4 || T < 1 || T > 8) return err(hipErrorInvalidValue);
     const dim3 g((n_out + 7) / 8);
+    int64_t ld;
+    const float* Wp = strata::kernels::rowpad_lookup(W, n_in, n_out, &ld);   // the padded router rows (same bits)
     static const bool f32pf = [] { const char* e = std::getenv("GLM_F32MV_PF"); return !e || e[0] != '0'; }();
     if (f32pf && T <= 4 && n_in >= 1024) {   // batched loads (bitwise)
         switch (T) {
-            case 1: hipLaunchKernelGGL((k_f32mv<1, true>), g, dim3(256), 0, S(s), W, x, y, n_in, n_out); break;
-            case 2: hipLaunchKernelGGL((k_f32mv<2, true>), g, dim3(256), 0, S(s), W, x, y, n_in, n_out); break;
-            case 3: hipLaunchKernelGGL((k_f32mv<3, true>), g, dim3(256), 0, S(s), W, x, y, n_in, n_out); break;
-            default: hipLaunchKernelGGL((k_f32mv<4, true>), g, dim3(256), 0, S(s), W, x, y, n_in, n_out); break;
+            case 1: hipLaunchKernelGGL((k_f32mv<1, true>), g, dim3(256), 0, S(s), Wp, x, y, n_in, n_out, ld); break;
+            case 2: hipLaunchKernelGGL((k_f32mv<2, true>), g, dim3(256), 0, S(s), Wp, x, y, n_in, n_out, ld); break;
+            case 3: hipLaunchKernelGGL((k_f32mv<3, true>), g, dim3(256), 0, S(s), Wp, x, y, n_in, n_out, ld); break;
+            default: hipLaunchKernelGGL((k_f32mv<4, true>), g, dim3(256), 0, S(s), Wp, x, y, n_in, n_out, ld); break;
         }
         return last();
     }
     switch (T) {
-        case 1: hipLaunchKernelGGL((k_f32mv<1>), g, dim3(256), 0, S(s), W, x, y, n_in, n_out); break;
-        case 2: hipLaunchKernelGGL((k_f32mv<2>), g, dim3(256), 0, S(s), W, x, y, n_in, n_out); break;
-        case 3: hipLaunchKernelGGL((k_f32mv<3>), g, dim3(256), 0, S(s), W, x, y, n_in, n_out); break;
-        case 4: hipLaunchKernelGGL((k_f32mv<4>), g, dim3(256), 0, S(s), W, x, y, n_in, n_out); break;
-        default: hipLaunchKernelGGL((k_f32mv<8>), g, dim3(256), 0, S(s), W, x, y, n_in, n_out); break;  // T 5..8
+        case 1: hipLaunchKernelGGL((k_f32mv<1>), g, dim3(256), 0, S(s), Wp, x, y, n_in, n_out, ld); break;
+        case 2: hipLaunchKernelGGL((k_f32mv<2>), g, dim3(256), 0, S(s), Wp, x, y, n_in, n_out, ld); break;
+        case 3: hipLaunchKernelGGL((k_f32mv<3>), g, dim3(256), 0, S(s), Wp, x, y, n_in, n_out, ld); break;
+        case 4: hipLaunchKernelGGL((k_f32mv<4>), g, dim3(256), 0, S(s), Wp, x, y, n_in, n_out, ld); break;
+        default: hipLaunchKernelGGL((k_f32mv<8>), g, dim3(256), 0, S(s), Wp, x, y, n_in, n_out, ld); break;  // T 5..8
     }
     return last();
 }

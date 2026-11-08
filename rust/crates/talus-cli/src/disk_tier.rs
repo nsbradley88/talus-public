@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use talus_state::disk::{
-    DiskCache, DiskCacheConfig, DiskIdentity, IdentityBuilder, ARGS_NOT_IN_IDENTITY,
+    DiskCache, DiskCacheConfig, DiskIdentity, IdentityBuilder, StageMode, ARGS_NOT_IN_IDENTITY,
 };
 use talus_state::{q36_disk, q36_kv_bytes, q36_state_bytes, Q36LayerStateView};
 
@@ -105,7 +105,7 @@ pub(crate) fn open_with(dc: DiskCacheConfig, id: DiskIdentity) -> Option<DiskCac
 /// Before the RAM restore: if the disk holds a deeper restore point for `ids`, load it into the RAM tier.
 pub(crate) fn restore_into_ram(
     me: &mut Q36StdioBackend,
-    view: &Q36LayerStateView,
+    view: &mut Q36LayerStateView,
     ids: &[i32],
     gridc: bool,
 ) {
@@ -132,6 +132,57 @@ pub(crate) fn restore_into_ram(
         return;
     }
     let t0 = Instant::now();
+    let kv_need = talus_state::q36_kv_bytes(view, e.tokens.len() as i32, 0) as u64;
+    let avail = talus_state::disk::mem_available_effective();
+    let no_room = pc.acct_peer.is_none()
+        && pc.mem_floor > 0
+        && avail.is_some_and(|a| a < kv_need + pc.mem_floor);
+    // the staged load holds the whole entry in host memory while the stash is allocated: stream when both do not
+    // fit above the stash floor (found on the desktop: the staged read left too little for the stash, the import failed)
+    let stream_stash = disk.should_stream_load(&e)
+        || (pc.mem_floor > 0 && avail.is_some_and(|a| a < e.bytes + kv_need + pc.mem_floor));
+    if no_room {
+        // : no room for a RAM-tier stash (64 GB at 128K): load the entry straight into the live KV and make it
+        // the live sequence; the regular restore then resumes from its snapshot without a KV copy
+        match q36_disk::load_direct(pc, view, disk, &e) {
+            Ok((ok, pf, bytes, read_ms)) => {
+                live.clear();
+                *live_pf = 0;
+                if ok {
+                    live.extend_from_slice(&e.tokens);
+                    *live_pf = pf.min(live.len());
+                }
+                eprintln!(
+                    "talus-pcache: disk hit {n} tokens (RAM tier had {ram_n}), {:.1} MiB streamed into the live KV in \
+                     {:.1} ms (no room for a stash), {} in {:.1} ms",
+                    bytes as f64 / (1u64 << 20) as f64,
+                    read_ms,
+                    if ok { "restored" } else { "snapshot import FAILED" },
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            Err(err) => {
+                live.clear();
+                *live_pf = 0;
+                eprintln!("talus-pcache: disk entry skipped ({err}); the KV cells were partly overwritten: cold start");
+            }
+        }
+        return;
+    }
+    if stream_stash {
+        // : the KV stash goes from the file to its device buffer one chunk at a time (no host copy)
+        match q36_disk::load_import_streamed(pc, view, disk, &e) {
+            Ok((ok, bytes, read_ms)) => eprintln!(
+                "talus-pcache: disk hit {n} tokens (RAM tier had {ram_n}), {:.1} MiB streamed in {:.1} ms, {} in {:.1} ms",
+                bytes as f64 / (1u64 << 20) as f64,
+                read_ms,
+                if ok { "restored to the RAM tier" } else { "import FAILED" },
+                t0.elapsed().as_secs_f64() * 1000.0
+            ),
+            Err(err) => eprintln!("talus-pcache: disk entry skipped ({err})"),
+        }
+        return;
+    }
     match disk.load(&e) {
         Ok(l) => {
             let read_ms = l.ms;
@@ -165,6 +216,10 @@ pub(crate) fn save_after_turn(me: &mut Q36StdioBackend) {
     let view = make_layer_state_view(&mut me.eng);
     me.pc.stash_kv_with_pf(&view, &me.live, 0, me.live_pf);
     let Some(plan) = q36_disk::plan_export(&me.pc, &me.live, min) else {
+        // : no stash of this conversation (it did not fit beside the floor): write from the live KV
+        if me.pc.acct_peer.is_none() {
+            save_live(me, &view, min, t0);
+        }
         return;
     };
     let ids = &me.pc.stashes[plan.stash].ids;
@@ -177,15 +232,33 @@ pub(crate) fn save_after_turn(me: &mut Q36StdioBackend) {
     if on_disk {
         return;
     }
-    if let Err(e) = disk.can_stage(plan.bytes) {
-        eprintln!("talus-pcache: disk write skipped ({e})");
-        return;
-    }
+    // : when the whole host copy would cross the memory floor (64 GB at 128K context), stream the entry
+    let mode = match disk.stage_mode(plan.bytes, 0) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("talus-pcache: disk write skipped ({e})");
+            return;
+        }
+    };
     // The next request comes first: if it is already waiting (or arrives while the state is copied off the GPU),
     // this turn is not written; that request's own turn writes a deeper entry.
     let waiting = talus_sched::requests_waiting;
     if waiting() {
         eprintln!("talus-pcache: disk write skipped (next request waiting)");
+        return;
+    }
+    if mode == StageMode::Streamed {
+        match q36_disk::export_streamed(&me.pc, &view, &plan, disk, &waiting) {
+            Ok(e) => eprintln!(
+                "talus-pcache: disk entry {} tokens, {:.1} MiB streamed in {:.0} ms (host staging {} MiB: \
+                 the whole copy would leave less than the memory floor)",
+                d,
+                e.bytes as f64 / (1u64 << 20) as f64,
+                t0.elapsed().as_secs_f64() * 1000.0,
+                talus_state::disk::STREAM_CHUNK >> 20
+            ),
+            Err(e) => eprintln!("talus-pcache: streamed disk write skipped ({e})"),
+        }
         return;
     }
     let Some(job) = q36_disk::export(&me.pc, &view, &plan, &waiting) else {
@@ -228,4 +301,38 @@ pub(crate) fn open_laguna(
     b.u64("ring", ring as u64).u64("ctx16", ctx16 as u64);
     b.process(ARGS_NOT_IN_IDENTITY);
     open_with(dc, b.finish())
+}
+
+/// : [`save_after_turn`] without a RAM-tier stash: stream the entry from the live KV, one layer at a time.
+fn save_live(me: &mut Q36StdioBackend, view: &Q36LayerStateView, min: usize, t0: Instant) {
+    let Some(disk) = me.disk.as_ref() else {
+        return;
+    };
+    let Some(plan) = q36_disk::plan_live(&me.pc, &me.live, me.live_pf, min) else {
+        return;
+    };
+    let d = plan.depth;
+    let live = &me.live;
+    let on_disk = disk
+        .best(|e| {
+            usize::from(e.depth as usize == d && e.tokens.len() >= d && e.tokens[..d] == live[..d])
+        })
+        .is_some();
+    if on_disk {
+        return;
+    }
+    let waiting = talus_sched::requests_waiting;
+    if waiting() {
+        eprintln!("talus-pcache: disk write skipped (next request waiting)");
+        return;
+    }
+    match q36_disk::export_streamed_live(&me.pc, view, live, me.live_pf, &plan, disk, &waiting) {
+        Ok(e) => eprintln!(
+            "talus-pcache: disk entry {} tokens, {:.1} MiB streamed from the live KV in {:.0} ms (no RAM-tier stash)",
+            d,
+            e.bytes as f64 / (1u64 << 20) as f64,
+            t0.elapsed().as_secs_f64() * 1000.0
+        ),
+        Err(e) => eprintln!("talus-pcache: streamed disk write skipped ({e})"),
+    }
 }

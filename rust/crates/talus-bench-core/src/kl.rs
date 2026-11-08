@@ -349,6 +349,64 @@ pub fn topk_kl_stats(xs: &[TopkKl]) -> Option<TopkKlStats> {
     })
 }
 
+/// What a scoring endpoint (E2) reports for one teacher-forced position whose full-vocabulary logits are `x`: the
+/// forced token's logprob and the `k` most likely tokens, from a log-softmax in f64 at temperature 1 (ties to the
+/// smaller id).
+pub fn topk_row_from_logits(x: &[f32], k: usize, forced: u32) -> TopkRow {
+    let ls = log_softmax(x);
+    let mut idx: Vec<u32> = (0..x.len() as u32).collect();
+    let by = |a: &u32, b: &u32| ls[*b as usize].total_cmp(&ls[*a as usize]).then(a.cmp(b));
+    let k = k.min(idx.len());
+    if k > 0 && k < idx.len() {
+        idx.select_nth_unstable_by(k - 1, by);
+    }
+    idx.truncate(k);
+    idx.sort_by(by);
+    TopkRow {
+        id: forced,
+        lp: ls.get(forced as usize).copied().unwrap_or(-9999.0),
+        top: idx.iter().map(|&i| (i, ls[i as usize])).collect(),
+    }
+}
+
+/// The full-vocabulary KL of two dumps next to the `kld_topk` screening KL of the same rows: each row reduced to
+/// what the scoring endpoint would report (`topk_row_from_logits`) and compared with `topk_kl`. This is how the
+/// screening thresholds are derived from the full-vocabulary release KL, per model, on real logits. `forced`:
+/// the teacher-forced token of each compared row (rows `skip..rows`); None takes the base row's argmax, which is in
+/// both lists' union anyway (then the forced token adds nothing).
+pub fn topk_vs_full(
+    a: &[f32],
+    b: &[f32],
+    rows: usize,
+    skip: usize,
+    k: usize,
+    forced: Option<&[u32]>,
+) -> Result<(KlStats, TopkKlStats), String> {
+    let full = kl_stats(a, b, rows, skip)?;
+    let v = a.len() / rows;
+    if let Some(f) = forced {
+        if f.len() != rows - skip {
+            return Err(format!(
+                "{} forced tokens for {} compared rows",
+                f.len(),
+                rows - skip
+            ));
+        }
+    }
+    let mut xs = Vec::with_capacity(rows - skip);
+    for r in skip..rows {
+        let ra = &a[r * v..(r + 1) * v];
+        let rb = &b[r * v..(r + 1) * v];
+        let id = forced.map(|f| f[r - skip]).unwrap_or(argmax(ra) as u32);
+        xs.push(topk_kl(
+            &topk_row_from_logits(ra, k, id),
+            &topk_row_from_logits(rb, k, id),
+        )?);
+    }
+    let tk = topk_kl_stats(&xs).ok_or("no rows")?;
+    Ok((full, tk))
+}
+
 #[cfg(test)]
 // the fixtures are numpy float32 values printed as Python floats (exact in f32)
 #[allow(clippy::excessive_precision)]
@@ -552,6 +610,33 @@ mod tests {
     /// Plain KL over a common support (the reference for the cases where top-k sees the whole distribution).
     fn exact_kl(p: &[f64], q: &[f64]) -> f64 {
         p.iter().zip(q).map(|(a, b)| a * (a / b).ln()).sum()
+    }
+
+    #[test]
+    fn topk_rows_from_full_logits() {
+        // 6 tokens; k = 3 keeps the three largest, sorted, ties to the smaller id
+        let x = [1.0f32, 3.0, 2.0, 3.0, -1.0, 0.0];
+        let r = topk_row_from_logits(&x, 3, 4);
+        let ids: Vec<u32> = r.top.iter().map(|t| t.0).collect();
+        assert_eq!(ids, vec![1, 3, 2]);
+        let ls = log_softmax(&x);
+        assert_eq!(r.lp, ls[4]);
+        assert_eq!(r.top[0].1, ls[1]);
+        // k >= V: the whole distribution, so the screening KL is the full KL
+        let y = [0.5f32, 2.5, 1.0, 2.0, -0.5, 0.3];
+        let (full, tk) = topk_vs_full(&x, &y, 1, 0, 6, None).unwrap();
+        assert!(
+            (full.mean - tk.mean).abs() < 1e-9,
+            "{} vs {}",
+            full.mean,
+            tk.mean
+        );
+        // k < V: close to the full KL when the tail is small, never NaN; identical dumps give 0 for both
+        let (full, tk) = topk_vs_full(&x, &y, 1, 0, 3, Some(&[2])).unwrap();
+        assert!(tk.mean.is_finite() && tk.mean >= 0.0 && full.mean > 0.0);
+        let (full, tk) = topk_vs_full(&x, &x, 1, 0, 3, None).unwrap();
+        assert_eq!((full.mean, tk.mean), (0.0, 0.0));
+        assert!(topk_vs_full(&x, &y, 1, 0, 3, Some(&[1, 2])).is_err());
     }
 
     #[test]

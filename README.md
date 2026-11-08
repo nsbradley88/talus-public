@@ -8,31 +8,34 @@ serves each model through an OpenAI-compatible HTTP API.
 
 ## How fast is it?
 
-The current release is **v0.1.5**, a security patch on v0.1.4
-([release notes](https://github.com/nsbradley88/talus-public/releases)). Its GPU kernel library is byte-identical to
-v0.1.3's and v0.1.4's and its greedy output is identical on all five models, so the figures below, measured on v0.1.3,
-stand for it too.
+The current release is **v0.1.6**: faster prompt processing and code editing on Qwen3.8-Flash-Next, follow-up turns on
+Qwen3.8-27B that reuse the cached reply, greedy output that no longer depends on drafting on GLM-5.3-Flash and
+Laguna-S-2.1, documented request limits, and a warm-up before the server reports ready
+([release notes](https://github.com/nsbradley88/talus-public/releases)). GLM-5.3-Flash replies differ from v0.1.5's,
+including on short prompts; the release notes explain why.
 
-Tokens per second for Talus v0.1.3 (its release candidate 1) on a Ryzen AI Max+ 395 desktop (GMKtec
+Tokens per second for Talus v0.1.6 (its release candidate 3) on a Ryzen AI Max+ 395 desktop (GMKtec
 EVO-X2, 128 GB, about 120 W sustained), end to end through the HTTP server, each model in its shipped configuration.
 `chat` is the sampled chat mix, `code` the coding-prompt mix, `edit` the code-editing mix, `pp2k` / `pp32k` prompt
 processing and `tg32k` generation at about 2K / 32K tokens of context. In brackets: the change from the published
-v0.1.2 tarball, measured in the same session on the same desktop.
+v0.1.5 tarball, measured in the same session on the same desktop. Before each timed run, every weight file was read in
+full and checked against its pinned SHA-256.
 
 | Model | chat | code | edit | pp2k | pp32k | tg32k |
 |---|---|---|---|---|---|---|
-| Qwen3.8-27B | 49.8 (−2.9 %) | 66.7 (−1.8 %) | 122.9 (−0.1 %) | 595 | 544 (−0.2 %) | 39.0 (+7.7 %) |
-| Qwen3.8-Flash-Next | 63.9 (+4.4 %) | 73.9 (+0.1 %) | 144.3 (−0.3 %) | 1,102 | 1,484 (+0.2 %) | 66.3 (+0.8 %) |
-| GLM-5.3-Flash | 34.1 (+0.3 %) | 34.7 (+0.3 %) | 36.6 (0.0 %) | 561 | 567 (0.0 %) | 35.4 (0.0 %) |
-| MiMo-V2.6-Flash | 40.0 (+4.2 %) | 49.3 (0.0 %) | 64.6 (0.0 %) | 734 | 664 (+0.3 %) | 42.5 (0.0 %) |
-| Laguna-S-2.1 | 44.2 (+16.3 %) | 54.6 (+4.4 %) | 122.4 (+20.9 %) | 1,154 | 1,009 (+0.4 %) | 36.7 (+1.4 %) |
+| Qwen3.8-27B | 49.9 (+0.2 %) | 66.8 (+0.1 %) | 123.0 (+0.3 %) | 597 | 546 (+1.1 %) | 39.1 (+0.3 %) |
+| Qwen3.8-Flash-Next | 63.5 (+1.0 %) | 73.6 (0.0 %) | 162.8 (+13.5 %) | 1,271 | 1,659 (+12.2 %) | 65.9 (+0.2 %) |
+| GLM-5.3-Flash | 32.9 (−0.9 %) | 35.0 (+1.4 %) | 35.7 (−1.7 %) | 559 | 569 (+1.8 %) | 35.2 (0.0 %) |
+| MiMo-V2.6-Flash | 40.4 (+0.2 %) | 49.9 (+1.2 %) | 65.3 (+1.2 %) | 728 | 659 (−0.3 %) | 42.9 (+1.2 %) |
+| Laguna-S-2.1 | 43.6 (+0.2 %) | 55.0 (+0.7 %) | 124.1 (+1.4 %) | 1,142 | 1,001 (−0.4 %) | 37.1 (+1.1 %) |
 
-The quality gates (long-context recall, an agentic smoke test on five coding tasks, KL divergence against a reference, a 45-minute soak
-test) ran mostly on our 70 W laptop (HP ZBook Ultra G1a); [docs/RESULTS.md](docs/RESULTS.md) says where each ran. The
-two machines have the same chip but different power limits, so their figures are not comparable with each other.
+The quality gates (long-context recall, an agentic smoke test on five coding tasks, logit rows against a frozen set,
+greedy output with drafts on and off, a 45-minute soak test) ran on both machines: the soaks on the desktop, the others
+mostly on our 70 W laptop (HP ZBook Ultra G1a); [docs/RESULTS.md](docs/RESULTS.md) says where each ran. The two
+machines have the same chip but different power limits, so their figures are not comparable with each other.
 
 How much the 27B's shipped 4-bit weights give up against the full BF16 weights, measured with v0.1.2 on the same
-desktop (not re-measured for v0.1.3):
+desktop (not re-measured since):
 
 | Weights | Size | KL code | top-1 code | code | pp32k | tg32k, no speculation |
 |---|---|---|---|---|---|---|
@@ -65,8 +68,10 @@ the same HTTP client and prompts; package power about 117-120 W for every engine
 
 ¹ Host-specific, cause unknown: the same llama.cpp build and settings give 82.4 on our laptop.
 
-Prompt processing is where Talus still trails: gufo and tubo prefill the 27B's `UD-Q4_K_XL` file faster, and gufo
-prefills Flash-Next 16 % faster at 32K (47 % at 2K). That is the focus of v0.1.6.
+Prompt processing is where Talus v0.1.3 trailed: gufo and tubo prefill the 27B's `UD-Q4_K_XL` file faster, and gufo
+prefilled Flash-Next 16 % faster at 32K (47 % at 2K). This release
+speeds up Flash-Next's prompt processing (the first table above, against v0.1.5); the other engines have not been
+re-measured against it, so this table still shows v0.1.3.
 
 Full tables (edit, 2K cells, time to first token, memory, the v0.1.2 figures from the same session, quality gates):
 [docs/RESULTS.md](docs/RESULTS.md). Every figure there names its machine and build. A model whose release run has not
@@ -90,8 +95,8 @@ In geology, talus is the slope of broken rock that collects at the foot of strat
 | OS | Linux with a ROCm SDK (see [Build](#build)) |
 
 We develop and measure on two machines with the same chip and 128 GB: an HP ZBook Ultra G1a laptop, whose firmware
-limits the APU to 70 W, and a GMKtec EVO-X2 desktop, which holds about 120 W. The v0.1.3 speed figures come from the
-desktop and the quality gates from the laptop; every figure in [docs/RESULTS.md](docs/RESULTS.md) names its machine.
+limits the APU to 70 W, and a GMKtec EVO-X2 desktop, which holds about 120 W. The speed figures come from the
+desktop and most quality gates from the laptop; every figure in [docs/RESULTS.md](docs/RESULTS.md) names its machine.
 Other Strix Halo machines may allow other power limits; we have not measured them.
 
 The kernel library has per-architecture tables keyed by GPU target. Only gfx1151 is tuned. The code also knows
@@ -123,20 +128,21 @@ and downloading a model:
 curl -fsSL https://raw.githubusercontent.com/nsbradley88/talus-public/main/install.sh | bash
 ```
 
-It checks the machine, installs the build tools (asking before it uses `sudo`), Rust and the ROCm SDK, builds
-Talus, and starts `talus setup`: pick models (Qwen3.8-27B is suggested for a first install), download them
+It checks the machine, installs the ROCm SDK and the latest release's prebuilt programs (it checks their SHA-256 and needs no
+compiler, only git, curl and Python 3), and starts `talus setup`: pick models (Qwen3.8-27B is suggested for a first install), download them
 (resumable, checksum-verified), and, for GLM-5.3-Flash and MiMo-V2.6-Flash, set the kernel parameters they need
 (it shows the change and asks; it never reboots). Afterwards `talus doctor` checks and repairs the install,
 `talus update` updates it, and `talus-tui` is the dashboard. Details: [docs/INSTALL-GUIDED.md](docs/INSTALL-GUIDED.md).
 
-To skip the compile, use the prebuilt programs of a [release](https://github.com/nsbradley88/talus-public/releases):
-each release has `talus-<tag>-linux-x86_64-gfx1151.tar.gz` with its `.sha256`, a build manifest and `SHA256SUMS`.
-`TALUS_RELEASE=<tag>` makes the installer download and check it instead of building, and then it installs no
-compiler, CMake, Ninja or Rust (it needs only git, curl and Python 3):
+Each [release](https://github.com/nsbradley88/talus-public/releases) has `talus-<tag>-linux-x86_64-gfx1151.tar.gz` with its
+`.sha256`, a build manifest and `SHA256SUMS`; `TALUS_RELEASE=<tag>` installs a particular one. To compile instead (about 40
+minutes; the installer then also installs a compiler, CMake, Ninja and Rust, asking before it uses `sudo`):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nsbradley88/talus-public/main/install.sh | TALUS_RELEASE=<tag> bash
+curl -fsSL https://raw.githubusercontent.com/nsbradley88/talus-public/main/install.sh | bash -s -- --from-source
 ```
+
+If a machine has no prebuilt programs, the installer says so and compiles.
 
 With `--yes` (no questions) the user service is installed only when you add `--service`; interactive installs still
 offer it. The release notes show how to unpack the tarball by hand; [scripts/release/README.md](scripts/release/README.md)
@@ -230,17 +236,30 @@ and chat UIs connect to it directly.
 
 - **Streaming** with server-sent events.
 - **Tool calls** in the model's own format (Qwen XML, GLM `<arg_key>`/`<arg_value>`, JSON), returned as typed
-  OpenAI or Anthropic tool calls.
+  OpenAI or Anthropic tool calls, for requests that declare tools. A request with no `tools` gets text. With
+  `"tool_call_recovery": true` (the default) a declared tool's `<function=NAME>` without `<tool_call>` around it, or a
+  call missing its `</tool_call>`, still counts as the call.
+- **`max_tokens`** past the context is shortened to the room left. `reasoning_budget_tokens` is ignored, with a warning
+  in the server log.
 - **Thinking control:** `enable_thinking` and `reasoning_effort` through `chat_template_kwargs` or top-level fields,
   or Anthropic's `thinking` object.
 - **Prompt cache:** a new request reuses the longest cached prefix of an earlier conversation and reads only the rest.
-  The usage reports the reused tokens (`usage.prompt_tokens_details.cached_tokens`). A warm answer is normally
-  identical to the same request read cold (see "exact" in [docs/METHODOLOGY.md](docs/METHODOLOGY.md#exact-and-opt-in-numerics)).
-  Known exception: on Qwen3.8-27B, a prompt whose start comes from the cache can give different greedy text than the
-  same prompt read whole (both are valid; see the release notes' known issues).
+  The usage reports the reused tokens (`usage.prompt_tokens_details.cached_tokens`). An exact repeat or resend of a
+  request gives the same answer as reading it cold (checked on Qwen3.8-27B, Qwen3.8-Flash-Next, MiMo-V2.6-Flash and
+  Laguna-S-2.1). Exception: on GLM-5.3-Flash a resend resumes from an earlier cut point and can differ from the cold
+  answer (a known issue in this release). A later turn of a conversation, or a raw
+  prompt that extends an earlier one, can differ from the same text read cold in one go, because the engine splits the
+  prompt at other points; both answers are valid, and the same history gives the same answer every time (see "exact" in
+  [docs/METHODOLOGY.md](docs/METHODOLOGY.md#exact-and-opt-in-numerics)).
 - **Auth:** `Authorization: Bearer <key>` or `x-api-key`, with the key from `TALUS_API_KEY` (or `STRATA_API_KEY`) or `--api-key`.
-- **Engine restart:** if the engine crashes, the next request restarts it, up to 3 times in 10 minutes
-  ([docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)).
+- **Request limits:** a request body may be at most 32 MiB (HTTP 413 past that). A request with more than about
+  1M (2^20) JSON values gets HTTP 400, and so does a `response_format` schema that is too large or too complex to
+  compile; the error says what to reduce. Requests over 1 MiB share a 128 MiB budget while they are being received,
+  room for four full-size requests at once. A request that doesn't fit gets HTTP 503 with `Retry-After`, possibly
+  before its upload has finished; send it again later. Requests of 1 MiB or less never wait for this budget. A stop
+  string may be at most 64 KiB (HTTP 400). At most 64 connections are open at once; more get HTTP 503.
+- **Engine restart:** if the engine crashes, the server restarts it, up to 3 times in 10 minutes
+  ([docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#serving)). A streamed reply cut short by a crash ends with an error event.
 - **Timings:** each response carries prompt and decode timings, as llama.cpp's server does.
 - **Text only:** the models are served as text models. A request with an image, audio or file content part
   (`image_url`, `input_image`, `image`, `input_audio`, `file`, ...) gets HTTP 400 with the error code

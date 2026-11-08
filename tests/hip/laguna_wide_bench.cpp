@@ -103,9 +103,11 @@ int main(int argc, char** argv) {
 
     if (what == "experts" || what == "all") {
         struct EL { Mat g, u, d; };
+        // LWV_DOWN_TYPE=14 benches the Q6_K down layers (default 13 = Q5_K)
+        const int down_type = [] { const char* e = std::getenv("LWV_DOWN_TYPE"); return e ? std::atoi(e) : 13; }();
         std::vector<EL> L;
         for (int p = 0; p < kPools; ++p)
-            L.push_back({make(12, kEmbd, kFf, kExp, rng), make(12, kEmbd, kFf, kExp, rng), make(13, kFf, kEmbd, kExp, rng)});
+            L.push_back({make(12, kEmbd, kFf, kExp, rng), make(12, kEmbd, kFf, kExp, rng), make(down_type, kFf, kEmbd, kExp, rng)});
         void* xq = rand_q8(kEmbd, kMaxN, rng, s);                // a token's normed hidden state (x_group 10)
         void* xff = rand_q8(kFf, kMaxN * kTopK, rng, s);         // one swiglu column per id
         const size_t ysz = (size_t) kMaxN * kTopK * kEmbd;

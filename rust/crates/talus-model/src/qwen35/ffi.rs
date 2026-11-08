@@ -1229,7 +1229,14 @@ pub unsafe fn tk_mmvq_w32_active() -> c_int {
 
 #[inline]
 pub fn tk_mmvq_set_w32(_ctx: *mut tk_ctx, enabled: bool) -> tk_status {
-    set_mmvq_w32(if enabled { 1 } else { 0 }, 0);
+    // w2: pass STRATA_MMVQ_W32_R through (0 = the per-type table). The kernels read it at load, but this call used to
+    // overwrite it with 0, so the documented override silently did nothing on the 27B (rust-port audit).
+    let rows = std::env::var("STRATA_MMVQ_W32_R")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|r| matches!(r, 1 | 2 | 4))
+        .unwrap_or(0);
+    set_mmvq_w32(if enabled { 1 } else { 0 }, rows);
     TK_OK
 }
 

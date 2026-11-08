@@ -1230,7 +1230,7 @@ static bool s26_tsum_on() {
     return on;
 }
 
-// S26 STRATA_LFUSE (PAIR): blocks n_out.. compute the same rows of w2 into y2 (two matrices of one shape on one
+// S26 STRATA_LFUSE (PAIR): blocks n_out.. compute the same rows of y2 (two matrices of one shape on one
 // input in one launch; each output's code is the single matrix's)
 template<typename F, int NCOLS, int NW, int ROWS, bool TS = false, bool PAIR = false>
 __launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))
@@ -1661,11 +1661,13 @@ __global__ void native_q8_1_interleave_kernel(const Q81Block* __restrict__ y, in
 
 #endif  // !__HIPCC__
 
+// native_quantize_q8_1 and native_q8_1_bytes take 32 columns; native_mmvq cuts more than 16 into two calls
+constexpr int kNativeMaxCols = 32;
 void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
     if (n_in <= 0 || n_in % block_elems != 0) {
         throw std::invalid_argument("native MMVQ requires n_in > 0 and divisible by its block element count");
     }
-    if (ncols < 1 || ncols > 16) throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 16");   // (Talus: the wave32 kernels take 16; the others check their own 8)
+    if (ncols < 1 || ncols > kNativeMaxCols) throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 32");   // (Talus: the wave32 kernels take 16; the others check their own 8)
 }
 void validate_pointer(const void* p) {
     if (!p || reinterpret_cast<std::uintptr_t>(p) % 4 != 0) {
@@ -2628,6 +2630,13 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
 
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream) {
+    if (ncols > 16) {   // two calls of <= 16 columns (bitwise across column counts); the q8_1 columns are contiguous
+        const int a = (ncols + 1) / 2;
+        native_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, a, stream);
+        native_mmvq(ggml_type, weights, static_cast<const uint8_t*>(x_q8_1) + std::size_t(a) * native_q8_1_bytes(n_in, 1), y + std::size_t(a) * n_out,
+                    n_in, n_out, ncols - a, stream);
+        return;
+    }
     if (native_mmvq_w32(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // gfx11 (Talus)
     switch (ggml_type) {
     case 2: native_q4_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
@@ -3573,6 +3582,46 @@ template<> struct GxTraits<Q5KTraits> {
     }
 };
 
+// Q6_K (Laguna's 2 Q6_K down layers): raw = Q6KTraits::load's loads (ql/qh words, the two signed
+// scales q6_q8_dot_impl reads, d), act = Q6KTraits::apply's activation loads, decode/apply = the same impl call.
+template<> struct GxTraits<Q6KTraits> {
+    using Block = Q6KBlock;
+    struct R { int vl, vh; int8_t s0, s1; half d; };
+    struct X { int u[2]; float d8[2]; };
+    __device__ static R raw(const Block* __restrict__ b, int iqs) {
+        R r;
+        const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
+        r.vl = load_int_b2(b->ql, iqs);
+        r.vh = load_int_b2(b->qh, 8 * (iqs / 16) + iqs % 8);
+        r.s0 = b->scales[scale_offset];
+        r.s1 = b->scales[scale_offset + 4];
+        r.d = b->d;
+        return r;
+    }
+    __device__ static X act(const Q81Block* __restrict__ x, int iqs) {
+        X a;
+        const int bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            a.u[i] = reinterpret_cast<const int*>(x[bq8_offset + 2 * i].qs)[iqs % 8];
+            a.d8[i] = __low2float(x[bq8_offset + 2 * i].ds);
+        }
+        return a;
+    }
+    struct W { int vl, vh; int8_t sc[8]; float d; };
+    __device__ static W decode(const R& r, int iqs) {
+        W w;
+        const int vh_shift = 2 * ((iqs % 16) / 8);
+        w.vl = r.vl;
+        w.vh = r.vh >> vh_shift;
+        w.sc[0] = r.s0;
+        w.sc[4] = r.s1;
+        w.d = r.d;
+        return w;
+    }
+    __device__ static float apply(const W& w, const X& x) { return q6_q8_dot_impl(w.vl, w.vh, x.u, w.sc, w.d, x.d8); }
+};
+
 template<typename F, int NC, int KI>
 __device__ __forceinline__ void group_rows_pass_v2(const MmvqItem& it, const typename F::Block* __restrict__ w,
                                                    int rb0, int rb1, int tpr, float* partial, const int* cols, int c0,
@@ -3817,16 +3866,21 @@ void native_mmvq_batch(const MmvqItem* items, int n_items, void* stream) {
                 }
                 g.start[g.n] = blocks;
                 const auto st = static_cast<cudaStream_t>(stream);
-                // Q4_K / Q5_K through group_rows_pass_v2 when every item has the same kbx count per lane
+                // Q4_K / Q5_K (and Q6_K) through group_rows_pass_v2 when every item has the same kbx count per lane
                 // (KI = blocks per row / blocks per iteration, 1..3). STRATA_EGROUP_V2=0: the pass above (kill switch).
-                // STRATA_EGROUP_V2_NC: columns per v2 pass (2 / 4 / 8; default 4 for KI >= 2, 8 for KI = 1); every
+                // STRATA_EGROUP_V2_NC: columns per v2 pass (2 / 4 / 8; default 4); every
                 // choice is bitwise the same.
                 static const bool v2_on = [] { const char* e = std::getenv("STRATA_EGROUP_V2"); return !(e && e[0] == '0'); }();
                 static const int v2_nc = [] { const char* e = std::getenv("STRATA_EGROUP_V2_NC"); return e ? std::atoi(e) : 0; }();
+                // the KI = 1 default (down projections) is 4 columns per pass; STRATA_EGROUP_V2_NC1=8
+                // restores 's 8 (bench/A-B toggle; bitwise the same either way).
+                static const int v2_nc1_default = [] { const char* e = std::getenv("STRATA_EGROUP_V2_NC1"); return e && std::atoi(e) == 8 ? 8 : 4; }();
                 int ki = 0;
-                if (v2_on && (type == 12 || type == 13)) {
+                // STRATA_EGROUP_V2_Q6=0 keeps Q6_K on the old pass (A/B toggle)
+                static const bool v2_q6 = [] { const char* e = std::getenv("STRATA_EGROUP_V2_Q6"); return !(e && e[0] == '0'); }();
+                if (v2_on && (type == 12 || type == 13 || (type == 14 && v2_q6))) {
                     for (int j = 0; j < g.n; ++j) {
-                        const int bpi = g.tpr[j] / (type == 12 ? Q4KTraits::T : Q5KTraits::T);
+                        const int bpi = g.tpr[j] / (type == 12 ? Q4KTraits::T : type == 13 ? Q5KTraits::T : Q6KTraits::T);
                         const int bpr = g.it[j].n_in / 256;
                         const int kj = bpi > 0 && bpr % bpi == 0 ? bpr / bpi : 0;
                         if (j == 0) ki = kj; else if (kj != ki) ki = 0;
@@ -3834,7 +3888,7 @@ void native_mmvq_batch(const MmvqItem* items, int n_items, void* stream) {
                     if (ki > 3) ki = 0;
                 }
                 if (ki > 0) {
-                    const int nc2 = v2_nc == 2 || v2_nc == 4 || v2_nc == 8 ? v2_nc : (ki == 1 ? 8 : 4);
+                    const int nc2 = v2_nc == 2 || v2_nc == 4 || v2_nc == 8 ? v2_nc : (ki == 1 ? v2_nc1_default : 4);
 #define STRATA_GROUP_V2(F, K) \
                     if (nc2 == 8) native_mmvq_group_kernel<F, 8, K><<<unsigned(blocks), dim3(WARP, WARPS), 0, st>>>(g); \
                     else if (nc2 == 2) native_mmvq_group_kernel<F, 2, K><<<unsigned(blocks), dim3(WARP, WARPS), 0, st>>>(g); \
@@ -3842,7 +3896,9 @@ void native_mmvq_batch(const MmvqItem* items, int n_items, void* stream) {
 #define STRATA_GROUP_V2_T(F) \
                     switch (ki) { case 1: STRATA_GROUP_V2(F, 1) break; case 2: STRATA_GROUP_V2(F, 2) break; \
                                   default: STRATA_GROUP_V2(F, 3) break; }
-                    if (type == 12) { STRATA_GROUP_V2_T(Q4KTraits) } else { STRATA_GROUP_V2_T(Q5KTraits) }
+                    if (type == 12) { STRATA_GROUP_V2_T(Q4KTraits) }
+                    else if (type == 13) { STRATA_GROUP_V2_T(Q5KTraits) }
+                    else { STRATA_GROUP_V2_T(Q6KTraits) }
 #undef STRATA_GROUP_V2_T
 #undef STRATA_GROUP_V2
                     launch_check();

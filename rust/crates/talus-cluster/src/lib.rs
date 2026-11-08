@@ -14,6 +14,7 @@ pub mod config;
 pub mod frame;
 pub mod ident;
 mod link;
+pub mod spin;
 pub mod transport;
 
 pub use beat::Beat;

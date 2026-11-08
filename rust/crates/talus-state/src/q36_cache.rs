@@ -711,6 +711,10 @@ pub struct Q36PromptCache {
     /// model's bytes on every stage, so each stage's cache takes the same store/evict decisions as one process would
     /// (a stage's own bytes differ). None outside a cluster: unchanged.
     pub acct_peer: Option<Q36LayerStateView>,
+    /// : a new KV stash is only allocated while the host keeps this much memory after it (bytes; 0 = no check).
+    /// Without it, stashing a long conversation at the turn end (6+ GiB at 90K tokens) could take a 64 GB box at
+    /// 128K context past the pressure guard's last-resort limit, and the engine exited.
+    pub mem_floor: u64,
 }
 
 impl Default for Q36PromptCache {
@@ -731,6 +735,49 @@ impl Q36PromptCache {
             max_msg: DEFAULT_MAX_MSG,
             clock: 0,
             acct_peer: None,
+            mem_floor: 0,
+        }
+    }
+
+    /// : whether allocating `need` more device bytes keeps [`Self::mem_floor`]; evicts least recently used stashes
+    /// (they hold device memory too) until it does. False = skip the new stash (logged once per process).
+    fn stash_room(&mut self, need: usize) -> bool {
+        if self.mem_floor == 0 {
+            return true;
+        }
+        loop {
+            let Some(avail) = crate::disk::mem_available_effective() else {
+                return true;
+            };
+            if avail >= need as u64 + self.mem_floor {
+                return true;
+            }
+            if self.stashes.is_empty() {
+                static LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "talus-pcache: KV stash of {} MiB skipped: it would leave {} MiB available, under the {} MiB \
+                         floor (the live KV still serves the conversation; logged once)",
+                        need >> 20,
+                        avail.saturating_sub(need as u64) >> 20,
+                        self.mem_floor >> 20
+                    );
+                }
+                return false;
+            }
+            let old = self
+                .stashes
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| s.used)
+                .map(|(i, _)| i)
+                .unwrap();
+            let removed = self.stashes.remove(old);
+            unsafe {
+                let _ = hipFree(removed.buf.cast::<c_void>());
+            }
+            self.stash_used = self.stash_used.saturating_sub(removed.charge);
         }
     }
 
@@ -833,6 +880,9 @@ impl Q36PromptCache {
                 let _ = hipFree(removed.buf.cast::<c_void>());
             }
             self.stash_used = self.stash_used.saturating_sub(removed.charge);
+        }
+        if !self.stash_room(need) {
+            return;
         }
         let mut raw: *mut c_void = ptr::null_mut();
         if unsafe { hipMalloc(&mut raw, need) }.is_success() {
@@ -969,9 +1019,24 @@ impl Q36PromptCache {
         pf: usize,
         host: &[u8],
     ) -> bool {
+        if host.len() != q36_kv_bytes(eng, ids.len() as i32, 0) {
+            return false;
+        }
+        self.insert_stash_with(eng, ids, pf, |buf| h2d(buf, host, eng.st))
+    }
+
+    /// [`Self::insert_stash_host`] with the device buffer filled by `fill(buf)` : a streamed disk load writes
+    /// it chunk by chunk). The stash is inserted only when `fill` returns true; otherwise the buffer is freed.
+    pub fn insert_stash_with(
+        &mut self,
+        eng: &Q36LayerStateView,
+        ids: &[i32],
+        pf: usize,
+        fill: impl FnOnce(*mut u8) -> bool,
+    ) -> bool {
         let need = q36_kv_bytes(eng, ids.len() as i32, 0);
         let charge = need + self.peer_kv_bytes(ids.len());
-        if need == 0 || host.len() != need || charge > self.stash_budget {
+        if need == 0 || charge > self.stash_budget {
             return false;
         }
         if let Some(i) = self.stashes.iter().position(|s| s.ids.as_slice() == ids) {
@@ -995,12 +1060,15 @@ impl Q36PromptCache {
             }
             self.stash_used = self.stash_used.saturating_sub(removed.charge);
         }
+        if !self.stash_room(need) {
+            return false;
+        }
         let mut raw: *mut c_void = ptr::null_mut();
         if !unsafe { hipMalloc(&mut raw, need) }.is_success() {
             return false;
         }
         let buf = raw.cast::<u8>();
-        if !h2d(buf, host, eng.st) {
+        if !fill(buf) {
             unsafe {
                 let _ = hipFree(raw);
             }
@@ -1093,7 +1161,7 @@ impl Q36PromptCache {
 }
 
 /// Synchronous host-to-device copy on `st`.
-fn h2d(dst: *mut u8, host: &[u8], st: hipStream_t) -> bool {
+pub(crate) fn h2d(dst: *mut u8, host: &[u8], st: hipStream_t) -> bool {
     if host.is_empty() {
         return true;
     }
@@ -1181,6 +1249,86 @@ impl Drop for Q36PromptCache {
                 s.buf = ptr::null_mut();
             }
         }
+    }
+}
+
+// ------------------------------------------------------------------------------------------- : layered KV copy
+
+/// The pieces of the stash layout of `n` positions ([`q36_kv_copy`] with `n0 = 0`): one view per attention layer
+/// (only that layer's K / V / V^T pointers, no DFlash rings), then a view with only the DFlash rings (when present).
+/// Copying each piece through its view writes exactly that piece's bytes of the full stash layout, so the pieces in
+/// order are the stash. Returns `(view, bytes)` per piece.
+pub fn q36_kv_pieces(eng: &Q36LayerStateView, n: i32) -> Vec<(Q36LayerStateView, usize)> {
+    let mut out = Vec::new();
+    let nl = eng.kc.len();
+    let none = |len: usize| vec![ptr::null_mut(); len];
+    for l in 0..nl {
+        if eng.kc[l].is_null() {
+            continue;
+        }
+        let mut v = eng.clone();
+        v.kc = none(nl);
+        v.vc = none(eng.vc.len());
+        v.vtc = none(eng.vtc.len());
+        v.kc[l] = eng.kc[l];
+        if l < eng.vc.len() {
+            v.vc[l] = eng.vc[l];
+        }
+        if l < eng.vtc.len() {
+            v.vtc[l] = eng.vtc[l];
+        }
+        v.dfl_k_ring = Vec::new();
+        v.dfl_v_ring = Vec::new();
+        let b = q36_kv_bytes(&v, n, 0);
+        out.push((v, b));
+    }
+    if !eng.dfl_k_ring.is_empty() {
+        let mut v = eng.clone();
+        v.kc = none(nl);
+        v.vc = none(eng.vc.len());
+        v.vtc = none(eng.vtc.len());
+        let b = q36_kv_bytes(&v, n, 0);
+        out.push((v, b));
+    }
+    out
+}
+
+/// : gather piece `piece` (a view from [`q36_kv_pieces`]) of the stash layout of `n` positions into `staging`.
+pub fn q36_kv_piece_save(piece: &Q36LayerStateView, staging: *mut u8, n: i32) {
+    let _ = q36_kv_copy_range_dfl(piece, staging, n, true, 0, n);
+}
+
+/// : scatter piece `piece` of a stash layout of `n` positions from `staging` into the live KV cells (and the
+/// DFlash rings: the drafter window is set as a stash restore into a fresh engine sets it). Call
+/// [`q36_kv_layered_begin`] first.
+pub fn q36_kv_piece_load(
+    eng: &mut Q36LayerStateView,
+    piece: &Q36LayerStateView,
+    staging: *mut u8,
+    n: i32,
+) {
+    if let Some((vlo, cnt)) = q36_kv_copy_range_dfl(piece, staging, n, false, 0, n) {
+        if cnt > 0 {
+            // as restore_with_pf does for a stash restore from position 0
+            let end = vlo + cnt as i64;
+            eng.dctx_lo = vlo;
+            eng.dctx_hi = end;
+            let top = end + eng.dfl_block as i64;
+            if eng.dctx_lo < top - eng.dfl_ring as i64 {
+                eng.dctx_lo = top - eng.dfl_ring as i64;
+            }
+            if eng.dctx_lo > eng.dctx_hi {
+                eng.dctx_lo = eng.dctx_hi;
+            }
+        }
+    }
+}
+
+/// : before a layered load: the drafter window of whatever the engine held is gone.
+pub fn q36_kv_layered_begin(eng: &mut Q36LayerStateView) {
+    if !eng.dfl_k_ring.is_empty() {
+        eng.dctx_lo = 0;
+        eng.dctx_hi = 0;
     }
 }
 

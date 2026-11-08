@@ -1191,8 +1191,14 @@ pub fn run(
     let mut pair_rows: Vec<(String, PairRow)> = Vec::new();
     let mut scored_pairs: Vec<compare::ScoredPair> = Vec::new();
     let mut verdicts = Vec::new();
-    for (cand_id, rows) in model_rows.iter().skip(1) {
+    for (ci, (cand_id, rows)) in model_rows.iter().enumerate().skip(1) {
         let mut gate_list: Vec<GateResult> = Vec::new();
+        // the served model (per-model kld_topk limits): the candidate's, else the reference's
+        let served = [ci, 0]
+            .iter()
+            .find_map(|&i| fingerprints.get(i)?["server"]["models"][0].as_str())
+            .unwrap_or("")
+            .to_string();
         for r in &resolved {
             let tid = r.task.id();
             if server_task_errors.contains_key(tid) {
@@ -1247,7 +1253,7 @@ pub fn run(
                 gate_list.push(if tid == "perplexity" {
                     gates::ppl_ratio_gate(&sp, g.ppl_ratio, g, req)
                 } else {
-                    gates::kld_topk_gate(&sp, &g.kld_topk, req)
+                    gates::kld_topk_gate(&sp, &g.kld_topk, &served, req)
                 });
                 gated = true;
                 scored_pairs.push(sp);

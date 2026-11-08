@@ -484,7 +484,14 @@ impl IdentityBuilder {
 /// Environment that can change numerics or kernel choice (every variable under these prefixes counts).
 pub const ENV_PREFIXES: &[&str] = &["TALUS_", "STRATA_", "GLM_", "HIPBLASLT_", "ROCBLAS_"];
 /// Environment under those prefixes that does not: the disk tier's own settings and diagnostics logs.
-pub const ENV_NOT_IN_IDENTITY: &[&str] = &["TALUS_PCACHE_", "TALUS_LAGUNA_GENLOG"];
+/// talus-cli mirrors every `TALUS_X` to `STRATA_X` at startup (`apply_env_aliases`), so the `STRATA_` spellings are
+/// excluded too: before, the disk folder, budget and stream switches changed the identity through their mirrors.
+pub const ENV_NOT_IN_IDENTITY: &[&str] = &[
+    "TALUS_PCACHE_",
+    "STRATA_PCACHE_",
+    "TALUS_LAGUNA_GENLOG",
+    "STRATA_LAGUNA_GENLOG",
+];
 /// Shared objects whose build changes numerics (kernel library, HIP runtime, BLAS).
 pub const LIBS_IN_IDENTITY: &[&str] = &["talus", "amdhip64", "hipblaslt", "rocblas"];
 /// Flags that never change what cached bytes mean (cache sizes and locations, serve mode).
@@ -568,6 +575,8 @@ pub enum DiskError {
     Budget(String),
     /// A write is already in flight.
     Busy,
+    /// A streamed write stopped because `abort()` turned true (the next request came first).
+    Aborted,
 }
 
 impl std::fmt::Display for DiskError {
@@ -578,6 +587,7 @@ impl std::fmt::Display for DiskError {
             DiskError::Mismatch(s) => write!(f, "mismatch: {s}"),
             DiskError::Budget(s) => write!(f, "budget: {s}"),
             DiskError::Busy => write!(f, "busy"),
+            DiskError::Aborted => write!(f, "aborted: the next request came first"),
         }
     }
 }
@@ -688,6 +698,14 @@ pub fn fs_space(dir: &Path) -> Option<(u64, u64)> {
 
 /// The free-space floor for a filesystem of `total` bytes.
 pub fn fs_floor(total: u64) -> u64 {
+    // `TALUS_PCACHE_FS_FLOOR_GIB=N` overrides the floor (0 = none): a large disk that is mostly full on purpose, or
+    // a test host whose only filesystem is under the default 10 %
+    if let Some(g) = std::env::var("TALUS_PCACHE_FS_FLOOR_GIB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return g << 30;
+    }
     FS_FLOOR_MIN_BYTES.max(total / 10)
 }
 
@@ -856,6 +874,127 @@ pub fn mem_available_bytes() -> Option<u64> {
     let line = s.lines().find(|l| l.starts_with("MemAvailable:"))?;
     let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
     Some(kb << 10)
+}
+
+/// The memory reading the disk tier checks its floor against ): the process's memory-pressure guard when one is
+/// installed (`MemAvailable` bounded by the cgroup limits and the operator cap `TALUS_MEM_LIMIT_MIB`, minus a
+/// simulated reservation `TALUS_MEM_PRESSURE_SIM_MIB`), else the same probe without the guard, else `MemAvailable`.
+/// Before the tier read `MemAvailable` alone, so a container limit or the 64 GB simulation cap was invisible.
+pub fn mem_available_effective() -> Option<u64> {
+    if let Some(p) = talus_mem::pressure::global() {
+        let a = p.available();
+        if a != u64::MAX {
+            return Some(a);
+        }
+    }
+    use talus_mem::HostMemProbe;
+    let cap = std::env::var("TALUS_MEM_LIMIT_MIB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let probe = talus_mem::LinuxProcMemProbe::new().with_memory_limit_mib(cap);
+    match probe.mem_available_bytes() {
+        Ok(a) => Some(a as u64),
+        Err(_) => mem_available_bytes(),
+    }
+}
+
+/// Host buffer of a streamed write or load ([`DiskCache::write_streamed`], [`DiskCache::load_streamed`]): a multiple
+/// of [`HASH_BLOCK`], so the block hashes of a streamed section are those of [`payload_hash`].
+pub const STREAM_CHUNK: usize = 64 << 20;
+
+/// How a write is staged ([`DiskCache::stage_mode`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageMode {
+    /// Copy the whole entry to host memory, write it on the background thread (the default when it fits).
+    Staged,
+    /// Stream the entry from the device in [`STREAM_CHUNK`] pieces on the calling thread: host memory stays at one
+    /// chunk (the page cache is written back and dropped per chunk). Used when the full copy would cross the floor.
+    Streamed,
+}
+
+/// `TALUS_PCACHE_STREAM`: `1` = always stream (tests), `0` = never (the pre- behaviour: skip), unset = auto.
+fn stream_switch() -> Option<bool> {
+    match std::env::var("TALUS_PCACHE_STREAM").ok()?.trim() {
+        "1" | "on" | "always" => Some(true),
+        "0" | "off" | "never" => Some(false),
+        _ => None,
+    }
+}
+
+#[allow(non_camel_case_types)]
+type off64_t = i64;
+extern "C" {
+    fn sync_file_range(fd: i32, offset: off64_t, nbytes: off64_t, flags: u32) -> i32;
+    fn posix_fadvise(fd: i32, offset: off64_t, len: off64_t, advice: i32) -> i32;
+}
+
+/// Write back `[off, off + len)` of `f` and drop it from the page cache, so a streamed write never holds more than
+/// one chunk of dirty or cached file pages (they would otherwise count against `MemAvailable` until writeback).
+fn writeback_and_drop(f: &File, off: u64, len: u64) {
+    use std::os::fd::AsRawFd;
+    const WAIT_BEFORE: u32 = 1;
+    const WRITE: u32 = 2;
+    const WAIT_AFTER: u32 = 4;
+    const DONTNEED: i32 = 4;
+    // SAFETY: plain syscalls on an open descriptor; failures only cost page-cache residency.
+    unsafe {
+        let _ = sync_file_range(
+            f.as_raw_fd(),
+            off as off64_t,
+            len as off64_t,
+            WAIT_BEFORE | WRITE | WAIT_AFTER,
+        );
+        let _ = posix_fadvise(f.as_raw_fd(), off as off64_t, len as off64_t, DONTNEED);
+    }
+}
+
+/// Drop `[off, off + len)` of a file just read from the page cache (a streamed load).
+fn drop_cached(f: &File, off: u64, len: u64) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: as above.
+    unsafe {
+        let _ = posix_fadvise(f.as_raw_fd(), off as off64_t, len as off64_t, 4);
+    }
+}
+
+/// Block digests of `data`, the `first`-th [`HASH_BLOCK`] block of its section onwards (parallel).
+fn block_digests(data: &[u8], first: usize, out: &mut Vec<u64>) {
+    let nb = data.len().div_ceil(HASH_BLOCK);
+    let base = out.len();
+    out.resize(base + nb, 0);
+    let digests = &mut out[base..];
+    let threads = hash_threads().min(nb.max(1));
+    let per = nb.div_ceil(threads).max(1);
+    std::thread::scope(|s| {
+        for (ci, chunk) in digests.chunks_mut(per).enumerate() {
+            s.spawn(move || {
+                for (j, d) in chunk.iter_mut().enumerate() {
+                    let i = ci * per + j;
+                    let a = i * HASH_BLOCK;
+                    let b = (a + HASH_BLOCK).min(data.len());
+                    *d = xxh64(&data[a..b], (first + i) as u64);
+                }
+            });
+        }
+    });
+}
+
+/// [`payload_hash`] from the digests of a whole section of `len` bytes (an empty section has one empty block).
+fn digests_hash(mut digests: Vec<u64>, len: u64) -> u64 {
+    if digests.is_empty() {
+        digests.push(xxh64(&[], 0));
+    }
+    combine_block_digests(&digests, len)
+}
+
+/// Clears the writer's busy flag (and the in-flight count) when a streamed write ends, however it ends.
+struct StreamBusy<'a>(&'a Shared);
+
+impl Drop for StreamBusy<'_> {
+    fn drop(&mut self) {
+        mark_idle(self.0);
+    }
 }
 
 impl DiskCache {
@@ -1076,7 +1215,7 @@ impl DiskCache {
             )));
         }
         self.space_ok(bytes)?;
-        if let Some(avail) = mem_available_bytes() {
+        if let Some(avail) = mem_available_effective() {
             if avail < bytes.saturating_add(self.cfg.mem_floor_bytes) {
                 return Err(DiskError::Budget(format!(
                     "staging {} MiB would leave less than {} MiB available (now {} MiB)",
@@ -1087,6 +1226,253 @@ impl DiskCache {
             }
         }
         Ok(())
+    }
+
+    /// : how to write an entry of `bytes`: [`StageMode::Staged`] when [`Self::can_stage`] admits the full host
+    /// copy, else [`StageMode::Streamed`] when one [`STREAM_CHUNK`] plus `extra_host` bytes keep the floor (the
+    /// disk budget and free-space checks still apply to the whole entry). The error is the staged refusal when
+    /// streaming is not possible either (or `TALUS_PCACHE_STREAM=0`). `TALUS_PCACHE_STREAM=1` streams whenever
+    /// the staged copy would also be admitted (tests).
+    pub fn stage_mode(&self, bytes: u64, extra_host: u64) -> Result<StageMode, DiskError> {
+        let sw = stream_switch();
+        let staged = self.can_stage(bytes);
+        let budget_refusal = matches!(staged, Err(DiskError::Budget(_)));
+        match (staged.is_ok(), sw) {
+            (true, Some(true)) => return Ok(StageMode::Streamed),
+            (true, _) => return Ok(StageMode::Staged),
+            (false, None | Some(true)) if budget_refusal => {}
+            (false, _) => return staged.map(|_| StageMode::Staged),
+        }
+        let host = STREAM_CHUNK as u64 + extra_host;
+        if bytes > self.cfg.budget_bytes || self.space_ok(bytes).is_err() {
+            return staged.map(|_| StageMode::Staged);
+        }
+        match mem_available_effective() {
+            Some(avail) if avail < host.saturating_add(self.cfg.mem_floor_bytes) => {
+                staged.map(|_| StageMode::Staged)
+            }
+            _ => Ok(StageMode::Streamed),
+        }
+    }
+
+    /// : write an entry on the calling thread, streaming each section from `fill(section, offset, buf)` (fill
+    /// `buf` with that section's bytes at `offset`; false = failed) through one [`STREAM_CHUNK`] host buffer. The
+    /// file is the one the staged writer produces for the same sections (same layout, same block-parallel
+    /// hashes): sections are written at their final offsets as they stream, then the head (with the hashes) and
+    /// the trailer; flushed, renamed and indexed as a staged write is. `abort()` is checked before every chunk: a
+    /// request that arrives meanwhile waits at most one chunk, and the partial temporary is deleted. Holds the
+    /// writer's busy flag (no background write overlaps it) and counts as disk work for the termination handler.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_streamed(
+        &self,
+        tokens: &[i32],
+        meta: &[u8],
+        depth: u64,
+        supersede: bool,
+        sections: &[(u64, u64)],
+        fill: &mut dyn FnMut(usize, u64, &mut [u8]) -> bool,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<DiskEntry, DiskError> {
+        let sh = &*self.shared;
+        if tokens.is_empty() {
+            return Err(DiskError::Budget("empty token list".into()));
+        }
+        if tokens.len() as u64 > MAX_TOKENS || meta.len() as u64 > MAX_META {
+            return Err(DiskError::Budget("entry too large".into()));
+        }
+        if sh
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            sh.stats.skipped_busy.fetch_add(1, Ordering::Relaxed);
+            return Err(DiskError::Busy);
+        }
+        WRITES_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+        *sh.idle.0.lock().unwrap() = false;
+        let _busy = StreamBusy(sh);
+        let t0 = Instant::now();
+
+        let mut buf: Vec<u8> = Vec::new();
+        buf.try_reserve_exact(STREAM_CHUNK)
+            .map_err(|_| DiskError::Budget("cannot allocate the stream buffer".into()))?;
+        buf.resize(STREAM_CHUNK, 0);
+
+        let mut secs: Vec<SectionDesc> = Vec::new();
+        let head_len = layout_sections(tokens.len(), meta.len(), sections, &mut secs, |_| 0);
+        let end = sections_end(&secs, head_len);
+        let depth = entry_depth(depth, tokens.len());
+        let name = entry_name(sh.identity, tokens);
+        let path = sh.root.join(&name);
+        let tmp = sh.root.join(format!(".{name}.tmp.{}", std::process::id()));
+
+        let res = (|| -> Result<u64, DiskError> {
+            let f = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map_err(|e| io_err("create entry", e))?;
+            for (si, s) in secs.iter_mut().enumerate() {
+                let mut digests = Vec::with_capacity(s.len.div_ceil(HASH_BLOCK as u64) as usize);
+                let mut off = 0u64;
+                while off < s.len {
+                    if abort() {
+                        return Err(DiskError::Aborted);
+                    }
+                    let n = (s.len - off).min(STREAM_CHUNK as u64) as usize;
+                    let b = &mut buf[..n];
+                    if !fill(si, off, b) {
+                        return Err(DiskError::Io("copy off the GPU failed".into()));
+                    }
+                    block_digests(b, (off / HASH_BLOCK as u64) as usize, &mut digests);
+                    f.write_all_at(b, s.offset + off)
+                        .map_err(|e| io_err("write entry", e))?;
+                    writeback_and_drop(&f, s.offset + off, n as u64);
+                    off += n as u64;
+                }
+                s.hash = digests_hash(digests, s.len);
+            }
+            let (head, hh) = build_head(sh.identity, tokens, depth, meta, &secs);
+            debug_assert_eq!(head.len() as u64, head_len);
+            f.write_all_at(&head, 0)
+                .map_err(|e| io_err("write entry", e))?;
+            // the gaps between the head and the sections are holes: they read as the zeros the staged writer
+            // writes there
+            let mut tr = [0u8; TRAILER];
+            tr[..8].copy_from_slice(&END_MAGIC);
+            tr[8..].copy_from_slice(&hh.to_le_bytes());
+            f.write_all_at(&tr, end)
+                .map_err(|e| io_err("write entry", e))?;
+            f.sync_all().map_err(|e| io_err("flush entry", e))?;
+            drop(f);
+            fs::rename(&tmp, &path).map_err(|e| io_err("rename entry", e))?;
+            let _ = sync_dir(&sh.root);
+            Ok(end + TRAILER as u64)
+        })();
+        let bytes = match res {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                if !matches!(e, DiskError::Aborted) {
+                    sh.stats.write_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                return Err(e);
+            }
+        };
+        let e = DiskEntry {
+            path,
+            tokens: Arc::new(tokens.to_vec()),
+            meta: meta.to_vec(),
+            sections: secs,
+            bytes,
+            depth,
+        };
+        commit_entry(sh, &e, supersede);
+        *sh.last_write_ms.lock().unwrap() = t0.elapsed().as_secs_f64() * 1000.0;
+        Ok(e)
+    }
+
+    /// : whether loading `e` whole ([`Self::load`]) would cross the memory floor, so it should be streamed.
+    /// `TALUS_PCACHE_STREAM=1` / `=0` force it on / off.
+    pub fn should_stream_load(&self, e: &DiskEntry) -> bool {
+        match stream_switch() {
+            Some(v) => v,
+            None => mem_available_effective()
+                .is_some_and(|a| a < e.bytes.saturating_add(self.cfg.mem_floor_bytes)),
+        }
+    }
+
+    /// : load an entry with section `stream_tag` streamed through one [`STREAM_CHUNK`] buffer into
+    /// `sink(offset, bytes)` (false = failed) instead of a host copy; the other sections are read as [`Self::load`]
+    /// reads them (the returned [`Loaded`] lacks `stream_tag`). The streamed section's hash is checked once all
+    /// of it went through `sink`: on a mismatch the entry is deleted and the error returned, so the caller must
+    /// not use what `sink` received until this returns `Ok`.
+    pub fn load_streamed(
+        &self,
+        e: &DiskEntry,
+        stream_tag: u64,
+        sink: &mut dyn FnMut(u64, &[u8]) -> bool,
+    ) -> Result<Loaded, DiskError> {
+        let t0 = Instant::now();
+        let r = (|| -> Result<Loaded, DiskError> {
+            let sh = &*self.shared;
+            let fresh = read_head(&e.path, sh.identity)?;
+            if fresh.tokens != e.tokens || fresh.sections != e.sections || fresh.meta != e.meta {
+                return Err(DiskError::Mismatch("entry changed on disk".into()));
+            }
+            if e.has_external() {
+                return Err(DiskError::Mismatch("entry has an external payload".into()));
+            }
+            let f = File::open(&e.path).map_err(|e| io_err("open entry", e))?;
+            let mut out = Loaded {
+                tokens: Arc::clone(&e.tokens),
+                meta: e.meta.clone(),
+                sections: Vec::new(),
+                external: None,
+                bytes: e.bytes,
+                ms: 0.0,
+            };
+            let mut buf: Vec<u8> = Vec::new();
+            for s in &e.sections {
+                if s.tag != stream_tag {
+                    let mut v = Vec::new();
+                    let h = read_and_hash(&f, s.offset, s.len, &mut v, true)
+                        .map_err(|e| io_err("read section", e))?;
+                    if h != s.hash {
+                        return Err(DiskError::Corrupt("section hash mismatch".into()));
+                    }
+                    out.sections.push((s.tag, v));
+                    continue;
+                }
+                if buf.is_empty() {
+                    buf.try_reserve_exact(STREAM_CHUNK).map_err(|_| {
+                        DiskError::Budget("cannot allocate the stream buffer".into())
+                    })?;
+                    buf.resize(STREAM_CHUNK, 0);
+                }
+                let mut digests = Vec::with_capacity(s.len.div_ceil(HASH_BLOCK as u64) as usize);
+                let mut off = 0u64;
+                while off < s.len {
+                    let n = (s.len - off).min(STREAM_CHUNK as u64) as usize;
+                    let b = &mut buf[..n];
+                    f.read_exact_at(b, s.offset + off)
+                        .map_err(|e| io_err("read section", e))?;
+                    drop_cached(&f, s.offset + off, n as u64);
+                    block_digests(b, (off / HASH_BLOCK as u64) as usize, &mut digests);
+                    if !sink(off, b) {
+                        return Err(DiskError::Io("copy to the GPU failed".into()));
+                    }
+                    off += n as u64;
+                }
+                if digests_hash(digests, s.len) != s.hash {
+                    return Err(DiskError::Corrupt("streamed section hash mismatch".into()));
+                }
+            }
+            Ok(out)
+        })();
+        match &r {
+            Ok(l) => {
+                self.shared.stats.hits.fetch_add(1, Ordering::Relaxed);
+                self.shared
+                    .stats
+                    .read_bytes
+                    .fetch_add(l.bytes, Ordering::Relaxed);
+                touch(&e.path);
+            }
+            Err(DiskError::Corrupt(_)) | Err(DiskError::Mismatch(_)) => {
+                self.shared.stats.corrupt.fetch_add(1, Ordering::Relaxed);
+                self.remove(e);
+            }
+            Err(_) => {
+                if !e.path.exists() {
+                    self.forget(&e.path);
+                }
+            }
+        }
+        r.map(|mut l| {
+            l.ms = t0.elapsed().as_secs_f64() * 1000.0;
+            l
+        })
     }
 
     /// Hand a write to the background writer. Returns `Busy` (and drops the job) if a write is in flight.
@@ -1421,39 +1807,7 @@ fn write_entry(sh: &Shared, job: WriteJob) -> Result<DiskEntry, DiskError> {
     let r = write_entry_inner(sh, &job);
     match r {
         Ok(e) => {
-            sh.stats.writes.fetch_add(1, Ordering::Relaxed);
-            sh.stats.write_bytes.fetch_add(e.bytes, Ordering::Relaxed);
-            {
-                let mut idx = sh.index.lock().unwrap();
-                idx.retain(|x| x.path != e.path);
-                if job.supersede {
-                    // Entries of the same conversation at earlier turns. The deepest one (the previous turn) stays:
-                    // it serves a regenerated last reply, which branches off before the new entry's snapshots.
-                    let older = |x: &DiskEntry| {
-                        let d = x.depth as usize;
-                        x.depth <= e.depth && d <= e.tokens.len() && e.tokens[..d] == x.tokens[..d]
-                    };
-                    let keep = idx
-                        .iter()
-                        .filter(|x| older(x))
-                        .max_by_key(|x| x.depth)
-                        .map(|x| x.path.clone());
-                    let mut gone = Vec::new();
-                    idx.retain(|x| {
-                        let drop = older(x) && Some(&x.path) != keep.as_ref();
-                        if drop {
-                            gone.push(x.clone());
-                        }
-                        !drop
-                    });
-                    for g in gone {
-                        let _ = fs::remove_file(&g.path);
-                        let _ = fs::remove_file(g.payload_path());
-                    }
-                }
-                idx.push(e.clone());
-            }
-            enforce_budget(sh);
+            commit_entry(sh, &e, job.supersede);
             Ok(e)
         }
         Err(err) => {
@@ -1461,6 +1815,84 @@ fn write_entry(sh: &Shared, job: WriteJob) -> Result<DiskEntry, DiskError> {
             discard_external(&job);
             Err(err)
         }
+    }
+}
+
+/// Index a new entry file (already renamed into place): counters, superseding, budget.
+fn commit_entry(sh: &Shared, e: &DiskEntry, supersede: bool) {
+    sh.stats.writes.fetch_add(1, Ordering::Relaxed);
+    sh.stats.write_bytes.fetch_add(e.bytes, Ordering::Relaxed);
+    {
+        let mut idx = sh.index.lock().unwrap();
+        idx.retain(|x| x.path != e.path);
+        if supersede {
+            // Entries of the same conversation at earlier turns. The deepest one (the previous turn) stays:
+            // it serves a regenerated last reply, which branches off before the new entry's snapshots.
+            let older = |x: &DiskEntry| {
+                let d = x.depth as usize;
+                x.depth <= e.depth && d <= e.tokens.len() && e.tokens[..d] == x.tokens[..d]
+            };
+            let keep = idx
+                .iter()
+                .filter(|x| older(x))
+                .max_by_key(|x| x.depth)
+                .map(|x| x.path.clone());
+            let mut gone = Vec::new();
+            idx.retain(|x| {
+                let drop = older(x) && Some(&x.path) != keep.as_ref();
+                if drop {
+                    gone.push(x.clone());
+                }
+                !drop
+            });
+            for g in gone {
+                let _ = fs::remove_file(&g.path);
+                let _ = fs::remove_file(g.payload_path());
+            }
+        }
+        idx.push(e.clone());
+    }
+    enforce_budget(sh);
+}
+
+/// Append the inline sections `(tag, len)` to `secs` (after any external one) at their aligned offsets, with
+/// `hash(i)` as the hash of section `i`; returns the head length. The one layout of every entry file (the staged
+/// writer and [`DiskCache::write_streamed`] produce the same file for the same sections).
+fn layout_sections(
+    n_tokens: usize,
+    meta_len: usize,
+    lens: &[(u64, u64)],
+    secs: &mut Vec<SectionDesc>,
+    mut hash: impl FnMut(usize) -> u64,
+) -> u64 {
+    let head_len =
+        (HEADER + n_tokens * 4 + meta_len) as u64 + 32 * (lens.len() + secs.len()) as u64;
+    let mut off = align_up(head_len);
+    for (i, &(t, len)) in lens.iter().enumerate() {
+        secs.push(SectionDesc {
+            tag: t,
+            offset: off,
+            len,
+            hash: hash(i),
+        });
+        off = align_up(off + len);
+    }
+    head_len
+}
+
+fn sections_end(secs: &[SectionDesc], head_len: u64) -> u64 {
+    secs.iter()
+        .filter(|s| !s.is_external())
+        .map(|s| s.offset + s.len)
+        .max()
+        .unwrap_or(head_len)
+}
+
+fn entry_depth(depth: u64, n_tokens: usize) -> u64 {
+    if depth == 0 {
+        n_tokens as u64
+    } else {
+        depth.min(n_tokens as u64)
     }
 }
 
@@ -1500,29 +1932,16 @@ fn write_entry_inner(sh: &Shared, job: &WriteJob) -> Result<DiskEntry, DiskError
     }
 
     // Lay out the inline sections.
-    let head_len = (HEADER + job.tokens.len() * 4 + job.meta.len()) as u64
-        + 32 * (job.sections.len() + secs.len()) as u64;
-    let mut off = align_up(head_len);
-    for (t, d) in &job.sections {
-        secs.push(SectionDesc {
-            tag: *t,
-            offset: off,
-            len: d.len() as u64,
-            hash: payload_hash(d),
-        });
-        off = align_up(off + d.len() as u64);
-    }
-    let end = secs
+    let lens: Vec<(u64, u64)> = job
+        .sections
         .iter()
-        .filter(|s| !s.is_external())
-        .map(|s| s.offset + s.len)
-        .max()
-        .unwrap_or(head_len);
-    let depth = if job.depth == 0 {
-        job.tokens.len() as u64
-    } else {
-        job.depth.min(job.tokens.len() as u64)
-    };
+        .map(|(t, d)| (*t, d.len() as u64))
+        .collect();
+    let head_len = layout_sections(job.tokens.len(), job.meta.len(), &lens, &mut secs, |i| {
+        payload_hash(&job.sections[i].1)
+    });
+    let end = sections_end(&secs, head_len);
+    let depth = entry_depth(job.depth, job.tokens.len());
     let (head, hh) = build_head(sh.identity, &job.tokens, depth, &job.meta, &secs);
     debug_assert_eq!(head.len() as u64, head_len);
 

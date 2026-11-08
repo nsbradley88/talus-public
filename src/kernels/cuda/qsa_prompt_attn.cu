@@ -1399,6 +1399,429 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
 #endif
 }
 
+// W2 A7 (STRATA_PA_PIPE, default on; =0 the kernel above): the same arithmetic as prompt_attn_wmma_kernel, bit for bit,
+// with the K/V traffic restructured (gfx11 only: it relies on lanes 16..31 repeating lanes 0..15):
+//   * software pipelined: chunk c+1's K fragments and V codes are loaded into registers while chunk c computes, and the
+//     ids -> page -> row chain runs two chunks ahead, so no load sits on the critical path of a chunk;
+//   * no V staging in LDS: lane (col, half) loads, for each of the chunk's 32 cells, the 4 bytes of dims
+//     dim0 + 4*col .. +3 (one dword); p.v tile j then holds output dims dim0 + 4*col + j (a column permutation of the
+//     old kernel's tile j, column col = dim0 + 16*j + col; each output element gets the same products in the same k
+//     order) and the B fragment is built with byte permutes;
+//   * int8 -> FP16 through the exponent trick (1024 + (c + 128) - 1152, exact) instead of int -> float -> half;
+//   * p is converted to FP16 once per element in the softmax step (e * (vs * vup), the same two FP32 products) and
+//     read by p.v as two 16-byte LDS loads; the four groups' vs * vup are formed by the wave that owns the group.
+#if STRATA_PA_GFX11
+typedef _Float16 wh2 __attribute__((ext_vector_type(2)));
+typedef _Float16 wh4 __attribute__((ext_vector_type(4)));
+typedef uint32_t wu8 __attribute__((ext_vector_type(8)));
+// two codes biased into bytes 0 and 2 ([u0, 0x64, u1, 0x64] after the xor, u = code ^ 0x80) -> exact half2 of the codes
+__device__ __forceinline__ uint32_t pa_mag2h(uint32_t x) {
+    wh2 h = __builtin_bit_cast(wh2, x);
+    h = h - wh2{(_Float16) 1152.0f, (_Float16) 1152.0f};
+    return __builtin_bit_cast(uint32_t, h);
+}
+// 16 consecutive int8 codes (k = 0..15) -> the 16 FP16 values of a gfx11 fragment lane, exactly
+__device__ __forceinline__ wh8 pa_k16_to_h(uint4 v) {
+    const uint32_t x[4] = {v.x ^ 0x80808080u, v.y ^ 0x80808080u, v.z ^ 0x80808080u, v.w ^ 0x80808080u};
+    wu8 o;
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {
+        o[2 * m] = pa_mag2h(__builtin_amdgcn_perm(0x64646464u, x[m], 0x04010400u));
+        o[2 * m + 1] = pa_mag2h(__builtin_amdgcn_perm(0x64646464u, x[m], 0x04030402u));
+    }
+    return __builtin_bit_cast(wh8, o);
+}
+// byte j of the 16 dwords d[0..15] (one per cell, k = 0..15) -> the 16 FP16 values of a gfx11 fragment lane, exactly
+template <int J>
+__device__ __forceinline__ wh8 pa_v16_to_h(const uint32_t* d) {
+    constexpr uint32_t sel = (uint32_t) J | (0x0cu << 8) | ((uint32_t) (4 + J) << 16) | (0x0cu << 24);
+    wu8 o;
+#pragma unroll
+    for (int m = 0; m < 8; ++m) o[m] = pa_mag2h(__builtin_amdgcn_perm(d[2 * m + 1], d[2 * m], sel) ^ 0x64806480u);
+    return __builtin_bit_cast(wh8, o);
+}
+// W2 A7b (SHARE): the other half-wave's value of each lane (lane l <- lane l ^ 16)
+__device__ __forceinline__ uint32_t pa_swap(uint32_t x) {
+    return __builtin_amdgcn_permlanex16(x, x, 0x76543210u, 0xfedcba98u, false, false);
+}
+// a fragment converted only from this half's own data -> the two replicated fragments: f0 = half 0's data in both
+// halves, f1 = half 1's
+__device__ __forceinline__ void pa_share(wh8 own, int half, wh8& f0, wh8& f1) {
+    const wu8 o = __builtin_bit_cast(wu8, own);
+    wu8 a, b;
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        const uint32_t w = pa_swap(o[m]);
+        a[m] = half ? w : o[m];
+        b[m] = half ? o[m] : w;
+    }
+    f0 = __builtin_bit_cast(wh8, a);
+    f1 = __builtin_bit_cast(wh8, b);
+}
+__device__ __forceinline__ float pa_swapf(float x) { return __builtin_bit_cast(float, pa_swap(__builtin_bit_cast(uint32_t, x))); }
+template <bool SPLIT>
+struct alignas(16) SmemPipe {
+    float part[4][16][36];                  // q.k per dim group (row stride 36: 16-byte aligned float4 reads)
+    _Float16 ph[SPLIT ? 2 : 1][4][16][40];  // p * (vs * vup) in FP16 per (hi/lo, group, row, cell)
+    float vsv[4][WCH];                      // vs * vup per (group, cell)
+    float qmax[4];
+    float alpha[16];
+    float lsum[16];
+    float mrow[16];
+};
+#endif
+
+// GATE (W2 A7 item 3, qsa_prompt_attn_gated): the epilogue applies the attention output gate and writes FP16 rows
+// of the o-projection input instead of `attn`: o16[t * ld16 + h * HD + d] = f16(a * (1 / (1 + exp(-g)))), g =
+// qf[t * n_head * 2 * HD + h * 2 * HD + HD + d] - the FP32 operations of prefill's gate_attn_kernel on the same a.
+// SHARE (W2 A7b, STRATA_PA_PIPE=2, the default): a half-wave loads only its own K/V data - lane = cell for K, half h =
+// cells 16h.. for V - converts it once and swaps it with the other half (v_permlanex16), half the VMEM lane requests
+// and 32 fewer VGPRs. The WMMA operands are the same bits and each output element's WMMA order is unchanged. Rows < 0
+// (masked cells) read 0 through the buffers' bounds check (a negative row is a huge unsigned offset), and the page
+// size (a power of two: the launcher checks) is a shift.
+template <bool SPLIT, bool GATE, bool SHARE>
+__global__ void __launch_bounds__(THREADS) prompt_attn_wmma_pipe_kernel(const float* __restrict__ q, QsaAttnPools p,
+                                                                        const int32_t* __restrict__ ids,
+                                                                        const int32_t* __restrict__ steps,
+                                                                        int n_kv_heads, int page_size, float scale_log2,
+                                                                        float* __restrict__ attn, int cap,
+                                                                        const float* __restrict__ qf,
+                                                                        uint16_t* __restrict__ o16, int64_t ld16) {
+#if STRATA_PA_WMMA && STRATA_PA_GFX11
+    __shared__ SmemPipe<SPLIT> S;
+    const int qi = blockIdx.x, kvh = blockIdx.y;
+    const int n_head = n_kv_heads * G;
+    if constexpr (GATE) {
+        qf += (size_t) qi * n_head * 2 * HD + (size_t) kvh * G * 2 * HD + HD;
+        o16 += (size_t) qi * ld16 + (size_t) kvh * G * HD;
+    }
+    q += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    attn += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    ids += (size_t) qi * cap;
+    const int n = __ldg(steps + (size_t) qi * kStepCount + kStepWidth);
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int col = lane & 15, half = lane >> 4;
+    const int dim0 = warp * 64;
+    const int n_chunks = (n + WCH - 1) / WCH;
+
+    // lane = cell of a chunk: its id (-1 past the selection), page and pool row (-1: masked)
+    auto load_id = [&](int ci) -> int {
+        const int c = ci * WCH + lane;
+        return c < n ? __ldg(ids + c) : -1;
+    };
+    const int ps_log2 = 31 - __builtin_clz((unsigned) page_size);
+    auto load_page = [&](int id) -> int {
+        if constexpr (SHARE) return id >= 0 ? __ldg(p.page_table + (id >> ps_log2)) : -1;
+        else return id >= 0 ? __ldg(p.page_table + id / page_size) : -1;
+    };
+    auto mk_row = [&](int id, int page) -> int {
+        if constexpr (SHARE) return page >= 0 ? (page * n_kv_heads + kvh) * page_size + (id & (page_size - 1)) : -1;
+        else return page >= 0 ? (page * n_kv_heads + kvh) * page_size + (id % page_size) : -1;
+    };
+    const __amdgpu_buffer_rsrc_t krsrc = __builtin_amdgcn_make_buffer_rsrc(const_cast<int8_t*>(p.k_q), (short) 0, (int) 0x7fffffff, 0x31004000);
+    const __amdgpu_buffer_rsrc_t ksrsrc = __builtin_amdgcn_make_buffer_rsrc(const_cast<uint16_t*>(p.k_scale), (short) 0, (int) 0x7fffffff, 0x31004000);
+    const __amdgpu_buffer_rsrc_t vsrsrc = __builtin_amdgcn_make_buffer_rsrc(const_cast<uint16_t*>(p.v_scale), (short) 0, (int) 0x7fffffff, 0x31004000);
+    const int gscale = warp * 2;   // byte offset of this wave's scale in a row's 4 FP16 scales
+    auto load_vs = [&](int row) -> float {
+        if constexpr (SHARE)
+            return __half2float(__ushort_as_half((unsigned short) __builtin_amdgcn_raw_buffer_load_b16(vsrsrc, row * (2 * (HD / KV_Q8_GROUP)) + gscale, 0, 0)));
+        else return row >= 0 ? __half2float(__ushort_as_half(__ldg(p.v_scale + (size_t) row * (HD / KV_Q8_GROUP) + warp)))
+                        : 0.0f;
+    };
+    uint4 kx[2][4];
+    float ksc[2];
+    auto load_k = [&](int row) {
+        if constexpr (SHARE) {   // kx[0] / ksc[0]: this lane's own cell (lane = cell)
+            ksc[0] = __half2float(__ushort_as_half((unsigned short) __builtin_amdgcn_raw_buffer_load_b16(ksrsrc, row * (2 * (HD / KV_Q8_GROUP)) + gscale, 0, 0)));
+            const int off = row * HD + dim0;
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                const auto r = __builtin_amdgcn_raw_buffer_load_b128(krsrc, off + kk * 16, 0, 0);
+                kx[0][kk] = make_uint4(r[0], r[1], r[2], r[3]);
+            }
+            return;
+        }
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            const int rr = __shfl(row, nt * 16 + col);
+            ksc[nt] = rr >= 0 ? __half2float(__ushort_as_half(__ldg(p.k_scale + (size_t) rr * (HD / KV_Q8_GROUP) + warp)))
+                              : 0.0f;
+            const uint4* src = reinterpret_cast<const uint4*>(p.k_q + (size_t) (rr >= 0 ? rr : 0) * HD + dim0);
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk) kx[nt][kk] = rr >= 0 ? __ldg(src + kk) : make_uint4(0, 0, 0, 0);
+        }
+    };
+    uint32_t vd[WCH];   // per cell: V codes of dims dim0 + 4*col .. +3
+    // V codes through a buffer resource over the V pool: the row offset (wave-uniform) goes in soffset and the lane's
+    // byte offset in voffset, so a load costs no VALU address math. 32-bit offsets: a pool row is (page * n_kv_heads
+    // + kvh) * page_size + slot, so row * HD stays below the 2^31 bound up to 4M cells of context.
+    const __amdgpu_buffer_rsrc_t vrsrc = __builtin_amdgcn_make_buffer_rsrc(const_cast<int8_t*>(p.v_q), (short) 0,
+                                                                          (int) 0x7fffffff, 0x31004000);
+    const int vlane = __builtin_amdgcn_readfirstlane(dim0) + 4 * col;
+    auto load_v = [&](int row) {
+        if constexpr (SHARE) {   // vd[0..15]: this half's 16 cells (a negative row reads 0)
+            const int rb = row * HD;
+#pragma unroll
+            for (int c = 0; c < WCH / 2; ++c) {
+                const uint32_t n = (uint32_t) c * 0x11111111u;   // every lane of the half reads lane c's row
+                const int ro = (int) __builtin_amdgcn_permlane16((uint32_t) rb, (uint32_t) rb, n, n, false, false);
+                vd[c] = (uint32_t) __builtin_amdgcn_raw_buffer_load_b32(vrsrc, ro + vlane, 0, 0);
+            }
+            return;
+        }
+        if (__builtin_amdgcn_ballot_w32(row >= 0) == 0xffffffffu) {   // every cell resident (the usual case)
+#pragma unroll
+            for (int c = 0; c < WCH; ++c) {
+                const int rc = __builtin_amdgcn_readlane(row, c);
+                vd[c] = (uint32_t) __builtin_amdgcn_raw_buffer_load_b32(vrsrc, vlane, rc * HD, 0);
+            }
+        } else {
+#pragma unroll
+            for (int c = 0; c < WCH; ++c) {
+                const int rc = __builtin_amdgcn_readlane(row, c);
+                vd[c] = rc >= 0 ? (uint32_t) __builtin_amdgcn_raw_buffer_load_b32(vrsrc, vlane, rc * HD, 0) : 0u;
+            }
+        }
+    };
+
+    // the pipeline's head: chunk 0's rows, K, V and scale; chunk 1's id and page
+    int row_c;
+    {
+        const int id0 = load_id(0);
+        row_c = mk_row(id0, load_page(id0));
+    }
+    float vsc = load_vs(row_c);
+    load_k(row_c);
+    load_v(row_c);
+    int id_n = load_id(1);
+    int pg_n = load_page(id_n);
+
+    float qm = 0.0f;
+    for (int i = t; i < G * HD; i += THREADS) qm = fmaxf(qm, fabsf(q[i]));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) qm = fmaxf(qm, __shfl_xor_sync(0xffffffffu, qm, o));
+    if (lane == 0) S.qmax[warp] = qm;
+    if (t < 16) { S.mrow[t] = -INFINITY; S.lsum[t] = 0.0f; }
+    __syncthreads();
+    qm = fmaxf(fmaxf(S.qmax[0], S.qmax[1]), fmaxf(S.qmax[2], S.qmax[3]));
+    int qe = 0;
+    if (qm > 0.0f) frexpf(qm, &qe);
+    const float qup = ldexpf(1.0f, 14 - qe), qdown = ldexpf(scale_log2, qe - 14);
+    wh8 qh[4], ql[4];
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+        float x[PA_KL];
+        if (col < G) {
+            const float4* src = reinterpret_cast<const float4*>(q + (size_t) col * HD + dim0 + kk * 16);
+#pragma unroll
+            for (int j = 0; j < PA_KL / 4; ++j) {
+                const float4 a = src[j];
+                x[4 * j] = a.x; x[4 * j + 1] = a.y; x[4 * j + 2] = a.z; x[4 * j + 3] = a.w;
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < PA_KL; ++i) x[i] = 0.0f;
+        }
+#pragma unroll
+        for (int i = 0; i < PA_KL; ++i) {
+            const float v = x[i] * qup;
+            const _Float16 hi = (_Float16) v;
+            qh[kk][i] = hi;
+            ql[kk][i] = (_Float16) (v - (float) hi);
+        }
+    }
+
+    wf8 acc[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[j] = wf8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    for (int ci = 0; ci < n_chunks; ++ci) {
+        const int id_nn = load_id(ci + 2);   // two chunks ahead: its page is read after the softmax
+        // this wave's V scale over the chunk (as the old kernel's p.v step forms it) and vs * vup per cell
+        float vmax = vsc;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, o));
+        const float vup = vmax > 0.0f ? 16384.0f / vmax : 0.0f, vdown = vmax * (1.0f / 16384.0f);
+        S.vsv[warp][lane] = vsc * vup;
+        const uint32_t valid = (uint32_t) __ballot(row_c >= 0);
+        // q.k over this wave's 64 dims for two 16-cell tiles, times the cell's K scale for this group
+        if constexpr (SHARE) {
+            wf8 s0 = wf8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f}, s1 = s0;
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                wh8 b0, b1;
+                pa_share(pa_k16_to_h(kx[0][kk]), half, b0, b1);
+                s0 = wmma_f16(qh[kk], b0, s0);
+                if constexpr (SPLIT) s0 = wmma_f16(ql[kk], b0, s0);
+                s1 = wmma_f16(qh[kk], b1, s1);
+                if constexpr (SPLIT) s1 = wmma_f16(ql[kk], b1, s1);
+            }
+            const float kso = pa_swapf(ksc[0]);
+            const float ks0 = half ? kso : ksc[0], ks1 = half ? ksc[0] : kso;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                S.part[warp][PA_ROW(i, half)][col] = s0[i] * ks0;
+                S.part[warp][PA_ROW(i, half)][16 + col] = s1[i] * ks1;
+            }
+        } else
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            wf8 s = wf8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                const wh8 b = pa_k16_to_h(kx[nt][kk]);
+                s = wmma_f16(qh[kk], b, s);
+                if constexpr (SPLIT) s = wmma_f16(ql[kk], b, s);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) S.part[warp][PA_ROW(i, half)][nt * 16 + col] = s[i] * ksc[nt];
+        }
+        // next chunk: rows (its page was read a chunk ago), V scale and K fragments
+        const int row_n = mk_row(id_n, pg_n);
+        const float vsc_n = load_vs(row_n);
+        load_k(row_n);
+        __syncthreads();
+        // online softmax over the four groups' sum (fixed order): row t/8, 4 cells per thread; then p * (vs * vup) per
+        // group in FP16 (hi, and lo when SPLIT), as the old kernel's p.v step forms them
+        {
+            const int r = t >> 3, sub = t & 7;
+            const float4 p0 = *reinterpret_cast<const float4*>(&S.part[0][r][sub * 4]);
+            const float4 p1 = *reinterpret_cast<const float4*>(&S.part[1][r][sub * 4]);
+            const float4 p2 = *reinterpret_cast<const float4*>(&S.part[2][r][sub * 4]);
+            const float4 p3 = *reinterpret_cast<const float4*>(&S.part[3][r][sub * 4]);
+            const float a0[4] = {p0.x, p0.y, p0.z, p0.w}, a1[4] = {p1.x, p1.y, p1.z, p1.w};
+            const float a2[4] = {p2.x, p2.y, p2.z, p2.w}, a3[4] = {p3.x, p3.y, p3.z, p3.w};
+            float x[4], mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = sub * 4 + j;
+                x[j] = (valid >> c) & 1u ? (((a0[j] + a1[j]) + a2[j]) + a3[j]) * qdown : -INFINITY;
+                mx = fmaxf(mx, x[j]);
+            }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float m_old = S.mrow[r];
+            const float m_new = fmaxf(m_old, mx);
+            float sum = 0.0f, e[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                e[j] = x[j] == -INFINITY ? 0.0f : exp2f(x[j] - m_new);
+                sum += e[j];
+            }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                const float4 vv = *reinterpret_cast<const float4*>(&S.vsv[w][sub * 4]);
+                const float vw[4] = {vv.x, vv.y, vv.z, vv.w};
+                wh4 h, l;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float pv = e[j] * vw[j];
+                    h[j] = (_Float16) pv;
+                    l[j] = (_Float16) (pv - (float) h[j]);
+                }
+                *reinterpret_cast<uint2*>(&S.ph[0][w][r][sub * 4]) = __builtin_bit_cast(uint2, h);
+                if constexpr (SPLIT) *reinterpret_cast<uint2*>(&S.ph[SPLIT ? 1 : 0][w][r][sub * 4]) = __builtin_bit_cast(uint2, l);
+            }
+            if (sub == 0) {
+                const float a = m_old == -INFINITY ? 0.0f : exp2f(m_old - m_new);
+                S.alpha[r] = a;
+                S.lsum[r] = fmaf(S.lsum[r], a, sum);
+                S.mrow[r] = m_new;
+            }
+        }
+        __syncthreads();
+        const int pg_nn = load_page(id_nn);
+        // p.v over this wave's 64 dims: tile j column col = dim dim0 + 4*col + j, 2 k-steps of 16 cells
+        {
+            wf8 tmp[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) tmp[j] = wf8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            if constexpr (SHARE) {
+                const wh8 ah0 = *reinterpret_cast<const wh8*>(&S.ph[0][warp][col][0]);
+                const wh8 ah1 = *reinterpret_cast<const wh8*>(&S.ph[0][warp][col][16]);
+                wh8 al0, al1;
+                if constexpr (SPLIT) {
+                    al0 = *reinterpret_cast<const wh8*>(&S.ph[SPLIT ? 1 : 0][warp][col][0]);
+                    al1 = *reinterpret_cast<const wh8*>(&S.ph[SPLIT ? 1 : 0][warp][col][16]);
+                }
+                auto pv_tile = [&](wf8& tj, wh8 own) {
+                    wh8 b0, b1;
+                    pa_share(own, half, b0, b1);
+                    tj = wmma_f16(ah0, b0, tj);
+                    if constexpr (SPLIT) tj = wmma_f16(al0, b0, tj);
+                    tj = wmma_f16(ah1, b1, tj);
+                    if constexpr (SPLIT) tj = wmma_f16(al1, b1, tj);
+                };
+                pv_tile(tmp[0], pa_v16_to_h<0>(vd));
+                pv_tile(tmp[1], pa_v16_to_h<1>(vd));
+                pv_tile(tmp[2], pa_v16_to_h<2>(vd));
+                pv_tile(tmp[3], pa_v16_to_h<3>(vd));
+            } else
+#pragma unroll
+            for (int ks = 0; ks < 2; ++ks) {
+                const wh8 ah = *reinterpret_cast<const wh8*>(&S.ph[0][warp][col][ks * 16]);
+                wh8 al;
+                if constexpr (SPLIT) al = *reinterpret_cast<const wh8*>(&S.ph[SPLIT ? 1 : 0][warp][col][ks * 16]);
+                const uint32_t* d = vd + ks * 16;
+                wh8 b;
+                b = pa_v16_to_h<0>(d);
+                tmp[0] = wmma_f16(ah, b, tmp[0]);
+                if constexpr (SPLIT) tmp[0] = wmma_f16(al, b, tmp[0]);
+                b = pa_v16_to_h<1>(d);
+                tmp[1] = wmma_f16(ah, b, tmp[1]);
+                if constexpr (SPLIT) tmp[1] = wmma_f16(al, b, tmp[1]);
+                b = pa_v16_to_h<2>(d);
+                tmp[2] = wmma_f16(ah, b, tmp[2]);
+                if constexpr (SPLIT) tmp[2] = wmma_f16(al, b, tmp[2]);
+                b = pa_v16_to_h<3>(d);
+                tmp[3] = wmma_f16(ah, b, tmp[3]);
+                if constexpr (SPLIT) tmp[3] = wmma_f16(al, b, tmp[3]);
+            }
+            float a[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) a[i] = S.alpha[PA_ROW(i, half)];
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) acc[j][i] = fmaf(acc[j][i], a[i], tmp[j][i] * vdown);
+        }
+        // next chunk's V codes; rotate the pipeline
+        load_v(row_n);
+        row_c = row_n;
+        vsc = vsc_n;
+        id_n = id_nn;
+        pg_n = pg_nn;
+    }
+    float inv[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const float l = S.lsum[PA_ROW(i, half)];
+        inv[i] = l > 0.0f ? 1.0f / l : 0.0f;
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int row = PA_ROW(i, half);
+        if (row >= G) continue;
+        const float a0 = acc[0][i] * inv[i], a1 = acc[1][i] * inv[i], a2 = acc[2][i] * inv[i], a3 = acc[3][i] * inv[i];
+        if constexpr (GATE) {
+            const float4 g = *reinterpret_cast<const float4*>(qf + (size_t) row * 2 * HD + dim0 + 4 * col);
+            ushort4 o;
+            o.x = __half_as_ushort(__float2half_rn(a0 * (1.0f / (1.0f + expf(-g.x)))));
+            o.y = __half_as_ushort(__float2half_rn(a1 * (1.0f / (1.0f + expf(-g.y)))));
+            o.z = __half_as_ushort(__float2half_rn(a2 * (1.0f / (1.0f + expf(-g.z)))));
+            o.w = __half_as_ushort(__float2half_rn(a3 * (1.0f / (1.0f + expf(-g.w)))));
+            *reinterpret_cast<ushort4*>(o16 + (size_t) row * HD + dim0 + 4 * col) = o;
+        } else {
+            *reinterpret_cast<float4*>(attn + (size_t) row * HD + dim0 + 4 * col) = make_float4(a0, a1, a2, a3);
+        }
+    }
+#else
+    __builtin_trap();
+#endif
+}
+
 // gfx12 (RDNA4) and gfx11 (RDNA3 / RDNA3.5), only on request: the output differs from the default kernel's in its
 // last bits
 bool hip_wmma_usable() {
@@ -1425,14 +1848,62 @@ bool hip_wmma_usable() {
     return arch[dev] == 1;
 }
 
+// gfx11 (the pipelined kernel's fragment layout); the device's arch name as hip_wmma_usable read it
+bool hip_wmma_gfx11() {
+    static int g[64] = {};   // 0 unknown, 1 gfx11, 2 other
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) { (void) hipGetLastError(); return false; }
+    if (g[dev] == 0) {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, dev) != hipSuccess) { (void) hipGetLastError(); return false; }
+        g[dev] = strata::kernels::gfx_arch_is_gfx11_wmma(prop.gcnArchName) ? 1 : 2;
+    }
+    return g[dev] == 1;
+}
+
+int g_force_pipe = -1, g_force_fast = -1;   // qsa_prompt_attn_force (tests); -1 = the environment
+int g_force_gate = -1;
+
+// 0 the previous kernel, 1 the pipelined one, 2 (default) pipelined + half-wave sharing; STRATA_PA_PIPE selects
+int pipe_mode(int page_size) {
+    static const int env = [] { const char* e = std::getenv("STRATA_PA_PIPE"); return e == nullptr ? 2 : std::atoi(e); }();
+    int m = g_force_pipe >= 0 ? g_force_pipe : env;
+    if (!hip_wmma_gfx11()) return 0;
+    if (m == 2 && (page_size <= 0 || (page_size & (page_size - 1)) != 0)) m = 1;
+    return m;
+}
+
 bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-                 const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
+                 const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st, const float* qf = nullptr,
+                 uint16_t* o16 = nullptr, int64_t ld16 = 0) {
     const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
+    // W2 A7: the pipelined kernel (bitwise the same output), STRATA_PA_PIPE=0 the previous one (A/B, kill switch)
+    const int pipe = pipe_mode((int) s.page_size);
     for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
         const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
-        static const bool fast = [] { const char* e = std::getenv("STRATA_PA_FAST"); return e != nullptr && e[0] == '1'; }();
+        static const bool fast_env = [] { const char* e = std::getenv("STRATA_PA_FAST"); return e != nullptr && e[0] == '1'; }();
+        const bool fast = g_force_fast >= 0 ? g_force_fast != 0 : fast_env;
         static const int64_t min_t = [] { const char* e = std::getenv("STRATA_PF_SWITCH_MIN_T"); return e ? (int64_t) std::atoll(e) : (int64_t) 0; }();
-        if (fast && n_q >= min_t)
+        const bool f = fast && n_q >= min_t;
+        const dim3 grid((unsigned) nb, (unsigned) s.n_head_kv);
+        const float* qq = q + q0 * s.n_head * HD;
+        const int32_t* ii = ids + q0 * cap;
+        const int32_t* ss = steps + q0 * kStepCount;
+        const int pl = (int) s.page_size;
+        const int kvn = (int) s.n_head_kv, ic = (int) cap;
+        float* at = attn ? attn + q0 * s.n_head * HD : nullptr;
+        const float* gq = o16 ? qf + q0 * s.n_head * 2 * HD : nullptr;
+        uint16_t* oo = o16 ? o16 + q0 * ld16 : nullptr;
+#define PA_LAUNCH_PIPE(SP, GT, SH) prompt_attn_wmma_pipe_kernel<SP, GT, SH><<<grid, THREADS, 0, st>>>(qq, pools, ii, ss, kvn, pl, scale_log2, at, ic, gq, oo, ld16)
+        // SPLIT keeps the unshared loads: the shared variant spills 45 VGPRs there and runs slower
+        if (o16 != nullptr && pipe == 2 && f) PA_LAUNCH_PIPE(false, true, true);
+        else if (o16 != nullptr && f) PA_LAUNCH_PIPE(false, true, false);
+        else if (o16 != nullptr) PA_LAUNCH_PIPE(true, true, false);
+        else if (pipe == 2 && f) PA_LAUNCH_PIPE(false, false, true);
+        else if (pipe >= 1 && f) PA_LAUNCH_PIPE(false, false, false);
+        else if (pipe >= 1) PA_LAUNCH_PIPE(true, false, false);
+#undef PA_LAUNCH_PIPE
+        else if (fast && n_q >= min_t)
             prompt_attn_wmma_kernel<false><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, 0, st>>>(
                 q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
                 (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
@@ -1451,6 +1922,43 @@ bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, 
 #endif
 
 }  // namespace
+
+void qsa_prompt_attn_force(int pipe, int fast) {
+#if defined(__HIPCC__)
+    g_force_pipe = pipe;
+    g_force_fast = fast;
+#else
+    (void) pipe; (void) fast;
+#endif
+}
+
+void qsa_prompt_attn_force_gate(int gate) {
+#if defined(__HIPCC__)
+    g_force_gate = gate;
+#else
+    (void) gate;
+#endif
+}
+
+bool qsa_prompt_attn_gated(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                           int64_t cap, const QsaShapes& s, const float* q_full, uint16_t* out16, int64_t ld16,
+                           int64_t n_q, void* stream) {
+#if defined(__HIPCC__)
+    static const bool gate_env = [] { const char* e = std::getenv("STRATA_PA_GATE"); return e == nullptr || e[0] != '0'; }();
+    const bool gate = g_force_gate >= 0 ? g_force_gate != 0 : gate_env;
+    if (n_q <= 0 || !gate || q_full == nullptr || out16 == nullptr) return false;
+    if (ld16 <= 0) ld16 = s.n_head * HD;
+    if (pools.k_q == nullptr || pools.v_q == nullptr || pools.k_scale == nullptr || pools.v_scale == nullptr ||
+        pools.k_q4 != nullptr || pools.v_q4 != nullptr || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv ||
+        cap <= 0 || !ids || !steps || !pools.page_table || (ld16 % 4) != 0 || !hip_wmma_usable() || pipe_mode((int) s.page_size) == 0)
+        return false;
+    return launch_wmma(q, pools, ids, steps, cap, s, nullptr, n_q, (cudaStream_t) stream, q_full, out16, ld16);
+#else
+    (void) q; (void) pools; (void) ids; (void) steps; (void) cap; (void) s; (void) q_full; (void) out16; (void) ld16;
+    (void) n_q; (void) stream;
+    return false;
+#endif
+}
 
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream) {

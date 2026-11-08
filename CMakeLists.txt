@@ -12,7 +12,7 @@ cmake_minimum_required(VERSION 3.24)
 # release the fork is based on; TALUS_VERSION is the fork's own.  Internal names (strata:: namespaces, CMake targets)
 # stay Strata's so upstream merges stay cheap; the binaries are renamed at the end of this file.
 project(strata VERSION 0.1.44.1 LANGUAGES CXX)
-set(TALUS_VERSION 0.1.3)
+set(TALUS_VERSION 0.1.6)
 # EXPERIMENTAL: the Intel Arc engine, the SYCL port in sycl/ (PR #423; icpx + oneMKL, docs/INTEL_ARC.md). It is its
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
 option(STRATA_ENABLE_SYCL "EXPERIMENTAL: build the Intel Arc (SYCL) engine from sycl/ - docs/INTEL_ARC.md" OFF)
@@ -661,12 +661,26 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_link_libraries(${_rde} PRIVATE talus_kernels ${_strata_gpu_runtime_target})
       target_include_directories(${_rde} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     endforeach()
+    # the real router kernels on padded vs plain rows (TALUS_ROUTER_PAD), bitwise + timing
+    add_executable(talus-router-pad tests/hip/router_pad_bench.cpp)
+    set_source_files_properties(tests/hip/router_pad_bench.cpp PROPERTIES LANGUAGE HIP)
+    target_link_libraries(talus-router-pad PRIVATE talus_kernels ${_strata_gpu_runtime_target})
+    target_include_directories(talus-router-pad PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     # DRAM channel-camping probe (standalone: no engine code)
     add_executable(talus-chan-probe tests/hip/chan_probe.cpp)
     set_source_files_properties(tests/hip/chan_probe.cpp PROPERTIES LANGUAGE HIP)
     target_link_libraries(talus-chan-probe PRIVATE ${_strata_gpu_runtime_target})
   endif()
 
+  # the matrix-core prompt attention parity tool without the test suite (W2 A7: QA_PIPE=1 bitwise check)
+  if(STRATA_PARITY_PROMPT_ATTN AND NOT STRATA_BUILD_TESTS AND STRATA_ENABLE_HIP)
+    add_executable(hip_prompt_attn_wmma src/kernels/qsa_prompt_attn_parity.cpp)
+    target_link_libraries(hip_prompt_attn_wmma PRIVATE strata_kernels strata_hip_runtime)
+    if(TARGET strata_prefill)   # the gate-fusion check against prefill's gate_attn
+      target_link_libraries(hip_prompt_attn_wmma PRIVATE strata_prefill)
+      target_compile_definitions(hip_prompt_attn_wmma PRIVATE STRATA_PA_GATE_TEST=1)
+    endif()
+  endif()
   if(STRATA_BUILD_TESTS)
   if(STRATA_ENABLE_HIP)
     enable_testing()
@@ -1705,6 +1719,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   set(_talus_kernels_sources
     src/laguna/laguna_kernels.cu
     src/laguna/talus_kernels_laguna.cpp
+    src/kernels/talus_rowpad.cpp
     src/qwen35/q36_kernels.cu
     src/qwen35/q36_kv8.cu
     src/qwen35/q36_adraft.cu
@@ -1744,6 +1759,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       src/qwen35/q36_kv8.cu
       src/qwen35/q36_adraft.cu
       src/qwen35/q36_dflash.cu
+      src/kernels/talus_rowpad.cpp
       PROPERTIES LANGUAGE HIP
     )
   endif()
@@ -1966,3 +1982,8 @@ foreach(_t IN LISTS _talus_targets)
     set_target_properties(${_t} PROPERTIES OUTPUT_NAME ${_out})
   endif()
 endforeach()
+# ---- reproducible device/host code across hosts, worktree paths and compiler caches (after every target exists):
+#      deterministic HIP CUIDs + path-independent __FILE__ (cmake/deterministic_cuid.cmake) ----
+include(cmake/deterministic_cuid.cmake)
+talus_apply_deterministic_cuid()
+talus_apply_repro_paths()

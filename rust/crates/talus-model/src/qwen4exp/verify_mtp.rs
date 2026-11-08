@@ -58,7 +58,11 @@ use crate::qwen4exp::skeleton::Qwen4ExpModelConfig;
 // ============================================================================
 
 /// `strata::kernels::kVerifyMaxT`: the widest window (verify_kernels.hpp; 16, copy windows).
-pub const K_VERIFY_MAX_T: usize = 16;
+pub const K_VERIFY_MAX_T: usize = 32;
+/// the default copy window (TALUS_COPY_VERIFY=16 restores the v0.1.5 width).
+pub const K_COPY_VERIFY_DEFAULT: usize = 32;
+/// the widest copy window that needs no whole wide window before it (`FnCopy::wide_cap`).
+pub const K_COPY_MID_ROWS: usize = 16;
 /// `strata::core::kSpecQStride`: one q row = 64 ids then 64 probabilities as float bits (spec_prob.hpp).
 pub const K_SPEC_Q_STRIDE: usize = 128;
 /// `strata::core::kCoupledHistCap`: the coupled drafter's penalty window cap (coupled_draft.hpp).

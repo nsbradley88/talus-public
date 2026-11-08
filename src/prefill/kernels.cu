@@ -1902,6 +1902,72 @@ __global__ void moe_combine4_kernel(const float* __restrict__ Dm, const int32_t*
     bo[i] = make_float4(s.x + sh.x * g, s.y + sh.y * g, s.z + sh.z * g, s.w + sh.w * g);
 }
 
+// #12: moe_combine4_kernel + gr_write_norm_rs_kernel in one launch, a block per token: the MoE row is summed (combine4's
+// per-float4 expression and k order) into LDS instead of bo, then each of the 4 streams is written and normed as
+// gr_write_norm_rs_kernel does (the same thread-to-element mapping and block_sum): same bits, with no bo write + 4 reads.
+__global__ void __launch_bounds__(256) moe_write_norm_rs_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                                                const float* __restrict__ w, const float4* __restrict__ shared,
+                                                                const float* __restrict__ sg, float* __restrict__ R,
+                                                                const float* __restrict__ inj, int64_t inj_ld,
+                                                                const float* __restrict__ wn, float eps,
+                                                                float* __restrict__ rs_out, uint16_t* __restrict__ xn16,
+                                                                uint16_t* __restrict__ xn16_lo, int64_t ldx) {
+    __shared__ float sh[32];
+    __shared__ __align__(16) float sbo[N];
+    const int64_t t = blockIdx.x;
+    float ww[10];
+    int64_t rr[10];
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        ww[k] = w[t * 10 + k];
+        rr[k] = slot[t * 10 + k];
+    }
+    const float g = sigm(sg[t]);
+#pragma unroll 1
+    for (int i = threadIdx.x; i < N / 4; i += 256) {
+        const int d = i * 4;
+        float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float4 v[10];
+#pragma unroll
+        for (int k = 0; k < 10; ++k) v[k] = *reinterpret_cast<const float4*>(Dm + rr[k] * N + d);
+#pragma unroll
+        for (int k = 0; k < 10; ++k) {
+            s.x = fmaf(ww[k], v[k].x, s.x); s.y = fmaf(ww[k], v[k].y, s.y);
+            s.z = fmaf(ww[k], v[k].z, s.z); s.w = fmaf(ww[k], v[k].w, s.w);
+        }
+        const float4 shv = shared[t * (N / 4) + i];
+        *reinterpret_cast<float4*>(&sbo[d]) = make_float4(s.x + shv.x * g, s.y + shv.y * g, s.z + shv.z * g, s.w + shv.w * g);
+    }
+    __syncthreads();
+#pragma unroll 1
+    for (int c = 0; c < HC; ++c) {
+        const int64_t row = t * HC + c;
+        float* r = R + row * N;
+        const int64_t xo = t * ldx + (int64_t) c * N;
+        const float sc = 2.0f * sigm(inj[t * inj_ld + c] / (float) HC);
+        float v[GRW_PER];
+        float ss = 0.0f;
+        int k = 0;
+#pragma unroll
+        for (int d = threadIdx.x; d < N; d += 256, ++k) {
+            const float x = fmaf(sbo[d], sc, r[d]);
+            r[d] = x;
+            v[k] = x;
+            ss += x * x;
+        }
+        const float rs = rsqrtf(block_sum(ss, sh) / (float) N + eps);
+        if (threadIdx.x == 0) rs_out[row] = rs;
+        k = 0;
+#pragma unroll
+        for (int d = threadIdx.x; d < N; d += 256, ++k) {
+            const float x = v[k] * rs * wn[c * N + d];
+            const uint16_t h = act16(x);
+            xn16[xo + d] = h;
+            if (xn16_lo) xn16_lo[xo + d] = bf_lo(x, h);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- QSA helpers
 __global__ void rms_rows_kernel(float* __restrict__ x, const float* __restrict__ w, int64_t cols, int64_t ld, float eps) {
     __shared__ float sh[32];
@@ -2781,6 +2847,14 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
 #endif
     moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T, row_sd);
     check("moe_combine");
+}
+void moe_write_norm_rs(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* R,
+                       const float* inj, int64_t inj_ld, const float* w_norm_next, float eps, float* rs, uint16_t* xn16, int64_t T,
+                       void* stream, uint16_t* xn16_lo, int64_t ldx) {
+    moe_write_norm_rs_kernel<<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, reinterpret_cast<const float4*>(shared), sg, R, inj,
+                                                                              inj_ld, w_norm_next, eps, rs, xn16, xn16_lo,
+                                                                              ldx > 0 ? ldx : D);
+    check("moe_write_norm_rs");
 }
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
     if (rows <= 0) return;

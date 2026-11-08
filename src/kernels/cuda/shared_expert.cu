@@ -217,6 +217,18 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     const bool gate_deferred = (lfuse & 1) != 0, pair = (lfuse & 2) != 0;
     // 1..16 rows (a Flash-Next copy window); the projections are native_mmvq's columns (bitwise across column
     // counts), the gate's BF16 rows run as calls of <= 8 rows (bf16_gemv_fp32_mmvf_multi's limit)
+    if (n_tok > 16) {   // 17..32 rows in two calls of <= 16 (row-wise; q8_1 scratch rewritten per call)
+        const int a = (n_tok + 1) / 2;
+        const size_t fb = native_q8_1_bytes((int) n_embd, 1);
+        const char* xr = static_cast<const char*>(x_q8_1_ready);
+        NativeSharedWeights nw2 = nw;   // the descriptor's q8_1, when it has one, is the window's: the second call's rows start at a
+        if (nw.x_q8_1) nw2.x_q8_1 = static_cast<const char*>(nw.x_q8_1) + a * fb;
+        shared_expert_multi(a, x, x_bf16, nw, gate_inp_bf16, gate, up, g, out, n_embd, n_ff, stream, xr, lfuse);
+        shared_expert_multi(n_tok - a, x + (size_t) a * n_embd, x_bf16 ? x_bf16 + (size_t) a * n_embd : nullptr, nw2, gate_inp_bf16,
+                            gate + (size_t) a * n_ff, up + (size_t) a * n_ff, g + a, out + (size_t) a * n_embd, n_embd, n_ff, stream,
+                            xr ? xr + a * fb : nullptr, lfuse);
+        return;
+    }
     if (n_tok < 1 || n_tok > 16 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
         throw std::invalid_argument("shared_expert_multi: needs 1..16 tokens, native weights, scratch and a stream");
     cudaStream_t cs = (cudaStream_t) stream;

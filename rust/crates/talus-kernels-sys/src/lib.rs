@@ -4169,6 +4169,21 @@ unsafe fn load_sym<T>(handle: *mut c_void, name: &'static str) -> Result<T, Stri
 }
 
 impl LibTalusKernels {
+    /// an optional entry point outside Contract v0 (null handle / missing symbol -> None).
+    #[cfg(unix)]
+    pub fn optional_sym(&self, name: &str) -> Option<*mut c_void> {
+        if self.handle.is_null() {
+            return None;
+        }
+        let c_name = CString::new(name).ok()?;
+        // SAFETY: the handle is a live dlopen handle; the name is NUL-terminated.
+        let sym = unsafe { dlsym(self.handle, c_name.as_ptr()) };
+        if sym.is_null() {
+            None
+        } else {
+            Some(sym)
+        }
+    }
     /// Dynamically load `libtalus_kernels.so` from `path` using `dlopen`/`dlsym` and resolve all
     /// Contract v0 entry points.
     #[cfg(unix)]

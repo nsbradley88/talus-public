@@ -251,7 +251,8 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, url: &str) {
         "generating" => ("● generating", ACCENT),
         "restarting" => ("◌ restarting: serving pauses", WARN),
         "unloaded" => ("○ unloaded", DIM),
-        "crashed" => ("✕ engine crashed: restarts on the next request", WARN),
+        "crashed" => ("✕ engine crashed: restarting shortly", WARN),
+        "engine_restarting" => ("◌ engine restarting after a crash", WARN),
         "down" => ("✕ engine down (crash loop)", BAD),
         other => (other, DIM),
     };

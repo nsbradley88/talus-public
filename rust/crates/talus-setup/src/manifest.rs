@@ -382,7 +382,9 @@ pub const MODELS: &[ModelInstall] = &[
         desktop_fit: DesktopFit::Yes,
         needs_big_gtt: false,
         min_start_gib: None,
-        release_free_gib: 51,
+        // fix 1: the prompt path keeps its own 16K-chunk buffers (+6.8 GiB) when every expert is resident
+        // (51 -> 45 GiB served MemAvailable at 256K, the desktop ; the engine keeps the loan when it does not fit)
+        release_free_gib: 45,
         auto_context_gib: 0,
         auto_pack_gib: 0,
         chat_tps: 63.9,
@@ -484,12 +486,12 @@ pub const MODELS: &[ModelInstall] = &[
         desktop_fit: DesktopFit::Tight,
         needs_big_gtt: true,
         min_start_gib: None,
-        release_free_gib: 14,
+        release_free_gib: 16,
         auto_context_gib: 0,
         auto_pack_gib: 0,
         chat_tps: 40.0,
         prompt_tps: 734.0,
-        context: "192K",
+        context: "256K",
     },
     ModelInstall {
         id: "laguna-s-2.1",

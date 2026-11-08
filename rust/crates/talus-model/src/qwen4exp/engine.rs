@@ -30,7 +30,7 @@ use crate::qwen4exp::kld_flags::{split_rust_only_flags, KldCliOpts}; // qwen4exp
 use crate::qwen4exp::skeleton::{LayerDumpHarness, Qwen4ExpModelConfig, Qwen4ExpRustEngine};
 use crate::qwen4exp::spec::{parse_logit_bias, DraftPolicy, SuffixDrafter};
 use crate::qwen4exp::state::{compute_prompt_cuts, prompt_end_checkpoint};
-use crate::qwen4exp::verify_mtp::K_VERIFY_MAX_T;
+use crate::qwen4exp::verify_mtp::{K_COPY_MID_ROWS, K_COPY_VERIFY_DEFAULT, K_VERIFY_MAX_T};
 use talus_spec::{copy_cfg_from_env, copy_enabled, copy_env_f64, CopyMatch, CopyProposer}; // the widest verify window (16)
 
 struct StdinShared {
@@ -188,6 +188,12 @@ struct FnCopy {
     /// stretches verify up to `TALUS_COPY_VERIFY` (16) rows at once, everything else keeps windows of <= 8 rows
     base_rows: usize,
     wide_q: f64,
+    /// rows past `mid_rows` (16) only right after a copy window of at least `mid_rows` rows that was
+    /// accepted whole, so a long copy earns them and a code-like run of short hits never pays for them
+    /// (`TALUS_COPY_WIDE_RAMP=0`: no such bar).
+    mid_rows: usize,
+    long_ok: bool,
+    ramp: bool,
     /// `TALUS_COPY_LOG=1`: round time sums / counts by window size and kind (0 MTP, 1 copy, 2 MTP + copy)
     log: bool,
     tsum: [[f64; K_VERIFY_MAX_T + 1]; 3],
@@ -212,6 +218,9 @@ impl FnCopy {
             out: Vec::new(),
             base_rows: COPY_BASE_ROWS,
             wide_q: copy_env_f64("WIDE_Q").unwrap_or(0.95),
+            mid_rows: K_COPY_MID_ROWS,
+            long_ok: false,
+            ramp: flag("WIDE_RAMP"),
             log: copy_env_f64("LOG").is_some_and(|v| v != 0.0),
             tsum: [[0.0; K_VERIFY_MAX_T + 1]; 3],
             tn: [[0; K_VERIFY_MAX_T + 1]; 3],
@@ -228,10 +237,15 @@ impl FnCopy {
     /// how many copied tokens a window that already holds `rows` rows may take - all `avail` (up to the
     /// verify window) when copies like `m` are accepted at >= `wide_q`, else only up to the release width.
     fn wide_cap(&self, m: &CopyMatch, avail: usize, rows: usize) -> usize {
-        if rows + avail <= self.base_rows || self.cp.accept_rate(m) >= self.wide_q {
+        let cap = if rows + avail <= self.base_rows || self.cp.accept_rate(m) >= self.wide_q {
             avail
         } else {
             avail.min(self.base_rows.saturating_sub(rows))
+        };
+        if self.ramp && !self.long_ok && rows + cap > self.mid_rows {
+            cap.min(self.mid_rows.saturating_sub(rows))
+        } else {
+            cap
         }
     }
 
@@ -241,6 +255,7 @@ impl FnCopy {
         self.cp.begin_request();
         self.next = None;
         self.cur = None;
+        self.long_ok = false;
         let _ = self.cp.take_stats();
     }
 
@@ -318,9 +333,12 @@ impl FnCopy {
 
     /// Records the verdict on this window's copy (`a` drafts accepted, `t_mtp - 1` of them the MTP's).
     fn observe(&mut self, a: i32, t_mtp: i32) {
+        self.long_ok = false;
         if let Some((m, k, chained)) = self.cur.take() {
+            let mtp_rows = if chained { (t_mtp - 1).max(0) } else { 0 };
+            // the window's rows: the verify row, the MTP's drafts (chained), the copy
+            self.long_ok = a >= mtp_rows + k as i32 && 1 + mtp_rows as usize + k >= self.mid_rows;
             if chained {
-                let mtp_rows = (t_mtp - 1).max(0);
                 if a >= mtp_rows {
                     self.cp.observe(&m, k, (a - mtp_rows) as usize, true);
                 }
@@ -364,7 +382,7 @@ impl FnCopy {
 /// high-confidence bar stay within it.
 const COPY_BASE_ROWS: usize = 8;
 
-/// copies fill verify windows of up to `TALUS_COPY_VERIFY` (default 16, the verify kernels'
+/// copies fill verify windows of up to `TALUS_COPY_VERIFY`  default 32, the verify kernels'
 /// kVerifyMaxT; 8 = the rc-copy release) tokens.  The C++ option parser widens `--spec S` to S + 2 for prompt lookup;
 /// with the copy proposer on and no `--mtp-max-t`, the window becomes `--spec W --mtp-max-t S` instead (the MTP keeps
 /// its S-token windows, the suffix drafter / draft policy their release width; only copies use rows past S + 2).
@@ -374,7 +392,7 @@ fn widen_verify_for_copy(argv: Vec<String>) -> Vec<String> {
     }
     let w = copy_env_f64("VERIFY")
         .map(|v| v as i64)
-        .unwrap_or(K_VERIFY_MAX_T as i64)
+        .unwrap_or(K_COPY_VERIFY_DEFAULT as i64)
         .clamp(2, K_VERIFY_MAX_T as i64);
     let Some(i) = argv.iter().rposition(|a| a == "--spec") else {
         return argv;
@@ -999,7 +1017,7 @@ unsafe extern "C" fn cb_run_serve_loop(
         }
     }
 
-    // with copies on, the verify window is 16 (rd-draft; widen_verify_for_copy) but the suffix drafter / draft policy keep
+    // with copies on, the verify window is 32  ; widen_verify_for_copy) but the suffix drafter / draft policy keep
     // their release width (the MTP's windows + 2): only copies fill the extra rows
     let copy_on_here = copy_enabled();
     let sfx_spec = if copy_on_here && info.lookup_chain == 0 && info.mtp_max_t >= 2 {
@@ -1026,6 +1044,14 @@ unsafe extern "C" fn cb_run_serve_loop(
             info.spec, info.mtp_max_t
         );
     }
+
+    // #40  ): the shared memory-pressure guard at the common 8 GiB floor; a GEN that arrives while the host is
+    // under it fails with `ERR insufficient_memory` and the loop keeps serving (TransientArenas = host-heap trim; the
+    // expert cache / checkpoints are not shed here)
+    talus_mem::pressure::install(
+        talus_mem::pressure::PressureConfig::strix_default(),
+        "talus-qwen4exp",
+    );
 
     loop {
         let req_stop = state.request_stop_fn;
@@ -1089,6 +1115,12 @@ unsafe extern "C" fn cb_run_serve_loop(
             let _ = std::io::stdout().flush();
             continue;
         }
+        // #40: refuse just this request when the host is under the MemAvailable floor
+        if let Err(e) = talus_mem::pressure::admit(&mut talus_mem::pressure::NoShed) {
+            println!("{}", talus_mem::pressure::err_line(&e.to_string()));
+            let _ = std::io::stdout().flush();
+            continue;
+        }
 
         let r0 = Instant::now();
         let sampling = TkQwen4ExpReqSampling {
@@ -1111,6 +1143,7 @@ unsafe extern "C" fn cb_run_serve_loop(
         let mut resumed_from0 = 0i32;
         let mut reread_to = -1i64;
         let mut pin_at = -1i64;
+        let mut resumed_checkpoint = 0i64;
 
         let begin_rc = (k.serve_begin_request)(
             ctx,
@@ -1132,6 +1165,7 @@ unsafe extern "C" fn cb_run_serve_loop(
             &mut resumed_from0,
             &mut reread_to,
             &mut pin_at,
+            &mut resumed_checkpoint,
         );
         if begin_rc < 0 {
             return 1;
@@ -1212,6 +1246,7 @@ unsafe extern "C" fn cb_run_serve_loop(
                 info.prompt_cache,
                 parsed.req_ckpt != 0,
                 info.short_read,
+                resumed_checkpoint,
             );
             if end_at > 0 && (k.serve_checkpoint_at)(ctx, end_at, 0, 0, cut_plan.turn_at) < 0 {
                 return 1;
@@ -1284,12 +1319,14 @@ unsafe extern "C" fn cb_run_serve_loop(
         let use_mtp = info.use_mtp != 0;
         let fn_trace = std::env::var_os("TALUS_FN_SPEC_TRACE").is_some();
         let mut fn_tr_line: Option<String> = None;
+        let clamp_last = std::env::var("TALUS_FN_CLAMP_LAST").map_or(true, |v| v != "0");
+        let row_hash = std::env::var_os("TALUS_FN_ROWHASH").is_some();
 
         while !cancelled && produced_n < parsed.max_new {
             let initial_t = if use_mtp { info.mtp_max_t } else { 1 };
             // a copy decided at the end of the last window fills this one
             let copy_next = copy.as_mut().and_then(|fc| fc.next.take().map(|m| (m, fc)));
-            let (mut t, t_mtp, from_sfx, sfx_match, mut chain_n, mut cm) =
+            let (mut t, mut t_mtp, from_sfx, sfx_match, mut chain_n, mut cm) =
                 if let Some((m, fc)) = copy_next {
                     let n = fc.next_toks.len().min(sbuf.len());
                     sbuf[..n].copy_from_slice(&fc.next_toks[..n]);
@@ -1333,6 +1370,19 @@ unsafe extern "C" fn cb_run_serve_loop(
                         chain_n = n;
                         cm = fc.cur.map_or(0, |c| c.0.len as i32);
                         t += n;
+                    }
+                }
+            }
+            // the last window stops at max_new. Rows past it would enter `consumed` and the recurrent
+            // state without being emitted, so the live session stops being a prefix of the follow-up prompt.
+            let remaining = (parsed.max_new - produced_n).min(i32::MAX as i64) as i32;
+            if clamp_last && t > remaining {
+                t = remaining;
+                t_mtp = t_mtp.min(t);
+                chain_n = t - t_mtp;
+                if let Some(fc) = copy.as_mut() {
+                    if let Some(c) = fc.cur.as_mut() {
+                        c.1 = c.1.min(if c.2 { chain_n } else { t - 1 } as usize);
                     }
                 }
             }
@@ -1383,6 +1433,22 @@ unsafe extern "C" fn cb_run_serve_loop(
             let mut a = 0i32;
             while a < t - 1 && window[(a + 1) as usize] == outv[a as usize] {
                 a += 1;
+            }
+            // TALUS_FN_ROWHASH=1 prints an FNV-1a hash of each accepted row's logits by decode position,
+            // so two arms can compare logits bitwise. Test only.
+            if row_hash {
+                let mut row = vec![0f32; info.n_vocab.max(0) as usize];
+                for i in 0..=a {
+                    let ok = (k.serve_copy_logits)(ctx, i, row.as_mut_ptr()) != 0;
+                    let mut h = 0xcbf29ce484222325u64;
+                    for v in &row {
+                        h = (h ^ u64::from(v.to_bits())).wrapping_mul(0x100000001b3);
+                    }
+                    eprintln!(
+                        "talus fnrow: pos {} t {t} row {i} ok {ok} hash {h:016x}",
+                        produced_n + i64::from(i)
+                    );
+                }
             }
             // TALUS_FN_SPEC_TRACE=1 prints one `fntr` line per window to stderr (rows t, MTP rows t_mtp,
             // suffix / copy flags, accepted a, position, verify / draft / round ms, the MTP drafts' probabilities and
@@ -1550,6 +1616,13 @@ unsafe extern "C" fn cb_run_serve_loop(
         let decode_ms = d0.elapsed().as_secs_f64() * 1000.0;
         if let Some(fc) = copy.as_mut() {
             fc.report();
+        }
+        if std::env::var_os("TALUS_FN_WARM_TRACE").is_some() {
+            eprintln!(
+                "talus fnwarm: end n_prompt {n_prompt} produced {produced_n} consumed {} (no-overshoot value {}) windows {dec_windows} finish {finish}",
+                consumed.len(),
+                n_prompt - 1 + produced_n
+            );
         }
         let finish_c = CString::new(finish).unwrap();
         if (k.serve_finish_request)(
@@ -2047,13 +2120,55 @@ mod rd_draft_tests {
             .map(|s| s.to_string())
             .collect();
         let w = widen_verify_for_copy(a);
-        assert_eq!(w, vec!["talus", "--spec", "16", "--mtp-max-t", "5"]);
+        assert_eq!(w, vec!["talus", "--spec", "32", "--mtp-max-t", "5"]);
         // an explicit --mtp-max-t, or a window already that wide: unchanged
-        let b: Vec<String> = ["talus", "--spec", "16"]
+        let b: Vec<String> = ["talus", "--spec", "32"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         assert_eq!(widen_verify_for_copy(b.clone()), b);
+    }
+
+    #[test]
+    fn rows_past_mid_need_a_whole_wide_window_first() {
+        let Some(mut fc) = FnCopy::from_env() else {
+            return;
+        };
+        fc.ramp = true;
+        fc.wide_q = 0.9;
+        let m = CopyMatch {
+            start: 0,
+            len: 60,
+            resumed: false,
+        };
+        // fresh: at most mid_rows, also behind MTP rows
+        assert_eq!(fc.wide_cap(&m, 31, 1), fc.mid_rows - 1);
+        assert_eq!(fc.wide_cap(&m, 31, 6), fc.mid_rows - 6);
+        // a whole mid_rows window opens the next one
+        fc.cur = Some((m, fc.mid_rows - 1, false));
+        fc.observe(fc.mid_rows as i32 - 1, 0);
+        assert!(fc.long_ok);
+        assert_eq!(fc.wide_cap(&m, 31, 1), 31);
+        // one rejected draft closes it
+        fc.cur = Some((m, 31, false));
+        fc.observe(30, 0);
+        assert!(!fc.long_ok);
+        assert_eq!(fc.wide_cap(&m, 31, 1), fc.mid_rows - 1);
+        // a short whole window does not open it
+        fc.cur = Some((m, 7, false));
+        fc.observe(7, 0);
+        assert!(!fc.long_ok);
+        // a chained window counts its MTP rows; its copy must be whole
+        fc.cur = Some((m, 11, true));
+        fc.observe(15, 5);
+        assert!(fc.long_ok);
+        fc.cur = Some((m, 11, true));
+        fc.observe(14, 5);
+        assert!(!fc.long_ok);
+        // a window without a copy closes it
+        fc.long_ok = true;
+        fc.observe(3, 4);
+        assert!(!fc.long_ok);
     }
 
     #[test]

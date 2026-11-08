@@ -1379,6 +1379,11 @@ pub fn serve_main(
             } else {
                 K_MAX_VERIFY
             };
+            // A verify window takes block-sparse attention as a whole once its last row reaches the sparse start, but a
+            // decode step only from its own position: a window straddling the start would give its earlier rows other
+            // attention than decoding them one by one, so greedy output would depend on the drafts. End the window
+            // before the start; rows past it are bitwise verify(1) rows at any width (sparse_exact).
+            let wmax = wmax.min(eng.window_before_sparse(pos_now));
             cost.at_depth(pos_now);
             let mut pl_bucket = usize::MAX;
             let mut pl_rate = 0.0;

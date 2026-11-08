@@ -375,9 +375,11 @@ fn validate_index_row(r: &IndexRow) -> Result<()> {
         } else {
             r.scales_bytes
         };
-        let sum_src = r.codes_bytes + src_scale_bytes + r.offset_bytes;
-        let sum_dst = r.codes_bytes + r.scales_bytes + r.offset_bytes;
-        if sum_src != r.src_bytes || sum_dst != r.dst_bytes {
+        // in u128: a wrapped sum could pass this check
+        let (codes, offset) = (u128::from(r.codes_bytes), u128::from(r.offset_bytes));
+        let sum_src = codes + u128::from(src_scale_bytes) + offset;
+        let sum_dst = codes + u128::from(r.scales_bytes) + offset;
+        if sum_src != u128::from(r.src_bytes) || sum_dst != u128::from(r.dst_bytes) {
             return Err(GgufError::PackFormat {
                 message: format!(
                     "{}: plane segments cover {sum_src}/{sum_dst} B but index declares {}/{} B",
@@ -386,8 +388,8 @@ fn validate_index_row(r: &IndexRow) -> Result<()> {
             });
         }
     } else if matches!(r.kind, WeightKind::Bf16InF32 | WeightKind::F16InF32) {
-        let elems = r.elements();
-        if r.src_bytes != elems * 4 || r.dst_bytes != elems * 2 {
+        let elems = u128::from(r.elements());
+        if u128::from(r.src_bytes) != elems * 4 || u128::from(r.dst_bytes) != elems * 2 {
             return Err(GgufError::PackFormat {
                 message: format!(
                     "{}: promoted tensor of {elems} elements is {} B in / {} B out, expected {}/{}",
@@ -1188,5 +1190,44 @@ impl StrataPack {
             });
         }
         Ok(&exp_bin.as_slice()[start..end])
+    }
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+
+    /// Sizes are compared without wrapping.
+    #[test]
+    fn promoted_tensor_size_overflow_is_an_error() {
+        // elements * 4 would wrap to src_bytes = 0, dst_bytes = 0
+        let wrapped = format!("t 0 1 0 0 0 0 {} 1 0 0 0 0 0 0 0 0 0 0\n", 1u64 << 62);
+        assert!(validate_index_row_text(&wrapped).is_err());
+    }
+
+    fn validate_index_row_text(line: &str) -> Result<()> {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let r = IndexRow {
+            name: f[0].to_string(),
+            file: PackFileId::from_id(f[1].parse().unwrap()).unwrap(),
+            kind: WeightKind::from_id(f[2].parse().unwrap()).unwrap(),
+            src_off: 0,
+            src_bytes: f[4].parse().unwrap(),
+            dst_off: 0,
+            dst_bytes: f[6].parse().unwrap(),
+            ne0: f[7].parse().unwrap(),
+            ne1: f[8].parse().unwrap(),
+            code_bits: 0,
+            code_bias: 0,
+            group_elems: 0,
+            codebook_iq4nl: false,
+            has_offset: false,
+            codes_bytes: 0,
+            scales_bytes: 0,
+            offset_bytes: 0,
+            scales_fp16: false,
+            act_kind: 0,
+        };
+        validate_index_row(&r)
     }
 }

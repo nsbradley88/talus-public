@@ -3,6 +3,7 @@
 
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
+#include "strata/kernels/rowpad.hpp"
 
 #include <cuda_runtime.h>
 
@@ -451,12 +452,13 @@ __global__ void __launch_bounds__(64) f32_matmul_v2_kernel(const float* __restri
 // activations stream from global/L2 in batches loaded one batch ahead of the chain.
 template <int OB>
 __global__ void __launch_bounds__(256) f32_matmul_few_kernel(const float* __restrict__ w, const float* __restrict__ x,
-                                                             float* __restrict__ y, int n_in, int n_out, int n_tok) {
+                                                             float* __restrict__ y, int n_in, int n_out, int n_tok,
+                                                             int64_t ld) {
     extern __shared__ float4 sw[];                 // OB rows x n_in / 4
     const int tid = threadIdx.x, o0 = blockIdx.x * OB, k4 = n_in / 4;
     for (int i = tid; i < OB * k4; i += 256) {
         const int r = i / k4, c = i % k4;
-        sw[i] = (o0 + r < n_out) ? *reinterpret_cast<const float4*>(w + (size_t) (o0 + r) * n_in + 4 * c)
+        sw[i] = (o0 + r < n_out) ? *reinterpret_cast<const float4*>(w + (size_t) (o0 + r) * ld + 4 * c)   // rd-pad
                                  : make_float4(0.f, 0.f, 0.f, 0.f);
     }
     __syncthreads();
@@ -488,6 +490,83 @@ __global__ void __launch_bounds__(256) f32_matmul_few_kernel(const float* __rest
         for (int j = 0; j < NB; ++j) a[j] = an[j];
     }
     y[(size_t) my_t * n_out + o0 + my_o] = acc;
+}
+
+// f32_matmul_few_kernel streams instead of staging.  The few kernel loads its 2 whole rows (32 KB at n_in 4096)
+// into LDS and only then runs the chains, so a block's load and its 4096-long FMA chain never overlap, and 128 blocks
+// of 32 KB LDS run in ~2 rounds: the MiMo router measured ~49 us per call (~86 GB/s, latency-bound; padding the rows
+// did nothing).  Here a block owns OB rows and walks k in chunks of KC: the next chunk's global loads (all 256
+// threads) are in flight while the compute threads (one per (token, row), as before) run the current chunk's part of
+// the chain from LDS (double-buffered, one barrier per chunk; row stride KC/4 + 1 float4 against bank conflicts).
+// Every output is the same sequential chain acc = fma(x[k], w[k], acc), k ascending from 0, as f32_matmul_few_kernel
+// and f32_matmul_kernel: bitwise identical.  TALUS_F32FEW_STREAM=0: the old kernel.  n_in % KC == 0.
+template <int OB, int KC>
+__global__ void __launch_bounds__(256) f32_matmul_stream_kernel(const float* __restrict__ w, const float* __restrict__ x,
+                                                                float* __restrict__ y, int n_in, int n_out, int n_tok,
+                                                                int64_t ld) {
+    constexpr int KC4 = KC / 4, RS = KC4 + 1, L = (OB * KC4 + 255) / 256, NB = 16;
+    static_assert(KC4 % NB == 0, "KC must be a multiple of 64");
+    __shared__ float4 sw[2][OB * RS];
+    const int tid = threadIdx.x, o0 = blockIdx.x * OB, k4 = n_in / 4, nch = n_in / KC;
+    float4 p[L];
+    auto gload = [&](int ch) {
+#pragma unroll
+        for (int u = 0; u < L; ++u) {
+            const int i = tid + 256 * u;
+            if (OB * KC4 % 256 == 0 || i < OB * KC4) {
+                const int r = i / KC4, c = i % KC4;
+                p[u] = (o0 + r < n_out) ? *reinterpret_cast<const float4*>(w + (size_t) (o0 + r) * ld + (size_t) ch * KC + 4 * c)
+                                        : make_float4(0.f, 0.f, 0.f, 0.f);
+            }
+        }
+    };
+    auto lstore = [&](int buf) {
+#pragma unroll
+        for (int u = 0; u < L; ++u) {
+            const int i = tid + 256 * u;
+            if (OB * KC4 % 256 == 0 || i < OB * KC4) sw[buf][(i / KC4) * RS + i % KC4] = p[u];
+        }
+    };
+    const int my_o = tid % OB, my_t = tid / OB;    // compute threads: OB x n_tok
+    const bool active = my_t < n_tok && o0 + my_o < n_out;
+    const float4* xv = reinterpret_cast<const float4*>(x + (size_t) (active ? my_t : 0) * n_in);
+    float acc = 0.0f;
+    float4 a[NB];
+    if (active) {
+#pragma unroll
+        for (int j = 0; j < NB; ++j) a[j] = xv[j];
+    }
+    gload(0);
+    lstore(0);
+    __syncthreads();
+    for (int ch = 0; ch < nch; ++ch) {
+        const bool more = ch + 1 < nch;
+        if (more) gload(ch + 1);
+        if (active) {
+            const float4* wr = &sw[ch & 1][my_o * RS];
+            for (int c = 0; c < KC4; c += NB) {
+                const int gi = ch * KC4 + c, gn = gi + NB < k4 ? gi + NB : gi;
+                float4 an[NB];
+#pragma unroll
+                for (int j = 0; j < NB; ++j) an[j] = xv[gn + j];
+                __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+                for (int j = 0; j < NB; ++j) {
+                    const float4 b = wr[c + j];
+                    acc = __builtin_fmaf(a[j].x, b.x, acc);
+                    acc = __builtin_fmaf(a[j].y, b.y, acc);
+                    acc = __builtin_fmaf(a[j].z, b.z, acc);
+                    acc = __builtin_fmaf(a[j].w, b.w, acc);
+                }
+                __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+                for (int j = 0; j < NB; ++j) a[j] = an[j];
+            }
+        }
+        if (more) lstore((ch + 1) & 1);
+        __syncthreads();
+    }
+    if (active) y[(size_t) my_t * n_out + o0 + my_o] = acc;
 }
 
 __global__ void silu_mul_kernel(float* __restrict__ g, const float* __restrict__ u, int64_t n) {
@@ -563,8 +642,36 @@ void f32_matmul(const float* w, const float* x, float* y, int n_in, int n_out, i
     if (n_in % 16 != 0) { std::fprintf(stderr, "laguna: f32_matmul: n_in %d not a multiple of 16\n", n_in); std::exit(1); }
     static const bool old_only = [] { const char* e = std::getenv("TALUS_F32MM_OLD"); return e && e[0] == '1'; }();
     if (!old_only && n_tok <= 16 && n_in % 64 == 0 && n_in <= 8192) {   // decode / verify windows: bitwise, 2 rows per block
+        int64_t ld;
+        const float* wp = strata::kernels::rowpad_lookup(w, n_in, n_out, &ld);   // rd-pad (same bits)
+        // the streaming kernel on padded rows (rd-pad copy registered: ld != n_in). On the plain rows every
+        // block reads the same k chunk of rows 16 KB apart (DRAM channel camping) and the stream kernel is slower than
+        // the staged one (kab2, the desktop: MiMo T1 46 us staged, 55-58 us stream plain, 24.8 us stream padded 16x256).
+        // TALUS_F32FEW_STREAM=0: never; =2: also on plain rows (bench). TALUS_F32FEW_CFG picks OB x KC (bench):
+        // 1 = 4x512, 2 = 8x512, 3 = 4x256, 4 = 8x256, 5 = 16x256 (default), 6 = 2x1024
+        static const int stream_mode = [] { const char* e = std::getenv("TALUS_F32FEW_STREAM"); return e ? std::atoi(e) : 1; }();
+        static const int cfg = [] { const char* e = std::getenv("TALUS_F32FEW_CFG"); return e ? std::atoi(e) : 5; }();
+        const bool stream_on = stream_mode >= 2 || (stream_mode == 1 && ld != n_in);
+        const cudaStream_t st = (cudaStream_t) stream;
+#define TALUS_F32_STREAM(OB, KC) \
+        if (n_in % KC == 0 && OB * n_tok <= 256) { \
+            f32_matmul_stream_kernel<OB, KC><<<(n_out + OB - 1) / OB, 256, 0, st>>>(wp, x, y, n_in, n_out, n_tok, ld); \
+            check_launch("f32_matmul_stream"); \
+            return; \
+        }
+        if (stream_on) {
+            switch (cfg) {
+            case 2: TALUS_F32_STREAM(8, 512) break;
+            case 3: TALUS_F32_STREAM(4, 256) break;
+            case 4: TALUS_F32_STREAM(8, 256) break;
+            case 1: TALUS_F32_STREAM(4, 512) break;
+            case 6: TALUS_F32_STREAM(2, 1024) break;
+            default: TALUS_F32_STREAM(16, 256) break;
+            }
+        }
+#undef TALUS_F32_STREAM
         f32_matmul_few_kernel<2><<<(n_out + 1) / 2, 256, (size_t) 2 * n_in * sizeof(float), (cudaStream_t) stream>>>(
-            w, x, y, n_in, n_out, n_tok);
+            wp, x, y, n_in, n_out, n_tok, ld);
         check_launch("f32_matmul_few");
         return;
     }
@@ -1126,10 +1233,10 @@ __global__ void __launch_bounds__(128) router_route_kernel(const float* __restri
                                                            float* __restrict__ logits, const float* __restrict__ bias,
                                                            int32_t* __restrict__ ids, float* __restrict__ wout,
                                                            int n_in, int k, float scale,
-                                                           unsigned int* __restrict__ counter) {
+                                                           unsigned int* __restrict__ counter, int64_t ld) {
     __shared__ float red[4];
     __shared__ bool last;
-    const float4* row = reinterpret_cast<const float4*>(w + (size_t) blockIdx.x * n_in);
+    const float4* row = reinterpret_cast<const float4*>(w + (size_t) blockIdx.x * ld);   // ld >= n_in
     const float4* xv = reinterpret_cast<const float4*>(x);
     float acc = 0.0f;
     if (n_in == 3072) {   // Laguna: 6 float4 per thread, all issued before the first use
@@ -1220,8 +1327,10 @@ void attn_merge_gate_quant(const float* part_acc, const float* part_ml, const fl
 void router_route(const float* w, const float* x, float* logits, const float* bias, int32_t* ids, float* wout,
                   int n_in, int n_expert, int k, float scale, unsigned int* counter, void* stream) {
     if (n_expert != 256 || n_in % 128 != 0 || k > 32) { std::fprintf(stderr, "laguna: router_route: shape\n"); std::exit(1); }
-    router_route_kernel<<<n_expert, 128, 0, (cudaStream_t) stream>>>(w, x, logits, bias, ids, wout, n_in, k, scale,
-                                                                     counter);
+    int64_t ld;
+    const float* wp = strata::kernels::rowpad_lookup(w, n_in, n_expert, &ld);   // rd-pad (same bits)
+    router_route_kernel<<<n_expert, 128, 0, (cudaStream_t) stream>>>(wp, x, logits, bias, ids, wout, n_in, k, scale,
+                                                                     counter, ld);
     check_launch("router_route");
 }
 
@@ -2643,9 +2752,10 @@ namespace {
 
 // y[t][o] = w[o] . x[t] for n_tok <= 8 tokens: one 128-thread block per row, the row read once for every token
 __global__ void __launch_bounds__(128) f32_matvec_rows_n_kernel(const float* __restrict__ w, const float* __restrict__ x,
-                                                                float* __restrict__ y, int n_in, int n_out, int n_tok) {
+                                                                float* __restrict__ y, int n_in, int n_out, int n_tok,
+                                                                int64_t ld) {
     __shared__ float red[4][8];
-    const float4* row = reinterpret_cast<const float4*>(w + (size_t) blockIdx.x * n_in);
+    const float4* row = reinterpret_cast<const float4*>(w + (size_t) blockIdx.x * ld);   // ld >= n_in
     float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     for (int i = threadIdx.x; i < n_in / 4; i += 128) {
         const float4 a = row[i];
@@ -2672,7 +2782,9 @@ __global__ void __launch_bounds__(128) f32_matvec_rows_n_kernel(const float* __r
 
 void f32_matvec_rows_n(const float* w, const float* x, float* y, int n_in, int n_out, int n_tok, void* stream) {
     if (n_tok < 1 || n_tok > 8 || n_in % 4 != 0) { std::fprintf(stderr, "laguna: f32_matvec_rows_n: shape\n"); std::exit(1); }
-    f32_matvec_rows_n_kernel<<<n_out, 128, 0, (cudaStream_t) stream>>>(w, x, y, n_in, n_out, n_tok);
+    int64_t ld;
+    const float* wp = strata::kernels::rowpad_lookup(w, n_in, n_out, &ld);   // rd-pad (same bits)
+    f32_matvec_rows_n_kernel<<<n_out, 128, 0, (cudaStream_t) stream>>>(wp, x, y, n_in, n_out, n_tok, ld);
     check_launch("f32_matvec_rows_n");
 }
 

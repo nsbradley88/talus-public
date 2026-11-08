@@ -62,6 +62,7 @@ pub struct P5Hooks {
         out_resume: *mut i64,
         out_read_from: *mut i64,
         out_reread_to: *mut i64,
+        out_resumed_checkpoint: *mut i64,
     ) -> c_int,
     pub pin: unsafe extern "C" fn(user: *mut std::ffi::c_void, len: i64) -> c_int,
     pub checkpoint: unsafe extern "C" fn(
@@ -501,7 +502,8 @@ impl ConvServe {
 
     /// The conversation part of a request's begin: picks the resume point (live session, a checkpoint, a parked
     /// conversation), parks the outgoing conversation, restores what the request continues from.
-    /// Returns (resume, read_from, reread_to); Err = an `ERR` line was printed and the engine stops.
+    /// Returns (resume, read_from, reread_to, resumed_checkpoint; the last is 0 for no checkpoint or the live state);
+    /// Err = an `ERR` line was printed and the engine stops.
     #[allow(clippy::too_many_arguments, clippy::result_unit_err)]
     pub fn begin(
         &mut self,
@@ -510,7 +512,7 @@ impl ConvServe {
         req_ckpt: bool,
         req_pin: i64,
         want_cvec: bool,
-    ) -> Result<(i64, i64, i64), ()> {
+    ) -> Result<(i64, i64, i64, i64), ()> {
         let n = cur.len() as i64;
         let starts_with = |pre: &[i32], pre_imgs: &[ImageKey]| -> bool {
             let len = pre.len() as i64;
@@ -531,6 +533,20 @@ impl ConvServe {
                 "talus serve: after non-finite logits (#879): dropped the live session, {n_checks} checkpoint{}, {n_parked} parked conversation{} and 0 idle slots (0 running slots not kept after their reply); reading this prompt from token 0",
                 if n_checks == 1 { "" } else { "s" },
                 if n_parked == 1 { "" } else { "s" }
+            );
+        }
+        if std::env::var_os("TALUS_FN_WARM_TRACE").is_some() {
+            let same = self
+                .live
+                .iter()
+                .zip(cur)
+                .take_while(|(&a, &b)| a as i64 == b)
+                .count();
+            eprintln!(
+                "talus fnwarm: begin cur {n} live {} live_ok {} common prefix {same} checkpoints {:?}",
+                self.live.len(),
+                self.live_ok,
+                self.checks.iter().map(|c| c.ids.len()).collect::<Vec<_>>()
             );
         }
         let mut resume = 0i64;
@@ -704,7 +720,12 @@ impl ConvServe {
         }
         let read_from = if reread_to > 0 { 0 } else { resume };
         self.conversations.limit_reuse(read_from);
-        Ok((resume, read_from, reread_to))
+        Ok((
+            resume,
+            read_from,
+            reread_to,
+            if from_live { 0 } else { resume },
+        ))
     }
 
     /// The live update at a request's end.
@@ -1203,6 +1224,7 @@ unsafe extern "C" fn hook_begin(
     out_resume: *mut i64,
     out_read_from: *mut i64,
     out_reread_to: *mut i64,
+    out_resumed_checkpoint: *mut i64,
 ) -> c_int {
     let s = me(user);
     match s.begin(
@@ -1212,10 +1234,11 @@ unsafe extern "C" fn hook_begin(
         req_pin,
         want_cvec != 0,
     ) {
-        Ok((resume, read_from, reread_to)) => {
+        Ok((resume, read_from, reread_to, resumed_checkpoint)) => {
             *out_resume = resume;
             *out_read_from = read_from;
             *out_reread_to = reread_to;
+            *out_resumed_checkpoint = resumed_checkpoint;
             1
         }
         Err(()) => -1,

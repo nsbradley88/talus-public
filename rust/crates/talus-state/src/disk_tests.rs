@@ -835,3 +835,374 @@ fn filesystem_floor_refuses_growth() {
         c.space_ok(1 << 20).unwrap();
     }
 }
+
+// ============================================================================
+// : streamed writes and loads
+// ============================================================================
+
+/// Write `job` through [`DiskCache::write_streamed`], filling from its own section buffers.
+fn write_streamed_job(
+    c: &DiskCache,
+    j: &WriteJob,
+    abort: &dyn Fn() -> bool,
+) -> Result<DiskEntry, DiskError> {
+    let lens: Vec<(u64, u64)> = j
+        .sections
+        .iter()
+        .map(|(t, d)| (*t, d.len() as u64))
+        .collect();
+    let mut fill = |si: usize, off: u64, buf: &mut [u8]| -> bool {
+        let src = &j.sections[si].1[off as usize..off as usize + buf.len()];
+        buf.copy_from_slice(src);
+        true
+    };
+    c.write_streamed(
+        &j.tokens,
+        &j.meta,
+        j.depth,
+        j.supersede,
+        &lens,
+        &mut fill,
+        abort,
+    )
+}
+
+/// The file minus the per-write timestamp and the head hash that covers it (header bytes 48..64, trailer 8..16).
+fn file_without_stamp(p: &Path) -> Vec<u8> {
+    let mut b = fs::read(p).unwrap();
+    b[48..64].fill(0);
+    let n = b.len();
+    b[n - 8..].fill(0);
+    b
+}
+
+#[test]
+fn streamed_write_is_the_staged_file() {
+    let (d1, d2) = (TempDir::new("stg"), TempDir::new("str"));
+    let id = ident("m-stream");
+    // three chunks (the last partial, not a whole hash block), a small section and an empty one
+    let big = 2 * STREAM_CHUNK + 5 * HASH_BLOCK + 3;
+    let mk = || WriteJob {
+        tokens: (0..5000).collect(),
+        meta: vec![9, 8, 7],
+        sections: vec![
+            (tag(b"KV"), pattern(big, 11)),
+            (tag(b"S0"), pattern(4097, 12)),
+            (tag(b"S1"), Vec::new()),
+        ],
+        external: None,
+        depth: 4096,
+        supersede: true,
+    };
+    let c1 = DiskCache::open(cfg(&d1.0, 1 << 32), id.clone()).unwrap();
+    let e1 = c1.write_now(mk()).unwrap();
+    let c2 = DiskCache::open(cfg(&d2.0, 1 << 32), id.clone()).unwrap();
+    let e2 = write_streamed_job(&c2, &mk(), &|| false).unwrap();
+    assert!(!c2.is_busy());
+    assert_eq!(e1.sections, e2.sections);
+    assert_eq!(
+        (e1.bytes, e1.depth, &e1.tokens),
+        (e2.bytes, e2.depth, &e2.tokens)
+    );
+    assert_eq!(e1.path.file_name(), e2.path.file_name());
+    assert!(file_without_stamp(&e1.path) == file_without_stamp(&e2.path));
+    // a reopened cache indexes it and loads it, whole or streamed, to the same bytes
+    drop(c2);
+    let c2 = DiskCache::open(cfg(&d2.0, 1 << 32), id).unwrap();
+    let e = only_entry(&c2);
+    let whole = c2.load(&e).unwrap();
+    assert_eq!(whole.section(tag(b"KV")).unwrap(), &mk().sections[0].1[..]);
+    let mut got = vec![0u8; big];
+    let mut sink = |off: u64, b: &[u8]| -> bool {
+        got[off as usize..off as usize + b.len()].copy_from_slice(b);
+        true
+    };
+    let l = c2.load_streamed(&e, tag(b"KV"), &mut sink).unwrap();
+    assert!(got == mk().sections[0].1);
+    assert!(l.section(tag(b"KV")).is_none());
+    assert_eq!(
+        l.section(tag(b"S0")).unwrap(),
+        whole.section(tag(b"S0")).unwrap()
+    );
+    assert_eq!(l.section(tag(b"S1")).unwrap(), &[] as &[u8]);
+}
+
+#[test]
+fn streamed_write_abort_leaves_nothing() {
+    let d = TempDir::new("stra");
+    let c = DiskCache::open(cfg(&d.0, 1 << 32), ident("m")).unwrap();
+    let j = job((0..100).collect(), STREAM_CHUNK + 10, 4);
+    let calls = std::cell::Cell::new(0);
+    let abort = || {
+        calls.set(calls.get() + 1);
+        calls.get() > 1 // the first chunk goes through, then the "next request" arrives
+    };
+    assert_eq!(
+        write_streamed_job(&c, &j, &abort).unwrap_err(),
+        DiskError::Aborted
+    );
+    assert!(c.is_empty() && !c.is_busy());
+    assert_eq!(
+        fs::read_dir(c.root())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .count(),
+        0
+    );
+    // while a background write is in flight, a streamed one is refused (one writer at a time)
+    c.submit(job(vec![1, 2, 3], 64 << 20, 1)).unwrap();
+    let r = write_streamed_job(&c, &job(vec![4], 10, 2), &|| false);
+    assert!(c.flush(Duration::from_secs(30)));
+    assert!(matches!(r, Ok(_) | Err(DiskError::Busy)));
+    write_streamed_job(&c, &j, &|| false).unwrap();
+    assert!(c.entries().iter().any(|e| *e.tokens == j.tokens));
+}
+
+#[test]
+fn streamed_load_detects_corruption_and_deletes() {
+    let d = TempDir::new("strc");
+    let c = DiskCache::open(cfg(&d.0, 1 << 32), ident("m")).unwrap();
+    let e = c
+        .write_now(job((0..10).collect(), HASH_BLOCK * 3 + 1, 5))
+        .unwrap();
+    let a = e
+        .sections
+        .iter()
+        .find(|s| s.tag == tag(b"A"))
+        .unwrap()
+        .clone();
+    {
+        use std::os::unix::fs::FileExt;
+        let f = fs::OpenOptions::new().write(true).open(&e.path).unwrap();
+        f.write_all_at(&[0xff], a.offset + HASH_BLOCK as u64 * 2 + 9)
+            .unwrap();
+    }
+    let mut n = 0usize;
+    let mut sink = |_: u64, b: &[u8]| -> bool {
+        n += b.len();
+        true
+    };
+    assert!(matches!(
+        c.load_streamed(&e, tag(b"A"), &mut sink),
+        Err(DiskError::Corrupt(_))
+    ));
+    assert_eq!(n as u64, a.len); // every byte went through the sink: the caller must drop it
+    assert!(c.is_empty() && !e.path.exists());
+}
+
+#[test]
+fn stage_mode_streams_only_past_the_floor() {
+    let d = TempDir::new("strm");
+    let mut k = cfg(&d.0, 1 << 40);
+    let avail = mem_available_effective().unwrap();
+    // a floor that leaves room for one chunk but not for the whole entry
+    k.mem_floor_bytes = avail.saturating_sub(16 * STREAM_CHUNK as u64);
+    let c = DiskCache::open(k, ident("m")).unwrap();
+    let small = STREAM_CHUNK as u64;
+    let big = 64 * STREAM_CHUNK as u64;
+    if std::env::var_os("TALUS_PCACHE_STREAM").is_none() {
+        assert_eq!(c.stage_mode(small, 0), Ok(StageMode::Staged));
+        assert_eq!(c.stage_mode(big, 0), Ok(StageMode::Streamed));
+        // no room even for one chunk: the staged refusal
+        assert!(matches!(
+            c.stage_mode(big, 32 * STREAM_CHUNK as u64),
+            Err(DiskError::Budget(_))
+        ));
+    }
+    // the disk budget still applies to the whole entry
+    let mut k = cfg(&d.0, 1 << 20);
+    k.mem_floor_bytes = 0;
+    let c2 = DiskCache::open(k, ident("m2")).unwrap();
+    assert!(matches!(
+        c2.stage_mode(2 << 20, 0),
+        Err(DiskError::Budget(_))
+    ));
+}
+
+#[test]
+fn q36_streamed_disk_restore_is_byte_identical_to_ram_hit() {
+    let d = TempDir::new("q36s");
+    let id = ident("qwen35-mock");
+    let prompt: Vec<i32> = (0..300).map(|i| 1000 + i).collect();
+    let g_end = 288;
+    let decoded: Vec<i32> = (0..20).map(|i| 9000 + i).collect();
+    let mut turn2 = prompt.clone();
+    turn2.extend(77..120);
+
+    let mut eng_a = MockQ36::new();
+    let mut pc_a = Q36PromptCache::new();
+    pc_a.stash_budget = 1 << 30;
+    let live_a = run_turn1(&mut eng_a, &mut pc_a, &prompt, g_end, &decoded);
+
+    let staged_file;
+    {
+        let mut eng = MockQ36::new();
+        let mut pc = Q36PromptCache::new();
+        pc.stash_budget = 1 << 30;
+        let live = run_turn1(&mut eng, &mut pc, &prompt, g_end, &decoded);
+        assert_eq!(live, live_a);
+        let plan = q36_disk::plan_export(&pc, &live, 1).unwrap();
+        // the staged entry, for the file comparison
+        let ds = TempDir::new("q36s-staged");
+        let cs = DiskCache::open(cfg(&ds.0, 1 << 30), id.clone()).unwrap();
+        let j = q36_disk::export(&pc, &eng.view, &plan, &|| false).unwrap();
+        staged_file = file_without_stamp(&cs.write_now(j).unwrap().path);
+        let c = DiskCache::open(cfg(&d.0, 1 << 30), id.clone()).unwrap();
+        assert_eq!(
+            q36_disk::export_streamed(&pc, &eng.view, &plan, &c, &|| true).unwrap_err(),
+            DiskError::Aborted
+        );
+        assert!(c.is_empty());
+        let e = q36_disk::export_streamed(&pc, &eng.view, &plan, &c, &|| false).unwrap();
+        assert_eq!(e.depth as usize, g_end);
+        assert!(
+            file_without_stamp(&e.path) == staged_file,
+            "streamed file != staged file"
+        );
+    }
+
+    for &(p, len) in &eng_a.allocs {
+        unsafe {
+            assert!(hipMemset(p, 0, len).is_success());
+        }
+    }
+    eng_a.view.pos = 0;
+    eng_a.view.gdn_pending = 0;
+    let (ram_n, _) = pc_a.restore_with_pf(&mut eng_a.view, &turn2, &[], 0, true);
+    assert_eq!(ram_n, g_end);
+
+    let mut eng_b = MockQ36::new();
+    let mut pc_b = Q36PromptCache::new();
+    pc_b.stash_budget = 1 << 30;
+    pc_b.snap_bytes = q36_state_bytes(&eng_b.view);
+    let c = DiskCache::open(cfg(&d.0, 1 << 30), id).unwrap();
+    let (e, n) = c
+        .best(|e| q36_disk::usable(e, &turn2, true, &pc_b, &eng_b.view))
+        .unwrap();
+    assert_eq!(n, g_end);
+    let (ok, bytes, _) = q36_disk::load_import_streamed(&mut pc_b, &eng_b.view, &c, &e).unwrap();
+    assert!(ok);
+    assert_eq!(bytes, e.bytes);
+    let (n_b, from_b) = pc_b.restore_with_pf(&mut eng_b.view, &turn2, &[], 0, true);
+    assert_eq!((n_b, from_b), (ram_n, "snapshot + KV stash"));
+    assert_eq!(eng_b.view.pos, eng_a.view.pos);
+    assert_eq!(eng_b.view.gdn_pending, eng_a.view.gdn_pending);
+    let (a, b) = (eng_a.dump(), eng_b.dump());
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        assert!(x == y, "buffer {i} differs");
+    }
+}
+
+#[test]
+fn pcache_settings_and_their_strata_mirrors_are_not_identity() {
+    for k in [
+        "TALUS_PCACHE_DISK",
+        "STRATA_PCACHE_DISK",
+        "STRATA_PCACHE_STREAM",
+        "TALUS_PCACHE_FS_FLOOR_GIB",
+    ] {
+        assert!(ENV_NOT_IN_IDENTITY.iter().any(|p| k.starts_with(p)), "{k}");
+    }
+    assert!(!ENV_NOT_IN_IDENTITY
+        .iter()
+        .any(|p| "STRATA_PF_GEMM".starts_with(p)));
+}
+
+#[test]
+fn kv_stash_respects_the_memory_floor() {
+    let prompt: Vec<i32> = (0..300).map(|i| 1000 + i).collect();
+    let decoded: Vec<i32> = (0..20).collect();
+    let mut eng = MockQ36::new();
+    let mut pc = Q36PromptCache::new();
+    pc.stash_budget = 1 << 30;
+    pc.mem_floor = 1 << 62; // no host has that much: the stash is skipped, nothing else changes
+    run_turn1(&mut eng, &mut pc, &prompt, 288, &decoded);
+    assert!(pc.stashes.is_empty() && pc.stash_used == 0);
+    assert_eq!(pc.snaps.len(), 1);
+    pc.mem_floor = 0;
+    let mut live = prompt.clone();
+    live.extend_from_slice(&decoded);
+    pc.stash_kv_with_pf(&eng.view, &live, 0, prompt.len());
+    assert_eq!(pc.stashes.len(), 1);
+}
+
+/// The stash layout of `n` positions read back from an engine (host bytes).
+fn kv_layout(eng: &MockQ36, n: i32) -> Vec<u8> {
+    let bytes = q36_kv_bytes(&eng.view, n, 0);
+    let mut dev: *mut c_void = ptr::null_mut();
+    let mut host = vec![0u8; bytes];
+    unsafe {
+        assert!(hipMalloc(&mut dev, bytes).is_success());
+        crate::q36_cache::q36_kv_copy(&eng.view, dev.cast(), n, true, 0);
+        assert!(
+            hipMemcpy(host.as_mut_ptr().cast(), dev, bytes, hipMemcpyDeviceToHost).is_success()
+        );
+        let _ = hipFree(dev);
+    }
+    host
+}
+
+#[test]
+fn q36_live_export_and_direct_restore_match_the_stash_path() {
+    let id = ident("qwen35-mock");
+    let prompt: Vec<i32> = (0..300).map(|i| 1000 + i).collect();
+    let g_end = 288;
+    let decoded: Vec<i32> = (0..20).map(|i| 9000 + i).collect();
+    let mut turn2 = prompt.clone();
+    turn2.extend(77..120);
+
+    // process X: turn 1, the entry written from its stash (staged) and from the live KV (streamed, no stash)
+    let mut eng_x = MockQ36::new();
+    let mut pc_x = Q36PromptCache::new();
+    pc_x.stash_budget = 1 << 30;
+    let live = run_turn1(&mut eng_x, &mut pc_x, &prompt, g_end, &decoded);
+    let ds = TempDir::new("q36l-stash");
+    let cs = DiskCache::open(cfg(&ds.0, 1 << 30), id.clone()).unwrap();
+    let plan = q36_disk::plan_export(&pc_x, &live, 1).unwrap();
+    let staged = cs
+        .write_now(q36_disk::export(&pc_x, &eng_x.view, &plan, &|| false).unwrap())
+        .unwrap();
+    let dl = TempDir::new("q36l-live");
+    let cl = DiskCache::open(cfg(&dl.0, 1 << 30), id.clone()).unwrap();
+    let lp = q36_disk::plan_live(&pc_x, &live, prompt.len(), 1).unwrap();
+    assert_eq!((lp.snaps.len(), lp.depth), (plan.snaps.len(), plan.depth));
+    let e =
+        q36_disk::export_streamed_live(&pc_x, &eng_x.view, &live, prompt.len(), &lp, &cl, &|| {
+            false
+        })
+        .unwrap();
+    assert!(
+        file_without_stamp(&e.path) == file_without_stamp(&staged.path),
+        "live entry != stash entry"
+    );
+
+    // in-process reference: turn 2 continues from the live KV (snapshot at the grid end, no KV copy)
+    let (n_x, from_x) = pc_x.restore_with_pf(&mut eng_x.view, &turn2, &live, prompt.len(), true);
+    assert_eq!((n_x, from_x), (g_end, "snapshot"));
+
+    // process Y after a restart: no stash, the entry goes straight into the live KV
+    let mut eng_y = MockQ36::new();
+    let mut pc_y = Q36PromptCache::new();
+    pc_y.stash_budget = 1 << 30;
+    pc_y.snap_bytes = q36_state_bytes(&eng_y.view);
+    let c = DiskCache::open(cfg(&dl.0, 1 << 30), id).unwrap();
+    let e = only_entry(&c);
+    let (ok, pf, _, _) = q36_disk::load_direct(&mut pc_y, &mut eng_y.view, &c, &e).unwrap();
+    assert!(ok && pf == prompt.len() && pc_y.stashes.is_empty());
+    let live_y: Vec<i32> = e.tokens.to_vec();
+    let (n_y, from_y) = pc_y.restore_with_pf(&mut eng_y.view, &turn2, &live_y, pf, true);
+    assert_eq!((n_y, from_y), (g_end, "snapshot"));
+    assert_eq!(eng_y.view.pos, eng_x.view.pos);
+    assert_eq!(eng_y.view.gdn_pending, eng_x.view.gdn_pending);
+    let n = live.len() as i32;
+    assert!(
+        kv_layout(&eng_x, n) == kv_layout(&eng_y, n),
+        "KV cells differ"
+    );
+    // recurrent state, conv and MTP hidden (gctl: only part of it is state; engine X keeps the rest from its prefill)
+    let (a, b) = (eng_x.dump(), eng_y.dump());
+    for i in [0usize, 1, 5] {
+        assert!(a[i] == b[i], "state buffer {i} differs");
+    }
+}

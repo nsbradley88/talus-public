@@ -539,7 +539,7 @@ const GLM_OPTIONS: &[TuneOption] = &[
 
 // ---------------------------------------------------------------------------------------------- MiMo-V2.6-Flash
 
-const MIMO_CTX: [Choice; 4] = [
+const MIMO_CTX: [Choice; 5] = [
     Choice {
         value: "32768",
         label: "32K",
@@ -555,9 +555,17 @@ const MIMO_CTX: [Choice; 4] = [
         label: "128K",
         edits: &[Edit::Arg("--max-context", "131072")],
     },
+    // : 192K stays as the fallback for a box with less free memory (a busy desktop session)
     Choice {
         value: "196608",
         label: "192K",
+        edits: &[Edit::Arg("--max-context", "196608")],
+    },
+    // (talus-public#5): the model's native context, the default since the DFlash drafter's KV became a ring
+    // (0.38 GiB instead of 5.0 at 256K): 256K now needs less memory than 192K did (the desktop: 16.9-17.5 GiB free at ready).
+    Choice {
+        value: "262144",
+        label: "256K",
         edits: &[],
     },
 ];
@@ -579,7 +587,7 @@ const MIMO_OPTIONS: &[TuneOption] = &[
         switch: "--max-context N",
         group: Group::Common,
         quality: Quality::Exact,
-        default: "196608",
+        default: "262144",
         choices: &MIMO_CTX,
         requires: None,
     },
@@ -812,10 +820,10 @@ pub static MODELS: &[ModelSpec] = &[
         id: "mimo-v2.6-flash",
         name: "MiMo-V2.6-Flash",
         engine: "mimo",
-        summary: "Mixture-of-experts model with 192K context and a DFlash drafter.",
+        summary: "Mixture-of-experts model with 256K context and a DFlash drafter.",
         weights: "about 92 GB with the drafter",
         drafter: "DFlash (Q8_0)",
-        min_free_gib: 11,
+        min_free_gib: 9,
         license: "MIT",
         options: MIMO_OPTIONS,
         reference: &[("numerics", OFF)],

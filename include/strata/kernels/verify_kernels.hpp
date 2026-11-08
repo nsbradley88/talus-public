@@ -23,7 +23,12 @@ namespace strata::kernels {
 /// share) stays at or below kVerifyMaxTBase.  Every kernel keeps its pre-rd-draft instantiation for T <= kVerifyMaxTBase
 /// (the same code for those widths); T in (kVerifyMaxTBase, kVerifyMaxT] takes an instantiation of the same per-token
 /// arithmetic, or two calls of <= kVerifyMaxTBase rows where a kernel is row-wise, so every row stays bitwise verify(1).
-inline constexpr int kVerifyMaxT = 16;
+/// 32 (TALUS_COPY_VERIFY opts in above 16; the default window stays kVerifyMaxTCopy16).  Rows past 16 add no
+/// new register arrays: row-wise kernels run as calls of <= 16 / <= 8 rows, and only the row-sequential GDN state replay
+/// (opt-in STRATA_GDN_SPLIT=1) takes a 32-entry instantiation.
+inline constexpr int kVerifyMaxT = 32;
+/// The instantiation windows of 9..16 rows keep (the same code as before kVerifyMaxT grew to 32).
+inline constexpr int kVerifyMaxTCopy16 = 16;
 /// The verify window's width before rd-draft (8): the kernels' old instantiations and the paths that never take wider
 /// windows (the CPU expert pool's tokens per job, the batch/split windows, the MTP's draft chain).
 inline constexpr int kVerifyMaxTBase = 8;

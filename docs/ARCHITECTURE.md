@@ -123,19 +123,25 @@ the speculative-decoding service, the prompt cache and the protocol. What each e
   numbers as decoding them one at a time. WMMA attention for decode and verify. Prompts run on an exact int8 GEMM over
   weights expanded at load time. Drafting: the model's MTP head, the DFlash2 block-diffusion drafter, or both with a
   switch by context depth, plus n-gram drafts and a 64K draft vocabulary. The prompt cache keeps snapshots of the
-  recurrent state on a fixed grid.
+  recurrent state on a fixed grid. From v0.1.6, after a reply the engine reads the reply up to its last grid point and
+  takes a snapshot there, so the next turn restores past the reply instead of re-reading it (`TALUS_Q27_CATCHUP=0`
+  turns this off); a request that arrives meanwhile stops the catch-up.
 - **`qwen4exp` (Qwen3.8-Flash-Next, MoE).** The Rust host drives Strata's C++ data plane through
   `talus_qwen4exp_kernels.h`; a pure-Rust port is in progress. Experts are streamed from a Strata pack with an expert
   cache, and prompts use fp16 expert kernels for large batches. Drafting: MTP with a window, plus a suffix drafter.
+  Copy windows (long runs of text repeated from the prompt) are verified up to 32 rows at a time. Before each request
+  the engine checks free memory and answers `insufficient_memory` rather than starting a request it can't finish.
 - **`glm` (GLM-5.3-Flash, MoE with MLA latent attention).** Kernels in `talus_glm_kernels.h`. Built-in NextN MTP
   drafting and a 64K draft vocabulary. Prompt chunks on fp16 experts. Fused decode kernels and a side stream, with
   greedy argmax on the device. The engine refuses to start without enough free memory and stops if `MemAvailable`
-  falls below the floor.
+  falls below the floor. From v0.1.6, the sparse attention splits its work the same way for every verify window of up
+  to 8 rows, so each row gets the same bits whatever the window's width and greedy output doesn't depend on drafting.
 - **`mimo` (MiMo-V2.6-Flash, MoE).** A DFlash drafter with a 64K draft vocabulary. Grouped prompt GEMMs and WMMA
   flash attention. Decode steps and drafter rounds are captured as HIP graphs.
 - **`laguna` (Laguna-S-2.1, MoE with sliding-window layers).** The sliding-window layers keep a ring buffer, so only the
   full-attention layers grow with the context. Block-sparse attention for long contexts, prompt-lookup speculation,
-  graph-captured decode with routing on the device.
+  graph-captured decode with routing on the device. A verify window ends before the point where block-sparse attention
+  starts, so its rows get the same attention as decoding them one by one (from v0.1.6).
 
 Every model's defaults, opt-ins and kill switches are in [MODELS.md](MODELS.md).
 
@@ -161,16 +167,34 @@ The server owns tokenization, chat templates, tool-call parsing and thinking con
 `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/models`, the Anthropic `/v1/messages`, and
 llama.cpp's `/tokenize`, `/detokenize` and `/completion`. It also serves `/health` and `/metrics`.
 
-From v0.1.4, if the engine process exits on its own, the next request restarts it. After a crash `/health` answers 503
-with the status `crashed` until the next request or `POST /load` restarts the engine. At most 3 automatic restarts happen
+From v0.1.6, for Flash-Next, GLM-5.3-Flash and MiMo-V2.6-Flash the server sends the engine one short warm-up request
+(256 prompt tokens by default) and clears it before it opens its port, so the first real request doesn't pay for
+first-use setup. Replies are bit for bit the same with and without it. `warmup_tokens` in the run config, or
+`TALUS_WARMUP_TOKENS`, sets its size; 0 turns it off.
+
+If the engine process exits on its own, the server restarts it (from v0.1.6 right away, at least 2 seconds after the
+crash, without waiting for a request; v0.1.4 and v0.1.5 waited for the next request). At most 3 automatic restarts happen
 in 10 minutes, so a fourth crash leaves the engine down until `POST /load` or a server restart, and requests get HTTP 503
-with the code `engine_down` and the reason. A crash during a streamed reply ends the stream early with no error event.
-`/health` reports the state (`ok`, `crashed`, `down` or `unloaded`) with the crash and restart counts and the last crash;
-`/metrics` and `talus-tui` show the same. `POST /unload` stops the engine process and
-frees its memory; the next request or `POST /load` starts it again.
+with the code `engine_down` and the reason. A request the engine never started on, because it had just died, is sent
+once more to the restarted engine. From v0.1.6, a crash during a streamed reply ends the stream with an error event on
+every streaming route. `/health` answers 200 only when the state is `ok`, and 503 for `restarting`, `crashed`, `down`
+or `unloaded`, with the crash and restart counts and the last crash; `/metrics` and `talus-tui` show the same.
+`POST /unload` stops the engine process and frees its memory; the next request or `POST /load` starts it again.
+
+Request limits (from v0.1.5, with the large-body budget changed in v0.1.6):
+
+- a request body may be at most 32 MiB (HTTP 413);
+- a request may hold at most 2^20 JSON values, and so may its `response_format` (HTTP 400); a JSON schema that would
+  take too much work to compile gets HTTP 400 with what to reduce;
+- request bodies over 1 MiB share a 128 MiB budget, counted as their bytes arrive. A body that would go past it gets
+  HTTP 503 with `Retry-After`, possibly before the client has finished sending it, and the server then reads and
+  discards a bounded part of the rest so the client can read the reply. Bodies of 1 MiB or less are never held back;
+- a stop string may be at most 64 KiB (HTTP 400);
+- at most 64 connections are open at once (HTTP 503 with `Retry-After` past that);
+- a chat template render that does not finish ends with an error instead of holding its thread.
 
 Streaming uses server-sent events. Auth is `Authorization: Bearer` or `x-api-key`, with the key from
-`TALUS_API_KEY` (or `STRATA_API_KEY`) or `--api-key`.
+`TALUS_API_KEY` (or `STRATA_API_KEY`) or `--api-key`; see [SECURITY.md](../SECURITY.md).
 
 Strata's Python server (`serve/server.py --engine strata`) speaks the same protocol and reads the same config, so it
 can drive `talus-cli` too.

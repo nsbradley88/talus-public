@@ -111,7 +111,7 @@ mod tests {
     fn crate_identity() {
         assert_eq!(CRATE_NAME, "talus-mem");
         assert_eq!(DEFAULT_FLOOR_BYTES, 8 * GIB);
-        assert_eq!(MIMO_FLOOR_BYTES, 11 * GIB);
+        assert_eq!(MIMO_FLOOR_BYTES, 8 * GIB + 512 * MIB);
         assert_eq!(STRIX_UNIFIED_TOTAL_BYTES, 128 * GIB);
         assert_eq!(DEFAULT_ARENA_ALIGN, 256);
     }
@@ -832,24 +832,24 @@ mod tests {
         let probe = MockMemProbe::new(20 * GIB);
         let budget =
             Budget::with_config(probe.clone(), BudgetConfig::mimo().with_max_budget(7 * GIB));
-        assert_eq!(budget.floor_bytes(), 11 * GIB);
+        assert_eq!(budget.floor_bytes(), MIMO_FLOOR_BYTES);
         assert_eq!(budget.max_budget_bytes(), Some(7 * GIB));
 
-        // Floor headroom is 20 - 11 = 9 GiB, but max_budget_bytes is 7 GiB -> headroom is 7 GiB.
+        // Floor headroom is 20 - 8.5 = 11.5 GiB, but max_budget_bytes is 7 GiB -> headroom is 7 GiB.
         assert_eq!(budget.headroom_bytes(), 7 * GIB);
         assert!(budget.can_fit(7 * GIB));
         assert!(!budget.can_fit(7 * GIB + 1));
 
-        // Requesting 8 GiB passes the 9 GiB floor headroom check, but fails the 7 GiB budget cap.
+        // Requesting 8 GiB passes the 11.5 GiB floor headroom check, but fails the 7 GiB budget cap.
         let cap_err = budget
             .try_reserve(BudgetCategory::Weights, "mimo_experts", 8 * GIB)
             .expect_err("must exceed 7 GiB cap");
         assert!(cap_err.is_cap_exceeded());
 
-        // Requesting 10 GiB violates the 11 GiB floor (20 - 10 = 10 < 11 GiB).
+        // Requesting 12 GiB violates the 8.5 GiB floor (20 - 12 = 8 < 8.5 GiB).
         let floor_err = budget
-            .try_reserve(BudgetCategory::Weights, "mimo_too_big", 10 * GIB)
-            .expect_err("must violate 11 GiB MiMo floor");
+            .try_reserve(BudgetCategory::Weights, "mimo_too_big", 12 * GIB)
+            .expect_err("must violate the MiMo floor");
         assert!(floor_err.is_floor_violation());
 
         // Materialized reservation transitions accounting when OS MemAvailable drops.
@@ -860,7 +860,7 @@ mod tests {
         probe.sub_available_bytes(5 * GIB); // OS now reports 15 GiB MemAvailable
         budget.mark_materialized(res.id).expect("mark materialized");
         assert_eq!(budget.unmaterialized_reserved_bytes(), 0);
-        // Effective available is 15 GiB, floor is 11 GiB -> 4 GiB floor headroom, 2 GiB cap headroom.
+        // Effective available is 15 GiB, floor is 8.5 GiB -> 6.5 GiB floor headroom, 2 GiB cap headroom.
         assert_eq!(budget.headroom_bytes(), 2 * GIB);
     }
 

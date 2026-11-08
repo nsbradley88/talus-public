@@ -1101,6 +1101,16 @@ impl Assembler {
         out
     }
 
+    /// `response.failed`: an error after the stream started (the HTTP status is already sent).
+    pub fn failed(&mut self, message: &str, code: &str) -> JsonValue {
+        let err = JsonValue::obj(vec![
+            ("code", JsonValue::from(code)),
+            ("message", JsonValue::from(message)),
+        ]);
+        let resp = self.response_object("failed", None, None, Some(err));
+        self.emit("response.failed", vec![("response", resp)])
+    }
+
     pub fn finish(
         &mut self,
         finish_reason: &str,

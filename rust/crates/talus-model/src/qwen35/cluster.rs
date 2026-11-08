@@ -540,6 +540,8 @@ impl Q36Engine {
         h.pos0 = rec.cur_p0_h.max(0) as u32;
         let bundle = unsafe { std::slice::from_raw_parts(cl.tx, len) };
         let link = cl.link.as_mut().unwrap();
+        // the stepping thread receives every step: start TALUS_CLUSTER_SPIN_US here (once; a no-op afterwards)
+        link.steady();
         if let Err(err) = link.send(h, &[bundle]) {
             die("send to the worker", err);
         }
@@ -1375,6 +1377,8 @@ fn worker_session(
         ),
     );
     link.send_msg(MsgType::InitAck, &ia.encode()).map_err(io)?;
+    // the engine is built: this thread receives every step from now on (TALUS_CLUSTER_SPIN_US)
+    link.steady();
     // this stage's shard of the prompt cache (created by the head's first cache message; dropped with the session)
     let mut pc: Option<Q36PromptCache> = None;
     loop {

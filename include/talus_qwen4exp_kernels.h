@@ -238,7 +238,8 @@ int tk_qwen4exp_serve_begin_request(
     int64_t* out_read_from,
     int* out_resumed_from0,
     int64_t* out_reread_to,
-    int64_t* out_pin_at
+    int64_t* out_pin_at,
+    int64_t* out_resumed_checkpoint
 );
 int tk_qwen4exp_serve_prefill_segment(
     tk_qwen4exp_serve_ctx_t* ctx,
@@ -1104,7 +1105,8 @@ typedef struct tk_qwen4exp_p5_hooks {
     void* user;
     // the conversation part of a request's begin: 1 = resume / read_from / reread_to set, -1 = ERR printed, stop
     int (*begin)(void* user, const int64_t* ids, size_t n, int req_cache, int req_ckpt, int64_t req_pin,
-                 int want_cvec, int64_t* out_resume, int64_t* out_read_from, int64_t* out_reread_to);
+                 int want_cvec, int64_t* out_resume, int64_t* out_read_from, int64_t* out_reread_to,
+                 int64_t* out_resumed_checkpoint);
     int (*pin)(void* user, int64_t len);                                   // 1 = a checkpoint of that length
     // a checkpoint after cur[0, len): 1 = ok, 0 = failed (why: the reason suffix of the ERR line)
     int (*checkpoint)(void* user, const int64_t* ids, size_t n_ids, int64_t len, int as_tail, char* why,
@@ -1641,6 +1643,9 @@ void tk_qwen4exp_p2_gr_write(float* r, const float* bo, const float* inj, int64_
 void tk_qwen4exp_p2_gr_write_norm_rs(float* r, const float* bo, const float* inj, int64_t inj_ld, const float* w_next,
                                      float eps, float* rs, uint16_t* xn16, int64_t t, void* stream,
                                      uint16_t* xn16_lo, int64_t ldx);
+void tk_qwen4exp_p2_moe_write_norm_rs(const float* dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                                      float* r, const float* inj, int64_t inj_ld, const float* w_next, float eps, float* rs,
+                                      uint16_t* xn16, int64_t t, void* stream, uint16_t* xn16_lo, int64_t ldx);
 void tk_qwen4exp_p2_gr_write_cvec_norm_rs(float* r, const float* bo, const float* inj, int64_t inj_ld,
                                           const float* v_l, const float* s_l, const int* on, int32_t mode,
                                           const float* w_next, float eps, float* rs, uint16_t* xn16, int64_t t,
@@ -1718,6 +1723,9 @@ int tk_qwen4exp_p2_fnp_tile_attn(const float* q, const tk_qwen4exp_p2_attn_pools
 int tk_qwen4exp_p2_prompt_attn_batch(const float* q, const tk_qwen4exp_p2_attn_pools_t* pools, const int32_t* ids,
                                      const int32_t* steps, int64_t cap, const tk_qwen4exp_p2_qsa_shapes_t* s,
                                      float* attn, int64_t n_q, void* stream);
+int tk_qwen4exp_p2_prompt_attn_gated(const float* q, const tk_qwen4exp_p2_attn_pools_t* pools, const int32_t* ids,
+                                     const int32_t* steps, int64_t cap, const tk_qwen4exp_p2_qsa_shapes_t* s,
+                                     const float* q_full, uint16_t* out16, int64_t ld16, int64_t n_q, void* stream);
 void tk_qwen4exp_p2_decode_attn_batch(const float* q, const tk_qwen4exp_p2_attn_pools_t* pools, const int32_t* ids,
                                       const int32_t* steps, int64_t cap, const tk_qwen4exp_p2_qsa_shapes_t* s,
                                       float* scratch, float* attn, int64_t n_q, void* stream);
@@ -1757,6 +1765,11 @@ int tk_qwen4exp_p2_mmq_gather_native_group(const uint8_t* const* blobs, int32_t 
                                            uint64_t gu_stride, void* d_dst, uint64_t d_stride, void* stream,
                                            uint64_t tail_off, void* tail_dst, uint64_t zero_bytes);
 void tk_qwen4exp_p2_mmq_gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream);
+/// gather-free products: whether a type / shape can read its experts in place, and the product (nonzero: launched)
+int tk_qwen4exp_p2_mmq_inplace_ok(int32_t type, int64_t w_rows, int64_t w_cols);
+int tk_qwen4exp_p2_mmq_product_each(const void* const* w_each, int32_t type, int64_t w_rows, int64_t w_cols, int32_t n,
+                                    const void* xq, const int32_t* bounds, const int32_t* ids, int64_t total_rows,
+                                    int64_t max_rows, float* dst, int64_t ld_dst, void* stream);
 /// run_mmq_product: tp_moe's moe_gemm (TALUS_PF_MOE, default on) where it covers the product, else MMQ (`mmq_ctx`)
 void tk_qwen4exp_p2_mmq_product(void* mmq_ctx, const void* w, int32_t type, int64_t w_rows, int64_t w_cols,
                                 uint64_t expert_bytes, int32_t n, const void* xq, const int32_t* bounds,
@@ -1780,6 +1793,7 @@ int tk_qwen4exp_p2_src_transient(void* src, int64_t l, int64_t e);
 int tk_qwen4exp_p2_src_pinned(void* src, int64_t l, int64_t e);
 const uint8_t* tk_qwen4exp_p2_src_blob_stable(void* src, int64_t l, int64_t e);
 const uint8_t* tk_qwen4exp_p2_cache_device_slot(void* cache, int32_t slot);
+const uint8_t* tk_qwen4exp_p2_cache_device_end(void* cache);
 // ---- MTP draft layer (E-9, draft_kv)
 typedef struct tk_qwen4exp_p2_mtp_info {
     const float* w_ne; const void* w_fe; const float* w_nh; const void* w_fh; const float* w_hn;

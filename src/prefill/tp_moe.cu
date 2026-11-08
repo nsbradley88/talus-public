@@ -340,7 +340,7 @@ __device__ __forceinline__ void moe5_body(const int* __restrict__ tile, const ch
                                           __amdgpu_buffer_rsrc_t rx, uint32_t xstride, int r0, int r1,
                                           const int32_t* __restrict__ ids, float* __restrict__ dst, int64_t ldd,
                                           int row0, const int* __restrict__ tab, const char* __restrict__ we2 = nullptr,
-                                          float limit = 0.f) {
+                                          float limit = 0.f, int kb_end = 0x7fffffff) {
 #if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
     constexpr int I = TpTiles<type>::I;
     if constexpr (MODE == 3)
@@ -567,7 +567,7 @@ __device__ __forceinline__ void moe5_body(const int* __restrict__ tile, const ch
                 const int kb = ki * NBK + j;
                 auto step = [&]<int U>() {
                     bload(min(kb + U + 2, KB - 1), ring[(U + 2) & 3]);
-                    block.template operator()<MODE == 3 ? U : -1>(j + U, ring[U]);
+                    if (kb + U < kb_end) block.template operator()<MODE == 3 ? U : -1>(j + U, ring[U]);
                     __builtin_amdgcn_sched_barrier(0);
                 };
                 step.template operator()<0>();
@@ -597,10 +597,10 @@ __device__ __forceinline__ void moe5_body(const int* __restrict__ tile, const ch
             for (int j = 0; j < NBK; j += 2) {
                 const int kb = ki * NBK + j;
                 bload(min(kb + 1, KB - 1), ring[1]);
-                block.template operator()<-1>(j, ring[0]);
+                if (kb < kb_end) block.template operator()<-1>(j, ring[0]);
                 if constexpr (kMidBarrier) __builtin_amdgcn_sched_barrier(0);
                 bload(min(kb + 2, KB - 1), ring[0]);
-                block.template operator()<-1>(j + 1, ring[1]);
+                if (kb + 1 < kb_end) block.template operator()<-1>(j + 1, ring[1]);
                 __builtin_amdgcn_sched_barrier(0);
             }
         }
@@ -775,6 +775,15 @@ __device__ __forceinline__ void moe5_body(const int* __restrict__ tile, const ch
 #endif
 }
 
+/// (kernarg): each[e] != null: expert e's matrix in place; kb_end: 32-value blocks a row has, the K tail's
+/// blocks from there on are skipped.  What a skipped block would do: its activations are zero (the q8_1 padding / out of
+/// range), so X = kB - kM = +0, f = +0 * dw = +-0 and dx = 0, and the accumulator gets fma(+-0, 0, acc): acc, unchanged
+/// (an accumulator starts at +0 and an fma never takes it to -0 unless both terms are -0, and +-0 * 0 + +0 = +0).  It
+/// needs dw finite: true of the group buffer's next slot or zero tail, unknowable for an in-place expert's next bytes.
+struct MoeKernArgs {
+    const char* each[kMoeEachMax] = {};
+    int kb_end = 0x7fffffff;
+};
 /// grid (ceil(max_rows / 32 NTWM), n / 128 (GU: n / 64), n_experts), block (32, 8).  NTWM : token tiles per wave
 /// at most - 3 = 96-row passes (fewer VGPRs than v6's 4); the expert's 32 NTWM-row chunks are the grid's x.
 template <ggml_type type, int MODE, bool kFast, bool kMid = true, int SKIP = 0, int NTWM = 4, bool kAS = false, bool GU = false,
@@ -782,7 +791,8 @@ template <ggml_type type, int MODE, bool kFast, bool kMid = true, int SKIP = 0, 
 __global__ void __launch_bounds__(256) k_moe5(const char* __restrict__ wq, size_t expert_bytes, int k,
                                               const char* __restrict__ xq, const int32_t* __restrict__ bounds,
                                               const int32_t* __restrict__ ids, int total_rows, float* __restrict__ dst,
-                                              int64_t ldd, const char* __restrict__ wq2 = nullptr, float limit = 0.f) {
+                                              int64_t ldd, const char* __restrict__ wq2 = nullptr, float limit = 0.f,
+                                              MoeKernArgs ka = {}) {
     extern __shared__ int tile[];
     const int e = blockIdx.z;
     const int eb = bounds[e], ee = bounds[e + 1];
@@ -791,7 +801,7 @@ __global__ void __launch_bounds__(256) k_moe5(const char* __restrict__ wq, size_
     if (r0 >= ee) return;
     const uint32_t xstride = (uint32_t) total_rows * kXBlock;
     const __amdgpu_buffer_rsrc_t rx = moe_rsrc(xq, (uint32_t) (k / 128) * xstride);
-    const char* we = wq + (size_t) e * expert_bytes;
+    const char* we = wq != nullptr ? wq + (size_t) e * expert_bytes : ka.each[e];
     const int row0 = blockIdx.y * (GU ? 64 : 128);
     const char* we2 = GU ? wq2 + (size_t) e * expert_bytes : nullptr;
     int* tab = nullptr;
@@ -809,7 +819,7 @@ __global__ void __launch_bounds__(256) k_moe5(const char* __restrict__ wq, size_
             static_assert(NTWM == 3 || NTWM == 4, "v73 / v74: 96- / 128-row passes");
             const int ntw = nt >> 1;
             const bool g1 = (threadIdx.y >> 2) != 0;
-#define TP_MOE5_B(N, X) moe5_body<type, MODE, N, kFast, kMid, SKIP, kAS, GU, X, Q8>(tile, we, k, rx, xstride, r0, r1, ids, dst, ldd, row0, tab, we2, limit)
+#define TP_MOE5_B(N, X) moe5_body<type, MODE, N, kFast, kMid, SKIP, kAS, GU, X, Q8>(tile, we, k, rx, xstride, r0, r1, ids, dst, ldd, row0, tab, we2, limit, ka.kb_end)
             if (nt & 1) {
                 if (ntw == 0) { if (g1) TP_MOE5_B(0, 1); else TP_MOE5_B(0, 0); }
                 else if (ntw == 1) { if (g1) TP_MOE5_B(1, 1); else TP_MOE5_B(1, 0); }
@@ -825,13 +835,13 @@ __global__ void __launch_bounds__(256) k_moe5(const char* __restrict__ wq, size_
             return;
         }
         const int ntw = (nt + 1 - (int) (threadIdx.y >> 2)) >> 1;
-        if (ntw == 0) moe5_body<type, MODE, 0, kFast, kMid, SKIP, kAS, GU>(tile, we, k, rx, xstride, r0, r1, ids, dst, ldd, row0, tab, we2, limit);
-        else if (ntw == 1) moe5_body<type, MODE, 1, kFast, kMid, SKIP, kAS, GU>(tile, we, k, rx, xstride, r0, r1, ids, dst, ldd, row0, tab, we2, limit);
-        else if (ntw == 2) moe5_body<type, MODE, 2, kFast, kMid, SKIP, kAS, GU>(tile, we, k, rx, xstride, r0, r1, ids, dst, ldd, row0, tab, we2, limit);
-        else if constexpr (NTWM == 3) moe5_body<type, MODE, 3, kFast, kMid, SKIP, kAS, GU>(tile, we, k, rx, xstride, r0, r1, ids, dst, ldd, row0, tab, we2, limit);
+        if (ntw == 0) moe5_body<type, MODE, 0, kFast, kMid, SKIP, kAS, GU>(tile, we, k, rx, xstride, r0, r1, ids, dst, ldd, row0, tab, we2, limit, ka.kb_end);
+        else if (ntw == 1) moe5_body<type, MODE, 1, kFast, kMid, SKIP, kAS, GU>(tile, we, k, rx, xstride, r0, r1, ids, dst, ldd, row0, tab, we2, limit, ka.kb_end);
+        else if (ntw == 2) moe5_body<type, MODE, 2, kFast, kMid, SKIP, kAS, GU>(tile, we, k, rx, xstride, r0, r1, ids, dst, ldd, row0, tab, we2, limit, ka.kb_end);
+        else if constexpr (NTWM == 3) moe5_body<type, MODE, 3, kFast, kMid, SKIP, kAS, GU>(tile, we, k, rx, xstride, r0, r1, ids, dst, ldd, row0, tab, we2, limit, ka.kb_end);
         else if constexpr (NTWM >= 4) {
-            if (ntw == 3) moe5_body<type, MODE, 3, kFast, kMid, SKIP, kAS, GU>(tile, we, k, rx, xstride, r0, r1, ids, dst, ldd, row0, tab, we2, limit);
-            else moe5_body<type, MODE, 4, kFast, kMid, SKIP, kAS, GU>(tile, we, k, rx, xstride, r0, r1, ids, dst, ldd, row0, tab, we2, limit);
+            if (ntw == 3) moe5_body<type, MODE, 3, kFast, kMid, SKIP, kAS, GU>(tile, we, k, rx, xstride, r0, r1, ids, dst, ldd, row0, tab, we2, limit, ka.kb_end);
+            else moe5_body<type, MODE, 4, kFast, kMid, SKIP, kAS, GU>(tile, we, k, rx, xstride, r0, r1, ids, dst, ldd, row0, tab, we2, limit, ka.kb_end);
         }
     }
 }
@@ -1145,6 +1155,16 @@ int moe_version_for(const MoeProduct& p) {
     return p.k % MMQ_ITER_K != 0 ? 6 : ver0;
 }
 
+// TP_MOE_KTAIL_SKIP=0 (A/B): a K tail's blocks past k run as before (in-place products never take this: moe_inplace_ok)
+MoeKernArgs moe_kern_args(const MoeProduct& p) {
+    static const bool skip = [] { const char* e = std::getenv("TP_MOE_KTAIL_SKIP"); return e == nullptr || e[0] != '0'; }();
+    MoeKernArgs a;
+    if (p.w_each != nullptr)
+        for (int e = 0; e < p.n_experts && e < kMoeEachMax; ++e) a.each[e] = (const char*) p.w_each[e];
+    if (skip && p.k % MMQ_ITER_K != 0) a.kb_end = p.k / 32;
+    return a;
+}
+
 template <ggml_type type, int MODE>
 constexpr size_t lds_v6() {
     return (TpSplit<type>::ok ? (size_t) 128 * kTpSplitSS * sizeof(int) : (size_t) 128 * kStride[MODE] * sizeof(int)) +
@@ -1160,12 +1180,12 @@ bool launch_gu(const MoeProduct& p, cudaStream_t s) {
     } else {
         const dim3 grid((unsigned) ((p.max_rows + 95) / 96), (unsigned) (p.n / 64), (unsigned) p.n_experts);
 #define TP_GU_ARGS (const char*) p.w, p.expert_bytes, p.k, (const char*) p.xq, p.bounds, p.ids, (int) p.total_rows, p.dst, p.ld_dst, \
-                   (const char*) p.w_up, p.swiglu_limit
+                   (const char*) p.w_up, p.swiglu_limit, moe_kern_args(p)
         if (p.q8_out != nullptr) {   // SwiGLU -> the down projection's q8_1 rows (v73 body only)
             if (moe_version_for(p) < 73) return false;
             k_moe5<type, MODE, true, true, 0, 3, true, true, true, true><<<grid, dim3(32, 8), lds_v6<type, MODE>(), s>>>(
                 (const char*) p.w, p.expert_bytes, p.k, (const char*) p.xq, p.bounds, p.ids, (int) p.total_rows,
-                (float*) p.q8_out, p.q8_rows, (const char*) p.w_up, p.swiglu_limit);
+                (float*) p.q8_out, p.q8_rows, (const char*) p.w_up, p.swiglu_limit, moe_kern_args(p));
         } else if (moe_version_for(p) >= 73)   // v73 / v74: balanced odd tiles (the fused kernel keeps 96-row passes)
             k_moe5<type, MODE, true, true, 0, 3, true, true, true><<<grid, dim3(32, 8), lds_v6<type, MODE>(), s>>>(TP_GU_ARGS);
         else
@@ -1198,35 +1218,35 @@ void launch(const MoeProduct& p, cudaStream_t s) {
     if constexpr (type == GGML_TYPE_Q4_K) {
         if (q4k_split == 0 || (q4k_split == 1 && p.n_experts > 1)) {
             switch (ver) {
-                case 7: k_moe5<type, MODE, false, false><<<grid, dim3(32, 8), lds, s>>>(TP_MOE5_ARGS); return;
-                case 63: case 72: k_moe5<type, MODE, false, true, 0, 3><<<grid96, dim3(32, 8), lds, s>>>(TP_MOE5_ARGS); return;
-                case 73: k_moe5<type, MODE, false, true, 0, 3, false, false, true><<<grid96, dim3(32, 8), lds, s>>>(TP_MOE5_ARGS); return;
-                case 74: k_moe5<type, MODE, false, true, 0, 4, false, false, true><<<grid, dim3(32, 8), lds, s>>>(TP_MOE5_ARGS); return;
-                case 0: case 6: case 61: case 62: case 5: k_moe5<type, MODE, false><<<grid, dim3(32, 8), lds, s>>>(TP_MOE5_ARGS); return;
+                case 7: k_moe5<type, MODE, false, false><<<grid, dim3(32, 8), lds, s>>>(TP_MOE5_ARGS, nullptr, 0.f, moe_kern_args(p)); return;
+                case 63: case 72: k_moe5<type, MODE, false, true, 0, 3><<<grid96, dim3(32, 8), lds, s>>>(TP_MOE5_ARGS, nullptr, 0.f, moe_kern_args(p)); return;
+                case 73: k_moe5<type, MODE, false, true, 0, 3, false, false, true><<<grid96, dim3(32, 8), lds, s>>>(TP_MOE5_ARGS, nullptr, 0.f, moe_kern_args(p)); return;
+                case 74: k_moe5<type, MODE, false, true, 0, 4, false, false, true><<<grid, dim3(32, 8), lds, s>>>(TP_MOE5_ARGS, nullptr, 0.f, moe_kern_args(p)); return;
+                case 0: case 6: case 61: case 62: case 5: k_moe5<type, MODE, false><<<grid, dim3(32, 8), lds, s>>>(TP_MOE5_ARGS, nullptr, 0.f, moe_kern_args(p)); return;
                 default: break;   // the k_moe_rp / k_moe versions below have no split path
             }
         }
     }
     if constexpr (MODE == 4) {   // Q6_K (rb-glm): the v6 body, 96-row passes (the per-row int scales cost VGPRs)
-        k_moe5<type, MODE, true, true, 0, 3><<<grid96, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS);
+        k_moe5<type, MODE, true, true, 0, 3><<<grid96, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS, nullptr, 0.f, moe_kern_args(p));
         return;
     } else if constexpr (MODE == 3) {   // Q2_K: the v6 body only (96-row passes; 128 for TP_MOE_VER 0 / 6)
-        if (ver == 0 || ver == 6) k_moe5<type, MODE, true><<<grid, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS);
+        if (ver == 0 || ver == 6) k_moe5<type, MODE, true><<<grid, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS, nullptr, 0.f, moe_kern_args(p));
         // (v73's balanced tiles do not help Q2_K: Q2_K keeps the v72 body; v74 = balanced 128-row passes)
-        else if (ver == 74) k_moe5<type, MODE, true, true, 0, 4, false, false, true><<<grid, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS);
-        else k_moe5<type, MODE, true, true, 0, 3><<<grid96, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS);
+        else if (ver == 74) k_moe5<type, MODE, true, true, 0, 4, false, false, true><<<grid, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS, nullptr, 0.f, moe_kern_args(p));
+        else k_moe5<type, MODE, true, true, 0, 3><<<grid96, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS, nullptr, 0.f, moe_kern_args(p));
         return;
     } else {
     switch (ver) {
-        case 0: case 6: k_moe5<type, MODE, true><<<grid, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS); return;
-        case 7: k_moe5<type, MODE, true, false><<<grid, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS); return;
-        case 61: k_moe5<type, MODE, true, true, 1><<<grid, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS); return;
-        case 62: k_moe5<type, MODE, true, true, 2><<<grid, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS); return;
-        case 63: k_moe5<type, MODE, true, true, 0, 3><<<grid96, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS); return;
-        case 72: k_moe5<type, MODE, true, true, 0, 3, TpSplit<type>::ok><<<grid96, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS); return;
-        case 73: k_moe5<type, MODE, true, true, 0, 3, TpSplit<type>::ok, false, true><<<grid96, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS); return;
-        case 74: k_moe5<type, MODE, true, true, 0, 4, TpSplit<type>::ok, false, true><<<grid, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS); return;
-        case 5: k_moe5<type, MODE, false><<<grid, dim3(32, 8), lds, s>>>(TP_MOE5_ARGS); return;
+        case 0: case 6: k_moe5<type, MODE, true><<<grid, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS, nullptr, 0.f, moe_kern_args(p)); return;
+        case 7: k_moe5<type, MODE, true, false><<<grid, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS, nullptr, 0.f, moe_kern_args(p)); return;
+        case 61: k_moe5<type, MODE, true, true, 1><<<grid, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS, nullptr, 0.f, moe_kern_args(p)); return;
+        case 62: k_moe5<type, MODE, true, true, 2><<<grid, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS, nullptr, 0.f, moe_kern_args(p)); return;
+        case 63: k_moe5<type, MODE, true, true, 0, 3><<<grid96, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS, nullptr, 0.f, moe_kern_args(p)); return;
+        case 72: k_moe5<type, MODE, true, true, 0, 3, TpSplit<type>::ok><<<grid96, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS, nullptr, 0.f, moe_kern_args(p)); return;
+        case 73: k_moe5<type, MODE, true, true, 0, 3, TpSplit<type>::ok, false, true><<<grid96, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS, nullptr, 0.f, moe_kern_args(p)); return;
+        case 74: k_moe5<type, MODE, true, true, 0, 4, TpSplit<type>::ok, false, true><<<grid, dim3(32, 8), lds6, s>>>(TP_MOE5_ARGS, nullptr, 0.f, moe_kern_args(p)); return;
+        case 5: k_moe5<type, MODE, false><<<grid, dim3(32, 8), lds, s>>>(TP_MOE5_ARGS, nullptr, 0.f, moe_kern_args(p)); return;
         case 41: k_moe_rp<type, MODE, 1><<<grid, dim3(32, 8), lds, s>>>(TP_MOE5_ARGS); return;
         case 42: k_moe_rp<type, MODE, 2><<<grid, dim3(32, 8), lds, s>>>(TP_MOE5_ARGS); return;
         case 4: k_moe_rp<type, MODE><<<grid, dim3(32, 8), lds, s>>>(TP_MOE5_ARGS); return;
@@ -1263,6 +1283,19 @@ bool moe_supported(int t, int n, int k) {
     if (k % MMQ_ITER_K == 0) return true;
     static const bool tail = [] { const char* e = std::getenv("TP_MOE_KTAIL"); return e == nullptr || e[0] != '0'; }();
     return tail && moe_ktail_type(t) && k % 32 == 0;
+}
+
+bool moe_inplace_ok(int t, int n, int k) {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_PF_INPLACE");
+        const char* s = std::getenv("TP_MOE_KTAIL_SKIP");
+        return (e == nullptr || e[0] != '0') && (s == nullptr || s[0] != '0');
+    }();
+    if (!on || !moe_supported(t, n, k) || moe_w16_enabled(t) || t == GGML_TYPE_Q2_K) return false;
+    MoeProduct p;
+    p.type = t; p.n = n; p.k = k; p.n_experts = kMoeEachMax;
+    const int ver = moe_version_for(p);
+    return ver == 0 || ver == 5 || ver == 6 || ver == 7 || ver == 63 || ver == 72 || ver == 73 || ver == 74;   // the k_moe5 bodies
 }
 
 void moe_set_version(int v) { g_moe_ver = v; }
@@ -1348,7 +1381,7 @@ bool moe_gemm_iq1m_q8_1(const MoeProduct& p, void* stream) {
 
 bool moe_gemm(const MoeProduct& p, void* stream) {
     // STRATA_PF_W16_MOE=1: the fp16 WMMA kernels where covered (moe_w16.hpp)
-    if (p.q8_out == nullptr && moe_gemm_w16(p, stream)) return true;   // (the q8-out GU form is int8 tp_moe only)
+    if (p.w_each == nullptr && p.q8_out == nullptr && moe_gemm_w16(p, stream)) return true;   // (the q8-out GU form is int8 tp_moe only)
     const cudaStream_t s = (cudaStream_t) stream;
     if (p.w_up != nullptr) {
         if (!moe_gu_supported(p.type, p.n, p.k) || p.max_rows <= 0 || p.n_experts <= 0) return false;

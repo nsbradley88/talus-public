@@ -43,15 +43,23 @@ pub struct ServerConfig {
     pub exe_path: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
     pub log_path: Option<PathBuf>,
+    /// Warm-up request before the port opens: prompt tokens; 0 = none. Config key `warmup_tokens`, env
+    /// TALUS_WARMUP_TOKENS over it; default per model (see `default_warmup_tokens`).
+    pub warmup_tokens: Option<usize>,
     pub tokenizer_path: Option<PathBuf>,
     pub chat_template_path: Option<PathBuf>,
     pub stop_tokens: Vec<String>,
     pub max_context: usize,
     pub n_predict: i64,
     pub reasoning_effort: String,
+    /// Accepted from older configs, not implemented: a warning at startup, no effect.
     pub reasoning_budget: usize,
+    /// Rescue a tool call from unclosed reasoning. No effect today: reasoning is streamed as it arrives, so nothing is
+    /// left to rescue at the end of the turn.
     pub reasoning_recovery: bool,
+    /// Read a bare `<function=` of a declared tool, or a call missing its `</tool_call>`, as the call (default on).
     pub tool_call_recovery: bool,
+    /// Accepted from older configs, no effect: `max_tokens` past the context is always shortened to fit, on or off.
     pub fit_max_tokens: bool,
     pub anthropic_think_unasked: bool,
     pub sampling: SamplingParams,
@@ -100,6 +108,7 @@ impl Default for ServerConfig {
             exe_path: None,
             cwd: None,
             log_path: None,
+            warmup_tokens: None,
             tokenizer_path: None,
             chat_template_path: None,
             stop_tokens: Vec::new(),
@@ -136,6 +145,17 @@ impl Default for ServerConfig {
         }
     }
 }
+
+/// Warm-up prompt size by model. Measured on the desktop, fresh server, first request: Flash-Next, GLM and
+/// MiMo pay a first-use cost on it; 27B and Laguna gain nothing, so they load without one.
+pub fn default_warmup_tokens(model_name: &str) -> usize {
+    match model_name {
+        "qwen3.8-flash-next" | "glm-5.3-flash" | "mimo-v2.6-flash" => WARMUP_TOKENS,
+        _ => 0,
+    }
+}
+/// 256 costs 1.4-2.1 s of load; 2048 costs 2.3-4.4 s and only GLM's first request gains more from it (-557 vs -440 ms).
+pub const WARMUP_TOKENS: usize = 256;
 
 pub fn default_model_name(arch: Option<&str>) -> &'static str {
     match arch.unwrap_or("") {
@@ -220,6 +240,9 @@ impl ServerConfig {
         if let Some(cwd) = val.get_str("cwd").filter(|s| !s.trim().is_empty()) {
             cfg.cwd = Some(PathBuf::from(cwd));
         }
+        if let Some(n) = val.get("warmup_tokens").and_then(|v| v.as_i64()) {
+            cfg.warmup_tokens = Some(n.max(0) as usize);
+        }
         if let Some(log) = val.get_str("log").filter(|s| !s.trim().is_empty()) {
             cfg.log_path = Some(PathBuf::from(log));
         }
@@ -270,11 +293,30 @@ impl ServerConfig {
         {
             cfg.reasoning_budget = rb;
         }
-        if let Some(rr) = val.get_bool("reasoning_recovery") {
-            cfg.reasoning_recovery = rr;
+        // a value that is not a boolean ("false" as a string) used to be ignored, leaving the switch on
+        for (key, slot) in [
+            ("reasoning_recovery", &mut cfg.reasoning_recovery),
+            ("tool_call_recovery", &mut cfg.tool_call_recovery),
+        ] {
+            if let Some(v) = val.get(key).filter(|v| !v.is_null()) {
+                *slot = v
+                    .as_bool()
+                    .ok_or_else(|| format!("config \"{key}\" must be true or false"))?;
+            }
         }
-        if let Some(tcr) = val.get_bool("tool_call_recovery") {
-            cfg.tool_call_recovery = tcr;
+        // accepted for the old Python server's configs; this server has no such feature: say so
+        if cfg.reasoning_budget > 0 {
+            eprintln!(
+                "[talus-server] warning: reasoning_budget_tokens is not implemented by this server and has no effect"
+            );
+        }
+        if val
+            .get("reasoning_loop_recovery")
+            .is_some_and(JsonValue::is_truthy)
+        {
+            eprintln!(
+                "[talus-server] warning: reasoning_loop_recovery is not implemented by this server and has no effect"
+            );
         }
         if let Some(fmt) = val.get_bool("fit_max_tokens") {
             cfg.fit_max_tokens = fmt;

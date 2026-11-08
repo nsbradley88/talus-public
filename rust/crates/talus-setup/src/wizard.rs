@@ -791,7 +791,7 @@ fn run_inner(a: Args) -> Result<(), String> {
                 gb(need.margin()),
                 gb(free)
             ));
-        } else if !need.fits(free) {
+        } else if !need.fits(free) && !a.no_download {
             return Err(format!(
                 "not enough disk space: {} needed (with a {} margin), {} free. Free space or choose another folder with --models-dir DIR.",
                 gb(need.remaining()),

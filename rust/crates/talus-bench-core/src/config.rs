@@ -282,35 +282,178 @@ pub struct GateConfig {
     pub kld_topk: KldTopkGate,
 }
 
-/// Thresholds of the `kld_topk` screening gate. Top-k KL differs from the full-vocabulary KL of the release
-/// gates (kld_teacher_forced), so these values are provisional until derived from paired full-vocabulary runs.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+/// Thresholds of the `kld_topk` screening gate. A value given in the config wins; otherwise the served model's row
+/// in `KLD_TOPK_PER_MODEL`: its full-vocabulary release KL gate times the measured screening / full KL ratio; otherwise
+/// the generic default (0.05 nats, 90 %). The release gate itself comes from the matrix's models.toml when one is
+/// named (`gates_file`, or the environment variable TALUS_BENCH_KLD_GATES), so a rebased gate needs no code change;
+/// the built-in value is the fallback.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct KldTopkGate {
     /// Mean per-position KL(reference || candidate) in nats.
-    #[serde(default = "default_kld_topk_mean")]
-    pub max_mean: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_mean: Option<f64>,
     /// Minimum top-1 agreement in percent.
-    #[serde(default = "default_kld_topk_top1")]
-    pub min_top1_pct: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_top1_pct: Option<f64>,
     /// false (default): a breach WARNs; true: it FAILs like a release gate.
     #[serde(default)]
     pub enforce: bool,
+    /// models.toml with `gate_max_mean` (and optionally `gate_min_top1`, a fraction) in `[rust.<key>.kld]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gates_file: Option<String>,
 }
 
-fn default_kld_topk_mean() -> f64 {
-    0.05
-}
-fn default_kld_topk_top1() -> f64 {
-    90.0
+/// The limits one `kld_topk` gate applies, and where they came from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KldTopkLimits {
+    pub max_mean: f64,
+    pub min_top1_pct: f64,
+    pub source: String,
 }
 
-impl Default for KldTopkGate {
-    fn default() -> Self {
-        Self {
-            max_mean: default_kld_topk_mean(),
-            min_top1_pct: default_kld_topk_top1(),
-            enforce: false,
+pub const KLD_TOPK_DEFAULT_MEAN: f64 = 0.05;
+pub const KLD_TOPK_DEFAULT_TOP1: f64 = 90.0;
+
+/// One model's screening derivation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KldTopkModel {
+    /// The served model id (`/v1/models`).
+    pub model: &'static str,
+    /// Its table key in the matrix's models.toml (`[rust.<key>.kld]`).
+    pub matrix_key: &'static str,
+    /// Mean top-20 screening KL / full-vocabulary KL, measured on the model's release dumps
+    /// (`talus-bench kl --topk 20`, .sh).
+    pub ratio: f64,
+    /// The release gate's max mean KL (rel-kld.sh) when no models.toml says otherwise.
+    pub gate_max_mean: f64,
+    /// The release gate's min top-1 agreement in percent, if the gate has one (else the generic default).
+    pub gate_min_top1_pct: Option<f64>,
+    pub derivation: &'static str,
+}
+
+/// From every model's release KL dumps
+/// through `talus-bench kl --topk 20`. Top-20 lists hold nearly all the mass on these rows, so the screening KL is
+/// close to the full KL. GLM-5.3-Flash has no full-logit dumps (its release KL is llama.cpp's KLD format): it keeps
+/// the generic default.
+pub const KLD_TOPK_PER_MODEL: &[KldTopkModel] = &[
+    KldTopkModel {
+        model: "qwen3.8-27b",
+        matrix_key: "qwen27b",
+        ratio: 0.9805,
+        gate_max_mean: 0.00291,
+        gate_min_top1_pct: None,
+        derivation: "talus UD-IQ4_XS vs llama.cpp CPU, the release pair: 6 prompts, 576 rows (Q4_K_XL pair: 0.9868)",
+    },
+    KldTopkModel {
+        model: "qwen3.8-flash-next",
+        matrix_key: "flashnext",
+        ratio: 0.8783,
+        gate_max_mean: 0.1064,
+        gate_min_top1_pct: Some(79.0),
+        derivation: "v0.1.3 vs the llama.cpp CPU BF16 reference: 43 prompts, first-token rows (per prompt 0.46-1.00)",
+    },
+    KldTopkModel {
+        model: "laguna-s-2.1",
+        matrix_key: "laguna",
+        ratio: 0.9238,
+        // The measured rounding floor at 2K: the KL that 1-ulp embedding perturbations alone give on served rows. The
+        // release gate itself is bitwise against frozen served rows; a change is reviewed against this floor.
+        gate_max_mean: 8.2e-3,
+        gate_min_top1_pct: Some(98.0),
+        derivation: "measured rounding floor at 2K (1.4e-3 at 32K); the release gate is bitwise against frozen served rows",
+    },
+    KldTopkModel {
+        model: "mimo-v2.6-flash",
+        matrix_key: "mimo",
+        ratio: 0.9159,
+        gate_max_mean: 1e-3,
+        gate_min_top1_pct: Some(99.0),
+        derivation: "every MiMo release pair is bitwise identical: the lowest measured ratio of the other models",
+    },
+];
+
+/// `gate_max_mean` / `gate_min_top1` of `[rust.<key>.kld]` in a models.toml (a minimal reader: `key = number` lines
+/// inside that table).
+pub fn matrix_gate(text: &str, key: &str) -> (Option<f64>, Option<f64>) {
+    let header = format!("[rust.{key}.kld]");
+    let (mut inside, mut mean, mut top1) = (false, None, None);
+    for line in text.lines() {
+        let l = line.split('#').next().unwrap_or("").trim();
+        if l.starts_with('[') {
+            inside = l == header;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        if let Some((k, v)) = l.split_once('=') {
+            let v = v.trim().parse::<f64>().ok();
+            match k.trim() {
+                "gate_max_mean" => mean = v,
+                "gate_min_top1" => top1 = v,
+                _ => {}
+            }
+        }
+    }
+    (mean, top1)
+}
+
+impl KldTopkGate {
+    fn gates_text(&self) -> Option<(String, String)> {
+        let path = self
+            .gates_file
+            .clone()
+            .or_else(|| std::env::var("TALUS_BENCH_KLD_GATES").ok())
+            .filter(|p| !p.is_empty())?;
+        let path = match path.strip_prefix("~/") {
+            Some(rest) => format!("{}/{rest}", std::env::var("HOME").unwrap_or_default()),
+            None => path,
+        };
+        std::fs::read_to_string(&path).ok().map(|t| (path, t))
+    }
+
+    /// The limits for the served model `model` (its `/v1/models` id).
+    pub fn limits(&self, model: &str) -> KldTopkLimits {
+        let (mean, top1, from) = match KLD_TOPK_PER_MODEL.iter().find(|r| r.model == model) {
+            Some(r) => {
+                let (fm, ft) = self
+                    .gates_text()
+                    .map(|(p, t)| (p, matrix_gate(&t, r.matrix_key)))
+                    .map(|(p, (m, t))| (m.map(|m| (m, p.clone())), t))
+                    .unwrap_or((None, None));
+                let (gate, gsrc) = match fm {
+                    Some((m, p)) => (m, p),
+                    None => (r.gate_max_mean, "built-in".to_string()),
+                };
+                let top1 = ft
+                    .map(|t| t * 100.0)
+                    .or(r.gate_min_top1_pct)
+                    .unwrap_or(KLD_TOPK_DEFAULT_TOP1);
+                (
+                    gate * r.ratio,
+                    top1,
+                    format!(
+                        "{model}: release gate {gate} ({gsrc}) x screening/full ratio {} ({})",
+                        r.ratio, r.derivation
+                    ),
+                )
+            }
+            None => (
+                KLD_TOPK_DEFAULT_MEAN,
+                KLD_TOPK_DEFAULT_TOP1,
+                "generic default".to_string(),
+            ),
+        };
+        let source = match (self.max_mean, self.min_top1_pct) {
+            (Some(_), Some(_)) => "config".to_string(),
+            (None, None) => from,
+            _ => format!("config + {from}"),
+        };
+        KldTopkLimits {
+            max_mean: self.max_mean.unwrap_or(mean),
+            min_top1_pct: self.min_top1_pct.unwrap_or(top1),
+            source,
         }
     }
 }
@@ -669,7 +812,9 @@ impl Config {
                 "quality_gates.ppl_ratio: need 1 <= target <= investigate (a ratio of candidate to reference perplexity)".into(),
             );
         }
-        if !(g.kld_topk.max_mean >= 0.0 && (0.0..=100.0).contains(&g.kld_topk.min_top1_pct)) {
+        if !(g.kld_topk.max_mean.unwrap_or(0.0) >= 0.0
+            && (0.0..=100.0).contains(&g.kld_topk.min_top1_pct.unwrap_or(0.0)))
+        {
             v.errors.push(
                 "quality_gates.kld_topk: need max_mean >= 0 and min_top1_pct in 0..100".into(),
             );
@@ -791,12 +936,49 @@ benchmarks:
         let c = Config::from_yaml(SAMPLE).unwrap();
         assert_eq!(c.quality_gates.ppl_ratio.target, 1.01);
         assert!(!c.quality_gates.kld_topk.enforce);
-        assert_eq!(c.quality_gates.kld_topk.max_mean, 0.05);
+        assert_eq!(c.quality_gates.kld_topk.max_mean, None);
+        let l = c.quality_gates.kld_topk.limits("some-other-model");
+        assert_eq!((l.max_mean, l.min_top1_pct), (0.05, 90.0));
+        assert_eq!(l.source, "generic default");
+        // a served model with a derived row: gate x ratio; a models.toml gate replaces the built-in gate
+        for r in KLD_TOPK_PER_MODEL {
+            let l = c.quality_gates.kld_topk.limits(r.model);
+            assert!(
+                (l.max_mean - r.gate_max_mean * r.ratio).abs() < 1e-15,
+                "{}",
+                r.model
+            );
+            assert!(l.source.starts_with(r.model));
+            assert!(r.ratio > 0.0 && r.gate_max_mean > 0.0);
+        }
+        let toml = "[rust.flashnext]\ngate = \"fn-gate\"\n[rust.flashnext.kld]\nref = \"x\"\ngate_max_mean = 0.08   # BF16 rebase\ngate_min_top1 = 0.9\n[rust.glm.kld]\ngate_max_mean = 1\n";
+        assert_eq!(matrix_gate(toml, "flashnext"), (Some(0.08), Some(0.9)));
+        assert_eq!(matrix_gate(toml, "glm"), (Some(1.0), None));
+        assert_eq!(matrix_gate(toml, "mimo"), (None, None));
+        if let Some(r) = KLD_TOPK_PER_MODEL
+            .iter()
+            .find(|r| r.matrix_key == "flashnext")
+        {
+            let d = std::env::temp_dir().join(format!("tb-gates-{}.toml", std::process::id()));
+            std::fs::write(&d, toml).unwrap();
+            let g = KldTopkGate {
+                gates_file: Some(d.display().to_string()),
+                ..Default::default()
+            };
+            let l = g.limits(r.model);
+            assert!((l.max_mean - 0.08 * r.ratio).abs() < 1e-15);
+            assert_eq!(l.min_top1_pct, 90.0);
+            assert!(l.source.contains("tb-gates-"), "{}", l.source);
+            std::fs::remove_file(&d).ok();
+        }
         let y = SAMPLE.to_string()
             + "quality_gates: {ppl_ratio: {target: 0.9, investigate: 1.0}, kld_topk: {max_mean: 0.01, enforce: true}}\n";
         let c = Config::from_yaml(&y).unwrap();
         assert!(c.quality_gates.kld_topk.enforce);
-        assert_eq!(c.quality_gates.kld_topk.min_top1_pct, 90.0);
+        assert_eq!(c.quality_gates.kld_topk.min_top1_pct, None);
+        let l = c.quality_gates.kld_topk.limits("qwen3.8-27b");
+        assert_eq!(l.max_mean, 0.01);
+        assert!(l.source.starts_with("config + "), "{}", l.source);
         assert!(c.validate().errors.join("\n").contains("ppl_ratio"));
         let typo =
             SAMPLE.to_string() + "quality_gates: {kld_topk: {max_mean: 0.01, enforced: true}}\n";

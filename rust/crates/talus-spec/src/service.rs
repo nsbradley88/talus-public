@@ -193,10 +193,11 @@ impl Default for CrossoverTable {
 }
 
 impl CrossoverTable {
-    /// Qwen3.5-27B (`gfx1151`): DFlash2 below 16K greedy / 32K sampled, MTP above, 2K margin.
+    /// Qwen3.5-27B (`gfx1151`): DFlash2 below 12K greedy / 32K sampled, MTP above, 2K margin.
+    /// Forced MTP overtakes DFlash2 near 12K on greedy coding prompts. Greedy outputs do not depend on the drafter.
     pub const fn qwen35_27b() -> Self {
         Self {
-            greedy_depth: 16384,
+            greedy_depth: 12288,
             sampled_depth: 32768,
             mtp_rows_margin: 2048,
             tmin: 0.0,

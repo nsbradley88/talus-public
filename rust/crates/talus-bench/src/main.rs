@@ -41,6 +41,7 @@ Usage:
   talus-bench pool [--task swebench_verified] [--json] RUN_DIR...
                                                       pool several runs (fresh draws) into one rate per model with a CI
   talus-bench kl BASE TEST [--rows N] [--skip K] [--model mimo|laguna | --max-mean X --min-top1 Y] [--label L]
+                          [--vocab V] [--topk K [--forced IDS_FILE]]
                                                       teacher-forced KL of two float32 [rows, V] logit dumps (kl.py port);
                                                       with a threshold: a RESULT line and exit 0 PASS / 1 FAIL
   talus-bench gpu-kld-plan --model mimo|laguna --build B --ref-build R [--depths 2000,32000] [--host H]
@@ -756,9 +757,63 @@ fn main() {
             };
             let rows = num("--rows").map(|r| r as usize);
             let skip = num("--skip").map(|r| r as usize).unwrap_or(0);
-            let st = talus_bench_core::kl::kl_files(Path::new(base), Path::new(test), rows, skip)
-                .unwrap_or_else(|e| die(&e));
+            // --vocab V: the dumps may hold different row counts (a llama.cpp CPU reference without the prompt
+            // row, as kldcmp.py reads them): compare the first min(rows) rows of each
+            let vocab = num("--vocab").map(|v| v as usize);
+            let trimmed = vocab.map(|v| {
+                let mut a =
+                    talus_bench_core::kl::read_f32(Path::new(base)).unwrap_or_else(|e| die(&e));
+                let mut b =
+                    talus_bench_core::kl::read_f32(Path::new(test)).unwrap_or_else(|e| die(&e));
+                let n = a.len().min(b.len()) / v.max(1);
+                a.truncate(n * v);
+                b.truncate(n * v);
+                (a, b, n)
+            });
+            let st = match &trimmed {
+                Some((a, b, n)) => talus_bench_core::kl::kl_stats(a, b, *n, skip),
+                None => {
+                    talus_bench_core::kl::kl_files(Path::new(base), Path::new(test), rows, skip)
+                }
+            }
+            .unwrap_or_else(|e| die(&e));
             let line = talus_bench_core::kl::kl_line(&st);
+            // --topk K: the kld_topk screening KL of the same rows (what E2 would report), next to the full KL
+            if let Some(k) = num("--topk").map(|k| k as usize) {
+                use talus_bench_core::kl;
+                let forced: Option<Vec<u32>> = flag(rest, "--forced").map(|f| {
+                    std::fs::read_to_string(&f)
+                        .unwrap_or_else(|e| die(&format!("{f}: {e}")))
+                        .split(|c: char| c == ',' || c.is_whitespace())
+                        .filter(|t| !t.is_empty())
+                        .map(|t| {
+                            t.parse()
+                                .unwrap_or_else(|_| die(&format!("{f}: bad id {t}")))
+                        })
+                        .collect()
+                });
+                let (a, b) = match trimmed {
+                    Some((a, b, _)) => (a, b),
+                    None => (
+                        kl::read_f32(Path::new(base)).unwrap_or_else(|e| die(&e)),
+                        kl::read_f32(Path::new(test)).unwrap_or_else(|e| die(&e)),
+                    ),
+                };
+                let (full, tk) =
+                    kl::topk_vs_full(&a, &b, st.rows + skip, skip, k, forced.as_deref())
+                        .unwrap_or_else(|e| die(&e));
+                println!(
+                    "topk {k}: screening KL mean {} p50 {} p99 {} max {} top1 {:.4} ref covered mean {:.4} min {:.4}; topk/full mean ratio {:.4}",
+                    kl::py_e3(tk.mean),
+                    kl::py_e3(tk.p50),
+                    kl::py_e3(tk.p99),
+                    kl::py_e3(tk.max),
+                    tk.top1,
+                    tk.ref_covered_mean,
+                    tk.ref_covered_min,
+                    if full.mean > 0.0 { tk.mean / full.mean } else { f64::NAN }
+                );
+            }
             let thr = match flag(rest, "--model") {
                 Some(m) => Some(
                     talus_bench_core::kl::RELEASE_TFKLD

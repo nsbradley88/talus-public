@@ -1331,7 +1331,28 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     const int64_t fit = (int64_t) TK_T * (counted ? TK_PER_MAX : TK_PER);
 #if defined(__HIPCC__)
     constexpr int64_t kRegMinBlocks = 7168;   // gfx1201: below ~28K cells the 1,024-thread kernel's fixed cost loses to the ref
-    const bool too_small = counted && reach < kRegMinBlocks;
+    // gfx1151 (W2 A7, 256 queries): the register kernel is ~0.28 ms flat, the ref 0.22 ms at 4,097 blocks, 0.31 at
+    // 4,609, 0.48 at 5,121 and 1.05 at 7,169 - so the crossover is ~4,096 blocks (16K cells)
+    constexpr int64_t kRegMinBlocksGfx1151 = 4096;
+    // STRATA_TOPK_REG_MIN=<blocks> (A/B): the crossover (the same ids either way)
+    static const int64_t reg_min_env = [] { const char* v = std::getenv("STRATA_TOPK_REG_MIN"); return v ? (int64_t) std::atoll(v) : (int64_t) -1; }();
+    static int arch11[64] = {};   // 0 unknown, 1 gfx11, 2 other
+    int64_t reg_min = kRegMinBlocks;
+    if (reg_min_env >= 0) {
+        reg_min = reg_min_env;
+    } else {
+        int dev = 0;
+        if (hipGetDevice(&dev) == hipSuccess && dev >= 0 && dev < 64) {
+            if (arch11[dev] == 0) {
+                hipDeviceProp_t prop{};
+                arch11[dev] = hipGetDeviceProperties(&prop, dev) == hipSuccess && gfx_arch_is_gfx1151(prop.gcnArchName) ? 1 : 2;
+            }
+            if (arch11[dev] == 1) reg_min = kRegMinBlocksGfx1151;
+        } else {
+            (void) hipGetLastError();
+        }
+    }
+    const bool too_small = counted && reach < reg_min;
     if (old || too_small || reach > fit) {
 #else
     constexpr int64_t kWideMinBlocks = 4608;   // RTX 3060: a prompt batch below ~18K cells is faster on the ref

@@ -157,7 +157,10 @@ pub fn run_config(m: &ModelInstall, ch: &Choices, c: &Ctx) -> Value {
                     &p(c.side_file("data/draft_vocab_en.bin")),
                 ]);
             } else {
-                a(&["--suffix-draft", "0"]);
+                // the native pack always decodes in verify windows: the engine refuses to start without --spec T
+                // (T >= 2). With no --mtp and no prompt lookup every window holds one token: plain decode 
+                // (--spec 2 without --mtp starts)
+                a(&["--spec", "2", "--suffix-draft", "0"]);
             }
             a(&["--max-context", "262144", "--kv", "int8"]);
             // no STRATA_HIPBLASLT_TUNING (talus#50): the kernel library finds the hipBLASLt table for the running
@@ -200,7 +203,7 @@ pub fn run_config(m: &ModelInstall, ch: &Choices, c: &Ctx) -> Value {
                 "--model",
                 &main,
                 "--max-context",
-                "196608",
+                "262144",
                 "--ubatch",
                 "2048",
             ]);
@@ -337,6 +340,37 @@ pub fn validate(text: &str, expect_model: &str) -> Vec<String> {
             bad.push(format!("{what} missing: {}", path.display()));
         }
     }
+    bad.extend(native_pack_problems(&v));
+    bad
+}
+
+/// A Flash-Next native pack (`--native`) starts only with `--spec T` (T >= 2) and `--prefill CHUNK`
+/// (src/program/generate.cpp); a config without them makes the engine exit before READY.
+fn native_pack_problems(v: &Value) -> Vec<String> {
+    let args: Vec<&str> = v
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if !args.contains(&"--native") {
+        return Vec::new();
+    }
+    let val = |k: &str| args.windows(2).find(|w| w[0] == k).map(|w| w[1]);
+    let mut bad = Vec::new();
+    if !val("--spec")
+        .and_then(|s| s.parse::<i64>().ok())
+        .is_some_and(|t| t >= 2)
+    {
+        bad.push(
+            "a native pack needs --spec T (T >= 2); the engine will not start without it"
+                .to_string(),
+        );
+    }
+    if val("--prefill").is_none() {
+        bad.push(
+            "a native pack needs --prefill CHUNK; the engine will not start without it".to_string(),
+        );
+    }
     bad
 }
 
@@ -416,7 +450,7 @@ mod tests {
         let mi = run_config(manifest::get("mimo-v2.6-flash").unwrap(), &ON, &c);
         assert_eq!(
             args(&mi).join(" "),
-            "--model /m/x/MiMo-V2.6-Flash-a4-x-00001-of-00003.gguf --max-context 196608 --ubatch 2048 \
+            "--model /m/x/MiMo-V2.6-Flash-a4-x-00001-of-00003.gguf --max-context 262144 --ubatch 2048 \
              --dflash-gguf /m/x/dflash-MiMo-V2.6-Flash-MOPD-Q8_0.gguf --spec 4 --spec-draft-vocab /m/x/mimo-dv-65536.bin"
         );
         let la = run_config(manifest::get("laguna-s-2.1").unwrap(), &ON, &c);
@@ -442,6 +476,35 @@ mod tests {
         // talus#50: the library finds the hipBLASLt table itself; no source-tree path in the config
         assert!(fx["env"].get("STRATA_HIPBLASLT_TUNING").is_none());
         assert_eq!(fx["tokenizer"], json!("/m/x/pack/tokenizer"));
+        assert!(native_pack_problems(&fx).is_empty());
+    }
+
+    /// Flash-Next with the drafters off: no MTP and no prompt lookup, but still --spec (T >= 2) and --prefill, or
+    /// the native-pack engine exits before READY (LEDGER 2026-11-02, stream).
+    #[test]
+    fn flash_next_drafters_off_still_starts() {
+        let c = ctx();
+        let fx0 = run_config(manifest::get("qwen3.8-flash-next").unwrap(), &OFF, &c);
+        let a = args(&fx0);
+        let val = |k: &str| a.windows(2).find(|w| w[0] == k).map(|w| w[1].clone());
+        assert!(val("--spec").unwrap().parse::<i64>().unwrap() >= 2);
+        assert_eq!(val("--suffix-draft").as_deref(), Some("0"));
+        assert!(val("--prefill").is_some());
+        assert!(val("--native").is_some());
+        for k in ["--mtp", "--mtp-window", "--mtp-draft-vocab", "--spec-min-p"] {
+            assert!(!a.iter().any(|x| x == k), "{k} with the drafters off");
+        }
+        assert!(native_pack_problems(&fx0).is_empty());
+        // and every other model's drafters-off config is free of native-pack problems too
+        for id in [
+            "qwen3.8-27b",
+            "glm-5.3-flash",
+            "mimo-v2.6-flash",
+            "laguna-s-2.1",
+        ] {
+            let v = run_config(manifest::get(id).unwrap(), &OFF, &c);
+            assert!(native_pack_problems(&v).is_empty(), "{id}");
+        }
     }
 
     #[test]
@@ -569,5 +632,17 @@ mod tests {
             "x",
         );
         assert_eq!(e, vec!["model missing: /nope/m.gguf".to_string()]);
+        // the v0.1.2 Flash-Next drafters-off config: --native without --spec
+        let e = validate(
+            r#"{"args":["--native","/nope.gguf","--prefill","auto:16384","--suffix-draft","0"],"model_name":"x"}"#,
+            "x",
+        );
+        assert!(e.iter().any(|m| m.contains("--spec T (T >= 2)")), "{e:?}");
+        let e = validate(
+            r#"{"args":["--native","/nope.gguf","--spec","1"],"model_name":"x"}"#,
+            "x",
+        );
+        assert!(e.iter().any(|m| m.contains("--spec T")), "{e:?}");
+        assert!(e.iter().any(|m| m.contains("--prefill CHUNK")), "{e:?}");
     }
 }

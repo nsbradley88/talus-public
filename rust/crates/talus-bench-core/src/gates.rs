@@ -439,7 +439,8 @@ pub fn ppl_ratio_gate(
 }
 
 /// `kld_topk`: screening KL from top-k lists (see the module docs). Value: mean KL in nats.
-pub fn kld_topk_gate(p: &ScoredPair, t: &KldTopkGate, required: bool) -> GateResult {
+pub fn kld_topk_gate(p: &ScoredPair, t: &KldTopkGate, model: &str, required: bool) -> GateResult {
+    let lim = t.limits(model);
     let mut g = GateResult {
         gate: format!("{} screening KL", p.task),
         task: p.task.clone(),
@@ -448,8 +449,8 @@ pub fn kld_topk_gate(p: &ScoredPair, t: &KldTopkGate, required: bool) -> GateRes
         status: GateStatus::Warn,
         value: p.kl.as_ref().map(|k| k.mean),
         threshold: Some(Threshold {
-            target: t.max_mean,
-            investigate: t.max_mean,
+            target: lim.max_mean,
+            investigate: lim.max_mean,
         }),
         interval: None,
         n: p.kl.as_ref().map(|k| k.positions).unwrap_or(0),
@@ -488,16 +489,20 @@ pub fn kld_topk_gate(p: &ScoredPair, t: &KldTopkGate, required: bool) -> GateRes
         k.cand_covered_mean * 100.0
     ));
     let mut breach = Vec::new();
-    if k.mean > t.max_mean {
-        breach.push(format!("mean {:.3e} > {}", k.mean, t.max_mean));
+    if k.mean > lim.max_mean {
+        breach.push(format!("mean {:.3e} > {}", k.mean, lim.max_mean));
     }
-    if k.top1 * 100.0 < t.min_top1_pct {
+    if k.top1 * 100.0 < lim.min_top1_pct {
         breach.push(format!(
             "top-1 {:.2}% < {}%",
             k.top1 * 100.0,
-            t.min_top1_pct
+            lim.min_top1_pct
         ));
     }
+    g.reasons.push(format!(
+        "limits: mean <= {} nats, top-1 >= {}% ({})",
+        lim.max_mean, lim.min_top1_pct, lim.source
+    ));
     let incomplete = !p.unscored.is_empty() || !p.kl_errors.is_empty();
     g.status = if !breach.is_empty() {
         if t.enforce {
@@ -521,7 +526,7 @@ pub fn kld_topk_gate(p: &ScoredPair, t: &KldTopkGate, required: bool) -> GateRes
         ));
     }
     if !t.enforce {
-        g.reasons.push("screening metric with provisional thresholds: WARN-only (quality_gates.kld_topk.enforce: false); the full-vocabulary release gate is kld_teacher_forced on the GPU host".into());
+        g.reasons.push("screening metric: WARN-only (quality_gates.kld_topk.enforce: false); the full-vocabulary release gate is kld_teacher_forced on the GPU host".into());
     }
     g
 }
@@ -841,21 +846,24 @@ mod tests {
             ..Default::default()
         };
         let t = KldTopkGate::default();
-        let g = kld_topk_gate(&p, &t, true);
+        let g = kld_topk_gate(&p, &t, "x", true);
         assert_eq!(g.status, GateStatus::Pass);
         assert!(g.reasons[0].contains("covers 97.00%"), "{:?}", g.reasons);
         assert!(g.reasons.iter().any(|r| r.contains("WARN-only")));
         p.kl = Some(stats(0.2, 0.99));
-        assert_eq!(kld_topk_gate(&p, &t, true).status, GateStatus::Warn);
+        assert_eq!(kld_topk_gate(&p, &t, "x", true).status, GateStatus::Warn);
         p.kl = Some(stats(1e-3, 0.5));
-        assert_eq!(kld_topk_gate(&p, &t, true).status, GateStatus::Warn);
+        assert_eq!(kld_topk_gate(&p, &t, "x", true).status, GateStatus::Warn);
         let enforce = KldTopkGate {
             enforce: true,
             ..Default::default()
         };
-        assert_eq!(kld_topk_gate(&p, &enforce, true).status, GateStatus::Fail);
+        assert_eq!(
+            kld_topk_gate(&p, &enforce, "x", true).status,
+            GateStatus::Fail
+        );
         p.kl = None;
-        assert_eq!(kld_topk_gate(&p, &t, true).status, GateStatus::NotRun);
+        assert_eq!(kld_topk_gate(&p, &t, "x", true).status, GateStatus::NotRun);
     }
 
     fn g(task: &str, s: GateStatus, required: bool) -> GateResult {

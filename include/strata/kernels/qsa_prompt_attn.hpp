@@ -29,4 +29,20 @@ namespace strata::kernels {
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream);
 
+/// Test hook (hip_prompt_attn_wmma, HIP builds): force the matrix-core kernel's variant. pipe: 2 pipelined + half-wave
+/// sharing (STRATA_PA_PIPE, default), 1 pipelined, 0 the previous one; fast: 1 one FP16 image of q and p (STRATA_PA_FAST=1), 0 hi + lo.
+/// -1 = from the environment (the default). No effect on CUDA builds.
+void qsa_prompt_attn_force(int pipe, int fast);
+
+/// W2 A7 item 3: `qsa_prompt_attn_batch` with prefill's attention output gate fused into the epilogue (HIP gfx11, the
+/// pipelined kernel only): writes out16[t * ld16 + h * head_dim + d] = f16(attn * sigmoid(q_full[t, h, head_dim + d]))
+/// (q_full: [t][n_head][2 * head_dim], the gate in the second half) - bitwise what gate_attn makes of the unfused
+/// output - and no `attn`. ld16 <= 0: n_head * head_dim. Returns false (nothing launched) where it does not apply or
+/// STRATA_PA_GATE=0: the caller then runs qsa_prompt_attn_batch and gate_attn.
+bool qsa_prompt_attn_gated(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                           int64_t cap, const QsaShapes& s, const float* q_full, uint16_t* out16, int64_t ld16,
+                           int64_t n_q, void* stream);
+/// Test hook: force qsa_prompt_attn_gated on (1) / off (0); -1 = STRATA_PA_GATE.
+void qsa_prompt_attn_force_gate(int gate);
+
 }  // namespace strata::kernels

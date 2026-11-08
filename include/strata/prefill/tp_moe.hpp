@@ -33,7 +33,14 @@ struct MoeProduct {
     /// q8_rows rows) instead of FP32 dst - bitwise llama.cpp's quantize_mmq_q8_1 of those rows (moe_gu_q8_supported)
     void* q8_out = nullptr;
     int64_t q8_rows = 0;
+    /// non-null (w ignored): expert e's matrix is at w_each[e], in place, instead of w + e * expert_bytes. Only where
+    /// moe_inplace_ok says so; n_experts <= kMoeEachMax. gather-free groups.
+    const void* const* w_each = nullptr;
 };
+constexpr int kMoeEachMax = 16;
+/// a grouped product of these types / shapes can read its experts in place (w_each): k_moe5 runs it and never
+/// uses a value past a matrix's last row (a K tail's blocks past k are skipped). STRATA_PF_INPLACE=0: false.
+bool moe_inplace_ok(int ggml_type, int n, int k);
 
 bool moe_supported(int ggml_type, int n, int k);
 /// dense (one-expert) Q6_K on tp_moe (bitwise MMQ); false = not covered, use MMQ

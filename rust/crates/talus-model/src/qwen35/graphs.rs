@@ -30,9 +30,14 @@ pub const K_MAX_STEPS: usize = 8;
 /// Rule defaults: calibration exponent 1.6, chained draft step 1.3 ms.
 const Q27_CD_NEAR: [f64; 8] = [72.3, 73.9, 75.4, 77.0, 78.5, 80.0, 81.6, 83.1];
 const Q27_CD_FAR: [f64; 8] = [81.9, 84.9, 87.9, 90.9, 93.9, 96.9, 99.9, 102.9];
+/// the 32K table with the int8 KV copy on (the v0.1.3 default for the dense quantized 27B): fit to a
+/// measured trace of the round cost; outputs bitwise (any window is exact).
+const Q27_CD_FAR_KV8: [f64; 8] = [77.9, 79.3, 80.6, 81.9, 83.3, 84.6, 85.9, 87.2];
 
 #[derive(Debug)]
 pub struct DraftLen {
+    /// w2: decode / verify read the int8 KV copy (picks the cost table; set before init_arch)
+    pub kv8: bool,
     pub mode: i32,
     pub dfix: i32,
     pub dmin: i32,
@@ -98,6 +103,7 @@ unsafe impl Sync for DraftLen {}
 impl Default for DraftLen {
     fn default() -> Self {
         Self {
+            kv8: false,
             mode: 0,
             dfix: 0,
             dmin: 2,
@@ -235,15 +241,14 @@ impl DraftLen {
         self.dfl_cum[1] = env_float("STRATA_DFL_CUM_S", 0.30);
 
         // default ON for greedy MTP windows (outputs bitwise)
-        self.cd = talus_spec::CostDepth::from_env_with(
-            "Q27",
-            &Q27_CD_NEAR,
-            &Q27_CD_FAR,
-            true,
-            1.6,
-            1,
-            1.3,
-        );
+        // w2: the far table and chained step follow the decode KV (int8 copy: cheaper rows, see Q27_CD_FAR_KV8)
+        let (far, step) = if self.kv8 {
+            (&Q27_CD_FAR_KV8, 2.8)
+        } else {
+            (&Q27_CD_FAR, 1.3)
+        };
+        self.cd =
+            talus_spec::CostDepth::from_env_with("Q27", &Q27_CD_NEAR, far, true, 1.6, 1, step);
         self.cdd = talus_spec::CostDepth::from_env("Q27D", &Q27_CD_NEAR, &Q27_CD_FAR, false);
         self.enabled = self.mode != 0;
         self.fixed_k = if self.mode == 0 { d_fixed } else { 0 };

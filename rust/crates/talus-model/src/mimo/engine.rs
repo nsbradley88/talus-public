@@ -30,7 +30,7 @@ use crate::tail_prune::{self, first_prunable_layer, plan_on_grid, Grid, LayerAtt
 
 /// One gibibyte in bytes (`1024^3`).
 pub const GIB: usize = 1024 * 1024 * 1024;
-/// MiMo-V2.6-Flash `MemAvailable` floor (`11 GiB`).
+/// MiMo-V2.6-Flash load-time `MemAvailable` floor (8.5 GiB, see `talus_mem::MIMO_FLOOR_BYTES`).
 pub const MIMO_FLOOR_BYTES: usize = talus_mem::MIMO_FLOOR_BYTES;
 
 fn io_err(e: std::io::Error) -> CoreError {
@@ -565,7 +565,8 @@ impl MimoDFlashRunner {
 /// Configuration for [`MimoEngine`].
 #[derive(Debug, Clone)]
 pub struct MimoEngineConfig {
-    /// Maximum context length (`4096` default, up to `196608`).
+    /// Maximum context length (`4096` default; the shipped config uses `196608`, the model's native context is
+    /// `262144`). Context-scaled memory is ~20.5 KiB/token (full-attention KV); the DFlash drafter KV is a fixed ring.
     pub max_seq_len: usize,
     /// Sampling temperature (`0.0` for greedy).
     pub temperature: f32,
@@ -664,6 +665,8 @@ struct MimoDFlashGpuState {
     df_conf_tops: Vec<f32>,
     /// Number of context tokens already injected into the DFlash KV cache.
     injected_pos: usize,
+    /// : rows of the K / V rings ([`mimo_df_ring`]; `max_ctx` with `TALUS_MIMO_DF_RING=0`).
+    ring: usize,
     allocs: Vec<*mut c_void>,
 }
 
@@ -740,6 +743,8 @@ struct MimoGpuState {
     /// Budget reservation backing `i8c`.
     i8_res: Option<Reservation>,
     allocs: Vec<*mut c_void>,
+    /// padded router rows (TALUS_ROUTER_PAD; released on drop)
+    _rowpad: crate::rowpad::RowPad,
 }
 
 // SAFETY: `MimoGpuState` owns its device pointers and synchronizes stream access through `&mut self`.
@@ -823,6 +828,11 @@ pub struct MimoEngine {
     prefill_hint: Option<(usize, usize)>,
     /// prompt rows `[a, b)` whose last-layer output (the DFlash tap) a pruned prefill skipped.
     tap_stale: Vec<(usize, usize)>,
+    /// `(end, logits)` of the last prompt pass that ended at `end`: the last row's logits as that
+    /// pass computed them. An exact resend resumes at `end` with these instead of re-reading row `end - 1` alone (a
+    /// 1-row chunk runs the decode kernels, `nb <= 8`, and its logits differ from the same row inside a prefill
+    /// chunk). Dropped by `reset`, `load_session` and any rollback below `end`.
+    prompt_end: Option<(usize, Vec<f32>)>,
 }
 
 /// tail pruning keeps a suffix of each chunk that starts on a multiple of this many rows from the chunk start
@@ -832,6 +842,23 @@ const TAIL_ALIGN: usize = 256;
 const TAIL_MIN_ROWS: usize = 128;
 /// rows kept past the drafter's window (its 32-key chunks and block positions).
 const TAIL_DF_MARGIN: usize = 128;
+
+/// : rows of the DFlash drafter's KV ring. The drafter attends to the last `window` rows only (`tk_attn_swa_sinks`
+/// with `stride` = ring reads cell `pos % ring`, its stores write `pos % ring`), so it needs: the window, plus how far
+/// the serve loop may roll back and still resume (`swa_stride - SWA_WINDOW`: the target SWA rings set that limit),
+/// plus one prefill chunk (`ub` rows are stored in one call), plus margin. Was `max_ctx` rows (20 KiB/token: 5 GiB at
+/// 262144). `TALUS_MIMO_DF_RING=0` restores the full-length cache.
+pub fn mimo_df_ring(max_ctx: usize, swa_stride: usize, ub: usize, df_window: usize) -> usize {
+    if std::env::var("TALUS_MIMO_DF_RING").is_ok_and(|v| v.trim() == "0") {
+        return max_ctx;
+    }
+    let need = swa_stride.saturating_sub(crate::mimo::weights::SWA_WINDOW as usize)
+        + ub
+        + df_window.max(128)
+        + TAIL_DF_MARGIN
+        + 256;
+    need.div_ceil(256).saturating_mul(256).min(max_ctx)
+}
 
 impl MimoEngine {
     /// Construct a real GPU-backed [`MimoEngine`] from a loaded [`MimoModel`], [`LibTalusKernels`],
@@ -862,7 +889,8 @@ impl MimoEngine {
             let _ = (lib.tk_q36_mmq_built)();
         }
         // MiMo's GPU attention kernels (`mimo_attn_swa_sinks` and `mimo_attn_k192_v128`) store
-        // K192 and V128 in F16 on GPU (~106 MiB total across all 40 SWA-128 rings + 8 full layers).
+        // K192 and V128 in F16 on GPU (the 40 SWA rings of `swa_stride` slots, ~3.15 GiB at ubatch 2048, + 8 full
+        // layers of max_ctx slots, 20 KiB/token). There is no int8 KV path : `--kv q8` warns and is ignored).
         let kv_q8 = false;
 
         // 1. Compute exact KV cache byte footprint across the 40 SWA rings (`[swa_stride, 8, 192]` K,
@@ -884,12 +912,15 @@ impl MimoEngine {
             layer_kv_specs.push((k_bytes, v_bytes, ks_bytes, vs_bytes));
         }
 
+        let df_ring = model.dflash.as_ref().map_or(max_ctx, |df| {
+            mimo_df_ring(max_ctx, swa_stride, ub, df.catalog.sliding_window as usize)
+        });
         if let Some(ref df) = model.dflash {
             let df_cat = &df.catalog;
             let k_pool_dim = df_cat.k_dim;
             for _ in 0..df_cat.block_count {
-                let k_bytes = max_ctx * df_cat.n_head_kv * k_pool_dim * 2;
-                let v_bytes = max_ctx * df_cat.n_head_kv * df_cat.v_dim * 2;
+                let k_bytes = df_ring * df_cat.n_head_kv * k_pool_dim * 2;
+                let v_bytes = df_ring * df_cat.n_head_kv * df_cat.v_dim * 2;
                 total_kv_bytes += k_bytes + v_bytes;
             }
         }
@@ -1165,8 +1196,8 @@ impl MimoEngine {
             let mut df_v_pool = Vec::with_capacity(df_cat.block_count);
             let k_pool_dim = df_cat.k_dim;
             for dl in 0..df_cat.block_count {
-                let kb = max_ctx * df_cat.n_head_kv * k_pool_dim * 2;
-                let vb = max_ctx * df_cat.n_head_kv * df_cat.v_dim * 2;
+                let kb = df_ring * df_cat.n_head_kv * k_pool_dim * 2;
+                let vb = df_ring * df_cat.n_head_kv * df_cat.v_dim * 2;
                 let kp = alloc_raw(&hip, &mut df_allocs, kb, &format!("df_k_pool.{dl}"))?;
                 let vp = alloc_raw(&hip, &mut df_allocs, vb, &format!("df_v_pool.{dl}"))?;
                 hip_memset(&hip, kp, 0, kb)?;
@@ -1175,6 +1206,18 @@ impl MimoEngine {
                 df_v_pool.push(vp);
             }
 
+            {
+                let row = df_cat.block_count * df_cat.n_head_kv * (k_pool_dim + df_cat.v_dim) * 2;
+                eprintln!(
+                    "talus-mimo: DFlash KV ring {} rows (window {}), {:.2} GiB ({:.2} GiB at the full {} context; \
+                     TALUS_MIMO_DF_RING=0: full)",
+                    df_ring,
+                    df_cat.sliding_window,
+                    (df_ring * row) as f64 / (1u64 << 30) as f64,
+                    (max_ctx * row) as f64 / (1u64 << 30) as f64,
+                    max_ctx
+                );
+            }
             let (draft_head, dv_map_dev) = if let Some(ref df_runner) = dflash {
                 let dv_ids = &df_runner.vocab_info.draft_to_target;
                 let n_dv = dv_ids.len();
@@ -1257,6 +1300,7 @@ impl MimoEngine {
                 df_conf_dev,
                 df_conf_tops: Vec::new(),
                 injected_pos: 0,
+                ring: df_ring,
                 allocs: df_allocs,
             })
         } else {
@@ -1366,6 +1410,22 @@ impl MimoEngine {
             .unwrap_or(true);
 
         let hparams = model.hparams.clone();
+        let rowpad = crate::rowpad::RowPad::register(
+            &lib,
+            &model
+                .layers
+                .iter()
+                .filter(|l| !l.ffn_gate_inp.dev.is_null() && l.ffn_gate_inp.qtype == TK_QTYPE_F32)
+                .map(|l| {
+                    (
+                        l.ffn_gate_inp.dev as *const c_void,
+                        l.ffn_gate_inp.n_out as i64,
+                        (l.ffn_gate_inp.n_in * 4) as i64,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            true,
+        );
         let gpu_state = MimoGpuState {
             model,
             lib,
@@ -1424,6 +1484,7 @@ impl MimoEngine {
             i8c: Arc::new(std::collections::HashMap::new()),
             i8_res: None,
             allocs,
+            _rowpad: rowpad,
         };
 
         let mut eng = Self {
@@ -1442,6 +1503,7 @@ impl MimoEngine {
             trace: MimoDispatchTrace::default(),
             prefill_hint: None,
             tap_stale: Vec::new(),
+            prompt_end: None,
         };
         eng.build_i8_cache();
         Ok(eng)
@@ -1620,6 +1682,7 @@ impl MimoEngine {
             trace: MimoDispatchTrace::default(),
             prefill_hint: None,
             tap_stale: Vec::new(),
+            prompt_end: None,
         })
     }
 
@@ -1699,6 +1762,7 @@ impl MimoEngine {
             trace: MimoDispatchTrace::default(),
             prefill_hint: None,
             tap_stale: Vec::new(),
+            prompt_end: None,
         })
     }
 
@@ -1760,6 +1824,7 @@ impl MimoEngine {
         self.n_pos = 0;
         self.token_history.clear();
         self.tap_stale.clear();
+        self.prompt_end = None;
         self.kv_state.fill(0);
         self.trace = MimoDispatchTrace::default();
         if let Some(ref mut df) = self.dflash {
@@ -3742,7 +3807,7 @@ impl MimoEngine {
                             }
 
                             let k_pool_dim = df_k_dim;
-                            let df_stride = max_ctx as usize;
+                            let df_stride = df_gpu.ring;
                             for (dl, df_layer) in df_weights.layers.iter().enumerate() {
                                 dense_mimo(
                                     &df_layer.wk,
@@ -4131,6 +4196,7 @@ impl MimoEngine {
             )?;
 
             // 3. Run the 5-layer DFlash transformer on GPU.
+            let df_ring_rows = df_gpu.ring as i32;
             for (dl, layer) in df_weights.layers.iter().enumerate() {
                 check_tk(
                     unsafe {
@@ -4278,7 +4344,7 @@ impl MimoEngine {
                             (n_kv * v_dim) as i32,
                             b_rows as i32,
                             gpu.pos_k_dev,
-                            max_ctx,
+                            df_ring_rows,
                             stream,
                         )
                     },
@@ -4310,7 +4376,7 @@ impl MimoEngine {
                             k_pool_dim as i32,
                             v_dim as i32,
                             df_window,
-                            max_ctx,
+                            df_ring_rows,
                             df_scale,
                             df_gpu.bpos_dev,
                             -2,
@@ -4864,6 +4930,30 @@ impl MimoEngine {
             for r in self.tap_stale.iter_mut() {
                 r.1 = r.1.min(new_pos);
             }
+            if self
+                .prompt_end
+                .as_ref()
+                .is_some_and(|(end, _)| *end > new_pos)
+            {
+                self.prompt_end = None;
+            }
+        }
+    }
+
+    /// record the last-row logits of a prompt pass that ended at `end` (`end == n_pos`).
+    pub fn set_prompt_end_logits(&mut self, end: usize, logits: &[f32]) {
+        self.prompt_end =
+            (end == self.n_pos && end > 0 && !logits.is_empty()).then(|| (end, logits.to_vec()));
+    }
+
+    /// the logits recorded by [`Self::set_prompt_end_logits`] for a prompt ending at `end`, when rows
+    /// `[0, end)` are still the ones that pass wrote (no reset, session load or rollback below `end` since).
+    pub fn prompt_end_logits(&self, end: usize) -> Option<&[f32]> {
+        match &self.prompt_end {
+            Some((e, l)) if *e == end && end <= self.n_pos && end <= self.token_history.len() => {
+                Some(l)
+            }
+            _ => None,
         }
     }
 
@@ -5153,6 +5243,7 @@ impl MimoEngine {
 
         self.n_pos = hdr.n_pos as usize;
         self.token_history = history;
+        self.prompt_end = None;
         self.rng_state = hdr.rng_state;
         self.kv_state = kv;
         Ok(hdr)

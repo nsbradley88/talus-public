@@ -18,13 +18,20 @@ namespace strata::kernels {
 
 /// f(c0, c) for the chunks [c0, c0 + c) of n rows (one chunk [0, n) when n <= kVerifyMaxTBase)
 template <typename F> inline void verify_row_chunks(int n, F&& f) {
-    if (n <= kVerifyMaxTBase) { f(0, n); return; }
-    const int a = (n + 1) / 2;
-    f(0, a);
-    f(a, n - a);
+    auto cut = [&f](int base, int m) {   // m <= 2 * kVerifyMaxTBase
+        if (m <= kVerifyMaxTBase) { f(base, m); return; }
+        const int a = (m + 1) / 2;
+        f(base, a);
+        f(base + a, m - a);
+    };
+    if (n <= 2 * kVerifyMaxTBase) { cut(0, n); return; }
+    // 17..32 rows: halves first, each cut as above (every call stays <= kVerifyMaxTBase rows)
+    const int h = (n + 1) / 2;
+    cut(0, h);
+    cut(h, n - h);
 }
 
-/// bf16_gemv_fp32_mmvf_multi over n rows (any n <= 2 * kVerifyMaxTBase)
+/// bf16_gemv_fp32_mmvf_multi over n rows (any n <= kVerifyMaxT)
 inline void bf16_gemv_fp32_mmvf_multi_wide(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                            int64_t n_in, int64_t n_out, int n, void* stream) {
     verify_row_chunks(n, [&](int c0, int c) {
@@ -33,7 +40,7 @@ inline void bf16_gemv_fp32_mmvf_multi_wide(const float* x, int64_t ldx, const ui
     });
 }
 
-/// fused_gr_read_multi over fa[0, n) (any n <= 2 * kFusedGrMaxT).  `xn_row`: the scratch's floats per row (hc * n_embd).
+/// fused_gr_read_multi over fa[0, n) (any n <= kVerifyMaxT).  `xn_row`: the scratch's floats per row (hc * n_embd).
 /// A wide group's calls write no q8_1 image (S26 STRATA_QFUSE: q8_mixed / q8_cnt are cleared, the call returns false
 /// and the caller quantizes - the bytes the image would hold).
 inline bool fused_gr_read_multi_wide(FusedGrArgs* fa, int n, float* xn, int64_t xn_row, void* stream,

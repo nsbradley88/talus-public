@@ -1004,6 +1004,30 @@ pub fn coerce_param_value(raw: &str, prop_schema: Option<&JsonValue>) -> JsonVal
     JsonValue::Str(raw.to_string())
 }
 
+/// Tool-call arguments: what `JsonValue::insert` does (a repeated name replaces the value and keeps its place), without
+/// a scan per insert.
+#[derive(Default)]
+struct ArgsBuilder {
+    entries: Vec<(String, JsonValue)>,
+    index: std::collections::HashMap<String, usize>,
+}
+
+impl ArgsBuilder {
+    fn insert(&mut self, key: String, val: JsonValue) {
+        match self.index.get(&key) {
+            Some(&i) => self.entries[i].1 = val,
+            None => {
+                self.index.insert(key.clone(), self.entries.len());
+                self.entries.push((key, val));
+            }
+        }
+    }
+
+    fn finish(self) -> JsonValue {
+        JsonValue::Object(self.entries)
+    }
+}
+
 /// Parse the inner body of a `<tool_call>...</tool_call>` block.
 /// Supports:
 /// 1. Qwen XML `<function=NAME><parameter=K>V</parameter></function>`
@@ -1028,7 +1052,7 @@ pub fn parse_tool_call(body: &str, schemas: Option<&[JsonValue]>) -> Option<Tool
             let end_pos = rest.rfind(FUNC_CLOSE)?;
             let inner = &rest[..end_pos];
             let props = get_schema_props(&name);
-            let mut args = JsonValue::empty_obj();
+            let mut args = ArgsBuilder::default();
             let mut cursor = inner;
             while let Some(p_start) = cursor.find("<parameter=") {
                 let after_p = &cursor[p_start + "<parameter=".len()..];
@@ -1058,7 +1082,7 @@ pub fn parse_tool_call(body: &str, schemas: Option<&[JsonValue]>) -> Option<Tool
             return Some(ToolCall {
                 id: format!("call_{}", next_hex_id(24)),
                 name,
-                arguments: args,
+                arguments: args.finish(),
             });
         }
     }
@@ -1075,7 +1099,7 @@ pub fn parse_tool_call(body: &str, schemas: Option<&[JsonValue]>) -> Option<Tool
             let rest = &trimmed[name_end..];
             if rest.trim().is_empty() || rest.contains(ARG_KEY_OPEN) {
                 let props = get_schema_props(&name);
-                let mut args = JsonValue::empty_obj();
+                let mut args = ArgsBuilder::default();
                 let mut cursor = rest;
                 while let Some(k_start) = cursor.find(ARG_KEY_OPEN) {
                     let after_k = &cursor[k_start + ARG_KEY_OPEN.len()..];
@@ -1109,7 +1133,7 @@ pub fn parse_tool_call(body: &str, schemas: Option<&[JsonValue]>) -> Option<Tool
                 return Some(ToolCall {
                     id: format!("call_{}", next_hex_id(24)),
                     name,
-                    arguments: args,
+                    arguments: args.finish(),
                 });
             }
         }
@@ -1145,6 +1169,9 @@ pub enum ParserState {
     ReasoningCall,
 }
 
+/// A longer `<function=...` with no `>` is not a tool's name.
+const MAX_TOOL_NAME: usize = 256;
+
 /// Incremental streaming parser for `<think>...</think>` and `<tool_call>...</tool_call>`.
 pub struct OutputParser {
     pub state: ParserState,
@@ -1152,7 +1179,14 @@ pub struct OutputParser {
     lead: bool,
     tools: Option<Vec<JsonValue>>,
     has_tools: bool,
+    /// `tool_call_recovery`: a bare `<function=`, or a call whose `</tool_call>` is missing, is the call.
     recover: bool,
+    /// `reasoning_recovery`: a whole tool call left inside an unclosed `<think>` on a natural stop is the call.
+    reasoning_rescue: bool,
+    /// The call being read opened without `<tool_call>`.
+    bare: bool,
+    /// Calls only for tools the request declared ; line-start and outside-code are still to come).
+    strict: bool,
     pub rescued: usize,
     pub refused: usize,
     pub recovered_from_reasoning: bool,
@@ -1164,9 +1198,13 @@ impl OutputParser {
         tools: Option<Vec<JsonValue>>,
         _stream_tool_args: bool,
         recover: bool,
-        _strict_tool_names: bool,
+        strict_tool_names: bool,
     ) -> Self {
-        let has_tools = tools.as_ref().map(|t| !t.is_empty()).unwrap_or(true);
+        // strict: a request that declared no tools gets no tool calls, whatever the answer's text looks like
+        let has_tools = tools
+            .as_ref()
+            .map(|t| !t.is_empty())
+            .unwrap_or(!strict_tool_names);
         Self {
             state: if thinking {
                 ParserState::Reasoning
@@ -1178,10 +1216,48 @@ impl OutputParser {
             tools,
             has_tools,
             recover,
+            reasoning_rescue: recover,
+            bare: false,
+            strict: strict_tool_names,
             rescued: 0,
             refused: 0,
             recovered_from_reasoning: false,
         }
+    }
+
+    /// Where a bare `<function=` opens a call: (position of a call, position still waiting for its name). Strict: only a
+    /// declared tool's name opens one; any other is the text it is.
+    fn bare_opener(&self) -> (Option<usize>, Option<usize>) {
+        if !self.strict {
+            return (self.buf.find(FUNC_OPEN), None);
+        }
+        let mut from = 0;
+        while let Some(i) = self.buf[from..].find(FUNC_OPEN) {
+            let pos = from + i;
+            let after = &self.buf[pos + FUNC_OPEN.len()..];
+            match after.find('>') {
+                Some(gt) => {
+                    let name = after[..gt].trim();
+                    let declared = self
+                        .tools
+                        .as_deref()
+                        .is_some_and(|t| t.iter().any(|d| d.get_str("name") == Some(name)));
+                    if declared {
+                        return (Some(pos), None);
+                    }
+                }
+                None if after.len() <= MAX_TOOL_NAME => return (None, Some(pos)),
+                None => {}
+            }
+            from = pos + FUNC_OPEN.len();
+        }
+        (None, None)
+    }
+
+    /// Set the reasoning rescue on its own (by default it follows `recover`).
+    pub fn with_reasoning_rescue(mut self, on: bool) -> Self {
+        self.reasoning_rescue = on;
+        self
     }
 
     pub fn feed(&mut self, piece: &str) -> Vec<Event> {
@@ -1229,10 +1305,10 @@ impl OutputParser {
                     } else {
                         None
                     };
-                    let bare_pos = if self.has_tools && self.recover {
-                        self.buf.find(FUNC_OPEN)
+                    let (bare_pos, bare_wait) = if self.has_tools && self.recover {
+                        self.bare_opener()
                     } else {
-                        None
+                        (None, None)
                     };
                     let open_match = match (tc_pos, bare_pos) {
                         (Some(a), Some(b)) => Some(a.min(b)),
@@ -1248,8 +1324,17 @@ impl OutputParser {
                         let is_tc = self.buf[pos..].starts_with(TOOL_OPEN);
                         let skip = if is_tc { TOOL_OPEN.len() } else { 0 };
                         self.buf.drain(..pos + skip);
+                        self.bare = !is_tc;
                         self.state = ParserState::Call;
                         continue;
+                    }
+                    if let Some(pos) = bare_wait {
+                        // `<function=` whose name has not arrived yet: hold it, emit what comes before
+                        if pos > 0 {
+                            let before: String = self.buf.drain(..pos).collect();
+                            out.push(Event::content(before));
+                        }
+                        break;
                     }
                     let mut guards = vec![TOOL_OPEN];
                     if self.recover {
@@ -1317,6 +1402,10 @@ impl OutputParser {
                                     out.push(Event::tool_start(start_call.clone()));
                                     out.push(Event::tool_args(args_json, start_call));
                                     out.push(Event::tool_call(call));
+                                } else {
+                                    // not a call after all: the text it is (it used to vanish)
+                                    let open = if self.bare { "" } else { TOOL_OPEN };
+                                    out.push(Event::content(format!("{open}{raw_call}")));
                                 }
                                 self.state = ParserState::Content;
                                 continue;
@@ -1343,7 +1432,7 @@ impl OutputParser {
         match self.state {
             ParserState::Reasoning => {
                 // Rescue tool call inside unclosed <think> if finish_reason == "stop"
-                if finish_reason == "stop" && self.has_tools && self.recover {
+                if finish_reason == "stop" && self.has_tools && self.reasoning_rescue {
                     if let Some(tc_pos) = leftover.find(TOOL_OPEN) {
                         if let Some(end_pos) = leftover[tc_pos..].find(TOOL_CLOSE) {
                             let before = &leftover[..tc_pos];
@@ -1659,5 +1748,153 @@ mod stream_tool_call_tests {
         out.extend(p.finish());
         assert_eq!(calls(&out).len(), 1);
         assert_eq!(content(&out).trim(), "");
+    }
+
+    const BARE: &str =
+        "<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n";
+
+    #[test]
+    fn bare_call_follows_tool_call_recovery_only() {
+        let run = |recover: bool, rescue: bool, thinking: bool, text: &str| {
+            let mut p = OutputParser::new(thinking, None, false, recover, false)
+                .with_reasoning_rescue(rescue);
+            let mut out = p.feed(text);
+            out.extend(p.finish());
+            out
+        };
+        // a bare call: only tool_call_recovery reads it, whatever reasoning_recovery says
+        assert_eq!(calls(&run(true, false, false, BARE)).len(), 1);
+        let off = run(false, true, false, BARE);
+        assert_eq!(calls(&off).len(), 0);
+        assert!(content(&off).contains("<function=get_weather>"));
+    }
+
+    /// Pins a gap, it is not a wanted behaviour: reasoning is streamed as it arrives, nothing holds a `<tool_call>` back,
+    /// so `finish_with_reason` has nothing to rescue and `reasoning_recovery` changes nothing (the Python server
+    /// delivers such calls, #804). Making it work changes output: it needs the gates.
+    #[test]
+    fn call_inside_unclosed_reasoning_stays_reasoning_text() {
+        for rescue in [true, false] {
+            let mut p =
+                OutputParser::new(true, None, false, true, false).with_reasoning_rescue(rescue);
+            let mut out = p.feed("thinking <tool_call><function=f></function></tool_call>");
+            out.extend(p.finish());
+            assert_eq!(calls(&out).len(), 0);
+            assert!(!p.recovered_from_reasoning);
+        }
+    }
+
+    #[test]
+    fn missing_closer_needs_tool_call_recovery() {
+        let text = format!("<tool_call>{BARE}more text");
+        let mut on = OutputParser::new(false, None, false, true, false);
+        let mut out = on.feed(&text);
+        out.extend(on.finish());
+        assert_eq!(calls(&out).len(), 1);
+        assert_eq!(content(&out).trim(), "more text");
+        // off: the wrapper stays open to the end of the stream
+        let mut off = OutputParser::new(false, None, false, false, false);
+        let events = off.feed(&text);
+        assert_eq!(calls(&events).len(), 0);
+    }
+
+    #[test]
+    fn recovered_form_that_does_not_parse_stays_text() {
+        let mut p = OutputParser::new(false, None, false, true, false);
+        let mut out = p.feed("<function=x>unterminated</parameter=></function>\nafter");
+        out.extend(p.finish());
+        let all = format!("{}{:?}", content(&out), calls(&out).len());
+        assert!(all.contains("after"), "{all}");
+    }
+
+    fn declared(name: &str) -> Option<Vec<JsonValue>> {
+        Some(vec![JsonValue::obj(vec![("name", JsonValue::from(name))])])
+    }
+
+    fn run_pieces(mut p: OutputParser, pieces: &[&str]) -> Vec<Event> {
+        let mut out = Vec::new();
+        for piece in pieces {
+            out.extend(p.feed(piece));
+        }
+        out.extend(p.finish());
+        out
+    }
+
+    /// What the parser did up to v0.1.4 (strict off): a `<function=` anywhere is a call, for any name, tools or not.
+    #[test]
+    fn loose_parser_invents_calls_from_answer_text() {
+        let quote = "Use it like this:\n```\n<function=demo>\n</function>\nnext line\n```\n";
+        let loose = run_pieces(OutputParser::new(false, None, false, true, false), &[quote]);
+        assert_eq!(calls(&loose).len(), 1, "the quoted example became a call");
+    }
+
+    #[test]
+    fn strict_no_tools_declared_means_no_calls() {
+        let quote = "Use it like this:\n<function=demo>\n</function>\nand <tool_call><function=x></function></tool_call> too";
+        let out = run_pieces(OutputParser::new(false, None, false, true, true), &[quote]);
+        assert_eq!(calls(&out).len(), 0);
+        assert_eq!(content(&out), quote);
+        // also an empty list
+        let out = run_pieces(
+            OutputParser::new(false, Some(vec![]), false, true, true),
+            &[quote],
+        );
+        assert_eq!(calls(&out).len(), 0);
+    }
+
+    #[test]
+    fn strict_bare_call_needs_a_declared_name() {
+        let text = "before\n<function=other>\n</function>\nafter";
+        let out = run_pieces(
+            OutputParser::new(false, declared("get_weather"), false, true, true),
+            &[text],
+        );
+        assert_eq!(calls(&out).len(), 0);
+        assert_eq!(content(&out), text);
+        // the declared one, also with the opener split across pieces, and text before it kept
+        let pieces = [
+            "before\n<func",
+            "tion=get_",
+            "weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n",
+        ];
+        let out = run_pieces(
+            OutputParser::new(false, declared("get_weather"), false, true, true),
+            &pieces,
+        );
+        assert_eq!(calls(&out).len(), 1);
+        assert_eq!(content(&out).trim(), "before");
+        // an undeclared opener, then a declared one
+        let text = "<function=other>x</function>\n<function=get_weather>\n</function>\n";
+        let out = run_pieces(
+            OutputParser::new(false, declared("get_weather"), false, true, true),
+            &[text],
+        );
+        assert_eq!(calls(&out).len(), 1);
+        assert!(content(&out).contains("<function=other>"));
+        // a very long non-name does not hold the stream forever
+        let long = format!("<function={}", "x".repeat(400));
+        let mut p = OutputParser::new(false, declared("get_weather"), false, true, true);
+        assert_eq!(content(&p.feed(&long)), long);
+    }
+
+    #[test]
+    fn strict_wrapped_call_with_tools_declared_is_unchanged() {
+        let text = "<tool_call>\n<function=anything>\n</function>\n</tool_call>";
+        let out = run_pieces(
+            OutputParser::new(false, declared("get_weather"), false, true, true),
+            &[text],
+        );
+        assert_eq!(calls(&out).len(), 1);
+    }
+
+    /// Still open Wave 2b, gated): with the tool declared, a quoted example in code or mid-line is still a call.
+    #[test]
+    fn strict_declared_call_in_code_is_still_read() {
+        let text = "Example:\n```\nfoo <function=get_weather>\n</function>\nbar\n```\n";
+        let out = run_pieces(
+            OutputParser::new(false, declared("get_weather"), false, true, true),
+            &[text],
+        );
+        assert_eq!(calls(&out).len(), 1);
     }
 }

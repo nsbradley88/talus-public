@@ -20,6 +20,8 @@
 #include "strata/prefill/moe_w16.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "wmma_gemm.h"
+#include "strata/prefill/kernels.hpp"
+#include "strata/kernels/dequant_bf16.hpp"
 #include <dlfcn.h>
 
 #include <hip/hip_fp16.h>
@@ -606,6 +608,125 @@ int bench_hcd(int argc, char** argv) {
     return 0;
 }
 
+// #11: Q8_0 dense GEMM, dequant_f16_ld + kernel_bk64 (the engine's padded path) vs the loader-decode kernel.
+//   talus-pf-bench q8g T N K [T N K ...]
+int bench_q8g(int argc, char** argv) {
+    hipStream_t s;
+    CK(hipStreamCreate(&s));
+    std::mt19937 rng(11);
+    for (int a = 0; a + 2 < argc; a += 3) {
+        const int64_t T = std::atoll(argv[a]), N = std::atoll(argv[a + 1]), K = std::atoll(argv[a + 2]);
+        const int64_t rb = K / 32 * 34, ldw = K + 64, ldx = (K % 2048 == 0) ? K + 64 : K;
+        std::vector<uint8_t> hw((size_t) N * rb);
+        for (auto& v : hw) v = (uint8_t) rng();
+        std::uniform_real_distribution<float> ld(-5.5f, -2.0f);
+        for (int64_t i = 0; i < N * (K / 32); ++i) { __half h = __float2half(std::pow(10.0f, ld(rng))); std::memcpy(hw.data() + (size_t) i * 34, &h, 2); }
+        std::normal_distribution<float> nd(0.f, 1.f);
+        std::vector<uint16_t> hx((size_t) T * ldx);
+        for (auto& v : hx) { __half h = __float2half(nd(rng)); std::memcpy(&v, &h, 2); }
+        uint8_t* dw; uint16_t *dx, *scr; float *ya, *yb;
+        CK(hipMalloc(&dw, hw.size() + 64)); CK(hipMalloc(&dx, hx.size() * 2)); CK(hipMalloc(&scr, (size_t) N * ldw * 2));
+        CK(hipMalloc(&ya, (size_t) T * N * 4)); CK(hipMalloc(&yb, (size_t) T * N * 4));
+        CK(hipMemcpy(dw, hw.data(), hw.size(), hipMemcpyHostToDevice));
+        CK(hipMemcpy(dx, hx.data(), hx.size() * 2, hipMemcpyHostToDevice));
+        CK(hipMemset(ya, 0xff, (size_t) T * N * 4)); CK(hipMemset(yb, 0xee, (size_t) T * N * 4));
+        auto deq = [&] { if (!strata::kernels::dequant_f16_ld(8, dw, 0, N, K, ldw, scr, s)) { std::fprintf(stderr, "dequant_f16_ld declined\n"); std::exit(1); } };
+        auto gem = [&] { if (!strata_pf_gemm_f16_ld(dx, ldx, scr, ldw, ya, T, N, K, N, 0.0f, s)) { std::fprintf(stderr, "gemm declined\n"); std::exit(1); } };
+        auto ctl = [&] { deq(); gem(); };
+        auto tst = [&] { if (!strata_pf_gemm_q8_ld(dx, ldx, dw, yb, T, N, K, N, 0.0f, s)) { std::fprintf(stderr, "q8 gemm declined\n"); std::exit(1); } };
+        ctl(); tst();
+        CK(hipStreamSynchronize(s));
+        std::vector<float> ca((size_t) T * N), cb((size_t) T * N);
+        CK(hipMemcpy(ca.data(), ya, ca.size() * 4, hipMemcpyDeviceToHost));
+        CK(hipMemcpy(cb.data(), yb, cb.size() * 4, hipMemcpyDeviceToHost));
+        int64_t diff = 0;
+        for (size_t j = 0; j < ca.size(); ++j) diff += std::memcmp(&ca[j], &cb[j], 4) != 0;
+        std::vector<float> vc, vt, vd, vg;
+        const int qr = std::max(5, (int) (40000 / T));
+        for (int w = 0; w < 3; ++w) time_ms(s, qr, ctl);
+        for (int r = 0; r < 12; ++r) {
+            if (r & 1) { vt.push_back(time_ms(s, qr, tst)); vc.push_back(time_ms(s, qr, ctl)); }
+            else { vc.push_back(time_ms(s, qr, ctl)); vt.push_back(time_ms(s, qr, tst)); }
+            vd.push_back(time_ms(s, qr, deq)); vg.push_back(time_ms(s, qr, gem));
+        }
+        auto med = [](std::vector<float> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+        const float tc = med(vc), tt = med(vt), td = med(vd), tg = med(vg);
+        std::printf("q8g T %lld N %lld K %lld: dequant %.3f + gemm %.3f, together %.3f ms; loader-decode %.3f ms (%+.1f%%); outputs differing %lld of %lld%s\n",
+                    (long long) T, (long long) N, (long long) K, td, tg, tc, tt, (tt / tc - 1) * 100, (long long) diff, (long long) ca.size(), diff ? "" : "  BITWISE");
+        CK(hipFree(dw)); CK(hipFree(dx)); CK(hipFree(scr)); CK(hipFree(ya)); CK(hipFree(yb));
+    }
+    return 0;
+}
+
+// #12: moe_combine + gr_write_norm_rs vs moe_write_norm_rs on one synthetic layer half.   talus-pf-bench hcf T...
+int bench_hcf(int argc, char** argv) {
+    namespace P = strata::prefill;
+    constexpr int64_t N = 2560, HC = 4, D = N * HC;
+    hipStream_t s;
+    CK(hipStreamCreate(&s));
+    std::mt19937 rng(13);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::uniform_real_distribution<float> ud(0.f, 1.f);
+    for (int a = 0; a < argc; ++a) {
+        const int64_t T = std::atoll(argv[a]), ldx = D + 64, rows = T * 10;
+        std::vector<float> hdm((size_t) rows * N), hsh((size_t) T * N), hw((size_t) rows), hsg((size_t) T), hR((size_t) T * D), hinj((size_t) T * HC), hwn((size_t) D);
+        for (auto& v : hdm) v = 0.1f * nd(rng);
+        for (auto& v : hsh) v = 0.1f * nd(rng);
+        for (auto& v : hw) v = ud(rng) * 0.2f;
+        for (auto& v : hsg) v = nd(rng);
+        for (auto& v : hR) v = nd(rng);
+        for (auto& v : hinj) v = nd(rng);
+        for (auto& v : hwn) v = 1.0f + 0.1f * nd(rng);
+        std::vector<int32_t> hslot((size_t) rows);
+        for (int64_t i = 0; i < rows; ++i) hslot[(size_t) i] = (int32_t) i;
+        std::shuffle(hslot.begin(), hslot.end(), rng);   // (the routed rows sit in expert order, a token's slots anywhere)
+        float *dm, *sh, *w, *sg, *R, *inj, *wn, *bo, *rs; int32_t* slot; uint16_t* xn;
+        CK(hipMalloc(&dm, hdm.size() * 4)); CK(hipMalloc(&sh, hsh.size() * 4)); CK(hipMalloc(&w, hw.size() * 4)); CK(hipMalloc(&sg, hsg.size() * 4));
+        CK(hipMalloc(&R, hR.size() * 4)); CK(hipMalloc(&inj, hinj.size() * 4)); CK(hipMalloc(&wn, hwn.size() * 4));
+        CK(hipMalloc(&bo, (size_t) T * N * 4)); CK(hipMalloc(&rs, (size_t) T * HC * 4)); CK(hipMalloc(&slot, hslot.size() * 4)); CK(hipMalloc(&xn, (size_t) T * ldx * 2));
+        CK(hipMemcpy(dm, hdm.data(), hdm.size() * 4, hipMemcpyHostToDevice)); CK(hipMemcpy(sh, hsh.data(), hsh.size() * 4, hipMemcpyHostToDevice));
+        CK(hipMemcpy(w, hw.data(), hw.size() * 4, hipMemcpyHostToDevice)); CK(hipMemcpy(sg, hsg.data(), hsg.size() * 4, hipMemcpyHostToDevice));
+        CK(hipMemcpy(inj, hinj.data(), hinj.size() * 4, hipMemcpyHostToDevice)); CK(hipMemcpy(wn, hwn.data(), hwn.size() * 4, hipMemcpyHostToDevice));
+        CK(hipMemcpy(slot, hslot.data(), hslot.size() * 4, hipMemcpyHostToDevice));
+        const float eps = 1e-5f;
+        auto cmb = [&] { P::moe_combine(dm, slot, w, sh, sg, bo, T, s, nullptr); };
+        auto wrt = [&] { P::gr_write_norm_rs(R, bo, inj, HC, wn, eps, rs, xn, T, s, nullptr, ldx); };
+        auto ctl = [&] { cmb(); wrt(); };
+        auto fus = [&] { P::moe_write_norm_rs(dm, slot, w, sh, sg, R, inj, HC, wn, eps, rs, xn, T, s, nullptr, ldx); };
+        std::vector<float> Ra((size_t) T * D), Rb((size_t) T * D), ra((size_t) T * HC), rb((size_t) T * HC);
+        std::vector<uint16_t> xa((size_t) T * ldx), xb((size_t) T * ldx);
+        auto one = [&](auto& f, std::vector<float>& oR, std::vector<float>& ors, std::vector<uint16_t>& ox) {
+            CK(hipMemcpy(R, hR.data(), hR.size() * 4, hipMemcpyHostToDevice));
+            CK(hipMemset(xn, 0, (size_t) T * ldx * 2));
+            f();
+            CK(hipStreamSynchronize(s));
+            CK(hipMemcpy(oR.data(), R, oR.size() * 4, hipMemcpyDeviceToHost));
+            CK(hipMemcpy(ors.data(), rs, ors.size() * 4, hipMemcpyDeviceToHost));
+            CK(hipMemcpy(ox.data(), xn, ox.size() * 2, hipMemcpyDeviceToHost));
+        };
+        one(ctl, Ra, ra, xa); one(fus, Rb, rb, xb);
+        int64_t dR = 0, drs = 0, dx = 0;
+        for (size_t j = 0; j < Ra.size(); ++j) dR += std::memcmp(&Ra[j], &Rb[j], 4) != 0;
+        for (size_t j = 0; j < ra.size(); ++j) drs += std::memcmp(&ra[j], &rb[j], 4) != 0;
+        for (size_t j = 0; j < xa.size(); ++j) dx += xa[j] != xb[j];
+        CK(hipMemcpy(R, hR.data(), hR.size() * 4, hipMemcpyHostToDevice));
+        std::vector<float> vc, vf, vm, vw;
+        const int qr = std::max(5, (int) (40000 / T));
+        for (int w = 0; w < 3; ++w) time_ms(s, qr, ctl);
+        for (int r = 0; r < 12; ++r) {
+            if (r & 1) { vf.push_back(time_ms(s, qr, fus)); vc.push_back(time_ms(s, qr, ctl)); }
+            else { vc.push_back(time_ms(s, qr, ctl)); vf.push_back(time_ms(s, qr, fus)); }
+            vm.push_back(time_ms(s, qr, cmb)); vw.push_back(time_ms(s, qr, wrt));
+        }
+        auto med = [](std::vector<float> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+        const float tc = med(vc), tf = med(vf), tm = med(vm), tw = med(vw);
+        std::printf("hcf T %lld: combine %.3f + write %.3f, together %.3f ms; fused %.3f ms (%+.1f%%); differing R %lld rs %lld xn16 %lld%s\n", (long long) T,
+                    tm, tw, tc, tf, (tf / tc - 1) * 100, (long long) dR, (long long) drs, (long long) dx, dR + drs + dx ? "" : "  BITWISE");
+        for (void* p : {(void*) dm, (void*) sh, (void*) w, (void*) sg, (void*) R, (void*) inj, (void*) wn, (void*) bo, (void*) rs, (void*) slot, (void*) xn}) CK(hipFree(p));
+    }
+    return 0;
+}
+
 int bench_w16(int argc, char** argv) {
     using namespace w16b;
     namespace F = strata::prefill::fused;
@@ -670,6 +791,37 @@ int bench_w16(int argc, char** argv) {
     }
     auto native = [&] { for (auto& b : batches) F::experts_native(b, g, E, n, scr, xa, dsrc, ha0, dm0, s); };
     auto w16 = [&](int ph) { for (auto& b : batches) F::experts_native_w16(b, g, E, n, scr, xa, dsrc, ha1, dm1, s, ph, true); };
+    // TP_BENCH_W16_VS=0,1,2  #9): the fp16 variants interleaved in one process: warm-up, hashes of each arm's outputs from zeroed buffers,
+    // then rounds in forward / reverse order, each arm timed over about 300 ms (gate/up, then down).
+    if (const char* vs = std::getenv("TP_BENCH_W16_VS")) {
+        std::vector<int> arms;
+        for (const char* c = vs; *c; ++c) if (*c >= '0' && *c <= '9') arms.push_back(*c - '0');
+        const int rounds = std::getenv("TP_BENCH_ROUNDS") ? std::atoi(std::getenv("TP_BENCH_ROUNDS")) : 10;
+        const int reps = std::max(5, (int) (60000 / T));
+        auto fnv = [](const void* p, size_t b) { const uint8_t* q = (const uint8_t*) p; uint64_t h = 0xcbf29ce484222325ull; for (size_t i = 0; i < b; ++i) { h ^= q[i]; h *= 0x100000001b3ull; } return h; };
+        std::vector<uint8_t> ho((size_t) F::act_bytes(n, NF));
+        std::vector<float> dmo((size_t) n * NE);
+        for (int v : arms) {
+            F::w16_bench_set_v(v);
+            CK(hipMemset(ha1, 0, ho.size())); CK(hipMemset(dm1, 0, dmo.size() * 4));
+            w16(0);
+            CK(hipStreamSynchronize(s));
+            CK(hipMemcpy(ho.data(), ha1, ho.size(), hipMemcpyDeviceToHost));
+            CK(hipMemcpy(dmo.data(), dm1, dmo.size() * 4, hipMemcpyDeviceToHost));
+            std::printf("w16v T %d V %d hash H %016llx dm %016llx\n", T, v, (unsigned long long) fnv(ho.data(), ho.size()), (unsigned long long) fnv(dmo.data(), dmo.size() * 4));
+        }
+        F::w16_bench_set_v(arms[0]);
+        for (int w = 0; w < 3; ++w) time_ms(s, reps, [&] { w16(0); });
+        for (int r = 0; r < rounds; ++r) {
+            for (size_t ai = 0; ai < arms.size(); ++ai) {
+                const int v = arms[(r & 1) ? arms.size() - 1 - ai : ai];
+                F::w16_bench_set_v(v);
+                const float tg = time_ms(s, reps, [&] { w16(1); }), td = time_ms(s, reps, [&] { w16(2); });
+                std::printf("w16t T %d r %d V %d GU %.3f DN %.3f\n", T, r, v, tg, td);
+            }
+        }
+        return 0;
+    }
     native();
     w16(0);
     CK(hipStreamSynchronize(s));
@@ -1391,6 +1543,8 @@ int main(int argc, char** argv) {
     if (m == "moe1m") return bench_moe1m(argc - 2, argv + 2);
     if (m == "w16") return bench_w16(argc - 2, argv + 2);
     if (m == "hcd") return bench_hcd(argc - 2, argv + 2);
+    if (m == "q8g") return bench_q8g(argc - 2, argv + 2);
+    if (m == "hcf") return bench_hcf(argc - 2, argv + 2);
     std::fprintf(stderr, "talus-pf-bench: unknown mode %s\n", m.c_str());
     return 2;
 }

@@ -781,10 +781,9 @@ mod tests {
         assert_eq!(j.get("numerics_env").unwrap().get_str("TALUS_A"), Some("1"));
 
         assert!(fp.start_hashing(false));
-        for _ in 0..500 {
-            if fp.complete() {
-                break;
-            }
+        // the hashing thread is slow on a loaded machine (5 s failed CI on busy build VMs): poll up to 30 s
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !fp.complete() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(fp.complete());

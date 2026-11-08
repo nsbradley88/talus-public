@@ -76,21 +76,29 @@ import minisweagent
 from minisweagent.agents.default import DefaultAgent
 from minisweagent.environments.local import LocalEnvironment
 from minisweagent.models.litellm_model import LitellmModel
+import litellm, requests  # the harness's own dependencies, loaded before the environment variables go
+
+# LocalEnvironment runs every command with os.environ: PYTHONPATH=/agent/mini/site would put the bundle's packages
+# (requests 2.34, urllib3, ...) ahead of the testbed's in the model's python, and the TB_* variables are ours. The
+# harness keeps its sys.path; the commands get the image's environment.
+tb = {k: os.environ.pop(k, None) for k in ("TB_MODEL", "TB_PORT", "TB_WALL", "TB_CWD")}
+for k in ("PYTHONPATH", "PYTHONDONTWRITEBYTECODE"):
+    os.environ.pop(k, None)
 
 out = pathlib.Path(os.environ["HOME"]) / "mini"
 cfg = yaml.safe_load((pathlib.Path(minisweagent.__file__).parent / "config/benchmarks/swebench.yaml").read_text())
 e = dict(cfg["environment"])
 env_vars = dict(e.get("env", {}))
 env_vars.pop("BASH_ENV", None)  # /root/.bashrc: the agent user already has the testbed env first on PATH
-env = LocalEnvironment(cwd=os.environ.get("TB_CWD") or e.get("cwd", "/testbed"), timeout=int(e.get("timeout", 60)), env=env_vars)
+env = LocalEnvironment(cwd=tb["TB_CWD"] or e.get("cwd", "/testbed"), timeout=int(e.get("timeout", 60)), env=env_vars)
 m = dict(cfg["model"])
-m["model_name"] = "openai/" + os.environ["TB_MODEL"]
-m["model_kwargs"] = {**m.get("model_kwargs", {}), "api_base": "http://127.0.0.1:%s/v1" % os.environ["TB_PORT"], "api_key": "set-by-the-bridge"}
+m["model_name"] = "openai/" + tb["TB_MODEL"]
+m["model_kwargs"] = {**m.get("model_kwargs", {}), "api_base": "http://127.0.0.1:%s/v1" % tb["TB_PORT"], "api_key": "set-by-the-bridge"}
 m["cost_tracking"] = "ignore_errors"
 model = LitellmModel(**m)
 a = dict(cfg["agent"])
 a["output_path"] = out / "traj.json"
-a["wall_time_limit_seconds"] = int(os.environ["TB_WALL"])
+a["wall_time_limit_seconds"] = int(tb["TB_WALL"])
 agent = DefaultAgent(model, env, **a)
 task = (out / "problem.txt").read_text()
 try:
@@ -278,7 +286,7 @@ PY=/opt/miniconda3/envs/testbed/bin/python
 bash $T/snapshot.sh /testbed {base} > $A/snapshot.log 2>&1
 git -C /testbed rev-parse HEAD > $A/head 2>/dev/null
 bash $T/verify.sh /testbed / > $A/verify.json
-$PY $T/scan.py {dist} {module} /testbed --roots / --clean > $A/sitepkg.json 2> $A/sitepkg.err
+$PY $T/scan.py {dist} {module} /testbed --roots / --clean --all-envs --quarantine > $A/sitepkg.json 2> $A/sitepkg.err
 grep -q '"ok": true' $A/verify.json || {{ echo "verification failed" > $A/exit; exit 0; }}
 # a uid no host file belongs to: the bind-mounted audit and bridge directories stay out of the agent's reach
 useradd -u 4242 -m -d /agent/home -s /bin/bash agent 2>/dev/null || true
@@ -957,6 +965,7 @@ impl Runtime for DockerRuntime {
                 "--roots",
                 "/",
                 "--clean",
+                "--all-envs",
             ])
             .output()
             .ok()?;
@@ -1017,6 +1026,17 @@ impl DockerRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mini_runner_clears_the_harness_environment_before_the_commands_run() {
+        // LocalEnvironment hands os.environ to every model command: PYTHONPATH (the bundle's packages) must be gone
+        // before the environment is created, after the harness's own imports
+        let pop = MINI_RUN_PY.find("os.environ.pop(k, None)").unwrap();
+        assert!(MINI_RUN_PY.find("import litellm, requests").unwrap() < pop);
+        assert!(pop < MINI_RUN_PY.find("env = LocalEnvironment(").unwrap());
+        assert!(MINI_RUN_PY.contains("\"PYTHONPATH\""));
+        assert!(!MINI_RUN_PY.contains("os.environ[\"TB_"));
+    }
 
     #[test]
     fn lru_eviction() {

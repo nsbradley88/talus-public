@@ -780,7 +780,9 @@ mod tests {
             eprintln!("python3 >= 3.9 not found: skipping the local-executor scoring test");
             return;
         }
-        let cs = fixture_cases(json!({"test_timeout_s": 1}));
+        // 10 s: a correct answer must not time out on a loaded machine (1 s failed CI); only the timeout case is tight
+        let cs = fixture_cases(json!({"test_timeout_s": 10}));
+        let tight = fixture_cases(json!({"test_timeout_s": 1}));
         let t = LcbTask::default();
         let (add, maxsub, half) = (&cs[0], &cs[1], &cs[2]);
         let s = t.score(add, &answer(ADD_OK));
@@ -814,9 +816,16 @@ mod tests {
         assert_eq!(s.details["first_fail"]["public"], false);
         assert_eq!(s.details["passed"], 1);
         // timeout
-        let s = t.score(add, &answer("while True:\n    pass"));
+        let s = t.score(&tight[0], &answer("while True:\n    pass"));
         assert!(!s.pass);
         assert_eq!(s.details["stage"], "timeout", "{}", s.details);
+        assert_eq!(s.details["first_fail"]["kind"], "timeout", "{}", s.details);
+        // the case's own limit ended it, not the 10 s one
+        assert!(
+            s.details["max_test_ms"].as_f64().unwrap() < 9000.0,
+            "{}",
+            s.details
+        );
         // crash
         let s = t.score(add, &answer("import sys\nsys.exit(3)"));
         assert_eq!(s.details["stage"], "runtime_error");
@@ -946,6 +955,44 @@ mod tests {
         .unwrap()
     }
 
+    /// `needle` appears in a string, an object key or a whole number of `v`. Fractional numbers are skipped: they
+    /// are measurements, and the digits of a timing like 0.9132520000000001 are not a test's expected output (a
+    /// substring search over the row's text failed on those in about 6% of runs).
+    fn holds_value(v: &Value, needle: &str) -> bool {
+        match v {
+            Value::String(s) => s.contains(needle),
+            Value::Number(n) => match n.as_f64() {
+                Some(f) if !n.is_i64() && !n.is_u64() => {
+                    f.fract() == 0.0 && format!("{f:.0}").contains(needle)
+                }
+                _ => n.to_string().contains(needle),
+            },
+            Value::Array(a) => a.iter().any(|x| holds_value(x, needle)),
+            Value::Object(o) => o
+                .iter()
+                .any(|(k, x)| k.contains(needle) || holds_value(x, needle)),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn hidden_value_search_ignores_timing_digits() {
+        let n = "2000000000";
+        // the row shape and value of a real false positive (29 of 500 runs had one like it)
+        assert!(!holds_value(
+            &json!({"timings": {"client_ms": 0.9132520000000001}}),
+            n
+        ));
+        for leak in [
+            json!({"raw_output": {"content": "expected 2000000000"}}),
+            json!({"first_fail": {"expected": 2000000000u64}}),
+            json!({"first_fail": {"expected": [2000000000.0]}}),
+            json!({"2000000000": true}),
+        ] {
+            assert!(holds_value(&leak, n), "{leak}");
+        }
+    }
+
     #[test]
     fn runner_pairs_reference_and_candidate_with_breakdown() {
         if !python_ok() {
@@ -1002,7 +1049,10 @@ quality_gates: {{min_cases: 2}}
         }
         // no hidden test (or its expected output) in any artifact row
         let rows = std::fs::read_to_string(out.join("baseline/cases.jsonl")).unwrap();
-        assert!(!rows.contains("2000000000"));
+        for line in rows.lines() {
+            let row: Value = serde_json::from_str(line).unwrap();
+            assert!(!holds_value(&row, "2000000000"), "{line}");
+        }
         let m: Value = serde_json::from_str(
             &std::fs::read_to_string(out.join("candidates/cand/metrics.json")).unwrap(),
         )
