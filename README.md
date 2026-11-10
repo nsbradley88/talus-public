@@ -14,11 +14,11 @@ The current release is **v0.1.7**: faster code editing on Qwen3.8-27B (verify wi
 ([release notes](https://github.com/nsbradley88/talus-public/releases)). Qwen3.8-Flash-Next replies differ from v0.1.6's;
 the release notes explain why.
 
-Tokens per second for Talus v0.1.7 (its release candidate 3) on a Ryzen AI Max+ 395 desktop (GMKtec
-EVO-X2, 128 GB, about 120 W sustained), end to end through the HTTP server, each model in its shipped configuration.
+Tokens per second for Talus v0.1.7 (its release candidate 1) on a Ryzen AI Max+ 395 desktop (GMKtec
+EVO-X2, 128 GB, about 120 W sustained, 15 of its 16 CPU cores online), end to end through the HTTP server, each model in its shipped configuration.
 `chat` is the sampled chat mix, `code` the coding-prompt mix, `edit` the code-editing mix, `pp2k` / `pp32k` prompt
 processing and `tg32k` generation at about 2K / 32K tokens of context. In brackets: the change from the published
-v0.1.5 tarball, measured in the same session on the same desktop. Before each timed run, every weight file was read in
+v0.1.6 tarball, measured in the same session on the same desktop. Before each timed run, every weight file was read in
 full and checked against its pinned SHA-256.
 
 | Model | chat | code | edit | pp2k | pp32k | tg32k |
@@ -70,8 +70,8 @@ the same HTTP client and prompts; package power about 117-120 W for every engine
 
 Prompt processing is where Talus v0.1.3 trailed: gufo and tubo prefill the 27B's `UD-Q4_K_XL` file faster, and gufo
 prefilled Flash-Next 16 % faster at 32K (47 % at 2K). Those gaps are
-v0.1.3's: Talus's Flash-Next prompt processing has been faster in each release since (v0.1.6 against v0.1.5 is in the
-first table above), which narrows them. The other engines have not been re-measured, so this table still shows v0.1.3.
+v0.1.3's: Talus's Flash-Next prompt processing was faster in each of v0.1.4 to v0.1.6, and in v0.1.7 its change is
+within noise (v0.1.7 against v0.1.6 is in the first table above), which narrows them. The other engines have not been re-measured, so this table still shows v0.1.3.
 
 Full tables (edit, 2K cells, time to first token, memory, the v0.1.2 figures from the same session, quality gates):
 [docs/RESULTS.md](docs/RESULTS.md). Every figure there names its machine and build. A model whose release run has not

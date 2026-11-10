@@ -9,8 +9,8 @@ How each cell and gate is measured: [METHODOLOGY.md](METHODOLOGY.md).
 
 | Release | |
 |---|---|
-| Talus | the v0.1.7 release candidate tarball (rc3), served by its own `talus-server` with the run configs `talus setup` writes. The published v0.1.7 tarball is the same engine source built from this repository (it differs in the speed table `talus setup` shows, in documentation, and in source comments, test fixtures and example paths cleaned of internal names); it gives identical greedy output on all five models |
-| Speed runs | 2026-11-09, on the desktop (GMKtec EVO-X2: Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), 128 GB, about 120 W sustained, BIOS set to its highest sustained power mode) |
+| Talus | the v0.1.7 release candidate tarball (rc1), served by its own `talus-server` with the run configs `talus setup` writes. The published v0.1.7 tarball is the same engine source built from this repository (it differs in the speed table `talus setup` shows, in documentation, and in source comments, test fixtures and example paths cleaned of internal names); it gives identical greedy output on all five models |
+| Speed runs | 2026-11-09, on the desktop (GMKtec EVO-X2: Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), 128 GB, about 120 W sustained, BIOS set to its highest sustained power mode; 15 of its 16 CPU cores online, one offline for a hardware check) |
 | Comparison build | the published v0.1.6 tarball, in the same session on the same desktop, alternating: the v0.1.7 candidate, v0.1.6, the candidate, v0.1.6 (each = the mean of its two runs). Before each run every weight file was read in full and checked against its pinned SHA-256 |
 | Quality gates | 2026-11-09 to 2026-11-10, mostly on the laptop (HP ZBook Ultra G1a: Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), 128 GB, 70 W firmware ceiling), on the v0.1.7 release candidates (see "Quality gates" for which ran on which); "Quality gates" below says which machine each gate ran on |
 | ROCm SDK | 10.2.0a20261014 |
