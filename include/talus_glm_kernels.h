@@ -112,6 +112,8 @@ int tkg_mmvq_ids_f32(int ggml_type, const void* w, size_t expert_bytes, const in
 
 /* dst[r] = src row ids[r] (row_bytes % 4 == 0), e.g. the draft-vocab head */
 int tkg_gather_rows(const void* src, size_t row_bytes, const int32_t* ids, int n, void* dst, void* stream);
+/* dst[r * n + j] = src[r * n + pos[j]] for rows r < rows (logits of a row-permuted head back in token order) */
+int tkg_unpermute_f32(const float* src, const int32_t* pos, int n, int rows, float* dst, void* stream);
 /* greedy argmax per row (row stride ld floats): first index of the max, NaN / -inf never win (host
    sample::argmax); out_tok[r] = map ? map[idx] : idx, out_idx[r] = idx (either may be NULL) */
 int tkg_argmax_rows(const float* x, int n, int rows, long ld, const int32_t* map, int32_t* out_tok, int32_t* out_idx,
@@ -187,6 +189,35 @@ int tkg_glm_sparse_fa_idx(const float* q, const void* kv_f16, const void* zero_m
                           float* split_buf, float* dst, int D, int H, int N, int n_kv_max, uint32_t q_nb1,
                           uint32_t q_nb2, uint32_t k_stride, float scale, void* stream);
 size_t tkg_glm_sparse_fa_split_bytes(int D, int H, int N, int n_kv_max);
+
+/* ---- lever 4: producers that write the next GEMM's MMQ q8_1 activations (llama.cpp block_q8_1_mmq,
+ * layout 0 = D4, 1 = DS4 as tk_q36_mmq_q8_layout) - bitwise the fp32 producer + tk_q36_mmq_quantize. -1 = not covered
+ * (nothing launched: run the separate path). Optional symbols. */
+/* tkg_kda_gate as MMQ rows row0 .. row0 + T - 1 of an ne1-row matrix of H * D columns (no fp32 output) */
+int tkg_kda_gate_mmq(const float* o, const float* g2, const float* w, void* mq, int layout, int row0, int ne1, int T,
+                     int H, int D, float eps, void* stream);
+/* tkg_heads_q8_0 (prompt chunk, the fp16 WMMA wide kernel) as MMQ rows row0 .. row0 + T - 1 of an ne1-row matrix of
+ * H * n_out columns (no fp32 output); W == NULL: probe only (0 = this shape / environment is covered) */
+int tkg_heads_q8_0_mmq(const void* W, const float* x, void* mq, int layout, int row0, int ne1, int H, int n_in, int n_out,
+                       int T, void* stream);
+/* tkg_swiglu_clamp over [rows][cols] (cols % 512 == 0) as the MMQ rows of a rows-row matrix (no fp32 output) */
+int tkg_swiglu_clamp_mmq(const float* g, const float* u, void* mq, int layout, int rows, int cols, float limit,
+                         void* stream);
+/* tkg_hc_post_mix_pre / tkg_hc_post_mix_moe_pre (all outputs as before) that also write y as n_mq (1 or 2) MMQ copies:
+ * copy o = (mq_o, layout_o, S_o, lim_o): rows below lim_o in slices of S_o rows, slice r0 = the matrix of its
+ * min(S_o, lim_o - r0) rows at byte offset r0 * n_embd / 128 * 144 (what tk_q36_mmq_quantize writes for that slice
+ * there). n_embd % 512 == 0. */
+int tkg_hc_post_mix_pre_mmq(const float* xo, float* xhc, float* pc, const void* w_next, float* parts, int T, int n_embd,
+                            int first, const float* scale, const float* base, const float* norm_w, float* y, float rms_eps,
+                            float norm_eps, float hc_eps, int iters, void* yq, int* cnt, int n_mq, void* mq0, int layout0,
+                            int S0, int lim0, void* mq1, int layout1, int S1, int lim1, void* stream);
+int tkg_hc_post_mix_moe_pre_mmq(const float* ey, const float* ew, const float* shexp, float* xhc, float* pc,
+                                const void* w_next, float* parts, int T, int k, int n_embd, const float* scale,
+                                const float* base, const float* norm_w, float* y, float rms_eps, float norm_eps,
+                                float hc_eps, int iters, void* yq, int* cnt, int n_mq, void* mq0, int layout0, int S0,
+                                int lim0, void* mq1, int layout1, int S1, int lim1, void* stream);
+/* 1 when tkg_w16_moe_gu_q8 covers a routed product of this type / size (reads the token rows as plain D4 MMQ rows) */
+int tkg_w16_moe_on(int type, int64_t total_rows, int n_experts);
 
 #ifdef __cplusplus
 }

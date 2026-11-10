@@ -383,16 +383,22 @@ fn env() -> &'static Env {
     })
 }
 
-/// rb-num (opt-in): `TALUS_FN_HC_BF16` = "1" (BF16) / "2" (FP16) keeps the prompt path's 4-stream residual R in 16 bits,
-/// in the `xn` slot (unused by the fused path; T x 10240 x 2 bytes); 0 = off (unset, any other value). prefill.cpp's
-/// `fn_hc16()` parses the same way (its own carve, the TALUS_FN_RUST=0 / r2-off arms).
+/// `TALUS_FN_HC_BF16` = "2" (FP16, the default since v0.1.7: #13, operator 11-08) / "1" (BF16) keeps the prompt
+/// path's 4-stream residual R in 16 bits, in the `xn` slot (unused by the fused path; T x 10240 x 2 bytes); "0" = FP32
+/// (the v0.1.6 numerics, kill switch). Unset or any other value = the default. prefill.cpp's `fn_hc16()` parses the
+/// same way (its own carve, the TALUS_FN_RUST=0 / r2-off arms).
 pub(crate) fn hc16_fmt() -> i32 {
     static V: OnceLock<i32> = OnceLock::new();
-    *V.get_or_init(|| match env_str("TALUS_FN_HC_BF16").as_deref() {
+    *V.get_or_init(|| hc16_parse(env_str("TALUS_FN_HC_BF16").as_deref()))
+}
+
+/// [`hc16_fmt`]'s rule on a raw value.
+pub(crate) fn hc16_parse(v: Option<&str>) -> i32 {
+    match v {
+        Some("0") => 0,
         Some("1") => 1,
-        Some("2") => 2,
-        _ => 0,
-    })
+        _ => 2,
+    }
 }
 
 /// `hc_pad_alloc()`: STRATA_PF_HCDOWN (0 off, 1 forced, 2 auto) or STRATA_HCD_EXACT. Its own once-cell, first read on
@@ -1962,5 +1968,19 @@ mod tests {
         assert_eq!(c_atof("x"), 0.0);
         assert_eq!(c_atof("0.25abc"), 0.25);
         assert_eq!(c_atof("1e"), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod hc16_tests {
+    use super::hc16_parse;
+
+    #[test]
+    fn hc16_default_is_fp16_and_zero_is_the_kill_switch() {
+        assert_eq!(hc16_parse(None), 2);
+        assert_eq!(hc16_parse(Some("2")), 2);
+        assert_eq!(hc16_parse(Some("")), 2);
+        assert_eq!(hc16_parse(Some("1")), 1);
+        assert_eq!(hc16_parse(Some("0")), 0);
     }
 }

@@ -164,12 +164,21 @@ impl Client {
     }
 }
 
+/// The error for a reply without a header end: the peer closed without answering, or the headers are cut short.
+fn no_header_end(n: usize) -> String {
+    if n == 0 {
+        "connection closed before any response".to_string()
+    } else {
+        format!("malformed HTTP response: no end of headers in {n} bytes")
+    }
+}
+
 /// Status code and JSON body of a raw HTTP/1.1 response (Content-Length or read-to-close; chunked is decoded).
 pub fn parse_response(raw: &[u8]) -> Result<(u16, Value), String> {
     let split = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| "malformed HTTP response".to_string())?;
+        .ok_or_else(|| no_header_end(raw.len()))?;
     let head = String::from_utf8_lossy(&raw[..split]).to_string();
     let payload = &raw[split + 4..];
     let code: u16 = head
@@ -264,6 +273,58 @@ mod tests {
         assert!(Client::new("https://a:1", None, 5).is_err());
         assert!(Client::new("http://a:1/v2/x", None, 5).is_err());
         assert!(Client::new("http://a:zz", None, 5).is_err());
+    }
+
+    #[test]
+    fn closed_connection_is_not_called_malformed() {
+        assert_eq!(
+            parse_response(b"").unwrap_err(),
+            "connection closed before any response"
+        );
+        // partial headers keep their own message, with the byte count
+        assert_eq!(
+            parse_response(b"HTTP/1.1 200 OK\r\n").unwrap_err(),
+            "malformed HTTP response: no end of headers in 17 bytes"
+        );
+    }
+
+    /// A server stopped mid-request: request read, connection closed, nothing sent. Still `Protocol`, so the
+    /// case stays a retryable `protocol_error` and nothing is scored.
+    #[test]
+    fn server_closing_without_a_reply_stays_a_retryable_protocol_error() {
+        use crate::case::CaseStatus;
+        let reply = |bytes: &'static [u8]| {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", l.local_addr().unwrap());
+            let t = std::thread::spawn(move || {
+                let (mut s, _) = l.accept().unwrap();
+                let mut got = Vec::new();
+                let mut b = [0u8; 1024];
+                while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = s.read(&mut b).unwrap();
+                    assert!(n > 0);
+                    got.extend_from_slice(&b[..n]);
+                }
+                s.write_all(bytes).unwrap();
+            });
+            let r = Client::new(&url, None, 5).unwrap().get("/x");
+            t.join().unwrap();
+            r
+        };
+        let e = reply(b"").unwrap_err();
+        assert_eq!(
+            e,
+            HttpError::Protocol("connection closed before any response".into())
+        );
+        assert_eq!(
+            e.to_string(),
+            "protocol: connection closed before any response"
+        );
+        assert_eq!(
+            reply(b"HTTP/1.1 2").unwrap_err(),
+            HttpError::Protocol("malformed HTTP response: no end of headers in 10 bytes".into())
+        );
+        assert!(!CaseStatus::ProtocolError.scored());
     }
 
     #[test]

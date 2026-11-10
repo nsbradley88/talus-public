@@ -967,7 +967,8 @@ unsafe fn run_prompt(
     Ok(true)
 }
 
-/// One stderr line per process the first time a prompt runs with TALUS_FN_HC_BF16 set: active, or why not.
+/// One stderr line per process the first time a prompt runs with 16-bit HC streams (the default, or TALUS_FN_HC_BF16=1):
+/// active, or why not.
 fn hc16_say(fmt: i32, active: bool) {
     static SAID: AtomicBool = AtomicBool::new(false);
     if fmt == 0 || SAID.swap(true, Ordering::Relaxed) {
@@ -975,7 +976,7 @@ fn hc16_say(fmt: i32, active: bool) {
     }
     if active {
         eprintln!(
-            "talus-qwen4exp: TALUS_FN_HC_BF16={fmt} active (prompt-path residual streams in {}, opt-in numerics)",
+            "talus-qwen4exp: TALUS_FN_HC_BF16={fmt} active (prompt-path residual streams in {}; TALUS_FN_HC_BF16=0 = FP32)",
             if fmt == 1 { "BF16" } else { "FP16" }
         );
     } else {

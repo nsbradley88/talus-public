@@ -1,7 +1,7 @@
 # Results
 
-This page is generated from the recorded release runs of Talus v0.1.6. The speed tables come from one
-session on the desktop machine below, in which the v0.1.6 release candidate and the published v0.1.5 tarball ran
+This page is generated from the recorded release runs of Talus v0.1.7. The speed tables come from one
+session on the desktop machine below, in which the v0.1.7 release candidate and the published v0.1.6 tarball ran
 interleaved; the quality gates come mostly from the laptop. The quant-vs-BF16 table was measured with v0.1.2, the
 desktop comparison with other engines with v0.1.3, and the laptop comparison with the v0.1.0 builds; each says so. A model
 whose release run has not passed every gate shows "pending", and so does a figure that was not measured.
@@ -9,10 +9,10 @@ How each cell and gate is measured: [METHODOLOGY.md](METHODOLOGY.md).
 
 | Release | |
 |---|---|
-| Talus | the v0.1.6 release candidate tarball (rc3), served by its own `talus-server` with the run configs `talus setup` writes. The published v0.1.6 tarball is the same engine source built from this repository (it differs in the speed table `talus setup` shows, in documentation, and in source comments, test fixtures and example paths cleaned of internal names); it gives identical greedy output on all five models |
-| Speed runs | 2026-11-08, on the desktop (GMKtec EVO-X2: Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), 128 GB, about 120 W sustained, BIOS set to its highest sustained power mode) |
-| Comparison build | the published v0.1.5 tarball, in the same session on the same desktop, alternating: the v0.1.6 candidate, v0.1.5, the candidate, v0.1.5 (each = the mean of its two runs). Before each run every weight file was read in full and checked against its pinned SHA-256 |
-| Quality gates | 2026-11-07 to 2026-11-08, mostly on the laptop (HP ZBook Ultra G1a: Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), 128 GB, 70 W firmware ceiling), on the v0.1.6 release candidates (see "Quality gates" for which ran on which); "Quality gates" below says which machine each gate ran on |
+| Talus | the v0.1.7 release candidate tarball (rc3), served by its own `talus-server` with the run configs `talus setup` writes. The published v0.1.7 tarball is the same engine source built from this repository (it differs in the speed table `talus setup` shows, in documentation, and in source comments, test fixtures and example paths cleaned of internal names); it gives identical greedy output on all five models |
+| Speed runs | 2026-11-09, on the desktop (GMKtec EVO-X2: Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), 128 GB, about 120 W sustained, BIOS set to its highest sustained power mode) |
+| Comparison build | the published v0.1.6 tarball, in the same session on the same desktop, alternating: the v0.1.7 candidate, v0.1.6, the candidate, v0.1.6 (each = the mean of its two runs). Before each run every weight file was read in full and checked against its pinned SHA-256 |
+| Quality gates | 2026-11-09 to 2026-11-10, mostly on the laptop (HP ZBook Ultra G1a: Ryzen AI Max+ 395 / Radeon 8060S (gfx1151), 128 GB, 70 W firmware ceiling), on the v0.1.7 release candidates (see "Quality gates" for which ran on which); "Quality gates" below says which machine each gate ran on |
 | ROCm SDK | 10.2.0a20261014 |
 
 The two machines have the same chip and memory but different power limits, so a figure from one is not comparable with
@@ -20,11 +20,11 @@ a figure from the other. Every table below names its machine and build.
 
 | Model | Release run |
 |---|---|
-| Qwen3.8-27B | v016sp3-qwen27b-t1 (2026-11-08) |
-| Qwen3.8-Flash-Next | v016sp3-flashnext-t1 (2026-11-08) |
-| GLM-5.3-Flash | v016sp3-glm-t1 (2026-11-08) |
-| MiMo-V2.6-Flash | v016sp3-mimo-t1 (2026-11-08) |
-| Laguna-S-2.1 | v016sp3-laguna-t1 (2026-11-08) |
+| Qwen3.8-27B | v017sp-qwen27b-t1 (2026-11-09) |
+| Qwen3.8-Flash-Next | v017sp-flashnext-t1 (2026-11-09) |
+| GLM-5.3-Flash | v017sp-glm-t1 (2026-11-09) |
+| MiMo-V2.6-Flash | v017sp-mimo-t1 (2026-11-09) |
+| Laguna-S-2.1 | v017sp-laguna-t1 (2026-11-09) |
 
 Read the tables with these points in mind:
 
@@ -35,21 +35,21 @@ Read the tables with these points in mind:
 - Each model runs its shipped default configuration (see [MODELS.md](MODELS.md)), in both builds.
 - Older release-to-release tables (v0.1.2 to v0.1.3 and earlier) are in those releases' RESULTS; they were not re-measured.
 
-## What changed from v0.1.5 (desktop)
+## What changed from v0.1.6 (desktop)
 
-Change of each cell from the published v0.1.5 tarball to the v0.1.6 release candidate, same desktop, same session,
+Change of each cell from the published v0.1.6 tarball to the v0.1.7 release candidate, same desktop, same session,
 computed from the tables below. Speeds: positive is faster. `TTFT c` (the warm 32K follow-up's time to first token):
 positive is slower.
 
 | Model | chat | code | edit | pp2k | pp32k | tg2k | tg32k | TTFT c |
 |---|---|---|---|---|---|---|---|---|
-| Qwen3.8-27B | +0.2 % | +0.1 % | +0.3 % | +1.2 % | +1.1 % | +0.2 % | +0.3 % | −1.2 % |
-| Qwen3.8-Flash-Next | +1.0 % | 0.0 % | +13.5 % | +16.2 % | +12.2 % | +1.3 % | +0.2 % | −28.3 % |
-| GLM-5.3-Flash | −0.9 % | +1.4 % | −1.7 % | +1.3 % | +1.8 % | −1.2 % | 0.0 % | 0.0 % |
-| MiMo-V2.6-Flash | +0.2 % | +1.2 % | +1.2 % | −0.5 % | −0.3 % | +1.5 % | +1.2 % | +1.5 % |
-| Laguna-S-2.1 | +0.2 % | +0.7 % | +1.4 % | −0.7 % | −0.4 % | +1.0 % | +1.1 % | −2.3 % |
+| Qwen3.8-27B | 0.0 % | −0.3 % | +8.7 % | 0.0 % | 0.0 % | −0.4 % | −0.8 % | −0.6 % |
+| Qwen3.8-Flash-Next | −1.9 % | +1.0 % | +0.7 % | +3.9 % | +4.9 % | +4.5 % | +0.3 % | −1.9 % |
+| GLM-5.3-Flash | +0.3 % | −0.3 % | 0.0 % | +1.4 % | +1.6 % | −0.3 % | −0.3 % | −1.1 % |
+| MiMo-V2.6-Flash | 0.0 % | 0.0 % | +0.2 % | +0.1 % | +0.2 % | 0.0 % | 0.0 % | −0.2 % |
+| Laguna-S-2.1 | −1.4 % | 0.0 % | −0.1 % | −0.1 % | 0.0 % | 0.0 % | +0.3 % | 0.0 % |
 
-Changes beyond the noise bands: Qwen3.8-Flash-Next edit (faster); Qwen3.8-Flash-Next pp2k (faster); Qwen3.8-Flash-Next pp32k (faster); Qwen3.8-Flash-Next ttft_c (faster). Everything else is inside its band.
+Changes beyond the noise bands: Qwen3.8-27B edit (faster); Qwen3.8-Flash-Next tg2k (faster). Everything else is inside its band.
 
 ## Speed (desktop)
 
@@ -61,8 +61,8 @@ column).
 
 | Build | chat | code | edit | pp2k | pp32k | tg2k | tg32k | TTFT a / b / c | MemAvailable min |
 |---|---|---|---|---|---|---|---|---|---|
-| Talus v0.1.6 (release candidate 3), shipped, 256K context | 49.9 | 66.8 | 123.0 | 597 | 546 | 50.6 | 39.1 | 3.72 s / 58.70 s / 1.61 s | 27 GiB |
-| Talus v0.1.5 (published tarball, same session), 256K context | 49.8 | 66.7 | 122.6 | 590 | 540 | 50.5 | 39.0 | 3.35 s / 59.35 s / 1.63 s | 27 GiB |
+| Talus v0.1.7 (release candidate 1), shipped, 256K context | 50.0 | 66.7 | 133.9 | 602 | 549 | 50.5 | 38.8 | 3.70 s / 58.34 s / 1.58 s | 32 GiB |
+| Talus v0.1.6 (published tarball, same session), 256K context | 50.0 | 66.9 | 123.2 | 602 | 549 | 50.7 | 39.1 | 3.72 s / 58.38 s / 1.59 s | 27 GiB |
 
 ### Qwen3.8-Flash-Next
 
@@ -70,8 +70,8 @@ Speeds in tokens per second. The depth prompts are about 1.8K and 30K tokens (Fl
 
 | Build | chat | code | edit | pp2k | pp32k | tg2k | tg32k | TTFT a / b / c | MemAvailable min |
 |---|---|---|---|---|---|---|---|---|---|
-| Talus v0.1.6 (release candidate 3) | 63.5 | 73.6 | 162.8 | 1,271 | 1,659 | 64.3 | 65.9 | 1.48 s / 17.19 s / 681 ms | 44 GiB |
-| Talus v0.1.5 (published tarball, same session) | 62.9 | 73.6 | 143.4 | 1,094 | 1,478 | 63.5 | 65.8 | 1.70 s / 19.32 s / 950 ms | 51 GiB |
+| Talus v0.1.7 (release candidate 1) | 61.8 | 73.9 | 163.1 | 1,329 | 1,744 | 66.8 | 65.7 | 1.43 s / 16.40 s / 679 ms | 44 GiB |
+| Talus v0.1.6 (published tarball, same session) | 63.0 | 73.2 | 161.9 | 1,279 | 1,663 | 63.9 | 65.5 | 1.48 s / 17.09 s / 692 ms | 44 GiB |
 
 ### GLM-5.3-Flash
 
@@ -79,8 +79,8 @@ Speeds in tokens per second.
 
 | Build | chat | code | edit | pp2k | pp32k | tg2k | tg32k | TTFT a / b / c | MemAvailable min |
 |---|---|---|---|---|---|---|---|---|---|
-| Talus v0.1.6 (release candidate 3) | 32.9 | 35.0 | 35.7 | 559 | 569 | 34.2 | 35.2 | 3.59 s / 56.46 s / 1.90 s | 9 GiB |
-| Talus v0.1.5 (published tarball, same session) | 33.2 | 34.5 | 36.3 | 552 | 559 | 34.6 | 35.2 | 3.60 s / 57.29 s / 1.90 s | 9 GiB |
+| Talus v0.1.7 (release candidate 1) | 33.6 | 35.0 | 35.8 | 574 | 579 | 34.1 | 35.2 | 3.45 s / 55.43 s / 1.85 s | 9 GiB |
+| Talus v0.1.6 (published tarball, same session) | 33.5 | 35.1 | 35.8 | 566 | 570 | 34.2 | 35.3 | 3.50 s / 56.28 s / 1.87 s | 9 GiB |
 
 ### MiMo-V2.6-Flash
 
@@ -88,8 +88,8 @@ Speeds in tokens per second.
 
 | Build | chat | code | edit | pp2k | pp32k | tg2k | tg32k | TTFT a / b / c | MemAvailable min |
 |---|---|---|---|---|---|---|---|---|---|
-| Talus v0.1.6 (release candidate 3) | 40.4 | 49.9 | 65.3 | 728 | 659 | 46.1 | 42.9 | 2.76 s / 48.55 s / 1.00 s | 16 GiB |
-| Talus v0.1.5 (published tarball, same session) | 40.3 | 49.3 | 64.5 | 732 | 661 | 45.4 | 42.4 | 2.74 s / 48.44 s / 985 ms | 12 GiB |
+| Talus v0.1.7 (release candidate 1) | 40.9 | 50.0 | 65.5 | 732 | 660 | 46.2 | 43.0 | 2.70 s / 48.51 s / 988 ms | 16 GiB |
+| Talus v0.1.6 (published tarball, same session) | 40.9 | 50.0 | 65.4 | 731 | 659 | 46.2 | 43.0 | 2.70 s / 48.59 s / 990 ms | 16 GiB |
 
 ### Laguna-S-2.1
 
@@ -97,12 +97,12 @@ Speeds in tokens per second. Both rows use the DFlash drafter (on by default fro
 
 | Build | chat | code | edit | pp2k | pp32k | tg2k | tg32k | TTFT a / b / c | MemAvailable min |
 |---|---|---|---|---|---|---|---|---|---|
-| Talus v0.1.6 (release candidate 3) | 43.6 | 55.0 | 124.1 | 1,142 | 1,001 | 68.4 | 37.1 | 1.77 s / 32.00 s / 643 ms | 37 GiB |
-| Talus v0.1.5 (published tarball, same session) | 43.5 | 54.6 | 122.4 | 1,150 | 1,005 | 67.7 | 36.7 | 1.74 s / 31.88 s / 658 ms | 38 GiB |
+| Talus v0.1.7 (release candidate 1) | 43.3 | 55.0 | 124.1 | 1,150 | 1,001 | 68.5 | 37.2 | 1.74 s / 32.00 s / 649 ms | 38 GiB |
+| Talus v0.1.6 (published tarball, same session) | 43.9 | 55.0 | 124.2 | 1,151 | 1,001 | 68.5 | 37.1 | 1.74 s / 32.01 s / 649 ms | 38 GiB |
 
 ## Quality gates (laptop, soaks on both machines)
 
-The logit-row, row-parity and drafts gates ran on release candidate 3. Candidate 3 differs from candidate 2 only in the MiMo-V2.6-Flash resend fix; GPU kernels and server are byte-identical, so the needle, agentic and soak results of Qwen3.8-27B, Qwen3.8-Flash-Next and GLM-5.3-Flash, and Laguna-S-2.1's soak, are candidate 2's. MiMo-V2.6-Flash ran everything on candidate 3, and Laguna-S-2.1 its needle and agentic tests. Needle and the agentic smoke test ran on the laptop through the shipped `talus-server`,
+All gates ran on release candidate 1. Qwen3.8-27B, Qwen3.8-Flash-Next and GLM-5.3-Flash ran every gate on it. MiMo-V2.6-Flash and Laguna-S-2.1 have no source change in this release: their logit-row, row-parity and drafts gates ran on candidate 1, and their needle, agentic and soak results are v0.1.6's. Needle and the agentic smoke test ran on the laptop through the shipped `talus-server`,
 the logit-row, row-parity and drafts gates on the laptop with the release binaries, and each 45-minute soak on the
 machine named in its cell.
 Needle: five codenames spread through one prompt, three seeds.
@@ -110,8 +110,8 @@ Agentic smoke test: five fixed coding tasks run once through an agent harness. I
 
 | Model | Needle 60K | Needle 81K | Agentic smoke test | Logit rows / KLD | Row parity | Drafts on vs off | Soak |
 |---|---|---|---|---|---|---|---|
-| Qwen3.8-27B | 15/15 | not run | 5/5 | rows bitwise vs frozen; KL vs CPU reference 0.00219, top-1 98.4% (not gated) | 9/9 identical | 6/6 identical | PASS: 168 requests over 45.0 min, 0 errors, greedy 113/113 (desktop) |
-| Qwen3.8-Flash-Next | 15/15 | not run | 4/5 (paginator-wrap failed; it passed when repeated twice on the candidate and twice on v0.1.5) | rows bitwise vs frozen (43/43); KL vs BF16 0.09674, top-1 83.7% (bar for a changed build: <= 0.1064, top-1 >= 79%) | 16/16 identical (widths 8 to 32) | 5/5 identical | PASS: 288 requests over 45.0 min, 0 errors, greedy 203/203 (desktop) |
+| Qwen3.8-27B | 15/15 | not run | 5/5 | rows bitwise vs frozen; KL vs CPU reference 0.00219, top-1 98.4% (not gated) | 14/14 identical | 6/6 identical | PASS: 168 requests over 45.0 min, 0 errors, greedy 113/113 (desktop) |
+| Qwen3.8-Flash-Next | 15/15 | 15/15 | 5/5 | changed by the 16-bit prompt-path streams (43/43 rows), frozen again from this release's candidate; KL vs BF16 0.09108, top-1 86.0% (bar for a changed build: <= 0.1064, top-1 >= 79%) | 15/15 identical (widths 8 to 32) | 5/5 identical | PASS: 384 requests over 60.0 min, 0 errors, greedy 275/275 (desktop) |
 | GLM-5.3-Flash | 15/15 | not run | 5/5 | rows bitwise vs frozen (2/2); KLD vs release logits 0.04174, top-1 95.0% (not gated) | 6/6 identical | 9/9 identical | PASS: 112 requests over 45.0 min, 0 errors, greedy 71/71 (desktop) |
 | MiMo-V2.6-Flash | not run | 15/15 | 5/5 | engine rows bitwise vs a fixed earlier Talus build at 2K and 32K; weights check vs original weights 0.1721 | 11/11 identical | 5/5 identical | PASS: 152 requests over 45.0 min, 0 errors, greedy 101/101 (desktop) |
 | Laguna-S-2.1 | not run | 15/15 | 5/5 | served rows bitwise vs frozen at 2K and 32K | 2/2 identical | 5/5 identical | PASS: 216 requests over 45.0 min, 0 errors, greedy 149/149 (desktop) |
@@ -126,15 +126,15 @@ KLD thresholds the run is judged by:
 | MiMo-V2.6-Flash | Engine: teacher-forced KL(a fixed earlier Talus build -> this build) @2K and @32K: bitwise, or mean <= 1e-3 and top-1 >= 0.99. Weights checks, not engine gates (llama.cpp on the GGUF, the build does not run): vs original weights kld-text <= 0.182 (same-top >= 88.5%), wiki2 <= 0.240; vs old release ref: KLD <= 0.10, PPL ratio <= 1.01 |
 | Laguna-S-2.1 | Served rows @2K and @32K bitwise equal to a frozen set; a change needs KL vs frozen <= the rounding floor (8.2e-3 @2K, 1.4e-3 @32K), top-1 >= 0.98 and human review. KL(a fixed earlier Talus build -> this build) recorded, not gated |
 
-Flash-Next's published KL rose from v0.1.5 because its reference changed; the logits are bit for bit the same. MiMo's three llama.cpp lines are weights checks, not engine gates. See "KLD references per model" in [METHODOLOGY.md](METHODOLOGY.md).
+Flash-Next's logits change in this release (16-bit prompt-path streams), so its rows were frozen again from this release's candidate. KL to the BF16 weights on the gate path (prompt cache off, the path published in v0.1.6): 0.0967 (top-1 83.7 %) in v0.1.6, 0.0911 (top-1 86.0 %) now. On the chat path (prompt cache on, the end of the prompt read through a verify window, as a served chat request is): 0.1167 (top-1 83.7 %) in v0.1.6, 0.0943 (top-1 81.4 %) now; top-1 agreement there is one prompt lower (35 of 43 against 36). MiMo's three llama.cpp lines are weights checks, not engine gates. See "KLD references per model" in [METHODOLOGY.md](METHODOLOGY.md).
 
-All five soaks ran without errors and every greedy check matched.
+Every soak ran without errors and every greedy check matched. Qwen3.8-Flash-Next's first 45-minute soak failed one memory rule (its memory rose in two steps near minute 42 and the run ended right after); a 60-minute rerun showed the same two steps, then flat memory, and passed. The table shows the 60-minute run.
 
 <details>
 <summary>Full KLD gate records</summary>
 
 - **Qwen3.8-27B**: qwen27b kld_iq4xs (not gated): talus      vs CPU: mean KL 0.00219 (decode rows 0.00219)  median 0.00012  p99 0.0179  top-1 0.9844, vs talus: mean KL 0.00000  (576 rows); qwen27b rows_iq4xs vs frozen: bitwise-identical 6/6 [PASS]; qwen27b kld_q4kxl (not gated): talus      vs CPU: mean KL 0.00449 (decode rows 0.00452)  median 0.00018  p99 0.0778  top-1 0.9809, vs talus: mean KL 0.00000  (576 rows); qwen27b rows_q4kxl vs frozen: bitwise-identical 6/6 [PASS]; qwen27b kld_4k (not gated): 4K-mid (6x4K+64) vs CPU: mean KL 0.005172 (exact 0.004515, ratio 1.145, dKL 0.000942), top-1 vs CPU 96.61% (vs exact 98.96%)
-- **Qwen3.8-Flash-Next**: flashnext 43 prompts, KL mean 0.09674 p99 0.33178 max 0.67817, top-1 agree 83.7%  rows vs frozen: gate settings bitwise-identical 43/43; shipped settings bitwise-identical 43/43 [PASS]; flashnext _ship vs BF16 (not gated): -ship: 43 prompts, KL mean 0.09674 p99 0.33178 max 0.67817, top-1 agree 83.7%; flashnext _old vs fnp/res/kld/ref (not gated, gate until v0.1.5): 43 prompts, KL mean 0.02422 p99 0.08175 max 0.16080, top-1 agree 90.7%
+- **Qwen3.8-Flash-Next**: 43 prompts, KL vs BF16 mean 0.09108, top-1 agree 86.0%; rows changed 43/43 at gate settings and 43/43 at shipped settings against the v0.1.6 set (expected: 16-bit prompt-path streams, default from this release), inside the BF16 bar, reviewed and frozen again from this release's candidate
 - **GLM-5.3-Flash**: glm rows vs frozen: bitwise-identical 2/2 [PASS]; glm kld (not gated): Mean KLD: 0.041744 ± 0.001575 Same top p: 95.044 ± 0.215 % count 10230; glm kld_fp8 (not gated): Mean KLD: 0.194853 ± 0.005785 Same top p: 90.078 ± 0.296 % count 10230; glm kld_fp8_code Mean KLD: 0.258527 ± 0.007847 Same top p: 90.264 ± 0.293 % count 10230  [RECORDED]
 - **MiMo-V2.6-Flash**: mimo kld_orig_kld_text weights check (llama.cpp on the GGUF, the build under test does not run): Mean KLD: 0.172126 ± 0.004728 (<= 0.182) Same top p: 89.130 ± 0.308 % (>= 88.5%) Mean PPL(Q)/PPL(base): 1.126300 ± 0.008012 [PASS]; mimo kld_orig_wiki2 weights check (llama.cpp on the GGUF, the build under test does not run): Mean KLD: 0.225455 ± 0.004879 (<= 0.240) Same top p: 82.502 ± 0.420 % Mean PPL(Q)/PPL(base): 1.211233 ± 0.010687 [PASS]; mimo kld_release weights check (llama.cpp on the GGUF, the build under test does not run): Mean KLD: 0.082200 ± 0.002238 (<= 0.10) Same top p: 92.587 ± 0.236 % Mean PPL(Q)/PPL(base): 1.003625 ± 0.004404 (<= 1.01) [PASS]; mimo kl_d2000 vs a fixed earlier Talus build: rows 129 V 152576 KL mean 0.000e+00 p50 0.000e+00 p99 0.000e+00 max 0.000e+00 top1 1.0000 bitwise-identical [PASS]; mimo kl_d32000 vs a fixed earlier Talus build: rows 129 V 152576 KL mean 0.000e+00 p50 0.000e+00 p99 0.000e+00 max 0.000e+00 top1 1.0000 bitwise-identical [PASS]
 - **Laguna-S-2.1**: laguna kl_d2000 served-vs-a fixed earlier Talus build (not gated): rows 129 V 100352 KL mean 9.149e-03 p50 1.146e-03 p99 8.448e-02 max 2.576e-01 top1 0.9845; laguna kl_d2000 decode-vs-a fixed earlier Talus build (not gated): rows 129 V 100352 KL mean 0.000e+00 p50 0.000e+00 p99 0.000e+00 max 0.000e+00 top1 1.0000; laguna kl_d2000 served-rows vs frozen: bitwise-identical [PASS]; laguna kl_d32000 served-vs-a fixed earlier Talus build (not gated): rows 129 V 100352 KL mean 1.923e-03 p50 4.231e-05 p99 2.940e-02 max 3.897e-02 top1 1.0000; laguna kl_d32000 decode-vs-a fixed earlier Talus build (not gated): rows 129 V 100352 KL mean 1.850e-03 p50 4.272e-05 p99 3.536e-02 max 4.405e-02 top1 0.9845; laguna kl_d32000 served-rows vs frozen: bitwise-identical [PASS]

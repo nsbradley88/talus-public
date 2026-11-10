@@ -2,6 +2,7 @@
 
 pub use talus_core_api as api;
 
+pub mod code_span;
 pub mod config;
 pub mod control;
 pub mod energy;

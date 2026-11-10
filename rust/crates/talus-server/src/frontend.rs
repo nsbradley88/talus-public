@@ -1,6 +1,7 @@
 //! Chat template rendering, OpenAI & Anthropic request normalization, and streaming `OutputParser`
 //! (`<think>` reasoning, Qwen XML `<function=...><parameter=...>`, JSON tool calls, and GLM `<arg_key>...<arg_value>`).
 
+use crate::code_span::CodeSpans;
 use crate::json::{next_hex_id, JsonValue};
 
 pub const THINK_OPEN: &str = "<think>";
@@ -1185,11 +1186,43 @@ pub struct OutputParser {
     reasoning_rescue: bool,
     /// The call being read opened without `<tool_call>`.
     bare: bool,
-    /// Calls only for tools the request declared ; line-start and outside-code are still to come).
+    /// Calls only for tools the request declared.
     strict: bool,
+    /// `tool_call_recovery_tight`: a bare `<function=` opens a call only at the start of a line and outside code, a
+    /// `<tool_call>` only outside code. `code` follows the answer text sent so far.
+    tight: bool,
+    code: CodeSpans,
     pub rescued: usize,
     pub refused: usize,
     pub recovered_from_reasoning: bool,
+    /// What has been read of the open call, so a piece only costs its own length.
+    scan: CallScan,
+}
+
+/// Progress through the open call held in `OutputParser::buf`. The buffer only grows while a call is open, so nothing
+/// before these offsets needs reading again; every other change to the buffer resets this.
+#[derive(Default)]
+struct CallScan {
+    /// No `</tool_call>` starts before this offset.
+    tool_close_from: usize,
+    /// No `</function>` starts before this offset.
+    func_close_from: usize,
+    /// Where the first `</function>` starts, once seen.
+    func_close: Option<usize>,
+    /// What follows that `</function>` is whitespace up to this offset.
+    rest_from: usize,
+    /// No newline follows that `</function>` before this offset.
+    newline_from: usize,
+    newline: bool,
+}
+
+/// First `tag` at or after `*from`; moves `*from` to where the next search has to start. A tag split between pieces is
+/// found because the last `tag.len() - 1` bytes stay in range.
+fn find_resuming(buf: &str, tag: &str, from: &mut usize) -> Option<usize> {
+    let hit = buf[*from..].find(tag).map(|i| *from + i);
+    let keep = buf.len().saturating_sub(tag.len() - 1);
+    *from = (*from).max(buf.floor_char_boundary(keep));
+    hit
 }
 
 impl OutputParser {
@@ -1219,21 +1252,59 @@ impl OutputParser {
             reasoning_rescue: recover,
             bare: false,
             strict: strict_tool_names,
+            tight: false,
+            code: CodeSpans::default(),
             rescued: 0,
             refused: 0,
             recovered_from_reasoning: false,
+            scan: CallScan::default(),
         }
+    }
+
+    /// Does the `</function>` of the open call end it, without its `</tool_call>`? Returns where it ends.
+    ///
+    /// Only once something other than that closer follows it. Streamed, the newline before `</tool_call>` often arrives
+    /// in an earlier piece than the closer; deciding on the newline alone ended the call early and sent the closer on as
+    /// content. A call that ends the stream without its closer is still recovered by `finish_with_reason`.
+    fn recovered_call_end(&mut self) -> Option<usize> {
+        let s = &mut self.scan;
+        let close = match s.func_close {
+            Some(p) => p,
+            None => {
+                let p = find_resuming(&self.buf, FUNC_CLOSE, &mut s.func_close_from)?;
+                s.func_close = Some(p);
+                s.rest_from = p + FUNC_CLOSE.len();
+                s.newline_from = s.rest_from;
+                p
+            }
+        };
+        let rest = self.buf[s.rest_from..].trim_start();
+        s.rest_from = self.buf.len() - rest.len();
+        if !s.newline {
+            s.newline = self.buf.as_bytes()[s.newline_from..].contains(&b'\n');
+            s.newline_from = self.buf.len();
+        }
+        (!rest.is_empty() && !TOOL_CLOSE.starts_with(rest) && s.newline)
+            .then_some(close + FUNC_CLOSE.len())
     }
 
     /// Where a bare `<function=` opens a call: (position of a call, position still waiting for its name). Strict: only a
     /// declared tool's name opens one; any other is the text it is.
     fn bare_opener(&self) -> (Option<usize>, Option<usize>) {
-        if !self.strict {
+        if !self.strict && !self.tight {
             return (self.buf.find(FUNC_OPEN), None);
         }
+        let mut code = self.code;
         let mut from = 0;
+        let mut seen = 0;
         while let Some(i) = self.buf[from..].find(FUNC_OPEN) {
             let pos = from + i;
+            code.push(&self.buf[seen..pos]);
+            seen = pos;
+            if self.tight && !code.at_line_start_outside_code() {
+                from = pos + FUNC_OPEN.len();
+                continue;
+            }
             let after = &self.buf[pos + FUNC_OPEN.len()..];
             match after.find('>') {
                 Some(gt) => {
@@ -1242,7 +1313,7 @@ impl OutputParser {
                         .tools
                         .as_deref()
                         .is_some_and(|t| t.iter().any(|d| d.get_str("name") == Some(name)));
-                    if declared {
+                    if declared || !self.strict {
                         return (Some(pos), None);
                     }
                 }
@@ -1254,10 +1325,56 @@ impl OutputParser {
         (None, None)
     }
 
+    /// Where a `<tool_call>` opens a call. Tight: not inside code, where it is a quoted example.
+    fn wrapped_opener(&self) -> Option<usize> {
+        if !self.tight {
+            return self.buf.find(TOOL_OPEN);
+        }
+        let mut code = self.code;
+        let mut from = 0;
+        let mut seen = 0;
+        while let Some(i) = self.buf[from..].find(TOOL_OPEN) {
+            let pos = from + i;
+            code.push(&self.buf[seen..pos]);
+            seen = pos;
+            if !code.in_code() {
+                return Some(pos);
+            }
+            from = pos + TOOL_OPEN.len();
+        }
+        None
+    }
+
+    /// What follows a call starts a new line of the answer.
+    fn call_ended(&mut self) {
+        if self.tight {
+            self.code.push("\n");
+        }
+    }
+
+    /// The answer text sent on from here (only tight reads it).
+    fn sent_content(&mut self, text: String) -> Event {
+        if self.tight {
+            self.code.push(&text);
+        }
+        Event::content(text)
+    }
+
+    /// Tighter tool-call recovery; see the field. Off by default.
+    pub fn with_tight_recovery(mut self, on: bool) -> Self {
+        self.tight = on;
+        self
+    }
+
     /// Set the reasoning rescue on its own (by default it follows `recover`).
     pub fn with_reasoning_rescue(mut self, on: bool) -> Self {
         self.reasoning_rescue = on;
         self
+    }
+
+    /// Text fed but not emitted yet: a possible tag, or a tool call still being read.
+    pub fn holds_text(&self) -> bool {
+        !self.buf.is_empty()
     }
 
     pub fn feed(&mut self, piece: &str) -> Vec<Event> {
@@ -1301,7 +1418,7 @@ impl OutputParser {
                     }
                     // Check for <tool_call> or (when recover is true) bare <function=
                     let tc_pos = if self.has_tools {
-                        self.buf.find(TOOL_OPEN)
+                        self.wrapped_opener()
                     } else {
                         None
                     };
@@ -1319,12 +1436,14 @@ impl OutputParser {
                     if let Some(pos) = open_match {
                         if pos > 0 {
                             let before = self.buf[..pos].to_string();
-                            out.push(Event::content(before));
+                            let ev = self.sent_content(before);
+                            out.push(ev);
                         }
                         let is_tc = self.buf[pos..].starts_with(TOOL_OPEN);
                         let skip = if is_tc { TOOL_OPEN.len() } else { 0 };
                         self.buf.drain(..pos + skip);
                         self.bare = !is_tc;
+                        self.scan = CallScan::default();
                         self.state = ParserState::Call;
                         continue;
                     }
@@ -1332,7 +1451,8 @@ impl OutputParser {
                         // `<function=` whose name has not arrived yet: hold it, emit what comes before
                         if pos > 0 {
                             let before: String = self.buf.drain(..pos).collect();
-                            out.push(Event::content(before));
+                            let ev = self.sent_content(before);
+                            out.push(ev);
                         }
                         break;
                     }
@@ -1349,12 +1469,15 @@ impl OutputParser {
                     if emit_len > 0 && self.buf.is_char_boundary(emit_len) {
                         let text = self.buf[..emit_len].to_string();
                         self.buf.drain(..emit_len);
-                        out.push(Event::content(text));
+                        let ev = self.sent_content(text);
+                        out.push(ev);
                     }
                     break;
                 }
                 ParserState::Call | ParserState::ReasoningCall => {
-                    if let Some(end_pos) = self.buf.find(TOOL_CLOSE) {
+                    let tool_close =
+                        find_resuming(&self.buf, TOOL_CLOSE, &mut self.scan.tool_close_from);
+                    if let Some(end_pos) = tool_close {
                         let raw_call = self.buf[..end_pos].to_string();
                         self.buf.drain(..end_pos + TOOL_CLOSE.len());
                         if let Some(call) = parse_tool_call(&raw_call, self.tools.as_deref()) {
@@ -1367,8 +1490,15 @@ impl OutputParser {
                             out.push(Event::tool_start(start_call.clone()));
                             out.push(Event::tool_args(args_json, start_call));
                             out.push(Event::tool_call(call));
+                            self.call_ended();
                         } else {
-                            out.push(Event::content(format!("{TOOL_OPEN}{raw_call}{TOOL_CLOSE}")));
+                            let open = if self.tight && self.bare {
+                                ""
+                            } else {
+                                TOOL_OPEN
+                            };
+                            let ev = self.sent_content(format!("{open}{raw_call}{TOOL_CLOSE}"));
+                            out.push(ev);
                         }
                         let trimmed = self.buf.trim_start_matches(['\r', '\n']).to_string();
                         self.buf = trimmed;
@@ -1376,40 +1506,28 @@ impl OutputParser {
                         continue;
                     }
                     if self.recover {
-                        if let Some(end_pos) = self.buf.find(FUNC_CLOSE) {
-                            let after = &self.buf[end_pos + FUNC_CLOSE.len()..];
-                            // A call whose `</tool_call>` the model left out is recovered only once something other
-                            // than that closer follows `</function>`. Streamed, the newline before `</tool_call>`
-                            // often arrives in an earlier piece than the closer; deciding on the newline alone ended
-                            // the call early and sent the closer on as content. A call that ends the stream without
-                            // its closer is still recovered by `finish_with_reason`.
-                            let rest = after.trim_start();
-                            if !rest.is_empty()
-                                && !TOOL_CLOSE.starts_with(rest)
-                                && after.contains('\n')
-                            {
-                                let raw_call = self.buf[..end_pos + FUNC_CLOSE.len()].to_string();
-                                self.buf.drain(..end_pos + FUNC_CLOSE.len());
-                                if let Some(call) =
-                                    parse_tool_call(&raw_call, self.tools.as_deref())
-                                {
-                                    let start_call = ToolCall {
-                                        id: call.id.clone(),
-                                        name: call.name.clone(),
-                                        arguments: JsonValue::empty_obj(),
-                                    };
-                                    let args_json = call.arguments.to_json_string();
-                                    out.push(Event::tool_start(start_call.clone()));
-                                    out.push(Event::tool_args(args_json, start_call));
-                                    out.push(Event::tool_call(call));
-                                } else {
-                                    // not a call after all: the text it is (it used to vanish)
-                                    let open = if self.bare { "" } else { TOOL_OPEN };
-                                    out.push(Event::content(format!("{open}{raw_call}")));
-                                }
-                                self.state = ParserState::Content;
-                                continue;
+                        if let Some(end) = self.recovered_call_end() {
+                            let raw_call = self.buf[..end].to_string();
+                            self.buf.drain(..end);
+                            if let Some(call) = parse_tool_call(&raw_call, self.tools.as_deref()) {
+                                let start_call = ToolCall {
+                                    id: call.id.clone(),
+                                    name: call.name.clone(),
+                                    arguments: JsonValue::empty_obj(),
+                                };
+                                let args_json = call.arguments.to_json_string();
+                                out.push(Event::tool_start(start_call.clone()));
+                                out.push(Event::tool_args(args_json, start_call));
+                                out.push(Event::tool_call(call));
+                                self.call_ended();
+                            } else {
+                                // not a call after all: the text it is (it used to vanish)
+                                let open = if self.bare { "" } else { TOOL_OPEN };
+                                let ev = self.sent_content(format!("{open}{raw_call}"));
+                                out.push(ev);
                             }
+                            self.state = ParserState::Content;
+                            continue;
                         }
                     }
                     break;
@@ -1429,6 +1547,7 @@ impl OutputParser {
             return out;
         }
         let leftover = std::mem::take(&mut self.buf);
+        self.scan = CallScan::default();
         match self.state {
             ParserState::Reasoning => {
                 // Rescue tool call inside unclosed <think> if finish_reason == "stop"
@@ -1473,6 +1592,8 @@ impl OutputParser {
                     out.push(Event::tool_start(start_call.clone()));
                     out.push(Event::tool_args(args_json, start_call));
                     out.push(Event::tool_call(call));
+                } else if self.tight && self.bare {
+                    out.push(Event::content(leftover));
                 } else {
                     out.push(Event::content(format!("{TOOL_OPEN}{leftover}")));
                 }
@@ -1497,6 +1618,78 @@ fn partial_suffix_len(s: &str, tags: &[&str]) -> usize {
         }
     }
     best
+}
+
+#[cfg(test)]
+mod incremental_call_tests {
+    use super::*;
+
+    /// (kind, text, call name and arguments), with neighbouring text joined; call ids are random.
+    fn run(text: &str, step: usize, recover: bool) -> Vec<(EventKind, String, Option<String>)> {
+        let tools = JsonValue::parse(r#"[{"name":"f"}]"#).unwrap();
+        let tools = tools.as_array().map(|t| t.to_vec());
+        let mut p = OutputParser::new(false, tools, true, recover, true);
+        let mut evs = Vec::new();
+        let mut i = 0;
+        while i < text.len() {
+            let mut e = (i + step).min(text.len());
+            while !text.is_char_boundary(e) {
+                e += 1;
+            }
+            evs.extend(p.feed(&text[i..e]));
+            i = e;
+        }
+        evs.extend(p.finish());
+        let mut out: Vec<(EventKind, String, Option<String>)> = Vec::new();
+        for ev in evs {
+            let call = ev
+                .call
+                .as_ref()
+                .map(|c| format!("{} {}", c.name, c.arguments.to_json_string()));
+            match out.last_mut() {
+                Some(last) if last.0 == ev.kind && call.is_none() && last.2.is_none() => {
+                    last.1.push_str(&ev.text)
+                }
+                _ => out.push((ev.kind, ev.text, call)),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn pieces_and_whole_input_parse_the_same() {
+        let long = "x y ".repeat(20_000);
+        let cases = [
+            "<tool_call><function=f><parameter=a>1</parameter></function></tool_call>after".to_string(),
+            "<tool_call><function=f><parameter=a>é\u{2003}ü</parameter></function>\n</tool_call>more".to_string(),
+            "a<tool_call><function=f></function>\u{2003}\n</tool_call><tool_call><function=f></function></tool_call>".to_string(),
+            format!("<tool_call><function=f><parameter=a>{long}</parameter></function></tool_call>"),
+            format!("<tool_call><function=f><parameter=a>{long}"),
+            "<function=f></function>\n</tool_cal".to_string(),
+            "<tool_call>not a call</tool_call>text".to_string(),
+        ];
+        for text in &cases {
+            for recover in [false, true] {
+                let whole = run(text, text.len().max(1), recover);
+                for step in [1, 2, 3, 7, 64, 4096] {
+                    assert_eq!(run(text, step, recover), whole, "step {step}, {:.60}", text);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_call_recovered_without_its_closer_ends_where_it_did() {
+        // whatever the pieces, the call ends at its first `</function>` once text and a newline follow it
+        for text in [
+            "<tool_call><function=f></function>\nnext",
+            "<tool_call><function=f></function>x\ny</function>\nz",
+        ] {
+            let got = run(text, 1, true);
+            assert_eq!(run(text, 2, true), got);
+            assert!(got.iter().any(|e| e.2.is_some()), "{text}: {got:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1896,5 +2089,123 @@ mod stream_tool_call_tests {
             &[text],
         );
         assert_eq!(calls(&out).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod tight_recovery_tests {
+    use super::*;
+
+    const WEATHER: &str =
+        "<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>";
+
+    /// (reasoning and content text joined, call names), same at every chunk width.
+    fn run(text: &str, tight: bool) -> (String, Vec<String>) {
+        let tools = JsonValue::parse(r#"[{"name":"get_weather"}]"#).unwrap();
+        let tools = tools.as_array().map(|t| t.to_vec());
+        let mut seen = None;
+        for width in [1, 2, 3, 7, text.len().max(1)] {
+            let mut p = OutputParser::new(false, tools.clone(), true, true, true)
+                .with_tight_recovery(tight);
+            let mut evs = Vec::new();
+            let mut i = 0;
+            while i < text.len() {
+                let mut e = (i + width).min(text.len());
+                while !text.is_char_boundary(e) {
+                    e += 1;
+                }
+                evs.extend(p.feed(&text[i..e]));
+                i = e;
+            }
+            evs.extend(p.finish());
+            let content: String = evs
+                .iter()
+                .filter(|e| e.kind == EventKind::Content)
+                .map(|e| e.text.as_str())
+                .collect();
+            let calls = evs
+                .iter()
+                .filter(|e| e.kind == EventKind::ToolCall)
+                .map(|e| e.call.as_ref().unwrap().name.clone())
+                .collect();
+            let got = (content, calls);
+            // newlines right after a call depend on the cut, with or without tight
+            let same = |x: &(String, Vec<String>)| (x.0.replace('\n', ""), x.1.clone());
+            if let Some(first) = &seen {
+                assert_eq!(same(first), same(&got), "width {width}: {text}");
+            }
+            seen = Some(got);
+        }
+        seen.unwrap()
+    }
+
+    #[test]
+    fn quoted_calls_stay_text() {
+        for quote in [
+            format!("Use it like this:\n```\n{WEATHER}\n```\nnext"),
+            format!("Use it like this:\n~~~xml\n{WEATHER}\n~~~\n"),
+            format!("Write `{WEATHER}` to call it."),
+            format!("For example {WEATHER} and so on\nmore"),
+            format!("```\n<tool_call>\n{WEATHER}\n</tool_call>\n```\n"),
+            format!("Write `<tool_call>{WEATHER}</tool_call>` to call it."),
+        ] {
+            assert_eq!(run(&quote, true), (quote.clone(), vec![]), "{quote}");
+            assert_eq!(
+                run(&quote, false).1,
+                vec!["get_weather"],
+                "loose reads it: {quote}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_calls_are_still_calls() {
+        for text in [
+            format!("{WEATHER}\n"),
+            format!("Checking.\n{WEATHER}\n"),
+            format!("Checking.\n  {WEATHER}\nthen"),
+            format!("```\ncode\n```\n{WEATHER}\n"),
+            format!("a `b` c\n{WEATHER}\n"),
+            format!("<tool_call>\n{WEATHER}\n</tool_call>"),
+            format!("mid-line wrapped <tool_call>\n{WEATHER}\n</tool_call>"),
+        ] {
+            assert_eq!(run(&text, true).1, vec!["get_weather"], "{text}");
+        }
+        // the second of two: a finished call ends its line
+        let two = format!("Now.<tool_call>\n{WEATHER}\n</tool_call>\n{WEATHER}\n");
+        assert_eq!(run(&two, true).1, vec!["get_weather", "get_weather"]);
+    }
+
+    #[test]
+    fn an_open_paragraph_of_backticks_keeps_a_call_out_until_it_ends() {
+        let open = format!("a stray ` here\n{WEATHER}\n");
+        assert!(run(&open, true).1.is_empty());
+        let closed = format!("a stray ` here\n\n{WEATHER}\n");
+        assert_eq!(run(&closed, true).1, vec!["get_weather"]);
+    }
+
+    #[test]
+    fn a_bare_call_that_does_not_parse_is_its_own_text() {
+        let text = "<function=get_weather>\nno end";
+        assert_eq!(run(text, true), (text.to_string(), vec![]));
+        assert_eq!(
+            run(text, false).0,
+            format!("<tool_call>{text}"),
+            "the default path keeps its prefix"
+        );
+    }
+
+    #[test]
+    fn plain_text_is_the_same_either_way() {
+        for text in [
+            "plain answer",
+            "a `b` c\n```\nd\n```\ne",
+            "almost <function",
+            "<tool_cal",
+            "<function=",
+            "é<function=x",
+        ] {
+            assert_eq!(run(text, true), run(text, false), "{text}");
+        }
     }
 }

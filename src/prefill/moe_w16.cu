@@ -1321,6 +1321,11 @@ extern "C" int tkg_w16_moe_gu_q8(int type, const void* w_gate, const void* w_up,
     const hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : (int) e;
 }
+// lever 4  ): 1 when tkg_w16_moe_gu_q8 would take a GLM routed product of this type / size (its first gate),
+// so the engine knows the token rows are read as plain D4 MMQ rows (not gathered) before it quantizes them
+extern "C" int tkg_w16_moe_on(int type, int64_t total_rows, int n_experts) {
+    return talus::prefill::w16_glm_on(type, total_rows, n_experts) ? 1 : 0;
+}
 // down: dst row ids[r] (ld ldd) of routed row r = W_e hq row r (hq: MMQ q8_1 D4 rows, k wide)
 extern "C" int tkg_w16_moe_down(int type, const void* w, size_t expert_bytes, int n_out, int k, int n_experts, const void* hq,
                                 const int32_t* bounds, const int32_t* ids, int64_t total_rows, float* dst, int64_t ldd,

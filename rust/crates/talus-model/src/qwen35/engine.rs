@@ -35,6 +35,11 @@ pub struct I8Cache {
     pub mats: HashMap<usize, I8Mat>,
     pub bytes: usize,
     pub budget_guard: Option<talus_mem::ReservationGuard>,
+    /// (#75): matrices the W4A4 sidecar takes over, not expanded by `tp_levers_init`; `w4i_init` expands the
+    /// ones it did not load (`i8x_expand_deferred`)
+    pub deferred: Vec<I8Candidate>,
+    /// the reservation of the deferred matrices expanded after all
+    pub deferred_guard: Option<talus_mem::ReservationGuard>,
 }
 
 unsafe impl Send for I8Cache {}
@@ -69,6 +74,8 @@ impl I8Cache {
         }
         self.bytes = 0;
         self.budget_guard = None;
+        self.deferred.clear();
+        self.deferred_guard = None;
     }
 }
 
@@ -83,6 +90,10 @@ pub const K_ATT_CHUNK: i32 = 512;
 pub const K_ATT_SMALL: i32 = 128;
 pub const K_ATT_SMALL_CELLS: i32 = 4096;
 pub const K_ARG_BLOCKS: i32 = 128;
+/// talus#78: the widest verify window (rows) the 27B engine sizes for: n-gram / copy windows of up to 32 rows in one
+/// forward (TALUS_Q27_VERIFY_MAX, 16 = the v0.1.6 engine). MTP / DFlash2 windows stay <= 16. Also the exact-test
+/// debug-row stride.
+pub const Q27_VMAX: usize = 32;
 
 #[inline]
 pub const fn att_chunk_size(ck: i32) -> i32 {
@@ -160,7 +171,21 @@ pub fn q27_bytes_per_token(model: &Q36Model) -> usize {
     } else {
         0
     };
-    n_state * row * if vc { 3 } else { 2 } + kv8 + 16 * (g.n_head as usize) * 6
+    q27_kv_bytes_per_token(n_state, row, vc, kv8, g.n_head as usize)
+}
+
+/// [`q27_bytes_per_token`]'s sum, pure: K + transposed V (+ the std-layout V copy `vc`) per attention state, the int8
+/// decode copy, and (#75) the legacy prompt-attention score scratch (`att_s` f32 + `att_p16` f16, 16 x n_head
+/// per token) only with `vc`: those buffers are read by the legacy prefill paths alone, which need `vc`, so the engine
+/// allocates them only then.
+pub fn q27_kv_bytes_per_token(
+    n_state: usize,
+    row: usize,
+    vc: bool,
+    kv8: usize,
+    n_head: usize,
+) -> usize {
+    n_state * row * if vc { 3 } else { 2 } + kv8 + if vc { 16 * n_head * 6 } else { 0 }
 }
 
 /// Context ladder for the 27B when no `--max-context` is given.
@@ -169,35 +194,99 @@ pub const Q27_AUTO_CONTEXTS: [i32; 3] = [262_144, 131_072, 65_536];
 /// graphs, the first prompt-cache snapshots (GiB).
 pub const Q27_AUTO_RESERVE_GIB: f64 = 3.0;
 
+/// The 27B's load plan for one context, from the memory free above the floor before the KV cache and the int8 prompt
+/// weights are placed. Pure, so the planner's margins can be tested without a GPU.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Q27MemPlan {
+    pub ctx: i32,
+    /// Bytes the context needs: prompt weights (int8 + W4A4 sidecar, ) + KV cache + reserve.
+    pub need: f64,
+    /// `head - need`; below 0 the int8 prompt weights are skipped.
+    pub margin: f64,
+}
+
+impl Q27MemPlan {
+    /// The planner's test for a ladder step: int8 weights, KV cache and the whole reserve fit. The engine itself places
+    /// the int8 weights down to the floor (`tp_levers_init`), so they can still load with this false: measured at a
+    /// 60.5 GiB cap, margin -0.4 GiB, int8 kept and 0.8 GiB above the floor after a short request ).
+    pub fn i8_fits(&self) -> bool {
+        self.margin >= 0.0
+    }
+}
+
+/// [`Q27MemPlan`] for context `ctx`.
+pub fn q27_mem_plan(head: f64, i8: f64, per_tok: f64, ctx: i32) -> Q27MemPlan {
+    let need = i8 + per_tok * f64::from(ctx) + Q27_AUTO_RESERVE_GIB * f64::from(1u32 << 30);
+    Q27MemPlan {
+        ctx,
+        need,
+        margin: head - need,
+    }
+}
+
+/// The automatic context: the largest ladder step that fits with the int8 prompt weights, else the smallest step
+/// (the context comes first: the engine then skips the int8 weights).
+pub fn q27_pick_context(head: f64, i8: f64, per_tok: f64) -> Q27MemPlan {
+    Q27_AUTO_CONTEXTS
+        .iter()
+        .map(|&c| q27_mem_plan(head, i8, per_tok, c))
+        .find(Q27MemPlan::i8_fits)
+        .unwrap_or_else(|| {
+            q27_mem_plan(
+                head,
+                i8,
+                per_tok,
+                Q27_AUTO_CONTEXTS[Q27_AUTO_CONTEXTS.len() - 1],
+            )
+        })
+}
+
+/// (#75): the prompt weights the engine will place: the int8 expansion (`i8_total`) less the copies the
+/// W4A4 sidecar takes over (`i8_superseded`), plus the sidecar (`w4`: weights + packed activation buffers).
+pub const fn q27_prompt_weight_bytes(i8_total: usize, i8_superseded: usize, w4: usize) -> usize {
+    i8_total - i8_superseded + w4
+}
+
 /// Pick the 27B's context when no `--max-context` is given: the largest of 256K / 128K / 64K whose
-/// KV cache fits in the memory budget beside the loaded weights and the int8 prompt expansion (`tp_i8x`, skipped
-/// with a warning when it does not fit). Call after `Q36Model::load` (weights resident). Returns the context and
-/// a one-line reason.
+/// KV cache fits in the memory budget beside the loaded weights and the prompt weights (the int8 expansion `tp_i8x`,
+/// skipped with a warning when it does not fit, and the default W4A4 sidecar, which replaces the int8 copies of the
+/// matrices it holds). Call after `Q36Model::load` (weights resident). Returns the context and a one-line reason.
 pub fn q27_auto_context(model: &Q36Model) -> (i32, String) {
     let gib = |b: f64| b / f64::from(1u32 << 30);
     let budget = q27_budget();
     let head = budget.headroom_bytes() as f64;
-    let i8 = i8x_candidates(model).1 as f64;
-    let per_tok = q27_bytes_per_token(model) as f64;
-    let reserve = Q27_AUTO_RESERVE_GIB * f64::from(1u32 << 30);
-    let need = |c: i32| i8 + per_tok * f64::from(c) + reserve;
-    let pick = Q27_AUTO_CONTEXTS
+    let (cands, i8_total) = i8x_candidates(model);
+    let sup = w4i_superseded(model, 512);
+    let i8_sup: usize = cands
         .iter()
-        .copied()
-        .find(|&c| need(c) <= head)
-        .unwrap_or(Q27_AUTO_CONTEXTS[Q27_AUTO_CONTEXTS.len() - 1]);
+        .filter(|c| sup.contains(&c.0))
+        .map(|c| c.6 + c.7)
+        .sum();
+    let w4 = w4i_select(model, 512, true).map_or(0, |s| s.total + s.act);
+    // (#75): the plan counts the prompt weights the engine will place (int8 less the copies the sidecar takes over,
+    // plus the sidecar); 's plan / margin / log wording unchanged otherwise
+    let prompt = q27_prompt_weight_bytes(i8_total, i8_sup, w4) as f64;
+    let per_tok = q27_bytes_per_token(model) as f64;
+    let plan = q27_pick_context(head, prompt, per_tok);
+    let pick = plan.ctx;
+    let w4_part = if w4 > 0 {
+        format!(" + W4 sidecar {:.1}", gib(w4 as f64))
+    } else {
+        String::new()
+    };
     let why = format!(
         "context {pick} (auto, no --max-context): {:.1} GiB free above the {:.0} GiB floor; needs {:.1} GiB = int8 \
-         prompt weights {:.1} + KV {:.0} KiB/token x {pick} ({:.1}) + reserve {:.0}{}",
+         prompt weights {:.1}{w4_part} + KV {:.0} KiB/token x {pick} ({:.1}) + reserve {:.0}; margin {:.1} GiB{}",
         gib(head),
         gib(budget.floor_bytes() as f64),
-        gib(need(pick)),
-        gib(i8),
+        gib(plan.need),
+        gib((i8_total - i8_sup) as f64),
         per_tok / 1024.0,
         gib(per_tok * f64::from(pick)),
         Q27_AUTO_RESERVE_GIB,
-        if need(pick) > head {
-            "; does not fit even at the smallest step (the int8 expansion will be skipped)"
+        gib(plan.margin),
+        if !plan.i8_fits() {
+            "; short of the reserve at the smallest step (the int8 weights load only if they fit above the floor)"
         } else if pick < Q27_AUTO_CONTEXTS[0] {
             "; 256K would not fit beside the int8 weights (set --max-context to choose)"
         } else {
@@ -252,6 +341,8 @@ pub struct Q36Engine {
     pub attn_w8: bool,
     pub v16: bool,
     pub gemm_t: i32,
+    /// talus#78: widest verify window (16..=32); rows 17..vt_max run with gemm_t = vt_max (wide_enter).
+    pub vt_max: i32,
     pub max_batch: i32,
     pub n_past: i32,
     pub cur_T: i32,
@@ -493,19 +584,19 @@ pub struct Q36Engine {
 
     // Captured HIP graphs
     pub g1: hipGraphExec_t,
-    pub gv: [hipGraphExec_t; 17],
+    pub gv: [hipGraphExec_t; Q27_VMAX + 1],
     pub gm1: hipGraphExec_t,
-    pub gA: [hipGraphExec_t; 17],
-    pub gB: [[hipGraphExec_t; 16]; 17],
-    pub gBi: [[hipGraphExec_t; 16]; 17],
-    pub gB0: [hipGraphExec_t; 17],
-    pub gB0i: [hipGraphExec_t; 17],
-    pub gC: [hipGraphExec_t; 17],
+    pub gA: [hipGraphExec_t; Q27_VMAX + 1],
+    pub gB: [[hipGraphExec_t; 16]; Q27_VMAX + 1],
+    pub gBi: [[hipGraphExec_t; 16]; Q27_VMAX + 1],
+    pub gB0: [hipGraphExec_t; Q27_VMAX + 1],
+    pub gB0i: [hipGraphExec_t; Q27_VMAX + 1],
+    pub gC: [hipGraphExec_t; Q27_VMAX + 1],
     pub gS: [hipGraphExec_t; 16],
-    pub gD: [hipGraphExec_t; 17],
-    pub gDm: [hipGraphExec_t; 17],
-    pub gD0: [hipGraphExec_t; 17],
-    pub gD0m: [hipGraphExec_t; 17],
+    pub gD: [hipGraphExec_t; Q27_VMAX + 1],
+    pub gDm: [hipGraphExec_t; Q27_VMAX + 1],
+    pub gD0: [hipGraphExec_t; Q27_VMAX + 1],
+    pub gD0m: [hipGraphExec_t; Q27_VMAX + 1],
     pub gDs: hipGraphExec_t,
 
     pub(crate) allocs: Vec<*mut c_void>,
@@ -577,6 +668,7 @@ impl Q36Engine {
             } else {
                 8
             },
+            vt_max: 16,
             max_batch: 512,
             n_past: 0,
             cur_T: 0,
@@ -781,19 +873,19 @@ impl Q36Engine {
             st_decide_ms: 0.0,
             st_rounds: 0,
             g1: ptr::null_mut(),
-            gv: [ptr::null_mut(); 17],
+            gv: [ptr::null_mut(); Q27_VMAX + 1],
             gm1: ptr::null_mut(),
-            gA: [ptr::null_mut(); 17],
-            gB: [[ptr::null_mut(); 16]; 17],
-            gBi: [[ptr::null_mut(); 16]; 17],
-            gB0: [ptr::null_mut(); 17],
-            gB0i: [ptr::null_mut(); 17],
-            gC: [ptr::null_mut(); 17],
+            gA: [ptr::null_mut(); Q27_VMAX + 1],
+            gB: [[ptr::null_mut(); 16]; Q27_VMAX + 1],
+            gBi: [[ptr::null_mut(); 16]; Q27_VMAX + 1],
+            gB0: [ptr::null_mut(); Q27_VMAX + 1],
+            gB0i: [ptr::null_mut(); Q27_VMAX + 1],
+            gC: [ptr::null_mut(); Q27_VMAX + 1],
             gS: [ptr::null_mut(); 16],
-            gD: [ptr::null_mut(); 17],
-            gDm: [ptr::null_mut(); 17],
-            gD0: [ptr::null_mut(); 17],
-            gD0m: [ptr::null_mut(); 17],
+            gD: [ptr::null_mut(); Q27_VMAX + 1],
+            gDm: [ptr::null_mut(); Q27_VMAX + 1],
+            gD0: [ptr::null_mut(); Q27_VMAX + 1],
+            gD0m: [ptr::null_mut(); Q27_VMAX + 1],
             gDs: ptr::null_mut(),
             allocs: Vec::new(),
             hallocs: Vec::new(),
@@ -916,6 +1008,17 @@ impl Q36Engine {
                 .map(|v| v != "0")
                 .unwrap_or(true);
         self.gemm_t = if model.dense && self.v16 { 16 } else { 8 };
+        // talus#78: TALUS_Q27_VERIFY_MAX (16..=32, default 32 on the dense 16-row engine; 16 = v0.1.6 exactly)
+        self.vt_max = if self.gemm_t == 16 {
+            std::env::var("TALUS_Q27_VERIFY_MAX")
+                .ok()
+                .and_then(|v| v.parse::<i32>().ok())
+                .unwrap_or(Q27_VMAX as i32)
+                .clamp(16, Q27_VMAX as i32)
+        } else {
+            self.gemm_t
+        };
+        let vr = (self.vt_max.max(16)) as usize;
         self.attn_w8 = model.opts.attn_w8
             || std::env::var("STRATA_ATTN_W8")
                 .map(|v| v == "1")
@@ -1036,15 +1139,15 @@ impl Q36Engine {
         for i in 0..(self.n_gdn as usize) {
             self.conv[i] = hip_alloc_zeroed::<f32>(3 * C, &mut self.allocs)?;
             self.S[i] = hip_alloc_zeroed::<f32>(HV * S_dim * S_dim, &mut self.allocs)?;
-            self.v_qkv[i] = hip_alloc_zeroed::<f32>(16 * C, &mut self.allocs)?;
-            self.v_hc[i] = hip_alloc_zeroed::<f32>(16 * C, &mut self.allocs)?;
-            self.v_alpha[i] = hip_alloc_zeroed::<f32>(16 * HV, &mut self.allocs)?;
-            self.v_beta[i] = hip_alloc_zeroed::<f32>(16 * HV, &mut self.allocs)?;
+            self.v_qkv[i] = hip_alloc_zeroed::<f32>(vr * C, &mut self.allocs)?;
+            self.v_hc[i] = hip_alloc_zeroed::<f32>(vr * C, &mut self.allocs)?;
+            self.v_alpha[i] = hip_alloc_zeroed::<f32>(vr * HV, &mut self.allocs)?;
+            self.v_beta[i] = hip_alloc_zeroed::<f32>(vr * HV, &mut self.allocs)?;
             for b in 0..2 {
-                self.pq[i][b] = hip_alloc_zeroed::<f32>(16 * C, &mut self.allocs)?;
-                self.ph[i][b] = hip_alloc_zeroed::<f32>(16 * C, &mut self.allocs)?;
-                self.pa[i][b] = hip_alloc_zeroed::<f32>(16 * HV, &mut self.allocs)?;
-                self.pb[i][b] = hip_alloc_zeroed::<f32>(16 * HV, &mut self.allocs)?;
+                self.pq[i][b] = hip_alloc_zeroed::<f32>(vr * C, &mut self.allocs)?;
+                self.ph[i][b] = hip_alloc_zeroed::<f32>(vr * C, &mut self.allocs)?;
+                self.pa[i][b] = hip_alloc_zeroed::<f32>(vr * HV, &mut self.allocs)?;
+                self.pb[i][b] = hip_alloc_zeroed::<f32>(vr * HV, &mut self.allocs)?;
             }
         }
         self.conv_state = self.conv.clone();
@@ -1082,12 +1185,27 @@ impl Q36Engine {
         self.pacc = hip_alloc_zeroed::<f32>(p_rows * H * max_chunks * HD, &mut self.allocs)?;
         self.pm = hip_alloc_zeroed::<f32>(p_rows * H * max_chunks, &mut self.allocs)?;
         self.pl = hip_alloc_zeroed::<f32>(p_rows * H * max_chunks, &mut self.allocs)?;
-        let ldp_max = ((ctx_len as usize) + 7) / 8 * 8;
-        self.score_floats = (16 * H * ldp_max).max(64 * 1024 * 1024);
-        self.att_s = hip_alloc_zeroed::<f32>(self.score_floats, &mut self.allocs)?;
-        self.att_p16 = hip_alloc_zeroed::<u16>(self.score_floats, &mut self.allocs)?;
-        let mask_b = tk_q36_fattn_mask_bytes(B as i64, self.vt_ctx as i64);
-        self.fattn_mask = hip_alloc_zeroed::<u16>((mask_b / 2).max(1), &mut self.allocs)?;
+        // (#75): the score scratch (att_s / att_p16, >= 64 Mi floats: 384 MiB at 64K) and the legacy flash mask
+        // (B x vt_ctx f16: 64 MiB at 64K) are read only by the legacy prompt attention (tk_attn_prefill_fa /
+        // tk_q36_attn_blas_prefill), which also reads `vc`. With talus_pf_fa_prefill (default) `vc` is not
+        // allocated and those branches cannot run, so neither are these: same rule as `vc` (TALUS_Q27_VC=1 keeps all).
+        // TALUS_Q27_KEEP_LEGACY_SCRATCH=1 (#75 sanity control): allocate the score scratch + mask as before even
+        // on the FA path, without `vc`, so a control run reproduces the old layout's memory at the W4 check.
+        let keep_legacy_scratch =
+            std::env::var("TALUS_Q27_KEEP_LEGACY_SCRATCH").is_ok_and(|v| v == "1");
+        if need_vc || keep_legacy_scratch {
+            let ldp_max = ((ctx_len as usize) + 7) / 8 * 8;
+            self.score_floats = (16 * H * ldp_max).max(64 * 1024 * 1024);
+            self.att_s = hip_alloc_zeroed::<f32>(self.score_floats, &mut self.allocs)?;
+            self.att_p16 = hip_alloc_zeroed::<u16>(self.score_floats, &mut self.allocs)?;
+            let mask_b = tk_q36_fattn_mask_bytes(B as i64, self.vt_ctx as i64);
+            self.fattn_mask = hip_alloc_zeroed::<u16>((mask_b / 2).max(1), &mut self.allocs)?;
+        } else {
+            self.score_floats = 0;
+            self.att_s = ptr::null_mut();
+            self.att_p16 = ptr::null_mut();
+            self.fattn_mask = ptr::null_mut();
+        }
 
         let max_in = E
             .max(V)
@@ -1267,7 +1385,9 @@ impl Q36Engine {
 
         let n_vocab = g.n_vocab as usize;
         let max_spec = 16usize;
-        self.logits = hip_alloc_zeroed::<f32>(max_spec * n_vocab, &mut self.allocs)?;
+        // talus#78: target rows of a verify window (head logits, picks): up to vt_max
+        let max_vrows = (self.vt_max.max(16)) as usize;
+        self.logits = hip_alloc_zeroed::<f32>(max_vrows * n_vocab, &mut self.allocs)?;
         self.logits_h = hip_host_alloc_zeroed::<f32>(n_vocab, &mut self.hallocs)?;
         self.tok_d = hip_alloc_zeroed::<i32>(B, &mut self.allocs)?;
         self.pos0_d = hip_alloc_zeroed::<i32>(1, &mut self.allocs)?;
@@ -1282,9 +1402,9 @@ impl Q36Engine {
         self.mtp_cat = hip_alloc_zeroed::<f32>(B * 2 * E, &mut self.allocs)?;
 
         self.logits_v = self.logits;
-        self.logits_v_h = hip_host_alloc_zeroed::<f32>(max_spec * n_vocab, &mut self.hallocs)?;
+        self.logits_v_h = hip_host_alloc_zeroed::<f32>(max_vrows * n_vocab, &mut self.hallocs)?;
         self.logits_Pinned = self.logits_v_h;
-        self.logits_pinned_len = max_spec * n_vocab;
+        self.logits_pinned_len = max_vrows * n_vocab;
 
         self.draft_n_vocab = if !model.dv_head.is_null() {
             model.dv_head.n_out
@@ -1298,12 +1418,12 @@ impl Q36Engine {
 
         self.logits_m = hip_alloc_zeroed::<f32>(n_vocab, &mut self.allocs)?;
         self.logits_m_h = hip_host_alloc_zeroed::<f32>(max_spec * vd, &mut self.hallocs)?;
-        self.pick_v = hip_alloc_zeroed::<i32>(max_spec, &mut self.allocs)?;
-        self.pick_v_h = hip_host_alloc_zeroed::<i32>(max_spec, &mut self.hallocs)?;
+        self.pick_v = hip_alloc_zeroed::<i32>(max_vrows, &mut self.allocs)?;
+        self.pick_v_h = hip_host_alloc_zeroed::<i32>(max_vrows, &mut self.hallocs)?;
         self.pick_m = hip_alloc_zeroed::<i32>(max_spec, &mut self.allocs)?;
         self.pick_m_h = hip_host_alloc_zeroed::<i32>(max_spec, &mut self.hallocs)?;
-        self.arg_pv = hip_alloc_zeroed::<f32>(max_spec * 256, &mut self.allocs)?;
-        self.arg_pi = hip_alloc_zeroed::<i32>(max_spec * 256, &mut self.allocs)?;
+        self.arg_pv = hip_alloc_zeroed::<f32>(max_vrows * 256, &mut self.allocs)?;
+        self.arg_pi = hip_alloc_zeroed::<i32>(max_vrows * 256, &mut self.allocs)?;
         self.rctl = hip_alloc_zeroed::<i32>(8, &mut self.allocs)?;
         self.rctl_h = hip_host_alloc_zeroed::<i32>(8, &mut self.hallocs)?;
         self.ds_d = hip_alloc_zeroed::<tk_q36_draft_samp>(1, &mut self.allocs)?;
@@ -1314,7 +1434,8 @@ impl Q36Engine {
         self.lse_md = hip_alloc_zeroed::<f32>(2 * max_spec, &mut self.allocs)?;
         self.conf_md = hip_alloc_zeroed::<f32>(2 * max_spec, &mut self.allocs)?;
         self.hconf = hip_host_alloc_zeroed::<f32>(2 * max_spec, &mut self.hallocs)?;
-        self.hpin = hip_host_alloc_zeroed::<i32>(128, &mut self.hallocs)?;
+        // talus#78: [0, 128) misc, window tokens at HPIN_WIN, picks at HPIN_PICK, n-gram drafts at HPIN_NG (32 each)
+        self.hpin = hip_host_alloc_zeroed::<i32>(256, &mut self.hallocs)?;
 
         // Sync prompt-alias pointers
         self.d_pos = self.pos0_d;
@@ -1369,8 +1490,8 @@ impl Q36Engine {
             .or_else(|_| std::env::var("STRATA_NG_KMAX"))
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
-            .map(|v| v.clamp(self.ng_kmin, 15))
-            .unwrap_or(15.max(self.ng_kmin));
+            .map(|v| v.clamp(self.ng_kmin, self.vt_max - 1))
+            .unwrap_or((self.vt_max - 1).max(self.ng_kmin));
 
         self.dl.init(&self.tk)?;
         self.dl.kv8 = self.kv8;
@@ -1643,9 +1764,25 @@ impl Q36Engine {
             return Ok(());
         }
 
-        let (candidates, total_bytes) = i8x_candidates(model);
+        let (mut candidates, mut total_bytes) = i8x_candidates(model);
         if candidates.is_empty() || total_bytes == 0 {
             return Ok(());
+        }
+        // (#75): the FFN matrices the W4A4 sidecar will run prompt chunks on (>= 64 rows) keep no int8 copy
+        // (4.6 GiB for the default sidecar's 48 matrices, which itself takes 2.1). Their shorter chunks run on MMQ,
+        // bitwise the int8 GEMM's result (tp_i8gemm is the MMQ arithmetic in MMQ's order). If the sidecar is then
+        // refused or fails, `w4i_init` expands them after all.
+        let superseded = w4i_superseded(model, self.max_batch.max(1));
+        if !superseded.is_empty() {
+            let (keep, defer): (Vec<I8Candidate>, Vec<I8Candidate>) = candidates
+                .into_iter()
+                .partition(|c| !superseded.contains(&c.0));
+            total_bytes = keep.iter().map(|c| c.6 + c.7).sum();
+            candidates = keep;
+            self.i8c.deferred = defer;
+            if candidates.is_empty() {
+                return Ok(());
+            }
         }
 
         // Account for tp_i8x's ~26 GiB in talus-mem::Budget before expanding.
@@ -1656,6 +1793,7 @@ impl Q36Engine {
         ) {
             Ok(g) => g,
             Err(e) => {
+                self.i8c.deferred.clear(); // (none of the int8 weights fit: do not try the deferred ones later)
                 eprintln!(
                     "talus-cli: WARN: int8 prompt weights ({:.1} GiB) do not fit beside the {}-token KV cache: prompts \
                      run on the slower MMQ path. A smaller --max-context, or TALUS_PF_I8=0 \
@@ -1667,6 +1805,47 @@ impl Q36Engine {
             }
         };
         self.tp_i8x_expand(candidates, guard)
+    }
+
+    /// (#75): expand the int8 copies `tp_levers_init` left to the W4A4 sidecar that the sidecar does not hold
+    /// (refused by the budget, failed, or a matrix it skipped), under their own reservation; refused: they stay on
+    /// MMQ (the same result, slower).
+    pub fn i8x_expand_deferred(&mut self) {
+        let deferred = std::mem::take(&mut self.i8c.deferred);
+        let pending: Vec<I8Candidate> = deferred
+            .into_iter()
+            .filter(|c| !self.w4i.mats.contains_key(&c.0))
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let bytes: usize = pending.iter().map(|c| c.6 + c.7).sum();
+        let guard = match self.budget.try_reserve_guard(
+            talus_mem::BudgetCategory::Weights,
+            "tp_i8x_deferred",
+            bytes,
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!(
+                    "talus-cli: WARN: int8 prompt weights for the {} matrices the W4A4 sidecar did not take ({:.1} GiB) \
+                     do not fit: they run on MMQ (same result, slower) ({e})",
+                    pending.len(),
+                    (bytes as f64) / ((1usize << 30) as f64)
+                );
+                return;
+            }
+        };
+        let (n, b) = self.i8x_expand_list(pending);
+        let _ = self.budget.mark_materialized(guard.id());
+        self.i8c.deferred_guard = Some(guard);
+        eprintln!(
+            "talus-cli: exact int8 prompt GEMM on {n} more matrices the W4A4 sidecar did not take, {:.2} GiB \
+             ({} matrices, {:.2} GiB in all)",
+            (b as f64) / ((1usize << 30) as f64),
+            self.i8c.len(),
+            (self.i8c.bytes as f64) / ((1usize << 30) as f64)
+        );
     }
 }
 
@@ -1733,6 +1912,175 @@ impl Q36Engine {
     }
 }
 
+/// (#75): the W4A4 sidecar `w4i_load` would load, without uploading anything: path, planes, the selected
+/// matrices (keyed like `I8Cache`: the GGUF weight pointer) and their device bytes (`total` weights, `act` the packed
+/// activation buffers for `rows`-row chunks). None when the sidecar is off, absent, unusable or selects nothing
+/// (`quiet`: no log lines; the planner and `tp_levers_init` ask before `w4i_init` logs the outcome).
+pub(crate) struct W4iSel {
+    pub path: String,
+    pub planes: String,
+    pub mode: &'static str,
+    pub f: std::fs::File,
+    pub want: Vec<(usize, super::w4i::W4iEntry, i32, i32)>,
+    pub total: usize,
+    pub act: usize,
+    pub kmax: i32,
+}
+
+pub(crate) fn w4i_select(model: &Q36Model, rows: i32, quiet: bool) -> Option<W4iSel> {
+    let say = |m: String| {
+        if !quiet {
+            eprintln!("{m}");
+        }
+    };
+    let env = std::env::var("TALUS_Q27_W4I").ok();
+    let Some((path, def_planes, mode)) =
+        super::w4i::resolve(env.as_deref(), model.file_path.as_deref())
+    else {
+        if env.is_some() {
+            say(format!(
+                "talus-cli: W4A4 prompt GEMMs off (TALUS_Q27_W4I={}): exact int8 prompt path",
+                env.unwrap_or_default()
+            ));
+        }
+        return None;
+    };
+    let path = path.to_string_lossy().into_owned();
+    if !std::path::Path::new(&path).exists() {
+        if mode == "default" {
+            return None; // (no sidecar installed: the exact int8 prompt path, silently)
+        }
+        say(format!(
+            "talus-cli: W4A4 sidecar {path} not found ({mode}): prompts stay on the exact int8 path \
+             (place the matching .w4i next to the GGUF, or TALUS_Q27_W4I=0 to silence this)"
+        ));
+        return None;
+    }
+    if !talus_pf_w4i_available() {
+        say(format!("talus-cli: W4A4 sidecar {path} found but libtalus_kernels has no tp_w4i: prompts stay exact"));
+        return None;
+    }
+    let planes = std::env::var("TALUS_Q27_W4I_PLANES").unwrap_or_else(|_| def_planes.to_string());
+    let mut f = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            say(format!(
+                "talus-cli: W4A4 sidecar {path}: {e}: prompts stay exact"
+            ));
+            return None;
+        }
+    };
+    let (idx, src) = match super::w4i::read_index(&mut f) {
+        Ok(v) => v,
+        Err(e) => {
+            say(format!(
+                "talus-cli: W4A4 sidecar {path}: {e}: prompts stay exact"
+            ));
+            return None;
+        }
+    };
+    if mode == "default" && src.as_ref().map(|s| s.version).unwrap_or(1) < 3 {
+        say(format!(
+            "talus-cli: W4A4 sidecar {path} is format v{} (pre-rd-q4quant): off by default, TALUS_Q27_W4I=auto to use it",
+            src.as_ref().map(|s| s.version).unwrap_or(1)
+        ));
+        return None;
+    }
+    if let (Some(src), Some(g)) = (&src, model.file_path.as_deref()) {
+        let gsize = std::fs::metadata(g).map(|m| m.len()).unwrap_or(0);
+        if src.size != 0 && src.size != gsize {
+            say(format!(
+                "talus-cli: W4A4 sidecar {path} was built for {} ({} bytes), not {} ({gsize} bytes): prompts stay exact",
+                src.name,
+                src.size,
+                g.display()
+            ));
+            return None;
+        }
+    }
+    let by_name: HashMap<&str, &super::w4i::W4iEntry> =
+        idx.iter().map(|e| (e.name.as_str(), e)).collect();
+    let mut want: Vec<(usize, super::w4i::W4iEntry, i32, i32)> = Vec::new();
+    let mut total = 0usize;
+    for (li, L) in model.layers.iter().enumerate() {
+        for (plane, nm, w) in [
+            (0usize, "ffn_gate", &L.ffn_gate_mat),
+            (2, "ffn_up", &L.ffn_up_mat),
+            (1, "ffn_down", &L.ffn_down_mat),
+        ] {
+            if w.is_null() || !super::w4i::plane_selected(&planes, li, plane) {
+                continue;
+            }
+            let name = format!("blk.{li}.{nm}.weight");
+            let Some(e) = by_name.get(name.as_str()) else {
+                continue;
+            };
+            if e.n as i32 != w.n_out || e.k as i32 != w.n_in || e.n % 128 != 0 || e.k % 256 != 0 {
+                say(format!(
+                    "talus-cli: TALUS_Q27_W4I: {name} shape mismatch, skipped"
+                ));
+                continue;
+            }
+            // rd-q4quant v3: smoothing / best-of-4 scales / 128-col groups need the pack2 kernel
+            if (e.off_ismooth != 0
+                || e.flags & 1 != 0
+                || e.wg == 128
+                || std::env::var("TALUS_Q27_W4I_KMODE").is_ok_and(|v| v == "1"))
+                && !talus_pf_w4i_pack2_available()
+            {
+                say(format!("talus-cli: TALUS_Q27_W4I: {name} needs talus_pf_w4i_pack2 (old libtalus_kernels), skipped"));
+                continue;
+            }
+            let wsb = if e.wg == 0 {
+                e.n as usize * 4
+            } else {
+                e.n as usize * (e.k / e.wg) as usize * 4
+            };
+            let smb = if e.off_ismooth != 0 {
+                e.k as usize * 4
+            } else {
+                0
+            };
+            total += e.n as usize * e.k as usize / 2 + wsb + e.k as usize + smb;
+            want.push((w.d as usize, (*e).clone(), e.wg as i32, wsb as i32));
+        }
+    }
+    if want.is_empty() {
+        say(format!(
+            "talus-cli: TALUS_Q27_W4I: no selected matrix in {path}: prompts stay exact"
+        ));
+        return None;
+    }
+    let kmax = want.iter().map(|w| w.1.k as i32).max().unwrap_or(0);
+    let act = 2
+        * (rows as usize * kmax as usize / 2
+            + rows as usize * (kmax as usize / 32)
+            + rows as usize * 4);
+    Some(W4iSel {
+        path,
+        planes,
+        mode,
+        f,
+        want,
+        total,
+        act,
+        kmax,
+    })
+}
+
+/// (#75): the weight pointers (`I8Cache` keys) of the FFN matrices the W4A4 sidecar would take over, empty when
+/// it is off / absent / unusable, or when int8 copies are kept on purpose (`TALUS_Q27_W4I_KEEP_I8=1`).
+/// W4 runs prompt chunks of `TALUS_Q27_W4I_MIN` (64) to `rows` (the prompt chunk at load, 512) rows; shorter chunks
+/// (and longer ones, with a `--chunk` above 512) run on MMQ, which gives the int8 GEMM's result.
+pub(crate) fn w4i_superseded(model: &Q36Model, rows: i32) -> std::collections::HashSet<usize> {
+    if std::env::var("TALUS_Q27_W4I_KEEP_I8").is_ok_and(|v| v == "1") {
+        return std::collections::HashSet::new();
+    }
+    w4i_select(model, rows, true)
+        .map(|s| s.want.iter().map(|w| w.0).collect())
+        .unwrap_or_default()
+}
+
 type I8Candidate = (usize, *const u8, i32, i32, i32, i32, usize, usize);
 
 /// The dense trunk matrices tp_i8x expands and their total bytes (0 when TALUS_PF_I8=0).
@@ -1784,7 +2132,29 @@ impl Q36Engine {
         candidates: Vec<I8Candidate>,
         guard: talus_mem::ReservationGuard,
     ) -> Result<()> {
+        self.i8x_expand_list(candidates);
+        let _ = self.budget.mark_materialized(guard.id());
+        self.i8c.budget_guard = Some(guard);
+        let left = self.i8c.deferred.len();
+        eprintln!(
+            "talus-cli: exact int8 prompt GEMM on {} expanded matrices, {:.2} GiB (TALUS_PF_I8=0: MMQ){}",
+            self.i8c.len(),
+            (self.i8c.bytes as f64) / ((1usize << 30) as f64),
+            if left > 0 {
+                format!(
+                    "; {left} FFN matrices left to the W4A4 sidecar (TALUS_Q27_W4I_KEEP_I8=1 keeps their int8 copies)"
+                )
+            } else {
+                String::new()
+            }
+        );
+        Ok(())
+    }
+
+    /// Expand `candidates` into `i8c` (stops at the first failed allocation); returns (matrices, bytes) added.
+    fn i8x_expand_list(&mut self, candidates: Vec<I8Candidate>) -> (usize, usize) {
         let stream = self.s_main.cast::<c_void>();
+        let (n0, b0) = (self.i8c.len(), self.i8c.bytes);
         for (key, w_ptr, raw_qt, n_out, n_in, mode, qb, wb) in candidates {
             let qs = match hip_malloc_bytes(qb) {
                 Ok(p) => p.cast::<i8>(),
@@ -1820,14 +2190,7 @@ impl Q36Engine {
             );
         }
         let _ = unsafe { hipStreamSynchronize(self.s_main) };
-        let _ = self.budget.mark_materialized(guard.id());
-        self.i8c.budget_guard = Some(guard);
-        eprintln!(
-            "talus-cli: exact int8 prompt GEMM on {} expanded matrices, {:.2} GiB (TALUS_PF_I8=0: MMQ)",
-            self.i8c.len(),
-            (self.i8c.bytes as f64) / ((1usize << 30) as f64)
-        );
-        Ok(())
+        (self.i8c.len() - n0, self.i8c.bytes - b0)
     }
 
     #[inline]
@@ -1943,8 +2306,10 @@ impl Q36Engine {
         if tk_q36_mmvq_supported(raw_qt) {
             self.quant(x, w.n_in, n_tok);
             let col_bytes = unsafe { tk_q8_1_bytes(w.n_in, 1) };
+            // talus#78: inside a 17..32-row verify window (gemm_t raised) one call of all columns: the C++ dispatch
+            // takes the one-launch 32-column tiles where its table has them, else the 16-column chunks as before
             let cmax = if unsafe { tk_mmvq_w32_active() } != 0 {
-                16
+                self.gemm_t.max(16)
             } else {
                 8
             };
@@ -2085,7 +2450,8 @@ impl Q36Engine {
         if n_tok <= 0 || n_mats == 0 {
             return;
         }
-        if n_tok > self.gemm_t || unsafe { tk_mmvq_w32_active() } == 0 {
+        // (talus#78: the multi launch takes <= 16 columns; a 17..32-row window runs the matrices one by one)
+        if n_tok > self.gemm_t || n_tok > 16 || unsafe { tk_mmvq_w32_active() } == 0 {
             for m in 0..n_mats {
                 self.apply(ws[m], x, ys[m], n_tok);
             }
@@ -2178,126 +2544,29 @@ impl Q36Engine {
 
     /// load the opt-in W4A4 sidecar (`TALUS_Q27_W4I=<file.w4i>`, planes `TALUS_Q27_W4I_PLANES`) for the FFN
     /// matrices of the selected layers.  Any failure leaves the cache empty (the exact paths run).
+    /// The W4A4 FFN prompt GEMMs (`TALUS_Q27_W4I`), then  , #75) the int8 prompt copies that
+    /// `tp_levers_init` left to the sidecar but it did not take (refused, failed, or a matrix it does not hold).
     pub fn w4i_init(&mut self, model: &Q36Model) {
         self.w4i.clear();
-        let env = std::env::var("TALUS_Q27_W4I").ok();
-        let Some((path, def_planes, mode)) =
-            super::w4i::resolve(env.as_deref(), model.file_path.as_deref())
-        else {
-            if env.is_some() {
-                eprintln!(
-                    "talus-cli: W4A4 prompt GEMMs off (TALUS_Q27_W4I={}): exact int8 prompt path",
-                    env.unwrap_or_default()
-                );
-            }
-            return;
-        };
-        let path = path.to_string_lossy().into_owned();
-        if !std::path::Path::new(&path).exists() {
-            if mode == "default" {
-                return; // (no sidecar installed: the exact int8 prompt path, silently)
-            }
-            eprintln!(
-                "talus-cli: W4A4 sidecar {path} not found ({mode}): prompts stay on the exact int8 path \
-                 (place the matching .w4i next to the GGUF, or TALUS_Q27_W4I=0 to silence this)"
-            );
-            return;
-        }
-        if !talus_pf_w4i_available() {
-            eprintln!("talus-cli: W4A4 sidecar {path} found but libtalus_kernels has no tp_w4i: prompts stay exact");
-            return;
-        }
-        let planes =
-            std::env::var("TALUS_Q27_W4I_PLANES").unwrap_or_else(|_| def_planes.to_string());
-        let mut f = match std::fs::File::open(&path) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("talus-cli: W4A4 sidecar {path}: {e}: prompts stay exact");
-                return;
-            }
-        };
-        let (idx, src) = match super::w4i::read_index(&mut f) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("talus-cli: W4A4 sidecar {path}: {e}: prompts stay exact");
-                return;
-            }
-        };
-        if mode == "default" && src.as_ref().map(|s| s.version).unwrap_or(1) < 3 {
-            eprintln!(
-                "talus-cli: W4A4 sidecar {path} is format v{} (pre-rd-q4quant): off by default, TALUS_Q27_W4I=auto to use it",
-                src.as_ref().map(|s| s.version).unwrap_or(1)
-            );
-            return;
-        }
-        if let (Some(src), Some(g)) = (&src, model.file_path.as_deref()) {
-            let gsize = std::fs::metadata(g).map(|m| m.len()).unwrap_or(0);
-            if src.size != 0 && src.size != gsize {
-                eprintln!(
-                    "talus-cli: W4A4 sidecar {path} was built for {} ({} bytes), not {} ({gsize} bytes): prompts stay exact",
-                    src.name,
-                    src.size,
-                    g.display()
-                );
-                return;
-            }
-        }
-        let by_name: HashMap<&str, &super::w4i::W4iEntry> =
-            idx.iter().map(|e| (e.name.as_str(), e)).collect();
-        let mut want: Vec<(usize, &super::w4i::W4iEntry, i32, i32)> = Vec::new();
-        let mut total = 0usize;
-        for (li, L) in model.layers.iter().enumerate() {
-            for (plane, nm, w) in [
-                (0usize, "ffn_gate", &L.ffn_gate_mat),
-                (2, "ffn_up", &L.ffn_up_mat),
-                (1, "ffn_down", &L.ffn_down_mat),
-            ] {
-                if w.is_null() || !super::w4i::plane_selected(&planes, li, plane) {
-                    continue;
-                }
-                let name = format!("blk.{li}.{nm}.weight");
-                let Some(e) = by_name.get(name.as_str()) else {
-                    continue;
-                };
-                if e.n as i32 != w.n_out || e.k as i32 != w.n_in || e.n % 128 != 0 || e.k % 256 != 0
-                {
-                    eprintln!("talus-cli: TALUS_Q27_W4I: {name} shape mismatch, skipped");
-                    continue;
-                }
-                // rd-q4quant v3: smoothing / best-of-4 scales / 128-col groups need the pack2 kernel
-                if (e.off_ismooth != 0
-                    || e.flags & 1 != 0
-                    || e.wg == 128
-                    || std::env::var("TALUS_Q27_W4I_KMODE").is_ok_and(|v| v == "1"))
-                    && !talus_pf_w4i_pack2_available()
-                {
-                    eprintln!("talus-cli: TALUS_Q27_W4I: {name} needs talus_pf_w4i_pack2 (old libtalus_kernels), skipped");
-                    continue;
-                }
-                let wsb = if e.wg == 0 {
-                    e.n as usize * 4
-                } else {
-                    e.n as usize * (e.k / e.wg) as usize * 4
-                };
-                let smb = if e.off_ismooth != 0 {
-                    e.k as usize * 4
-                } else {
-                    0
-                };
-                total += e.n as usize * e.k as usize / 2 + wsb + e.k as usize + smb;
-                want.push((w.d as usize, *e, e.wg as i32, wsb as i32));
-            }
-        }
-        if want.is_empty() {
-            eprintln!("talus-cli: TALUS_Q27_W4I: no selected matrix in {path}: prompts stay exact");
-            return;
-        }
+        self.w4i_load(model);
+        self.i8x_expand_deferred();
+    }
+
+    fn w4i_load(&mut self, model: &Q36Model) {
         let rows = self.max_batch.max(1);
-        let kmax = want.iter().map(|w| w.1.k as i32).max().unwrap_or(0);
-        let act = 2
-            * (rows as usize * kmax as usize / 2
-                + rows as usize * (kmax as usize / 32)
-                + rows as usize * 4);
+        let Some(sel) = w4i_select(model, rows, false) else {
+            return;
+        };
+        let W4iSel {
+            path,
+            planes,
+            mode,
+            mut f,
+            want,
+            total,
+            act,
+            kmax,
+        } = sel;
         let guard = match self.budget.try_reserve_guard(
             talus_mem::BudgetCategory::Weights,
             "tp_w4i_sidecar",
@@ -4121,6 +4390,11 @@ impl Q36Engine {
         let E = g.n_embd as i32;
         let eps = g.rms_norm_eps;
         let stream = self.s_main.cast::<c_void>();
+        let wide_g = if verify {
+            self.wide_enter(n_tok)
+        } else {
+            self.gemm_t
+        };
         self.prep(n_tok);
         let _ = tk_q36_embed_rows(
             self.tk.as_ptr(),
@@ -4175,10 +4449,10 @@ impl Q36Engine {
             if self.use_dflash && self.df.ready {
                 self.df.tap((li + 1) as i32, self.x, n_tok, self.s_main);
             }
-            if !self.dbg.is_null() && self.dbg_row + n_tok <= 16 {
+            if !self.dbg.is_null() && (self.dbg_row + n_tok) as usize <= Q27_VMAX {
                 let dst = unsafe {
                     self.dbg
-                        .add((li * 16 + (self.dbg_row as usize)) * (E as usize))
+                        .add((li * Q27_VMAX + (self.dbg_row as usize)) * (E as usize))
                 };
                 let _ = unsafe {
                     hipMemcpyAsync(
@@ -4200,6 +4474,34 @@ impl Q36Engine {
         if heads > 0 {
             let hn = unsafe { self.h_last.add(((n_tok - heads) as usize) * (E as usize)) };
             self.head_rows_with_pick(hn, heads, self.logits, self.pick_v, None, ptr::null());
+        }
+        self.wide_exit(wide_g);
+    }
+
+    /// talus#78: a verify window (or its round-advance MTP rows) of 17..=vt_max rows runs every product on the
+    /// decode-width path (mat-vec / one-launch tiles, the same per-row arithmetic as a decode step), by raising
+    /// gemm_t for the call. Returns the gemm_t to restore. Prompt chunks never come here. Off in cluster mode.
+    #[inline]
+    pub fn wide_enter(&mut self, t: i32) -> i32 {
+        let g = self.gemm_t;
+        if t > g && t <= self.vt_max && self.cl.is_none() {
+            self.gemm_t = self.vt_max;
+        }
+        g
+    }
+
+    #[inline]
+    pub fn wide_exit(&mut self, g: i32) {
+        self.gemm_t = g;
+    }
+
+    /// talus#78: the widest window the proposers may build now (16 in cluster mode).
+    #[inline]
+    pub fn vt_cap(&self) -> i32 {
+        if self.cl.is_some() {
+            self.vt_max.min(16)
+        } else {
+            self.vt_max
         }
     }
 
@@ -4236,6 +4538,12 @@ impl Q36Engine {
         let E = g.n_embd as i32;
         let eps = g.rms_norm_eps;
         let stream = self.s_main.cast::<c_void>();
+        // talus#78: the round advance after a 17..32-row window (graph mode) runs its MTP rows at decode width too
+        let wide_g = if _graph_mode {
+            self.wide_enter(T)
+        } else {
+            self.gemm_t
+        };
         self.prep(T);
         let _ = tk_q36_embed_rows(
             self.tk.as_ptr(),
@@ -4340,6 +4648,7 @@ impl Q36Engine {
                 self.head_rows_with_pick(last_hn, 1, self.logits_m, pk, Some(head), self.draft_map);
             }
         }
+        self.wide_exit(wide_g);
     }
 
     /// Run single-token MTP draft block (`Engine::forward_mtp` convenience wrapper).
@@ -4621,8 +4930,8 @@ impl Q36Engine {
                 let _ = self.ensure_round_graphs(self.mtp_d as usize, false, self.use_dflash);
             }
             let mut dw = self.mtp_d;
-            let mut win = [0i32; 16];
-            let mut picks = [0i32; 16];
+            let mut win = [0i32; Q27_VMAX];
+            let mut picks = [0i32; Q27_VMAX];
             self.spec_start_window(filler, self.mtp_d);
             self.spec_verify_window(&mut dw, &mut win, &mut picks);
             self.spec_advance_window(0, picks[0], self.mtp_d, None);
@@ -4657,7 +4966,7 @@ impl Q36Engine {
         k: usize,
         already_on_host: bool,
     ) -> Vec<talus_spec::logprobs::RowLogprobs> {
-        let rows = chosen.len().min(16);
+        let rows = chosen.len().min(Q27_VMAX);
         let v = self.n_vocab().max(0) as usize;
         if rows == 0 || v == 0 {
             return Vec::new();
@@ -4850,10 +5159,10 @@ impl Q36Engine {
         let g = self.model().g.clone();
         let N = g.n_embd as usize;
         let L = self.model().layers.len();
-        let T = toks.len().clamp(1, 16);
+        let T = toks.len().clamp(1, self.vt_cap().max(16) as usize);
         let V = g.n_vocab as usize;
-        let mut a = vec![0.0f32; L * 16 * N];
-        let mut b = vec![0.0f32; L * 16 * N];
+        let mut a = vec![0.0f32; L * Q27_VMAX * N];
+        let mut b = vec![0.0f32; L * Q27_VMAX * N];
         let mut la = vec![0.0f32; T * V];
         let mut lb = vec![0.0f32; T * V];
 
@@ -4944,7 +5253,7 @@ impl Q36Engine {
         let mut bad = 0usize;
         for l in 0..L {
             for t in 0..T {
-                let off = (l * 16 + t) * N;
+                let off = (l * Q27_VMAX + t) * N;
                 let pa = &a[off..off + N];
                 let pb = &b[off..off + N];
                 if pa

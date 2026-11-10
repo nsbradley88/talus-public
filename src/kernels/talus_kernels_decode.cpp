@@ -189,6 +189,12 @@ inline void tk_dispatch_mmvq_cols(
     // wide calls (Laguna verify windows) take the matrix-core or LDS-staged kernel in one launch when it covers the type
     if (strata::kernels::native_mmvq_xt(ggml_type, w, x_q8_1, y, n_in, n_out, ncols, stream)) return;
     if (strata::kernels::native_mmvq_lds(ggml_type, w, x_q8_1, y, n_in, n_out, ncols, stream)) return;
+    // talus#78: 17..32 columns (27B copy windows) in one launch: the 32-column tiles, or the LDS-staged kernel for the
+    // types without a tile (opt-in); else the 16-column chunks below (bitwise the same columns either way)
+    if (ncols > 16 && ncols <= 32 &&
+        (strata::kernels::native_mmvq_tw32(ggml_type, w, x_q8_1, y, n_in, n_out, ncols, stream) ||
+         strata::kernels::native_mmvq_lds_wide(ggml_type, w, x_q8_1, y, n_in, n_out, ncols, stream)))
+        return;
     const size_t col_q8_bytes = strata::kernels::native_q8_1_bytes(n_in, 1);
     const int32_t cmax = (strata::kernels::native_mmvq_w32_supported(ggml_type) &&
                           strata::kernels::native_mmvq_w32_active())

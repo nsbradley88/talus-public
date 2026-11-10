@@ -1961,6 +1961,161 @@ void glm_kda_step_v3_kernel(
     }
 }
 
+// v4 KDA step (glm-kda4): one lane owns one state column (128 rows in registers), 4 waves per head, so the column dot
+// products run in-lane with no cross-lane traffic and no barrier per token. Bitwise v3 (= v2): the prologue (l2 norms,
+// gates, beta) is v3's code, lane L still covering rows 4L..4L+3 with glm_wave32_sum_dpp; each in-lane dot product forms
+// v3's per-lane partials p_L (a fmaf chain over rows 4L..4L+3 from 0) and sums them in the tree glm_wave32_sum_dpp
+// builds ((p0+p1)+(p2+p3)) ... (float addition commutes bitwise, so the mirrored DPP pairings give the same nodes).
+// Prologue outputs of TC tokens are staged in LDS per chunk (two barriers per chunk, read as broadcasts).
+// glm_wave32_sum_dpp's tree over 32 lane partials, fed one leaf at a time (L = 0..31, unrolled: the parity tests
+// fold away), so at most five pending sums stay live instead of 32 leaves.
+struct GlmKdaTree32 {
+    float a1, a2, a3, a4, a5, r;
+    __device__ __forceinline__ void push(int L, float x) {
+        if ((L & 1) == 0) { a1 = x; return; }
+        x = a1 + x;
+        if ((L & 2) == 0) { a2 = x; return; }
+        x = a2 + x;
+        if ((L & 4) == 0) { a3 = x; return; }
+        x = a3 + x;
+        if ((L & 8) == 0) { a4 = x; return; }
+        x = a4 + x;
+        if ((L & 16) == 0) { a5 = x; return; }
+        r = a5 + x;
+    }
+};
+
+template <int TC>
+__global__ __launch_bounds__(128)
+void glm_kda_step_v4_kernel(
+    const float*   __restrict__ data_q,
+    const float*   __restrict__ data_k,
+    const float*   __restrict__ data_v,
+    const float*   __restrict__ data_g,
+    const float*   __restrict__ data_beta,
+    float*         __restrict__ data_state,
+    const int32_t* __restrict__ data_ids,
+    const float*   __restrict__ data_dtb,
+    const float*   __restrict__ data_a,
+    float*         __restrict__ data_dst,
+    uint32_t H,
+    uint32_t n_tokens,
+    uint32_t K_snap,
+    uint32_t n_B,
+    float    scale,
+    uint32_t prologue,
+    float    pro_lb,
+    float    pro_l2_eps)
+{
+    constexpr uint32_t S_v = 128;
+    __shared__ float4 sq[TC][32], sk[TC][32], sgx[TC][32];
+    __shared__ float sbeta[TC];
+
+    const uint32_t head_id = blockIdx.x;
+    const uint32_t b_idx   = blockIdx.z;
+    const uint32_t w       = threadIdx.x >> 5;
+    const uint32_t lane    = threadIdx.x & 31u;
+    const uint32_t col     = threadIdx.x;   // this lane's state column
+    const uint32_t sv2 = S_v * S_v;
+    const uint32_t n_seq_tokens = n_tokens / n_B;
+    const uint32_t state_stride_b = sv2 * H;
+
+    const int32_t slot_in = (K_snap > 0) ? data_ids[b_idx] : static_cast<int32_t>(b_idx);
+    const float4* st_in = reinterpret_cast<const float4*>(data_state + static_cast<size_t>(slot_in) * state_stride_b + head_id * sv2);
+    float s[S_v];
+#pragma unroll
+    for (int L = 0; L < 32; ++L) {
+        const float4 x = st_in[col * 32u + L];
+        s[4 * L] = x.x; s[4 * L + 1] = x.y; s[4 * L + 2] = x.z; s[4 * L + 3] = x.w;
+    }
+    float a_h = 0.0f;
+    float4 db = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (prologue != 0) {
+        a_h = data_a[head_id];
+        db = reinterpret_cast<const float4*>(data_dtb + head_id * S_v)[lane];
+    }
+    float nv = (n_seq_tokens > 0) ? data_v[(b_idx * n_seq_tokens) * S_v * H + head_id * S_v + col] : 0.0f;
+
+    for (uint32_t t0 = 0; t0 < n_seq_tokens; t0 += TC) {
+        const uint32_t nt = min(static_cast<uint32_t>(TC), n_seq_tokens - t0);
+        // prologue of this chunk's tokens: wave w takes tokens w, w + 4, ... (v3's wave-0 code, lane L = rows 4L..4L+3)
+        for (uint32_t j = w; j < nt; j += 4u) {
+            const uint32_t token_idx = b_idx * n_seq_tokens + t0 + j;
+            const uint32_t vb = token_idx * S_v * H + head_id * S_v;
+            float4 q = reinterpret_cast<const float4*>(data_q + vb)[lane];
+            float4 k = reinterpret_cast<const float4*>(data_k + vb)[lane];
+            const float4 gr = reinterpret_cast<const float4*>(data_g + vb)[lane];
+            float beta_val = data_beta[token_idx * H + head_id];
+            float4 g4;
+            if (prologue != 0) {
+                float qq = 0.0f, kk = 0.0f;
+                qq = fmaf(q.x, q.x, qq); qq = fmaf(q.y, q.y, qq); qq = fmaf(q.z, q.z, qq); qq = fmaf(q.w, q.w, qq);
+                kk = fmaf(k.x, k.x, kk); kk = fmaf(k.y, k.y, kk); kk = fmaf(k.z, k.z, kk); kk = fmaf(k.w, k.w, kk);
+                qq = glm_wave32_sum_dpp(qq);
+                kk = glm_wave32_sum_dpp(kk);
+                const float n = static_cast<float>(S_v);
+                const float eps = pro_l2_eps / n;
+                const float fq = rsqrtf(qq / n + eps), fk = rsqrtf(kk / n + eps), isn = rsqrtf(n);
+                q = make_float4(fq * q.x * isn, fq * q.y * isn, fq * q.z * isn, fq * q.w * isn);
+                k = make_float4(fk * k.x * isn, fk * k.y * isn, fk * k.z * isn, fk * k.w * isn);
+                beta_val = 1.0f / (1.0f + expf(-beta_val));
+                auto gx = [&](float gv, float dv) { return expf((1.0f / (1.0f + expf((gv + dv) * a_h))) * pro_lb); };
+                g4 = make_float4(gx(gr.x, db.x), gx(gr.y, db.y), gx(gr.z, db.z), gx(gr.w, db.w));
+            } else {
+                g4 = make_float4(expf(gr.x), expf(gr.y), expf(gr.z), expf(gr.w));
+            }
+            sq[j][lane] = q; sk[j][lane] = k; sgx[j][lane] = g4;
+            if (lane == 0) sbeta[j] = beta_val;
+        }
+        __syncthreads();
+        for (uint32_t j = 0; j < nt; ++j) {
+            const uint32_t t = t0 + j;
+            const uint32_t token_idx = b_idx * n_seq_tokens + t;
+            const float v_val = nv;
+            if (t + 1 < n_seq_tokens) nv = data_v[(token_idx + 1) * S_v * H + head_id * S_v + col];
+            const float beta_val = sbeta[j];
+            GlmKdaTree32 tk, ta;
+            // decay and k . s_col (v3: sc *= g, then the lane partial over its 4 rows, then the wave sum)
+#pragma unroll
+            for (int L = 0; L < 32; ++L) {
+                const float4 g = sgx[j][L], k = sk[j][L];
+                s[4 * L] *= g.x; s[4 * L + 1] *= g.y; s[4 * L + 2] *= g.z; s[4 * L + 3] *= g.w;
+                float kv = 0.0f;
+                kv = fmaf(s[4 * L], k.x, kv); kv = fmaf(s[4 * L + 1], k.y, kv);
+                kv = fmaf(s[4 * L + 2], k.z, kv); kv = fmaf(s[4 * L + 3], k.w, kv);
+                tk.push(L, kv);
+                // keep the LDS broadcast loads streaming (hoisting all 32 float4 pairs spilled the state)
+                if ((L & 3) == 3) __builtin_amdgcn_sched_barrier(0);
+            }
+            const float kv_col = tk.r;
+            const float delta = (v_val - kv_col) * beta_val;
+#pragma unroll
+            for (int L = 0; L < 32; ++L) {
+                const float4 k = sk[j][L], q = sq[j][L];
+                s[4 * L] = fmaf(k.x, delta, s[4 * L]); s[4 * L + 1] = fmaf(k.y, delta, s[4 * L + 1]);
+                s[4 * L + 2] = fmaf(k.z, delta, s[4 * L + 2]); s[4 * L + 3] = fmaf(k.w, delta, s[4 * L + 3]);
+                float at = 0.0f;
+                at = fmaf(s[4 * L], q.x, at); at = fmaf(s[4 * L + 1], q.y, at);
+                at = fmaf(s[4 * L + 2], q.z, at); at = fmaf(s[4 * L + 3], q.w, at);
+                ta.push(L, at);
+                // keep the LDS broadcast loads streaming (hoisting all 32 float4 pairs spilled the state)
+                if ((L & 3) == 3) __builtin_amdgcn_sched_barrier(0);
+            }
+            data_dst[(token_idx * H + head_id) * S_v + col] = ta.r * scale;
+            if (K_snap > 0 && t >= n_seq_tokens - K_snap) {
+                const uint32_t k_idx = t - (n_seq_tokens - K_snap);
+                const int32_t slot_out = data_ids[k_idx * n_B + b_idx];
+                if (slot_out >= 0) {
+                    float4* st_out = reinterpret_cast<float4*>(data_state + static_cast<size_t>(slot_out) * state_stride_b + head_id * sv2);
+#pragma unroll
+                    for (int L = 0; L < 32; ++L) st_out[col * 32u + L] = make_float4(s[4 * L], s[4 * L + 1], s[4 * L + 2], s[4 * L + 3]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // ============================================================================
 // 3A. DSA Decode Lightning Indexer (glm_dsa_lightning_indexer)
 //     - Direct port of ggml-vulkan/vulkan-shaders/lightning_indexer_vec.comp
@@ -3277,6 +3432,26 @@ hipError_t glm_mmvq_ids_f32(
     return glm_mmvq_ids(qtype, W, x_q8_1_scratch, ids, y, N, K, n_expert_used, n_tokens, x_group, ids_s1, stream);
 }
 
+hipError_t glm_kda_step_v4(const float* q, const float* k, const float* v, const float* g, const float* beta, float* state,
+                           const int32_t* ids, const float* dtb, const float* a, float* dst, int H, int T, int K_snap,
+                           int n_B, float scale, bool prologue, float pro_lb, float pro_l2_eps, hipStream_t stream) {
+    const dim3 grid(static_cast<uint32_t>(H), 1u, static_cast<uint32_t>(n_B));
+    hipLaunchKernelGGL((glm_kda_step_v4_kernel<16>), grid, dim3(128), 0, stream,
+        q, k, v, g, beta, state, ids, dtb, a, dst, static_cast<uint32_t>(H), static_cast<uint32_t>(T),
+        static_cast<uint32_t>(K_snap), static_cast<uint32_t>(n_B), scale, prologue ? 1u : 0u, pro_lb, pro_l2_eps);
+    return hipGetLastError();
+}
+
+hipError_t glm_kda_step_v3(const float* q, const float* k, const float* v, const float* g, const float* beta, float* state,
+                           const int32_t* ids, const float* dtb, const float* a, float* dst, int H, int T, int K_snap,
+                           int n_B, float scale, bool prologue, float pro_lb, float pro_l2_eps, hipStream_t stream) {
+    const dim3 grid(static_cast<uint32_t>(H), 2u, static_cast<uint32_t>(n_B));
+    hipLaunchKernelGGL((glm_kda_step_v3_kernel<8, 8>), grid, dim3(256), 0, stream,
+        q, k, v, g, beta, state, ids, dtb, a, dst, static_cast<uint32_t>(H), static_cast<uint32_t>(T),
+        static_cast<uint32_t>(K_snap), static_cast<uint32_t>(n_B), scale, prologue ? 1u : 0u, pro_lb, pro_l2_eps);
+    return hipGetLastError();
+}
+
 hipError_t glm_kda_step(
     const float* q,
     const float* k,
@@ -3314,6 +3489,13 @@ hipError_t glm_kda_step(
         const int nwv = (cols_per_wave - 10000) / 100, cpw = cols_per_wave % 100;
         // v3 (bitwise v2, pipelined loads) for prompt windows (T > 8 per sequence); GLM_KDA_V3=0: v2
         static const bool v3 = [] { const char* e = std::getenv("GLM_KDA_V3"); return e == nullptr || e[0] != '0'; }();
+        // glm-kda4: v4 (one column per lane, bitwise v3) for the same windows. Default OFF (bench 1.17x at T512, below the
+        // 1.6x ship rule, 2026-11-08); GLM_KDA_V4=1 opts in.
+        static const bool v4 = [] { const char* e = std::getenv("GLM_KDA_V4"); return e != nullptr && e[0] == '1'; }();
+        if (v3 && v4 && T / n_B > 8 && cpw == 8 && nwv == 8) {
+            return glm_kda_step_v4(q, k, v, g, beta, state, ids, dtb, a, dst, H, T, K_snap, n_B, scale, prologue, pro_lb,
+                                   pro_l2_eps, stream);
+        }
         if (v3 && T / n_B > 8 && cpw == 8 && nwv == 8) {
             const dim3 grid(static_cast<uint32_t>(H), static_cast<uint32_t>(S_v / 64), static_cast<uint32_t>(n_B));
             hipLaunchKernelGGL((glm_kda_step_v3_kernel<8, 8>), grid, dim3(256), 0, stream,

@@ -190,6 +190,10 @@ struct tk_prefill_state {
     void* mmq_dense_buf = nullptr;
     int64_t mmq_dense_cap_rows = 0;
     bool mmq_dense_failed = false;
+    // tk_prefill_mmq's identity row ids + bounds (glm-mem #81): it reads only these, never an activation buffer,
+    // so they get their own small buffer instead of mmq_dense_buf's rows x 32768 Q8_1 activations.
+    void* mmq_ids_buf = nullptr;
+    int64_t mmq_ids_cap_rows = 0;
     bool f16_io = false;
 
     void* algo_cache = nullptr;
@@ -232,6 +236,9 @@ tk_status tk_prefill_ctx_init(tk_ctx* ctx) TK_NOEXCEPT;
 void tk_prefill_ctx_destroy(tk_ctx* ctx) TK_NOEXCEPT;
 /// #40: free the prompt path's grown caches (dense MMQ buffer, MMQ launch context); rebuilt on next use.
 tk_status tk_prefill_trim(tk_ctx* ctx) TK_NOEXCEPT;
+/// glm-mem (#81): this context never calls the BLAS paths: its prefill state skips the hipBLAS / hipBLASLt handles and
+/// their 32 MiB workspace (per context; STRATA_PREFILL_NO_BLAS=1 does it process-wide). Call before its first use.
+void tk_prefill_ctx_skip_blas(tk_ctx* ctx) noexcept;
 
 /**
  * Load a per-architecture hipBLASLt tuning table into `ctx`'s prefill state from `dir_or_file`.

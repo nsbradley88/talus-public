@@ -187,6 +187,20 @@ pub fn load_engine(c: &mut GlmCli) -> Result<GlmEngine> {
     // activations (phase-aliased, measured 406 MiB at GLM_PCH=512) and 2 prompt-cache snapshots
     let acts: u64 = 640 << 20; // 512-token chunks with phase-aliased buffers: 406 MiB + MMQ scratch
     let snaps: u64 = (34 * (4 << 20) + 34 * 3 * 8192 * 3 * 4) as u64; // 1 by default (GLM_PROMPT_SNAPS)
+
+    // + the prompt-end record's state (talus-cli glm_serve; off with TALUS_GLM_RESEND_LOGITS=0)
+    let resend_off = matches!(
+        std::env::var("TALUS_GLM_RESEND_LOGITS")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("0") | Some("false") | Some("off")
+    );
+    let snaps = if c.serve && !resend_off {
+        2 * snaps
+    } else {
+        snaps
+    };
     let budget = Budget::with_floor(LinuxProcMemProbe::new(), weights::floor_bytes() as usize);
     let ids = weights::reserve(
         &budget,
@@ -214,7 +228,28 @@ pub fn load_engine(c: &mut GlmCli) -> Result<GlmEngine> {
     }
     let mtp_bytes = weights::mtp_weight_bytes(&g, &hp);
     preflight_gpu_memory(c, wbytes, (kv + rec) as u64 + acts + snaps, mtp_bytes, &hp)?;
-    let w = GlmWeights::load(&g, &hp, c.mtp, c.verbose)?;
+    // glm-mem (#81): serve / gen with MTP and a draft vocabulary store the output head with the draft vocabulary's
+    // rows first, so the draft head is a slice of it instead of a gathered copy (176 MiB at 65536 tokens; logits
+    // are the same bits, copied back to token order). GLM_DV_PERMUTE=0 = file order + copy, as before.
+    // GLM_DV_PERMUTE=2 (test knob): in every mode given --draft-vocab (eval / KLD dumps then score the permuted head)
+    let force = std::env::var("GLM_DV_PERMUTE").as_deref() == Ok("2");
+    let head_first = if (force || (c.mtp && (c.serve || c.gen.is_some())))
+        && lib.g.unpermute_f32.is_some()
+        && std::env::var("GLM_DV_PERMUTE")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    {
+        match &c.draft_vocab {
+            Some(dv) => Some(read_draft_vocab(dv)?),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let w = GlmWeights::load(&g, &hp, c.mtp, c.verbose, head_first.as_deref())?;
+    if c.verbose && w.output_perm.is_some() {
+        eprintln!("glm: output head stored draft-vocabulary first (no draft-head copy)");
+    }
     drop(g);
     if let Some(e) = &w.mtp_dropped {
         eprintln!(

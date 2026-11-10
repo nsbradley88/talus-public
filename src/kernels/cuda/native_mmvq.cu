@@ -1025,7 +1025,8 @@ struct Q3KTraits {
         r.scales = w->scales;
         return r;
     }
-    __device__ static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
+    template<typename XB>   // talus#78: Q81Block, or Q81Lds (native_mmvq_lds_wide); the Q81Block instance is the old code
+    __device__ static float apply(const W& r, const XB* __restrict__ x, int iqs) {
         int u[4];
         float d8[4];
 #pragma unroll
@@ -1205,7 +1206,8 @@ struct SmallTraits<IQ4NLBlock, 4> {
         r.dw = __half2float(w->d);
         return r;
     }
-    __device__ static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
+    template<typename XB>   // talus#78: Q81Block, or Q81Lds (native_mmvq_lds_wide); the Q81Block instance is the old code
+    __device__ static float apply(const W& r, const XB* __restrict__ x, int iqs) {
         const int* q8 = reinterpret_cast<const int*>(x->qs) + iqs;
         int sumi = 0;
 #pragma unroll
@@ -4703,6 +4705,28 @@ bool native_mmvq_lds(int t, const void* w, const void* x, float* y, int n_in, in
     return true;
 }
 
+// talus#78: the LDS-staged kernel for the 27B's types without a wide tile (Q3_K, Q6_K, Q8_0, IQ4_NL) at 17..32 columns:
+// one launch (weights from DRAM once) instead of two 16-column wave32 launches.  27B only (the loader's
+// native_mmvq_tw_note) and independent of STRATA_MMVQ_LDS (which would also move <= 16-column calls).  Default OFF until
+// the bench measures it: TALUS_MMVQ_LDS_WIDE=1 on, 0 off; native_mmvq_lds_wide_set (benches) forces.
+namespace { int g_lds_wide = -1; }
+void native_mmvq_lds_wide_set(int mode) { g_lds_wide = mode; }
+bool native_mmvq_lds_wide(int t, const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* stream) {
+    static const int env = [] { const char* e = std::getenv("TALUS_MMVQ_LDS_WIDE"); return e && *e ? (std::atoi(e) != 0 ? 1 : 0) : 0; }();
+    const bool on = g_lds_wide >= 0 ? g_lds_wide != 0 : (env == 1 && tw_engine_noted());
+    if (!on || ncols <= 16 || ncols > 64 || !w32_on() || !native_mmvq_w32_supported(t)) return false;
+    const auto s = static_cast<cudaStream_t>(stream);
+    switch (t) {
+    case 11: validate_shape(n_in, 1, 256); lds_dispatch<Q3KTraits>(w, x, y, n_in, n_out, ncols, s); break;
+    case 14: validate_shape(n_in, 1, 256); lds_dispatch<Q6KTraits>(w, x, y, n_in, n_out, ncols, s); break;
+    case 8:  validate_shape(n_in, 1, 32);  lds_dispatch<SmallTraits<Q80Block, 8>>(w, x, y, n_in, n_out, ncols, s); break;
+    case 20: validate_shape(n_in, 1, 32);  lds_dispatch<SmallTraits<IQ4NLBlock, 4>>(w, x, y, n_in, n_out, ncols, s); break;
+    default: return false;
+    }
+    launch_check();
+    return true;
+}
+
 // --- - exact wide dense mat-vec on gfx11 matrix cores (Laguna verify windows, Q4_K / Q5_K) ----
 // A column's sum in the wave32 kernel (KQ8Traits, R any): lane l = 8 c + j takes sub-block j of superblocks
 // sb = c + 4 i in i order, tmp += v(sb, j) with v = dm.x * (d8 * (dot1 * sc)) - dm.y * (d8 * (dot2 * m)) (dot1 the
@@ -5197,6 +5221,89 @@ void tr_multi_launch(const TwMulti& m, int blocks, const void* x, int n_in, int 
 #undef TALUS_TR_ONE
 }
 #undef TALUS_TR_NC
+// talus#78: 17..32 columns in one launch.  mode 5 = A (one wave, both column tiles), 6 = B (8 waves, wave pairs),
+// 7 / 8 = A / B with the half-wave split decode (types with X::kSplit; others take 5 / 6).  On the tile-plane copy when
+// the matrix has one, else on the GGUF rows.
+// A on IQ3_XXS GGUF rows: 256 VGPRs + 194 spills (kinfo, both decodes) - not instantiated; those calls take B.
+template<typename X, bool PACKED>
+constexpr bool tw32_a_ok() { return PACKED || !std::is_same_v<X, tw::IQ3XXS>; }
+template<typename X, bool PACKED, bool SPLIT>
+void tw32_launch_ps(bool pair, unsigned blocks, const uint8_t* wb, const Q81Block* xq, float* y, int n_in, int n_out, int ncols,
+                    cudaStream_t s) {
+    if (pair || !tw32_a_ok<X, PACKED>()) native_mmvq_tw32p_kernel<X, PACKED, SPLIT><<<blocks, 256, 0, s>>>(wb, xq, y, n_in, n_out, ncols);
+    else if constexpr (tw32_a_ok<X, PACKED>()) native_mmvq_tw32_kernel<X, PACKED, SPLIT><<<blocks, 128, 0, s>>>(wb, xq, y, n_in, n_out, ncols);
+}
+template<typename X, bool PACKED>
+void tw32_launch_p(int mode, const uint8_t* wb, const Q81Block* xq, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+    const unsigned blocks = unsigned((n_out + tw::kTileRows - 1) / tw::kTileRows);
+    const bool pair = mode == 6 || mode == 8;
+    if constexpr (X::kSplit) {   // (types without a split decode: one instance per (A / B, layout))
+        if (mode == 7 || mode == 8) { tw32_launch_ps<X, PACKED, true>(pair, blocks, wb, xq, y, n_in, n_out, ncols, s); return; }
+    }
+    tw32_launch_ps<X, PACKED, false>(pair, blocks, wb, xq, y, n_in, n_out, ncols, s);
+}
+template<typename X>
+void tw32_launch(int mode, bool packed, const void* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+    const auto* wb = static_cast<const uint8_t*>(w);
+    const auto* xq = static_cast<const Q81Block*>(x);
+    if (packed) tw32_launch_p<X, true>(mode, wb, xq, y, n_in, n_out, ncols, s);
+    else tw32_launch_p<X, false>(mode, wb, xq, y, n_in, n_out, ncols, s);
+}
+// gfx1151 first cut (before the bench): A everywhere, the split decode for the IQ3 / IQ2_S grids (as at 9..16)
+const TwRule kTw32Gfx1151[] = {
+    {21, 17, 32, 7, 0, 0}, {18, 17, 32, 7, 0, 0}, {22, 17, 32, 7, 0, 0},
+    {23, 17, 32, 5, 0, 0}, {13, 17, 32, 5, 0, 0}, {12, 17, 32, 5, 0, 0}, {17, 17, 32, 5, 0, 0},
+};
+// TALUS_MMVQ_WIDE32: unset = on where the 16-column tiles are on (tw_active: the 27B loader), 0 = kill (two 16-column
+// launches as before), 1 = on.  TALUS_MMVQ_WIDE32_TAB = TALUS_MMVQ_WIDE_TAB's syntax (mode 0 = off for that cell).
+int tw32_env() {
+    static const int m = [] { const char* e = std::getenv("TALUS_MMVQ_WIDE32"); return e && *e ? (std::atoi(e) != 0 ? 1 : 0) : -1; }();
+    return m;
+}
+std::vector<TwRule> tw32_env_rules() {
+    std::vector<TwRule> r;
+    const char* e = std::getenv("TALUS_MMVQ_WIDE32_TAB");
+    if (!e) return r;
+    std::string v(e);
+    for (size_t p0 = 0; p0 < v.size();) {
+        size_t p1 = v.find_first_of(",;", p0);
+        if (p1 == std::string::npos) p1 = v.size();
+        const std::string it = v.substr(p0, p1 - p0);
+        p0 = p1 + 1;
+        TwRule q{-1, 17, 32, 0, 0, 0};
+        size_t q0 = 0;
+        for (int k = 0; k < 5 && q0 <= it.size(); ++k) {
+            size_t q1 = it.find(':', q0);
+            if (q1 == std::string::npos) q1 = it.size();
+            const std::string t = it.substr(q0, q1 - q0);
+            q0 = q1 + 1;
+            if (t == "*" || t.empty()) continue;
+            if (k == 0) q.type = std::atoi(t.c_str());
+            else if (k == 1) { const size_t d = t.find('-'); q.n0 = std::atoi(t.c_str()); q.n1 = d == std::string::npos ? q.n0 : std::atoi(t.c_str() + d + 1); }
+            else if (k == 2) q.mode = std::atoi(t.c_str());
+            else if (k == 3) q.k = std::atoi(t.c_str());
+            else q.n = std::atoi(t.c_str());
+        }
+        r.push_back(q);
+    }
+    return r;
+}
+int g_tw32_force = -1;   // native_mmvq_tw32_set (benches)
+int tw32_mode(int type, int ncols, int n_in, int n_out) {
+    if (g_tw32_force >= 0) return g_tw32_force;
+    if (tw32_env() == 0 || !(tw32_env() == 1 || tw_active()) || w32_arch() != 1) return 0;
+    static const std::vector<TwRule> env = tw32_env_rules();
+    auto find = [&](const TwRule* b, const TwRule* e, int& m) {
+        for (const TwRule* q = b; q != e; ++q)
+            if ((q->type < 0 || q->type == type) && ncols >= q->n0 && ncols <= q->n1 && (q->k == 0 || q->k == n_in) &&
+                (q->n == 0 || q->n == n_out)) { m = q->mode; return true; }
+        return false;
+    };
+    int m = 0;
+    if (!env.empty() && find(env.data(), env.data() + env.size(), m)) return m;
+    if (find(std::begin(kTw32Gfx1151), std::end(kTw32Gfx1151), m)) return m;
+    return 0;
+}
 #define TALUS_TW_CASES(FN, ...) \
     switch (t) { \
     case 23: FN<tw::IQ4XS>(__VA_ARGS__); break; \
@@ -5263,6 +5370,17 @@ bool native_mmvq_tw_multi(int t, int n, const void* const* w, float* const* y, c
     launch_check();
     return true;
 }
+bool native_mmvq_tw32(int t, const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* stream) {
+    if (ncols < 17 || ncols > 32 || !tw_type_ok(t) || n_in % 256 != 0 || !w32_on()) return false;
+    const int mode = tw32_mode(t, ncols, n_in, n_out);
+    if (mode < 5 || mode > 8) return false;
+    const TwPacked* pk = tw_find(w, n_in, n_out);
+    const auto s = static_cast<cudaStream_t>(stream);
+    TALUS_TW_CASES(tw32_launch, mode, pk != nullptr, pk ? pk->p : w, x, y, n_in, n_out, ncols, s)
+    launch_check();
+    return true;
+}
+void native_mmvq_tw32_set(int mode) { g_tw32_force = mode; }
 #undef TALUS_TW_CASES
 bool native_mmvq_tw_active() { return tw_active(); }
 int native_mmvq_tw_pack_mode() { return tw_pack_env(); }

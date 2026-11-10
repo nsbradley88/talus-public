@@ -629,6 +629,40 @@ mod tests {
         assert_eq!(args.join(" "), "--model x --max-context 65536 --serve");
     }
 
+    /// Off means plain decode: no MTP, no prompt lookup and no long copies (with TALUS_COPY left on, the copy proposer
+    /// widens the verify window to 16 rows without any drafter).
+    #[test]
+    fn spec_off_makes_flash_next_plain() {
+        let m = model("qwen3.8-flash-next").unwrap();
+        let mut args: Vec<String> = [
+            "--native",
+            "n.gguf",
+            "--spec",
+            "5",
+            "--spec-min-p",
+            "0.5",
+            "--mtp",
+            "rt",
+            "--mtp-window",
+            "8192",
+            "--mtp-draft-vocab",
+            "dv.bin",
+            "--mtp-q4",
+            "head",
+        ]
+        .iter()
+        .map(|x| x.to_string())
+        .collect();
+        let mut env = Vec::new();
+        apply_edits(
+            &mut args,
+            &mut env,
+            &m.edits(&s(&[("spec", "off")])).unwrap(),
+        );
+        assert_eq!(args.join(" "), "--native n.gguf --spec 2 --suffix-draft 0");
+        assert_eq!(env, vec![("TALUS_COPY".into(), "0".into())]);
+    }
+
     #[test]
     fn reference_and_fast_edits() {
         let lag = model("laguna-s-2.1").unwrap();
@@ -641,13 +675,21 @@ mod tests {
         let f = mimo.edits(&mimo.level_selection(Level::Fast)).unwrap();
         assert_eq!(f, vec![Edit::Env("MIMO_IQ1M_TPMOE", "1")]);
         let fnx = model("qwen3.8-flash-next").unwrap();
-        let f = fnx.edits(&fnx.level_selection(Level::Fast)).unwrap();
-        assert_eq!(f, vec![Edit::Env("TALUS_FN_HC_BF16", "2")]);
+        // v0.1.7 (#13): 16-bit HC streams are a gated default; Reference turns them off, Fast adds nothing
+        assert!(!fnx.has_fast());
+        let r = fnx.edits(&fnx.level_selection(Level::Reference)).unwrap();
+        assert!(r.contains(&Edit::Env("TALUS_FN_HC_BF16", "0")));
+        assert!(fnx
+            .edits(&fnx.level_selection(Level::Balanced))
+            .unwrap()
+            .is_empty());
         let mut args: Vec<String> = [
             "--mtp",
             "rt",
             "--mtp-draft-vocab",
             "data/draft_vocab_en.bin",
+            "--mtp-q4",
+            "head",
             "--kv",
             "int8",
         ]

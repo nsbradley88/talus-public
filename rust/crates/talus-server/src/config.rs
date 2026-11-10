@@ -59,6 +59,9 @@ pub struct ServerConfig {
     pub reasoning_recovery: bool,
     /// Read a bare `<function=` of a declared tool, or a call missing its `</tool_call>`, as the call (default on).
     pub tool_call_recovery: bool,
+    /// Tighter `tool_call_recovery` (default off): a bare `<function=` only at the start of a line and outside code, a
+    /// `<tool_call>` only outside code.
+    pub tool_call_recovery_tight: bool,
     /// Accepted from older configs, no effect: `max_tokens` past the context is always shortened to fit, on or off.
     pub fit_max_tokens: bool,
     pub anthropic_think_unasked: bool,
@@ -118,6 +121,7 @@ impl Default for ServerConfig {
             reasoning_budget: 0,
             reasoning_recovery: true,
             tool_call_recovery: true,
+            tool_call_recovery_tight: false,
             fit_max_tokens: false,
             anthropic_think_unasked: false,
             sampling: SamplingParams::default(),
@@ -297,6 +301,10 @@ impl ServerConfig {
         for (key, slot) in [
             ("reasoning_recovery", &mut cfg.reasoning_recovery),
             ("tool_call_recovery", &mut cfg.tool_call_recovery),
+            (
+                "tool_call_recovery_tight",
+                &mut cfg.tool_call_recovery_tight,
+            ),
         ] {
             if let Some(v) = val.get(key).filter(|v| !v.is_null()) {
                 *slot = v

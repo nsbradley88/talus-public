@@ -17,7 +17,11 @@ USAGE
                 [--no-power-profile]
   talus hw      the hardware report only (read-only)
   talus update  [--check] [--rebuild] [--yes] [--dry-run]
-  talus serve   run the server on the installed models (what the service runs)
+  talus serve   run the server on the installed models in this terminal (what the service runs)
+  talus start   [--no-wait]  start the server: the user service if installed, else in the background
+                (log: ~/.local/state/talus/server.log); waits until it answers
+  talus stop    stop it (the service, or the background server setup or `talus start` started; waits up to 90 s)
+  talus status  running or not, how it was started, pid, port, model and health (exit 3 when not running)
   talus tui     open the dashboard (talus-tui)
   talus fetch   MODEL FILE... [--dir DIR]   download single model files (resumable, verified)
 
@@ -170,6 +174,14 @@ fn serve() -> i32 {
         }
     };
     let _ = std::fs::create_dir_all(&paths.state);
+    // v0.1.7 `talus stop`/`status`: the pid survives exec, so it is the server's. The service has systemd's own record.
+    let under_systemd = std::env::var_os("INVOCATION_ID").is_some();
+    if !under_systemd {
+        let _ = std::fs::write(
+            talus_setup::lifecycle::pidfile(&paths),
+            format!("{}\n", std::process::id()),
+        );
+    }
     let err = std::process::Command::new(service::server_exe(&paths))
         .args(&args)
         .exec();
@@ -178,6 +190,42 @@ fn serve() -> i32 {
         service::server_exe(&paths).display()
     ));
     1
+}
+
+/// v0.1.7 `talus start` / `stop` / `status` (public #11).
+fn lifecycle_cmd(cmd: &str, argv: Vec<String>) -> Result<i32, String> {
+    use talus_setup::lifecycle as lc;
+    let mut wait = true;
+    for a in argv {
+        match a.as_str() {
+            "--no-wait" if cmd == "start" => wait = false,
+            other => return Err(format!("unknown option for {cmd}: {other}")),
+        }
+    }
+    let paths = Paths::from_env();
+    let st = SetupState::load(&paths)?.ok_or("nothing installed yet: run `talus setup`")?;
+    let h = lc::Sys;
+    match cmd {
+        "status" => {
+            println!("{}", lc::status(&h, &paths, &st));
+            Ok(if lc::running(&h, &paths, &st) == lc::Running::No {
+                3
+            } else {
+                0
+            })
+        }
+        "stop" => {
+            ui::say(&lc::stop(&h, &paths, &st)?);
+            Ok(0)
+        }
+        _ => {
+            if wait {
+                ui::say("Starting; loading the model takes a few minutes the first time ...");
+            }
+            ui::say(&ui::good(&lc::start(&h, &paths, &st, wait)?));
+            Ok(0)
+        }
+    }
 }
 
 fn main() {
@@ -196,6 +244,7 @@ fn main() {
         }),
         "update" | "upgrade" => parse_update(argv).map(update::run),
         "serve" => Ok(serve()),
+        "start" | "stop" | "status" => lifecycle_cmd(&cmd, argv),
         // run by `talus update` with the new binary
         "migrate" => Ok(update::run_migrate(
             argv.iter().any(|a| a == "--yes" || a == "-y"),

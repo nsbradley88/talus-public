@@ -73,6 +73,10 @@ pub struct Endpoint {
     /// Talus-vs-Talus: put the server on this model/level/choices before the run (through /v1/talus/apply).
     #[serde(default)]
     pub talus: Option<TalusSelection>,
+    /// talus-server: read weight files whose hash came from the server's hash cache again (`?hash=weights&verify=1`),
+    /// for published numbers. The default takes the cached hash, valid while the file's metadata is unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verify_weights: bool,
     #[serde(default)]
     pub provenance: Provenance,
 }

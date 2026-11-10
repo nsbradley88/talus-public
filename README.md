@@ -8,13 +8,13 @@ serves each model through an OpenAI-compatible HTTP API.
 
 ## How fast is it?
 
-The current release is **v0.1.6**: faster prompt processing and code editing on Qwen3.8-Flash-Next, follow-up turns on
-Qwen3.8-27B that reuse the cached reply, greedy output that no longer depends on drafting on GLM-5.3-Flash and
-Laguna-S-2.1, documented request limits, and a warm-up before the server reports ready
-([release notes](https://github.com/nsbradley88/talus-public/releases)). GLM-5.3-Flash replies differ from v0.1.5's,
-including on short prompts; the release notes explain why.
+The current release is **v0.1.7**: faster code editing on Qwen3.8-27B (verify windows of up to 32 rows), the default
+4-bit prompt weights on 64 GB machines, an exact resend on GLM-5.3-Flash, less memory and faster prompts on GLM-5.3-Flash,
+16-bit prompt-path streams and a 4-bit draft head on Qwen3.8-Flash-Next, and `talus start` / `stop` / `status`
+([release notes](https://github.com/nsbradley88/talus-public/releases)). Qwen3.8-Flash-Next replies differ from v0.1.6's;
+the release notes explain why.
 
-Tokens per second for Talus v0.1.6 (its release candidate 3) on a Ryzen AI Max+ 395 desktop (GMKtec
+Tokens per second for Talus v0.1.7 (its release candidate 3) on a Ryzen AI Max+ 395 desktop (GMKtec
 EVO-X2, 128 GB, about 120 W sustained), end to end through the HTTP server, each model in its shipped configuration.
 `chat` is the sampled chat mix, `code` the coding-prompt mix, `edit` the code-editing mix, `pp2k` / `pp32k` prompt
 processing and `tg32k` generation at about 2K / 32K tokens of context. In brackets: the change from the published
@@ -23,11 +23,11 @@ full and checked against its pinned SHA-256.
 
 | Model | chat | code | edit | pp2k | pp32k | tg32k |
 |---|---|---|---|---|---|---|
-| Qwen3.8-27B | 49.9 (+0.2 %) | 66.8 (+0.1 %) | 123.0 (+0.3 %) | 597 | 546 (+1.1 %) | 39.1 (+0.3 %) |
-| Qwen3.8-Flash-Next | 63.5 (+1.0 %) | 73.6 (0.0 %) | 162.8 (+13.5 %) | 1,271 | 1,659 (+12.2 %) | 65.9 (+0.2 %) |
-| GLM-5.3-Flash | 32.9 (−0.9 %) | 35.0 (+1.4 %) | 35.7 (−1.7 %) | 559 | 569 (+1.8 %) | 35.2 (0.0 %) |
-| MiMo-V2.6-Flash | 40.4 (+0.2 %) | 49.9 (+1.2 %) | 65.3 (+1.2 %) | 728 | 659 (−0.3 %) | 42.9 (+1.2 %) |
-| Laguna-S-2.1 | 43.6 (+0.2 %) | 55.0 (+0.7 %) | 124.1 (+1.4 %) | 1,142 | 1,001 (−0.4 %) | 37.1 (+1.1 %) |
+| Qwen3.8-27B | 50.0 (0.0 %) | 66.7 (−0.3 %) | 133.9 (+8.7 %) | 602 | 549 (0.0 %) | 38.8 (−0.8 %) |
+| Qwen3.8-Flash-Next | 61.8 (−1.9 %) | 73.9 (+1.0 %) | 163.1 (+0.7 %) | 1,329 | 1,744 (+4.9 %) | 65.7 (+0.3 %) |
+| GLM-5.3-Flash | 33.6 (+0.3 %) | 35.0 (−0.3 %) | 35.8 (0.0 %) | 574 | 579 (+1.6 %) | 35.2 (−0.3 %) |
+| MiMo-V2.6-Flash | 40.9 (0.0 %) | 50.0 (0.0 %) | 65.5 (+0.2 %) | 732 | 660 (+0.2 %) | 43.0 (0.0 %) |
+| Laguna-S-2.1 | 43.3 (−1.4 %) | 55.0 (0.0 %) | 124.1 (−0.1 %) | 1,150 | 1,001 (0.0 %) | 37.2 (+0.3 %) |
 
 The quality gates (long-context recall, an agentic smoke test on five coding tasks, logit rows against a frozen set,
 greedy output with drafts on and off, a 45-minute soak test) ran on both machines: the soaks on the desktop, the others
@@ -245,9 +245,8 @@ and chat UIs connect to it directly.
   or Anthropic's `thinking` object.
 - **Prompt cache:** a new request reuses the longest cached prefix of an earlier conversation and reads only the rest.
   The usage reports the reused tokens (`usage.prompt_tokens_details.cached_tokens`). An exact repeat or resend of a
-  request gives the same answer as reading it cold (checked on Qwen3.8-27B, Qwen3.8-Flash-Next, MiMo-V2.6-Flash and
-  Laguna-S-2.1). Exception: on GLM-5.3-Flash a resend resumes from an earlier cut point and can differ from the cold
-  answer (a known issue in this release). A later turn of a conversation, or a raw
+  request gives the same answer as reading it cold (checked on all five models: Qwen3.8-27B, Qwen3.8-Flash-Next,
+  GLM-5.3-Flash, MiMo-V2.6-Flash and Laguna-S-2.1; GLM-5.3-Flash from v0.1.7). A later turn of a conversation, or a raw
   prompt that extends an earlier one, can differ from the same text read cold in one go, because the engine splits the
   prompt at other points; both answers are valid, and the same history gives the same answer every time (see "exact" in
   [docs/METHODOLOGY.md](docs/METHODOLOGY.md#exact-and-opt-in-numerics)).

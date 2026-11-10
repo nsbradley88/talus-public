@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # rust/ci.sh : the repo's CI gate.
 #   CPU stages (always): pinned-toolchain check, cargo fmt --check, clippy -D warnings, cargo test, cargo deny,
+#   src/core/spec_prob_test.cpp (exact speculative sampling law and its negative controls, C++17, CPU),
 #   install.sh's NO_COLOR / no-terminal output (tests/install/no-color.sh), its build-failure output, job count and
 #   stale build directory handling (tests/install/build-error.sh).
 #   Kernel stage (opt-in): TALUS_CI_KERNELS=1 builds libtalus_kernels with ../build.sh (needs a ROCm SDK:
@@ -45,6 +46,13 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo deny check licenses
+# Exact speculative sampling law (src/core/spec_prob_test.cpp, CPU only, ~5 s): chi-square on every drafter case,
+# including the --mtp-q4 head, plus negative controls that must fail. Exit status non-zero on any failed case.
+CXX_BIN="${CXX:-c++}"
+command -v "$CXX_BIN" >/dev/null || { echo "ci.sh: no C++ compiler ($CXX_BIN) for spec_prob_test; set CXX" >&2; exit 1; }
+"$CXX_BIN" -O2 -std=c++17 -I"$SCRIPT_DIR/../include" "$SCRIPT_DIR/../src/core/spec_prob_test.cpp" -o "$TMPDIR/spec_prob_test"
+"$TMPDIR/spec_prob_test" > "$TMPDIR/spec_prob_test.out" || { cat "$TMPDIR/spec_prob_test.out"; exit 1; }
+tail -1 "$TMPDIR/spec_prob_test.out"
 "$SCRIPT_DIR/../tests/install/no-color.sh"
 "$SCRIPT_DIR/../tests/install/build-error.sh"
 

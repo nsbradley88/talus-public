@@ -503,12 +503,13 @@ inline bool gr_unfused() {
     static const bool v = [] { const char* e = std::getenv("STRATA_GR_UNFUSED"); return e && e[0] == '1'; }();
     return v;
 }
-// rb-num (opt-in TALUS_FN_HC_BF16=1 BF16 / =2 FP16): the Rust prompt path keeps R in 16 bits in the `xn` slot,
-// which the fused path leaves unused (T x 10240 x 2 bytes); the C++ path never reads it.  Unset / 0: no buffer.
+// rb-num (TALUS_FN_HC_BF16: unset / 2 = FP16, the v0.1.7 default; 1 = BF16; 0 = FP32): the Rust prompt path keeps R in
+// 16 bits in the `xn` slot, which the fused path leaves unused (T x 10240 x 2 bytes); the C++ path never reads it.
+// 0: no buffer.  Same rule as setup.rs hc16_parse.
 inline bool fn_hc16() {
     static const bool v = [] {
         const char* e = std::getenv("TALUS_FN_HC_BF16");
-        return e && (e[0] == '1' || e[0] == '2') && e[1] == 0;
+        return !(e && e[0] == '0' && e[1] == 0);
     }();
     return v;
 }

@@ -169,6 +169,18 @@ std::size_t native_mmvq_tw_packed_bytes();
 /// 3 = one row per lane (dp4a, wave-uniform activations; packed copy only, else not taken), 4 = the tiles
 /// with the decode split between the half-waves (packed copy when registered)).  TALUS_MMVQ_WIDE_TAB takes the same modes.
 void native_mmvq_tw_set(int mode);
+/// talus#78: 17..32 columns of a wide-tile type in ONE launch (two 16-column tiles of the same weight rows; every column
+/// bitwise the single-column result).  false: not taken (other widths / types / archs, TALUS_MMVQ_WIDE32=0, or the cell
+/// says 0).  Modes (TALUS_MMVQ_WIDE32_TAB, native_mmvq_tw32_set): 5 = one wave holds both column tiles (decode once),
+/// 6 = wave pairs (8 waves), 7 / 8 = 5 / 6 with the half-wave split decode; packed copy when registered.
+bool native_mmvq_tw32(int ggml_type, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                      void* stream);
+void native_mmvq_tw32_set(int mode);   // benches: -1 the table, 0 off, 5..8 force
+/// talus#78: the LDS-staged kernel above 16 columns for Q3_K / Q6_K / Q8_0 / IQ4_NL (27B loader only, TALUS_MMVQ_LDS_WIDE=1;
+/// default off until measured).  native_mmvq_lds_wide_set: -1 env, 0 off, 1 force on (benches).
+bool native_mmvq_lds_wide(int ggml_type, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                          void* stream);
+void native_mmvq_lds_wide_set(int mode);
 
 // mode 0 off, 1 on; rows per wave (0: the table).  For benches; set before graph capture.
 void native_mmvq_set_w32(int mode, int rows);

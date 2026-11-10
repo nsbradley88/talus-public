@@ -220,10 +220,9 @@ fn chat_usage_and_timing_split() {
         ["reasoning_n", "answer_n", "reasoning_ms", "answer_ms"]
     );
     assert_eq!(t.get_usize("reasoning_n"), Some(rt));
-    assert_eq!(
-        t.get_usize("reasoning_n").unwrap() + t.get_usize("answer_n").unwrap(),
-        ct
-    );
+    // "</think>" (one token) and "\n\n" are in neither count
+    assert_eq!(t.get_usize("answer_n"), Some("Hello from Talus!".len()));
+    assert_eq!(rt + "Hello from Talus!".len() + 3, ct);
     let sum = t.get_f64("reasoning_ms").unwrap() + t.get_f64("answer_ms").unwrap();
     assert!((sum - t.get_f64("predicted_ms").unwrap()).abs() <= 0.11);
 
@@ -249,4 +248,79 @@ fn chat_usage_and_timing_split() {
     );
     assert!(last.get("timings").unwrap().get("answer_ms").is_some());
     drop(srv);
+}
+
+fn chat_timings(script: &str, body: &str) -> JsonValue {
+    let cfg = ServerConfig {
+        model_name: "qwen3.8-27b".to_string(),
+        port: 0,
+        ..Default::default()
+    };
+    let srv = start(cfg, vec![script.to_string()]);
+    let (code, r) = json(srv.port(), "POST", "/v1/chat/completions", Some(body));
+    assert_eq!(code, 200, "{}", r.to_json_string());
+    r
+}
+
+fn first_choice(r: &JsonValue) -> JsonValue {
+    r.get("choices").unwrap().as_array().unwrap()[0].clone()
+}
+
+#[test]
+fn answer_n_is_zero_when_max_tokens_ends_the_reasoning() {
+    if skip() {
+        return;
+    }
+    // the "<think>" token emits nothing; predicted_n - reasoning_n called it the answer (answer_n 1, seen on the GPU)
+    let r = chat_timings(
+        "<think>Still thinking hard",
+        r#"{"model":"qwen3.8-27b","max_tokens":10,"messages":[{"role":"user","content":"Hi"}]}"#,
+    );
+    let c = first_choice(&r);
+    assert_eq!(c.get_str("finish_reason"), Some("length"));
+    let m = c.get("message").unwrap();
+    assert!(m.get("content").unwrap().is_null());
+    assert_eq!(m.get_str("reasoning_content"), Some("Still thi"));
+    let t = r.get("timings").unwrap();
+    assert_eq!(t.get_usize("predicted_n"), Some(10));
+    assert_eq!(t.get_usize("reasoning_n"), Some(9));
+    assert_eq!(t.get_usize("answer_n"), Some(0));
+    assert_eq!(t.get_f64("answer_ms"), Some(0.0));
+    assert_eq!(t.get_f64("reasoning_ms"), t.get_f64("predicted_ms"));
+}
+
+const TOOLS: &str = r#""tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]"#;
+
+#[test]
+fn answer_n_counts_a_tool_call_and_held_text() {
+    if skip() {
+        return;
+    }
+    let body = format!(
+        r#"{{"model":"qwen3.8-27b",{TOOLS},"messages":[{{"role":"user","content":"Hi"}}]}}"#
+    );
+    // every token of the call is answer, though the parser emits it all at the closing tag
+    let call = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+    let r = chat_timings(&format!("Plan.</think>\n{call}"), &body);
+    let c = first_choice(&r);
+    assert_eq!(c.get_str("finish_reason"), Some("tool_calls"));
+    let t = r.get("timings").unwrap();
+    assert_eq!(t.get_usize("reasoning_n"), Some("Plan.".len()));
+    assert_eq!(t.get_usize("answer_n"), Some(call.len()));
+
+    // a possible tag held back until the reply ends still counts, and so does the same text mid-answer
+    let r = chat_timings("</think>Hi <tool", &body);
+    let c = first_choice(&r);
+    assert_eq!(
+        c.get("message").unwrap().get_str("content"),
+        Some("Hi <tool")
+    );
+    let t = r.get("timings").unwrap();
+    assert_eq!(t.get_usize("reasoning_n"), Some(0));
+    assert_eq!(t.get_usize("answer_n"), Some("Hi <tool".len()));
+    let r = chat_timings("</think>a <tool b", &body);
+    assert_eq!(
+        r.get("timings").unwrap().get_usize("answer_n"),
+        Some("a <tool b".len())
+    );
 }

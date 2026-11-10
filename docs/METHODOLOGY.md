@@ -22,7 +22,7 @@ Which figures come from which machine:
 
 | Figures | Machine | Build |
 |---|---|---|
-| Speed of the current release (RESULTS "Speed" tables, the README's first table) | desktop | the v0.1.6 release candidate tarball (rc1; the same engine source as the published tarball, see RESULTS) |
+| Speed of the current release (RESULTS "Speed" tables, the README's first table) | desktop | the v0.1.7 release candidate tarball (rc1; the same engine source as the published tarball, see RESULTS) |
 | The previous release on the same machine (RESULTS "v0.1.2" rows and the change table) | desktop | the published v0.1.2 tarball, interleaved with the current release in the same session |
 | Qwen3.8-27B 4-bit weights against BF16 (RESULTS) | desktop | v0.1.2 (release candidate 2); not re-measured for v0.1.3 |
 | Quality gates of the current release | laptop (some soaks on the desktop; RESULTS names the machine) | the same release (RESULTS says which build each gate ran on) |
@@ -220,10 +220,10 @@ depending on where the chunks are cut. The cache only restores state at a cut po
 also use, and re-reads the rest; it never restores rows that a decode step wrote. So:
 
 - An exact repeat or resend of a request gives the same answer as the same request read cold, checked on
-  Qwen3.8-27B, Qwen3.8-Flash-Next, MiMo-V2.6-Flash and Laguna-S-2.1 (from v0.1.6; before it, a MiMo-V2.6-Flash resend
-  could differ from cold, and on Qwen3.8-Flash-Next the turn after a resend could differ from the same conversation
-  without the resend). Not yet on GLM-5.3-Flash: a resend resumes from an earlier cut point and re-reads the rest of the
-  prompt in other chunks, so its answer can differ from the cold one (a known issue in v0.1.6).
+  all five models (from v0.1.6 on Qwen3.8-27B, Qwen3.8-Flash-Next, MiMo-V2.6-Flash and Laguna-S-2.1; before it, a
+  MiMo-V2.6-Flash resend could differ from cold, and on Qwen3.8-Flash-Next the turn after a resend could differ from the
+  same conversation without the resend. From v0.1.7 on GLM-5.3-Flash: a resend used to resume from an earlier cut point
+  and re-read the rest of the prompt in other chunks; it now resumes where the first pass ended).
 - A conversation restored at the same cuts gives the same bits as reading it cold with those cuts.
 - A later turn of a conversation, or a raw prompt that extends an earlier one, is cut at other points than the same
   text read cold in one go, so its answer can differ from that cold read. Both answers are valid, and the same history

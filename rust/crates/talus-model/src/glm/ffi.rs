@@ -554,6 +554,9 @@ pub struct Tkg {
     pub glm_sparse_fa_split_bytes: unsafe extern "C" fn(c_int, c_int, c_int, c_int) -> usize,
     pub gather_rows:
         unsafe extern "C" fn(*const c_void, usize, *const i32, c_int, *mut c_void, S) -> c_int,
+    /// glm-mem (#81): logits of the row-permuted output head back in token order (optional)
+    pub unpermute_f32:
+        Option<unsafe extern "C" fn(*const f32, *const i32, c_int, c_int, *mut f32, S) -> c_int>,
     pub gather_q8_1:
         unsafe extern "C" fn(*const f32, *const i32, *mut c_void, c_int, c_int, S) -> c_int,
     /// routed experts of prompt windows on the fp16 kernels with the activations quantized once per token
@@ -710,7 +713,111 @@ pub struct Tkg {
         *mut i32,
         S,
     ) -> c_int,
+    /// lever 4  ): producers writing the next GEMM's MMQ q8_1 rows (optional; -1 = not covered)
+    pub kda_gate_mmq: Option<KdaGateMmq>,
+    pub heads_q8_0_mmq: Option<HeadsMmq>,
+    pub swiglu_clamp_mmq: Option<SwigluMmq>,
+    pub hc_post_mix_pre_mmq: Option<HcPostMixPreMmq>,
+    pub hc_post_mix_moe_pre_mmq: Option<HcPostMixMoePreMmq>,
+    pub w16_moe_on: Option<unsafe extern "C" fn(c_int, i64, c_int) -> c_int>,
 }
+
+/// tkg_kda_gate_mmq(o, g2, w, mq, layout, row0, ne1, T, H, D, eps, s)
+pub type KdaGateMmq = unsafe extern "C" fn(
+    *const f32,
+    *const f32,
+    *const f32,
+    *mut c_void,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    f32,
+    S,
+) -> c_int;
+/// tkg_heads_q8_0_mmq(W, x, mq, layout, row0, ne1, H, n_in, n_out, T, s)
+pub type HeadsMmq = unsafe extern "C" fn(
+    *const c_void,
+    *const f32,
+    *mut c_void,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    S,
+) -> c_int;
+/// tkg_swiglu_clamp_mmq(g, u, mq, layout, rows, cols, limit, s)
+pub type SwigluMmq =
+    unsafe extern "C" fn(*const f32, *const f32, *mut c_void, c_int, c_int, c_int, f32, S) -> c_int;
+/// tkg_hc_post_mix_pre_mmq: tkg_hc_post_mix_pre's arguments, then n_mq and 2 x (mq, layout, S, lim), stream
+pub type HcPostMixPreMmq = unsafe extern "C" fn(
+    *const f32,
+    *mut f32,
+    *mut f32,
+    *const c_void,
+    *mut f32,
+    c_int,
+    c_int,
+    c_int,
+    *const f32,
+    *const f32,
+    *const f32,
+    *mut f32,
+    f32,
+    f32,
+    f32,
+    c_int,
+    *mut c_void,
+    *mut i32,
+    c_int,
+    *mut c_void,
+    c_int,
+    c_int,
+    c_int,
+    *mut c_void,
+    c_int,
+    c_int,
+    c_int,
+    S,
+) -> c_int;
+/// tkg_hc_post_mix_moe_pre_mmq: tkg_hc_post_mix_moe_pre's arguments, then n_mq and 2 x (mq, layout, S, lim), stream
+pub type HcPostMixMoePreMmq = unsafe extern "C" fn(
+    *const f32,
+    *const f32,
+    *const f32,
+    *mut f32,
+    *mut f32,
+    *const c_void,
+    *mut f32,
+    c_int,
+    c_int,
+    c_int,
+    *const f32,
+    *const f32,
+    *const f32,
+    *mut f32,
+    f32,
+    f32,
+    f32,
+    c_int,
+    *mut c_void,
+    *mut i32,
+    c_int,
+    *mut c_void,
+    c_int,
+    c_int,
+    c_int,
+    *mut c_void,
+    c_int,
+    c_int,
+    c_int,
+    S,
+) -> c_int;
 
 /// Loaded kernel library: the generic table, the GLM table and one `tk_ctx`.
 pub struct GlmLib {
@@ -853,9 +960,16 @@ impl GlmLib {
             glm_sparse_fa_idx: sym!("tkg_glm_sparse_fa_idx"),
             glm_sparse_fa_split_bytes: sym!("tkg_glm_sparse_fa_split_bytes"),
             gather_rows: sym!("tkg_gather_rows"),
+            unpermute_f32: sym_opt!("tkg_unpermute_f32"),
             moe_route_sort: sym!("tkg_moe_route_sort"),
             gather_q8_1: sym!("tkg_gather_q8_1"),
             glm_mmvq_grouped: sym!("tkg_glm_mmvq_grouped"),
+            kda_gate_mmq: sym_opt!("tkg_kda_gate_mmq"),
+            heads_q8_0_mmq: sym_opt!("tkg_heads_q8_0_mmq"),
+            swiglu_clamp_mmq: sym_opt!("tkg_swiglu_clamp_mmq"),
+            hc_post_mix_pre_mmq: sym_opt!("tkg_hc_post_mix_pre_mmq"),
+            hc_post_mix_moe_pre_mmq: sym_opt!("tkg_hc_post_mix_moe_pre_mmq"),
+            w16_moe_on: sym_opt!("tkg_w16_moe_on"),
         };
         // SAFETY: plain C call.
         let abi = unsafe { (g.abi_version)() };
@@ -906,6 +1020,20 @@ impl GlmLib {
                 })
             }
         };
+        // glm-mem (#81): GLM's prompt path is MMQ / tp_moe / w16 only, never BLAS: skip the hipBLAS / hipBLASLt
+        // handles and their 32 MiB workspace for this context (a BLAS call would fail loudly with TK_ERR_HIPBLAS).
+        // GLM_PREFILL_BLAS=1 keeps them.
+        if std::env::var("GLM_PREFILL_BLAS").as_deref() != Ok("1") {
+            let cn = CString::new("tk_prefill_ctx_skip_blas").unwrap();
+            // SAFETY: handle valid.
+            let f = unsafe { dlsym(h, cn.as_ptr()) };
+            if !f.is_null() {
+                // SAFETY: extern "C" void tk_prefill_ctx_skip_blas(tk_ctx*); ctx valid and not used yet.
+                unsafe {
+                    std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut tk_ctx)>(f)(ctx);
+                }
+            }
+        }
         let prefill_trim = {
             let cn = CString::new("tk_prefill_trim").unwrap();
             // SAFETY: handle valid.

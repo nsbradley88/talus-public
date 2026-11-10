@@ -876,6 +876,49 @@ pub struct Q36StdioBackend {
     /// E6: the model file (its tokenizer backs json_schema masks) and the lazily built grammar context.
     pub model_path: Option<std::path::PathBuf>,
     pub grammar: Option<grammar::GrammarCtx>,
+    /// K31: whether the after-reply catch-up has been paying off (`TALUS_Q27_CATCHUP_SKIP`).
+    catch_up_trigger: CatchUpTrigger,
+    /// K31: when the last reply's DONE went out (the log line with the client's gap).
+    done_at: Option<Instant>,
+}
+
+/// K31: tracks whether the requests that follow a reply continue it. After each reply that crossed a grid point the
+/// first chunk the catch-up would read is remembered, whether or not the catch-up ran, so the check costs no GPU work
+/// and a paused catch-up comes back at the first request that would have used it.
+#[derive(Debug, Default)]
+struct CatchUpTrigger {
+    /// Prompt + reply up to the end of the catch-up's first chunk; empty = nothing to check.
+    expect: Vec<i32>,
+    /// Requests in a row that did not continue the reply far enough to use that chunk.
+    misses: u32,
+}
+
+impl CatchUpTrigger {
+    /// A reply crossed a grid point: `prefix` ends where the first catch-up chunk would end.
+    fn arm(&mut self, prefix: &[i32]) {
+        self.expect.clear();
+        self.expect.extend_from_slice(prefix);
+    }
+
+    /// The next request arrived. `Some(true)` = it would use the first chunk, `None` = nothing was armed.
+    fn observe(&mut self, ids: &[i32]) -> Option<bool> {
+        if self.expect.is_empty() {
+            return None;
+        }
+        let hit = ids.starts_with(&self.expect);
+        self.expect.clear();
+        self.misses = if hit {
+            0
+        } else {
+            self.misses.saturating_add(1)
+        };
+        Some(hit)
+    }
+
+    /// `skip` misses in a row pause the catch-up (0 = never).
+    fn paused(&self, skip: u32) -> bool {
+        skip > 0 && self.misses >= skip
+    }
 }
 
 /// default ladder spacing (tokens). A long prompt also gets recurrent-state snapshots at these grid points, so a
@@ -989,6 +1032,8 @@ impl Q36StdioBackend {
             pc,
             live: Vec::new(),
             live_pf: 0,
+            catch_up_trigger: CatchUpTrigger::default(),
+            done_at: None,
             cache_live: cfg.cache_live != 0,
             ng: NgramMod::with_n(ng_n),
             ngram_k: cfg.ngram,
@@ -1112,6 +1157,21 @@ impl Q36StdioBackend {
         out: &mut dyn Write,
     ) -> io::Result<()> {
         let ids = &cmd.prompt_ids;
+        let cu_hit = self.catch_up_trigger.observe(ids);
+        if let (Some(done_at), Some(arrived)) =
+            (self.done_at.take(), talus_sched::last_line_arrival())
+        {
+            eprintln!(
+                "talus-serve: request arrived {:.0} ms after the last reply, waited {:.0} ms for after-reply work{}",
+                arrived.saturating_duration_since(done_at).as_secs_f64() * 1000.0,
+                arrived.elapsed().as_secs_f64() * 1000.0,
+                match cu_hit {
+                    Some(true) => ", continues the reply",
+                    Some(false) => ", does not continue the reply",
+                    None => "",
+                }
+            );
+        }
         let max_ctx = self.eng.max_seq() as usize;
         if ids.is_empty() || ids.len() >= max_ctx || cmd.max_new <= 0 {
             let done = DoneStats {
@@ -1651,6 +1711,7 @@ impl Q36StdioBackend {
         let _save_guard =
             (self.disk.is_some() && cache_enabled).then(talus_state::disk::SaveGuard::new);
         write_done_line(out, &done)?;
+        self.done_at = Some(Instant::now());
         // w2: read the reply up to its last grid point with the prompt kernels, so the next turn restores past it
         if gridc && cache_enabled && cmd.use_cache && finish != "cancel" && catch_up_enabled() {
             out.flush()?;
@@ -1685,6 +1746,23 @@ impl Q36StdioBackend {
             .peek_with_pf(&full[..target], &self.live, self.live_pf, true);
         if r == 0 || r % grid != 0 || target - r > catch_up_max() {
             return;
+        }
+        if r < target {
+            self.catch_up_trigger.arm(&full[..r + grid]);
+        }
+        let skip = catch_up_skip();
+        if self.catch_up_trigger.paused(skip) {
+            eprintln!(
+                "talus-serve: catch-up skipped ({} requests in a row did not continue the reply)",
+                self.catch_up_trigger.misses
+            );
+            return;
+        }
+        // K31: a client that answers at once gets the engine idle; the delay costs a slower client at most its length
+        let delay = catch_up_delay();
+        let d0 = Instant::now();
+        while !talus_sched::requests_waiting() && d0.elapsed() < delay {
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         if talus_sched::requests_waiting() {
             eprintln!("talus-serve: catch-up skipped (next request waiting)");
@@ -1774,6 +1852,29 @@ fn catch_up_max() -> usize {
             .and_then(|v| v.parse().ok())
             .unwrap_or(4096)
     })
+}
+
+/// K31: `TALUS_Q27_CATCHUP_SKIP`: this many requests in a row that do not continue the reply pause the catch-up until
+/// one does (default 0 = never pause). Which grid point the next turn restores from doesn't change its output.
+fn catch_up_skip() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("TALUS_Q27_CATCHUP_SKIP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// K31: `TALUS_Q27_CATCHUP_DELAY_MS`: idle time after DONE before the catch-up starts (default 0).
+fn catch_up_delay() -> std::time::Duration {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_millis(*N.get_or_init(|| {
+        std::env::var("TALUS_Q27_CATCHUP_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }))
 }
 
 /// E2 `SCORE` for the Qwen3.8-27B engine: one cold prefill of the prompt (prompt cache off: the live state is
@@ -3026,7 +3127,10 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
     if cfg.exact_test > 0 {
         let mut pr = prompt_tokens.clone();
         let mut fz = force_tokens.clone();
-        if pr.is_empty() && cfg.exact_test > 16 {
+        // talus#78: N <= vt_max: a verify window of N rows at the prompt's end; N > vt_max: position N with
+        // TALUS_EXACT_T rows (default 4)
+        let vmax = eng.vt_max.max(16);
+        if pr.is_empty() && cfg.exact_test > vmax {
             if cfg.exact_test + 4 > eng.max_seq() {
                 eprintln!("talus-cli: --exact-test position exceeds --max-context");
                 return 2;
@@ -3036,12 +3140,17 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
                 *slot = 100 + ((i * 131) % 30000) as i32;
             }
             if fz.is_empty() {
-                for i in 0..4 {
+                let nt = std::env::var("TALUS_EXACT_T")
+                    .ok()
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .unwrap_or(4)
+                    .clamp(1, vmax);
+                for i in 0..nt {
                     fz.push(198 + i);
                 }
             }
         } else {
-            let n = cfg.exact_test.min(16);
+            let n = cfg.exact_test.min(vmax);
             if (pr.len() as i32) + n > eng.max_seq() {
                 eprintln!("talus-cli: --exact-test position exceeds --max-context");
                 return 2;
@@ -3168,8 +3277,8 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
             let t2 = Instant::now();
             if eng.dev_rounds {
                 eng.spec_start_window(nx, eng.mtp_d);
-                let mut picks = [0i32; 16];
-                let mut win = [0i32; 16];
+                let mut picks = [0i32; talus_model::qwen35::engine::Q27_VMAX];
+                let mut win = [0i32; talus_model::qwen35::engine::Q27_VMAX];
                 for i in 0..n_steps {
                     let mut dw = 0i32;
                     eng.spec_verify_window(&mut dw, &mut win, &mut picks);
@@ -3694,6 +3803,29 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn catch_up_trigger_pauses_after_misses_and_comes_back_on_a_continuation() {
+        let mut t = super::CatchUpTrigger::default();
+        assert_eq!(t.observe(&[1, 2, 3]), None); // first request: nothing armed
+        assert!(!t.paused(2));
+        t.arm(&[1, 2, 3]);
+        assert_eq!(t.observe(&[1, 2, 3, 4]), Some(true));
+        assert_eq!(t.misses, 0);
+        t.arm(&[1, 2, 3]);
+        assert_eq!(t.observe(&[1, 2]), Some(false)); // too short to use the chunk
+        assert!(!t.paused(2));
+        assert_eq!(t.observe(&[7]), None); // armed only once per reply: not a second miss
+        assert_eq!(t.misses, 1);
+        t.arm(&[1, 2, 3]);
+        assert_eq!(t.observe(&[1, 9, 3, 4]), Some(false));
+        assert!(t.paused(2));
+        assert!(!t.paused(0)); // 0 = the v0.1.5 behaviour
+        assert!(!t.paused(3));
+        t.arm(&[5, 6]); // armed while paused too, which is how it comes back
+        assert_eq!(t.observe(&[5, 6, 7]), Some(true));
+        assert!(!t.paused(2));
+    }
+
     use super::*;
     use std::path::PathBuf;
 

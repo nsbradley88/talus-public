@@ -26,6 +26,30 @@ use crate::parser::parse_tool_call;
 const MAX_TEMPLATE_FUEL: u64 = 500_000_000;
 /// The same for the capability probes at load, which render a few tiny messages.
 const CAPS_TEMPLATE_FUEL: u64 = 10_000_000;
+/// Bytes one render may write. Eight times the largest request body: a prompt this long is far over any context.
+const MAX_TEMPLATE_OUTPUT: usize = 256 << 20;
+
+/// The rendered text, up to a limit: a write past it fails, which ends the render.
+struct CappedOutput {
+    text: Vec<u8>,
+    limit: usize,
+    over: bool,
+}
+
+impl io::Write for CappedOutput {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.len() > self.limit.saturating_sub(self.text.len()) {
+            self.over = true;
+            return Err(io::ErrorKind::OutOfMemory.into());
+        }
+        self.text.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Errors produced when loading or rendering a [`ChatTemplate`] or normalizing a request.
 #[derive(Debug, Error)]
@@ -469,13 +493,24 @@ impl ChatTemplate {
             .get_template("chat")
             .map_err(|e| TemplateError::Jinja(e.to_string()))?;
 
-        tmpl.render(MjValue::from_serialize(&ctx)).map_err(|e| {
+        let mut out = CappedOutput {
+            text: Vec::new(),
+            limit: MAX_TEMPLATE_OUTPUT,
+            over: false,
+        };
+        if let Err(e) = tmpl.render_captured_to(MjValue::from_serialize(&ctx), &mut out) {
+            if out.over {
+                return Err(TemplateError::Request(format!(
+                    "chat template output is over {MAX_TEMPLATE_OUTPUT} bytes"
+                )));
+            }
             let detail = e
                 .detail()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| e.to_string());
-            TemplateError::Request(detail)
-        })
+            return Err(TemplateError::Request(detail));
+        }
+        String::from_utf8(out.text).map_err(|e| TemplateError::Jinja(e.to_string()))
     }
 
     /// Convenience method to render with `enable_thinking` explicitly set.
@@ -1676,4 +1711,24 @@ pub fn anthropic_to_messages(
     }
 
     Ok((late_system_to_user(messages), tools, kwargs))
+}
+
+#[cfg(test)]
+mod fuel_tests {
+    use super::*;
+
+    #[test]
+    fn output_past_the_limit_fails_the_write() {
+        use std::io::Write;
+        let mut out = CappedOutput {
+            text: Vec::new(),
+            limit: 8,
+            over: false,
+        };
+        assert!(out.write_all(b"12345678").is_ok());
+        assert!(!out.over);
+        assert!(out.write_all(b"9").is_err());
+        assert!(out.over);
+        assert_eq!(out.text, b"12345678");
+    }
 }

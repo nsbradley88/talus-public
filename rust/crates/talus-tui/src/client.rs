@@ -106,9 +106,16 @@ impl Client {
 /// Status code and JSON body of a raw HTTP/1.1 response (Content-Length or read-to-close; chunked is decoded).
 pub fn parse_response(raw: &[u8]) -> Result<(u16, Value), String> {
     let text = String::from_utf8_lossy(raw);
-    let (head, payload) = text
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| "malformed HTTP response".to_string())?;
+    let (head, payload) = text.split_once("\r\n\r\n").ok_or_else(|| {
+        if raw.is_empty() {
+            "connection closed before any response".to_string()
+        } else {
+            format!(
+                "malformed HTTP response: no end of headers in {} bytes",
+                raw.len()
+            )
+        }
+    })?;
     let code: u16 = head
         .split_whitespace()
         .nth(1)
@@ -170,6 +177,34 @@ mod tests {
         );
         assert!(Client::new("https://x:1", None).is_err());
         assert!(Client::new("http://x:notaport", None).is_err());
+    }
+
+    #[test]
+    fn closed_connection_is_not_called_malformed() {
+        assert_eq!(
+            parse_response(b"").unwrap_err(),
+            "connection closed before any response"
+        );
+        assert_eq!(
+            parse_response(b"HTTP/1.1 200 OK\r\n").unwrap_err(),
+            "malformed HTTP response: no end of headers in 17 bytes"
+        );
+        // a server that reads the request and closes without answering
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let t = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut got = Vec::new();
+            let mut b = [0u8; 1024];
+            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = s.read(&mut b).unwrap();
+                assert!(n > 0);
+                got.extend_from_slice(&b[..n]);
+            }
+        });
+        let r = Client::new(&url, None).unwrap().get("/x");
+        t.join().unwrap();
+        assert_eq!(r.unwrap_err(), "connection closed before any response");
     }
 
     #[test]

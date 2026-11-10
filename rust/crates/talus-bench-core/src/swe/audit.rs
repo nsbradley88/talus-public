@@ -15,7 +15,8 @@
 //! `outside_repo` (a tool process opens a file outside the repo and the system allowlist; stat/access, chdir
 //! and directory listings are exploration, not flagged), `swebench_read` (any path, argument or
 //! URL naming SWE-bench), `target_copy_read` (code of the target library outside the repo: site-packages,
-//! caches, archives), `network` (a connect to anything but the model bridge, from a tool process),
+//! caches, archives, and copies vendored inside another package such as pip/_vendor/requests: pip itself needs its
+//! copy, so only pip's own processes may open it, see [`is_pip_exec`]), `network` (a connect to anything but the model bridge, from a tool process),
 //! `network_tool` (curl/wget/pip install/npm/ssh/... executed), `audit_missing` (the trace is unreadable),
 //! `git_history` (reaching objects beyond the snapshot: fetch/pull/clone/ls-remote, URLs, or naming a commit
 //! other than the snapshot's; probes such as --all, reflog or fsck are the `git_probe` note) (formerly: git commands that name other
@@ -255,6 +256,24 @@ impl Policy {
             })
         {
             out.push(("bundle_copy_read", p.to_string()));
+        }
+        // a copy vendored inside another package (pip/_vendor/requests in every SWE image, at a later release than
+        // any requests task), or pip's bundled wheel, which holds the same copy; the strace audit lets pip's own
+        // processes open them (`vendored_kind`). Case-sensitive like the site-packages rule: paths, not names.
+        let real_segs: Vec<&str> = p.split('/').collect();
+        let vendored = !self.target_module.is_empty()
+            && real_segs.windows(2).any(|w| {
+                ["_vendor", "vendor", "vendored"].contains(&w[0]) && w[1] == self.target_module
+            });
+        let pip_wheel = self.target_module == "requests"
+            && real_segs.windows(3).any(|w| {
+                w[0] == "ensurepip"
+                    && w[1] == "_bundled"
+                    && w[2].starts_with("pip-")
+                    && w[2].ends_with(".whl")
+            });
+        if vendored || pip_wheel {
+            out.push(("vendored_copy_read", p.to_string()));
         }
         // ancestor directories of the repo and of allowed prefixes (path resolution, e.g. python's /opt while
         // finding /opt/miniconda3) and the allowlist
@@ -506,6 +525,65 @@ fn bundle_kind(k: &'static str, tool: bool) -> Option<&'static str> {
     }
 }
 
+/// `vendored_copy_read` counts as `target_copy_read`, except for pip (or the harness's own interpreter) loading its
+/// own vendored packages, which is how pip runs and shows the model nothing.
+fn vendored_kind(k: &'static str, own_copy: bool) -> Option<&'static str> {
+    match k {
+        "vendored_copy_read" if own_copy => None,
+        "vendored_copy_read" => Some("target_copy_read"),
+        _ => Some(k),
+    }
+}
+
+/// Where pip's code lives in the images: root-owned, the agent (uid 4242) cannot write there.
+fn in_trusted_env(p: &str) -> bool {
+    p.starts_with("/opt/miniconda3/") || p.starts_with("/usr/")
+}
+
+/// Does this exec run the environment's real pip? Judged from the executable's path and the interpreter's own
+/// argument order, never from argv[0] (`exec -a pip`), a script's name elsewhere (`/tmp/pip`), or a later `-m pip`
+/// (`python -c CODE -m pip` runs CODE). A pip run from a venv the model made is not trusted: the model can write there.
+fn is_pip_exec(exe: &str, argv: &[String]) -> bool {
+    if !in_trusted_env(exe) {
+        return false;
+    }
+    let base = exe.rsplit('/').next().unwrap_or("");
+    let numbered = |rest: &str| rest.chars().all(|c| c.is_ascii_digit() || c == '.');
+    if base.strip_prefix("pip").is_some_and(numbered) {
+        return true;
+    }
+    if !base.strip_prefix("python").is_some_and(numbered) {
+        return false;
+    }
+    let mut args = argv.iter().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "-W" | "-X" => {
+                args.next();
+            }
+            "-" => return false,
+            f if f.starts_with('-') => {
+                // a short-flag cluster such as -Im; `--` and long options name no module or code
+                let flags = f.trim_start_matches('-');
+                if flags.ends_with('m') {
+                    return args.next().is_some_and(|m| m == "pip");
+                }
+                if flags.contains('c') {
+                    return false;
+                }
+            }
+            // pip re-running itself: `python .../site-packages/pip ...` or `.../pip/__pip-runner__.py`
+            script => {
+                return in_trusted_env(script)
+                    && (script.trim_end_matches('/').ends_with("/pip")
+                        || script.ends_with("/pip/__main__.py")
+                        || script.ends_with("/pip/__pip-runner__.py"));
+            }
+        }
+    }
+    false
+}
+
 fn is_harness_exe(path: &str, policy: &Policy) -> bool {
     path == policy.harness_exe
         || path.ends_with("/opencode")
@@ -541,6 +619,8 @@ struct Procs<'a> {
     actor: BTreeMap<u32, Actor>,
     /// processes that are (or descend from) opencode: a shell they start is a tool call
     under_harness: BTreeMap<u32, bool>,
+    /// processes running the environment's real pip ([`is_pip_exec`]), until they load python code from elsewhere
+    pip: BTreeMap<u32, bool>,
     start_cwd: &'a str,
 }
 
@@ -568,6 +648,8 @@ impl Procs<'_> {
                 self.actor.insert(q, act);
                 let u = *self.under_harness.get(&pp).unwrap_or(&false);
                 self.under_harness.insert(q, u);
+                let pip = *self.pip.get(&pp).unwrap_or(&false);
+                self.pip.insert(q, pip);
             }
             self.known.insert(q);
         }
@@ -598,6 +680,7 @@ where
         exe: BTreeMap::new(),
         actor: BTreeMap::new(),
         under_harness: BTreeMap::new(),
+        pip: BTreeMap::new(),
         start_cwd,
     };
     for line in source() {
@@ -668,6 +751,14 @@ fn audit_pass<I, S>(
             .and_then(|r| r[1].parse::<i64>().ok())
             .is_some_and(|v| v < 0);
         let tool = procs.actor.get(&pid) == Some(&Actor::Tool);
+        // pip's own imports of its vendored packages, or the harness's interpreter: not a read of a copy
+        let own_copy = |procs: &Procs| {
+            procs.pip.get(&pid) == Some(&true)
+                || procs
+                    .exe
+                    .get(&pid)
+                    .is_some_and(|e| is_harness_exe(e, policy))
+        };
         match name.as_str() {
             "execve" => {
                 let path = first_cstr(&args).unwrap_or_default();
@@ -697,6 +788,9 @@ fn audit_pass<I, S>(
                 let mut tool = tool;
                 if !failed {
                     procs.exe.insert(pid, path.clone());
+                    procs
+                        .pip
+                        .insert(pid, is_pip_exec(&join(&here, &path), &argv));
                     if is_harness_exe(&path, policy) {
                         procs.under_harness.insert(pid, true);
                     } else if is_shell(&path) && procs.under_harness.get(&pid) == Some(&true) {
@@ -722,7 +816,9 @@ fn audit_pass<I, S>(
                     }
                 }
                 for (k, d) in policy.check_path(&join(&here, &path)) {
-                    let Some(k) = bundle_kind(k, tool) else {
+                    let Some(k) =
+                        bundle_kind(k, tool).and_then(|k| vendored_kind(k, own_copy(procs)))
+                    else {
                         continue;
                     };
                     if k != "outside_repo" {
@@ -737,7 +833,9 @@ fn audit_pass<I, S>(
                     }
                     // changing directory is not reading: what is opened there is checked
                     for (k, d) in policy.check_path(&join(&here, &p)) {
-                        let Some(k) = bundle_kind(k, tool) else {
+                        let Some(k) =
+                            bundle_kind(k, tool).and_then(|k| vendored_kind(k, own_copy(procs)))
+                        else {
                             continue;
                         };
                         if k != "outside_repo" {
@@ -827,8 +925,19 @@ fn audit_pass<I, S>(
                     let opens_file = ["open", "openat", "openat2", "creat"]
                         .contains(&name.as_str())
                         && !args.contains("O_DIRECTORY");
+                    // a pip process that loads python code from a place the model can write (a local `pip/`
+                    // package under `python -m pip`, sitecustomize.py on PYTHONPATH) is no longer just pip
+                    if opens_file
+                        && !failed
+                        && (abs.ends_with(".py") || abs.ends_with(".pyc"))
+                        && !in_trusted_env(&abs)
+                    {
+                        procs.pip.insert(pid, false);
+                    }
                     for (k, d) in policy.check_path(&abs) {
-                        let Some(k) = bundle_kind(k, tool) else {
+                        let Some(k) =
+                            bundle_kind(k, tool).and_then(|k| vendored_kind(k, own_copy(procs)))
+                        else {
                             continue;
                         };
                         // the harness's own probing outside the repo (its runtime, certificates, config lookups)
@@ -893,7 +1002,8 @@ pub fn audit_events(events: &str, policy: &Policy, a: &mut Audit) {
                 if p.starts_with('/') {
                     for (k, d) in policy.check_path(p) {
                         // every event is the model's own action
-                        let Some(k) = bundle_kind(k, true) else {
+                        let Some(k) = bundle_kind(k, true).and_then(|k| vendored_kind(k, false))
+                        else {
                             continue;
                         };
                         a.flag(k, d, "events");
@@ -947,6 +1057,119 @@ mod tests {
             target_module: "demolib".into(),
             target_dist: "demo-lib".into(),
         }
+    }
+
+    /// Lines shaped as in a real strace of the psf__requests-2931 image (pip 24.2 and 23.3.1).
+    fn vendored_flags(log: &str, module: &str) -> Vec<String> {
+        let mut p = policy("/testbed");
+        p.target_module = module.into();
+        p.target_dist = module.into();
+        let mut a = Audit::default();
+        audit_strace(log, &p, "/testbed", &mut a);
+        assert!(!a.flags.iter().any(|f| f.kind == "vendored_copy_read"));
+        a.flags
+            .iter()
+            .filter(|f| f.kind == "target_copy_read")
+            .map(|f| f.detail.clone())
+            .collect()
+    }
+
+    const VENDORED: &str =
+        "/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/pip/_vendor/requests/sessions.py";
+
+    #[test]
+    fn pip_vendored_copy_of_the_target_is_flagged_when_read() {
+        // : this copy was readable and unflagged. Every way a model command reaches it:
+        for (name, exec) in [
+            ("cat", format!(r#"execve("/usr/bin/cat", ["cat", "{VENDORED}"], 0x1) = 0"#)),
+            ("python -c import", r#"execve("/opt/miniconda3/envs/testbed/bin/python", ["python", "-c", "import pip._vendor.requests as r"], 0x1) = 0"#.to_string()),
+            // the interpreter runs CODE; the later -m pip is only an argument to it
+            ("-c CODE -m pip", r#"execve("/opt/miniconda3/envs/testbed/bin/python", ["python", "-c", "print(1)", "-m", "pip"], 0x1) = 0"#.to_string()),
+            ("cluster -Ic", r#"execve("/opt/miniconda3/envs/testbed/bin/python", ["python", "-Ic", "print(1)", "-m", "pip"], 0x1) = 0"#.to_string()),
+            ("-m other", r#"execve("/opt/miniconda3/envs/testbed/bin/python", ["python", "-m", "pipx"], 0x1) = 0"#.to_string()),
+            // exec -a pip python ...: argv[0] says nothing
+            ("exec -a pip", r#"execve("/opt/miniconda3/envs/testbed/bin/python", ["pip", "/tmp/x.py"], 0x1) = 0"#.to_string()),
+            // the model's own script called pip, by path or in a venv it made
+            ("/tmp/pip", r#"execve("/tmp/pip", ["pip", "list"], 0x1) = 0"#.to_string()),
+            ("venv pip", r#"execve("/tmp/v1/bin/pip", ["/tmp/v1/bin/pip", "--version"], 0x1) = 0"#.to_string()),
+        ] {
+            let log = format!(
+                "100 {exec}\n100 openat(AT_FDCWD, \"{VENDORED}\", O_RDONLY|O_CLOEXEC) = 3\n"
+            );
+            assert_eq!(vendored_flags(&log, "requests"), vec![VENDORED], "{name}");
+        }
+        // cached bytecode, another env's copy, a conda package's copy, pip's bundled wheel, other vendoring packages
+        for path in [
+            "/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/pip/_vendor/requests/__pycache__/models.cpython-39.pyc",
+            "/opt/miniconda3/lib/python3.11/site-packages/pip/_vendor/requests/models.py",
+            "/opt/miniconda3/pkgs/pip-24.2-py39h06a4308_0/lib/python3.9/site-packages/pip/_vendor/requests/models.py",
+            "/usr/lib/python3/dist-packages/pip/_vendor/requests/models.py",
+            "/opt/miniconda3/envs/testbed/lib/python3.9/ensurepip/_bundled/pip-23.0.1-py3-none-any.whl",
+            "/opt/miniconda3/lib/python3.11/site-packages/botocore/vendored/requests/api.py",
+        ] {
+            let log = format!(
+                "100 execve(\"/usr/bin/cat\", [\"cat\", \"{path}\"], 0x1) = 0\n100 openat(AT_FDCWD, \"{path}\", O_RDONLY) = 3\n"
+            );
+            assert_eq!(vendored_flags(&log, "requests"), vec![path], "{path}");
+        }
+        // opencode's read tool: from the event stream
+        let mut a = Audit::default();
+        let mut p = policy("/testbed");
+        p.target_module = "requests".into();
+        let ev = format!(
+            r#"{{"type":"tool_use","part":{{"type":"tool","tool":"read","state":{{"input":{{"filePath":"{VENDORED}"}}}}}}}}"#
+        );
+        audit_events(&ev, &p, &mut a);
+        assert!(
+            a.flags
+                .iter()
+                .any(|f| f.kind == "target_copy_read" && f.source == "events"),
+            "{:#?}",
+            a.flags
+        );
+    }
+
+    #[test]
+    fn pip_loading_its_own_vendored_copy_is_not_a_read() {
+        // `pip list` and friends import pip._vendor.requests on every run: must not make an instance INVALID
+        for exec in [
+            r#"execve("/opt/miniconda3/envs/testbed/bin/pip", ["pip", "list"], 0x1) = 0"#,
+            r#"execve("/opt/miniconda3/envs/testbed/bin/pip3.9", ["pip3.9", "list"], 0x1) = 0"#,
+            r#"execve("/usr/bin/pip", ["pip", "--version"], 0x1) = 0"#,
+            r#"execve("/opt/miniconda3/envs/testbed/bin/python", ["python", "-m", "pip", "check"], 0x1) = 0"#,
+            r#"execve("/opt/miniconda3/envs/testbed/bin/python", ["python", "-Im", "pip", "check"], 0x1) = 0"#,
+            r#"execve("/opt/miniconda3/envs/testbed/bin/python", ["python", "-W", "ignore", "-m", "pip", "check"], 0x1) = 0"#,
+            r#"execve("/opt/miniconda3/envs/testbed/bin/python", ["/opt/miniconda3/envs/testbed/bin/python", "/opt/miniconda3/envs/testbed/lib/python3.9/site-packages/pip/__pip-runner__.py", "install"], 0x1) = 0"#,
+        ] {
+            let log = format!(
+                "100 {exec}\n100 clone(child_stack=NULL, flags=SIGCHLD) = 101\n100 openat(AT_FDCWD, \"{VENDORED}\", O_RDONLY|O_CLOEXEC) = 3\n101 openat(AT_FDCWD, \"{VENDORED}\", O_RDONLY) = 3\n"
+            );
+            assert!(vendored_flags(&log, "requests").is_empty(), "{exec}");
+        }
+        // what pip starts is judged on its own: `pip install -e .` runs the model's setup.py
+        let log = format!(
+            r#"100 execve("/opt/miniconda3/envs/testbed/bin/pip", ["pip", "install", "-e", "."], 0x1) = 0
+100 clone(child_stack=NULL, flags=SIGCHLD) = 101
+101 execve("/opt/miniconda3/envs/testbed/bin/python", ["python", "-c", "exec(compile(setup.py))"], 0x1) = 0
+101 openat(AT_FDCWD, "{VENDORED}", O_RDONLY) = 3
+"#
+        );
+        assert_eq!(vendored_flags(&log, "requests"), vec![VENDORED]);
+        // a local package named pip under `python -m pip`, or sitecustomize.py on PYTHONPATH: code the model wrote
+        for loaded in ["/tmp/f/pip/__main__.py", "/testbed/sitecustomize.py"] {
+            let log = format!(
+                r#"100 execve("/opt/miniconda3/envs/testbed/bin/python", ["python", "-m", "pip"], 0x1) = 0
+100 openat(AT_FDCWD, "{loaded}", O_RDONLY|O_CLOEXEC) = 3
+100 openat(AT_FDCWD, "{VENDORED}", O_RDONLY) = 3
+"#
+            );
+            assert_eq!(vendored_flags(&log, "requests"), vec![VENDORED], "{loaded}");
+        }
+        // pip's copy of something else is not a copy of the target, and django is not vendored by pip
+        let log = format!(
+            "100 execve(\"/usr/bin/cat\", [\"cat\", \"{VENDORED}\"], 0x1) = 0\n100 openat(AT_FDCWD, \"{VENDORED}\", O_RDONLY) = 3\n100 openat(AT_FDCWD, \"/opt/miniconda3/envs/testbed/lib/python3.9/ensurepip/_bundled/pip-23.0.1-py3-none-any.whl\", O_RDONLY) = 3\n"
+        );
+        assert!(vendored_flags(&log, "django").is_empty());
     }
 
     #[test]
@@ -1330,6 +1553,77 @@ true"#
             .iter()
             .any(|k| *k == "bundle_copy_read" || *k == "target_copy_read"));
         assert!(kinds("/agent/mini/site/demolib/api.py").contains(&"bundle_copy_read"));
+    }
+
+    /// and together, on one requests task: each call site applies bundle_kind, then vendored_kind.
+    /// The harness's own imports (its bundle copy, its pip's vendored copy) and pip's own runs stay unflagged; every
+    /// model read of either copy is target_copy_read, from strace and from opencode's read events.
+    #[test]
+    fn bundle_and_vendored_rules_together() {
+        let bundle_vendored = "/agent/mini/site/pip/_vendor/requests/api.py";
+        let log = format!(
+            r#"100   execve("/agent/mini/python/cpython-3.12.13-linux-x86_64-gnu/bin/python3.12", ["python3.12", "mini_run.py"], 0x1 /* 1 vars */) = 0
+100   openat(AT_FDCWD, "/agent/mini/site/requests/__init__.py", O_RDONLY|O_CLOEXEC) = 3
+100   openat(AT_FDCWD, "{bundle_vendored}", O_RDONLY|O_CLOEXEC) = 3
+100   vfork() = 200
+200   execve("/bin/sh", ["/bin/sh", "-c", "cat /agent/mini/site/requests/models.py; pip list; cat {VENDORED} {bundle_vendored}"], 0x2 /* 1 vars */) = 0
+200   clone(child_stack=NULL, flags=SIGCHLD) = 201
+201   execve("/usr/bin/cat", ["cat", "/agent/mini/site/requests/models.py"], 0x3 /* 1 vars */) = 0
+201   openat(AT_FDCWD, "/agent/mini/site/requests/models.py", O_RDONLY) = 3
+200   clone(child_stack=NULL, flags=SIGCHLD) = 202
+202   execve("/opt/miniconda3/envs/testbed/bin/pip", ["pip", "list"], 0x3 /* 1 vars */) = 0
+202   openat(AT_FDCWD, "{VENDORED}", O_RDONLY|O_CLOEXEC) = 3
+200   clone(child_stack=NULL, flags=SIGCHLD) = 203
+203   execve("/usr/bin/cat", ["cat", "{VENDORED}", "{bundle_vendored}"], 0x3 /* 1 vars */) = 0
+203   openat(AT_FDCWD, "{VENDORED}", O_RDONLY) = 3
+203   openat(AT_FDCWD, "{bundle_vendored}", O_RDONLY) = 3
+"#
+        );
+        let mut p = policy("/testbed");
+        p.target_module = "requests".into();
+        p.target_dist = "requests".into();
+        let mut a = Audit::default();
+        audit_strace(&log, &p, "/", &mut a);
+        assert!(
+            !a.flags
+                .iter()
+                .any(|f| f.kind == "bundle_copy_read" || f.kind == "vendored_copy_read"),
+            "{:#?}",
+            a.flags
+        );
+        let mut copies: Vec<&str> = a
+            .flags
+            .iter()
+            .filter(|f| f.kind == "target_copy_read")
+            .map(|f| f.detail.as_str())
+            .collect();
+        copies.sort();
+        copies.dedup();
+        assert_eq!(
+            copies,
+            vec![
+                "/agent/mini/site/pip/_vendor/requests/api.py",
+                "/agent/mini/site/requests/models.py",
+                VENDORED,
+            ],
+            "{:#?}",
+            a.flags
+        );
+        // opencode's read tool: every event is the model's own action, so both copies flag
+        for path in ["/agent/mini/site/requests/api.py", VENDORED] {
+            let mut a = Audit::default();
+            let ev = format!(
+                r#"{{"type":"tool_use","part":{{"type":"tool","tool":"read","state":{{"input":{{"filePath":"{path}"}}}}}}}}"#
+            );
+            audit_events(&ev, &p, &mut a);
+            assert!(
+                a.flags.iter().any(|f| f.kind == "target_copy_read"
+                    && f.detail == path
+                    && f.source == "events"),
+                "{path}: {:#?}",
+                a.flags
+            );
+        }
     }
 
     #[test]

@@ -366,6 +366,10 @@ pub struct GlmWeights {
     /// Set when the NextN (MTP) layer was requested but did not fit in GPU memory (the hipMalloc error): the
     /// weights then hold the trunk only and the engine must run without MTP.
     pub mtp_dropped: Option<String>,
+    /// glm-mem (#81): `output` rows stored permuted, row i = token `output_perm[i]` (the draft vocabulary first, then
+    /// every other token ascending), so the draft head is the first rows of `output` instead of a gathered copy
+    /// (and how many leading rows are the draft vocabulary)
+    pub output_perm: Option<(Vec<u32>, usize)>,
 }
 
 unsafe impl Send for GlmWeights {}
@@ -403,7 +407,14 @@ struct Uploader<'a> {
     t_read: f64,
     t_alloc: f64,
     t_sync: f64,
+    /// glm-mem (#81): one device allocation per layer, tensors placed in it at ARENA_ALIGN offsets: (base, capacity,
+    /// used). GLM_WEIGHT_ARENA=0 = one hipMalloc per tensor, as before.
+    arena: Option<(*mut c_void, usize, usize)>,
+    use_arena: bool,
 }
+
+/// Offset alignment of a tensor inside a layer arena (hipMalloc itself guarantees 256 bytes).
+const ARENA_ALIGN: usize = 4096;
 
 impl<'a> Uploader<'a> {
     fn new(g: &'a GgufModel) -> Result<Self> {
@@ -445,7 +456,49 @@ impl<'a> Uploader<'a> {
             t_read: 0.0,
             t_alloc: 0.0,
             t_sync: 0.0,
+            arena: None,
+            use_arena: std::env::var("GLM_WEIGHT_ARENA")
+                .map(|v| v != "0")
+                .unwrap_or(true),
         })
+    }
+
+    /// Start a layer arena: one allocation holding every GGUF tensor named `prefix`* (each at an ARENA_ALIGN offset);
+    /// the following loads of those tensors are placed in it. Floor check and test limit as for one tensor.
+    fn begin_arena(&mut self, prefix: &str) -> Result<()> {
+        self.arena = None;
+        if !self.use_arena {
+            return Ok(());
+        }
+        let total: usize = self
+            .g
+            .tensors()
+            .filter(|(_, e)| e.name.starts_with(prefix))
+            .map(|(_, e)| (e.byte_size as usize).div_ceil(ARENA_ALIGN) * ARENA_ALIGN)
+            .sum();
+        if total == 0 {
+            return Ok(());
+        }
+        let p = self.alloc_checked(prefix, total)?;
+        self.arena = Some((p, total, 0));
+        Ok(())
+    }
+
+    fn end_arena(&mut self) {
+        self.arena = None;
+    }
+
+    /// Device memory for one tensor: the next slot of the open arena when it fits, else its own allocation.
+    fn place(&mut self, name: &str, bytes: usize) -> Result<*mut c_void> {
+        if let Some((base, cap, used)) = self.arena {
+            let need = bytes.div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
+            if used + need <= cap {
+                self.arena = Some((base, cap, used + need));
+                // SAFETY: inside the arena allocation.
+                return Ok(unsafe { (base as *mut u8).add(used) } as *mut c_void);
+            }
+        }
+        self.alloc_checked(name, bytes)
     }
 
     fn entry(&self, name: &str) -> Option<(TensorEntry, usize, u64)> {
@@ -487,11 +540,81 @@ impl<'a> Uploader<'a> {
             .ok_or_else(|| CoreError::MissingTensor { name: name.into() })
     }
 
-    fn load_opt(&mut self, name: &str) -> Result<Option<Tensor>> {
-        let Some((e, si, off)) = self.entry(name) else {
-            return Ok(None);
-        };
+    /// Tensor `name` (dims [n_cols, n_rows]) with its rows stored in the order `perm` (row i = file row perm[i]).
+    /// The tensor is read once into host memory and staged row by row; same bytes per row as `load`.
+    fn load_permuted(&mut self, name: &str, perm: &[u32]) -> Result<Tensor> {
+        let (e, si, off) = self
+            .entry(name)
+            .ok_or_else(|| CoreError::MissingTensor { name: name.into() })?;
         let bytes = e.byte_size as usize;
+        let n_rows = e.dims[1] as usize;
+        if perm.len() != n_rows || n_rows == 0 || bytes % n_rows != 0 {
+            return Err(CoreError::InvalidArgument {
+                reason: format!(
+                    "{name}: row permutation of {} rows for {n_rows}",
+                    perm.len()
+                ),
+            });
+        }
+        let rb = bytes / n_rows;
+        let dev = self.place(name, bytes)?;
+        let mut host = vec![0u8; bytes];
+        let tr = std::time::Instant::now();
+        self.files[si]
+            .read_exact_at(&mut host, off)
+            .map_err(|err| CoreError::IoError {
+                message: format!("pread {name}: {err}"),
+            })?;
+        self.t_read += tr.elapsed().as_secs_f64();
+        let rows_per = (STAGE / rb).max(1);
+        let mut r0 = 0usize;
+        while r0 < n_rows {
+            let nr = (n_rows - r0).min(rows_per);
+            let st = self.stage[self.which];
+            let ev = self.events[self.which];
+            // SAFETY: event valid.
+            ffi::ckh(
+                unsafe { hip_sys::hipEventSynchronize(ev) },
+                "hipEventSynchronize",
+            )?;
+            // SAFETY: stage has STAGE >= nr * rb bytes.
+            let buf = unsafe { std::slice::from_raw_parts_mut(st as *mut u8, nr * rb) };
+            for (i, &src) in perm[r0..r0 + nr].iter().enumerate() {
+                let src = src as usize;
+                buf[i * rb..(i + 1) * rb].copy_from_slice(&host[src * rb..(src + 1) * rb]);
+            }
+            // SAFETY: dev has `bytes` bytes.
+            let dst = unsafe { (dev as *mut u8).add(r0 * rb) } as *mut c_void;
+            ffi::h2d_async(dst, st, nr * rb, self.stream)?;
+            // SAFETY: event/stream valid.
+            ffi::ckh(
+                unsafe { hip_sys::hipEventRecord(ev, self.stream) },
+                "hipEventRecord",
+            )?;
+            self.which ^= 1;
+            r0 += nr;
+        }
+        // SAFETY: fd valid; advisory.
+        unsafe {
+            posix_fadvise(
+                self.files[si].as_raw_fd(),
+                off as i64,
+                bytes as i64,
+                POSIX_FADV_DONTNEED,
+            );
+        }
+        self.bytes += bytes;
+        self.names.push(name.to_string());
+        Ok(Tensor {
+            ptr: dev,
+            ty: ggml_type_id(&e),
+            ne: e.dims,
+            bytes,
+        })
+    }
+
+    /// Live floor check, the TALUS_GLM_DEV_LIMIT_GIB test limit and the device allocation of one tensor.
+    fn alloc_checked(&mut self, name: &str, bytes: usize) -> Result<*mut c_void> {
         // live check: what is still to load must fit above the floor (another process may have taken memory)
         let remaining = self.total.saturating_sub(self.bytes as u64);
         let avail = mem_available_bytes();
@@ -519,6 +642,16 @@ impl<'a> Uploader<'a> {
         let dev = dev_alloc(bytes).map_err(|e| self.alloc_context(name, e))?;
         self.t_alloc += ta.elapsed().as_secs_f64();
         self.allocs.push(dev);
+        Ok(dev)
+    }
+
+    fn load_opt(&mut self, name: &str) -> Result<Option<Tensor>> {
+        let Some((e, si, off)) = self.entry(name) else {
+            return Ok(None);
+        };
+        let bytes = e.byte_size as usize;
+        // floor check, test limit and allocation (or the open layer arena's next slot)
+        let dev = self.place(name, bytes)?;
         let fd = self.files[si].as_raw_fd();
         let mut done = 0usize;
         while done < bytes {
@@ -654,6 +787,19 @@ fn load_layer(
     output_norm: Tensor,
 ) -> Result<LayerW> {
     let b = |s: &str| format!("blk.{il}.{s}");
+    up.begin_arena(&format!("blk.{il}."))?;
+    let l = load_layer_tensors(up, hp, il, output_norm, &b);
+    up.end_arena();
+    l
+}
+
+fn load_layer_tensors(
+    up: &mut Uploader,
+    hp: &GlmHparams,
+    il: usize,
+    output_norm: Tensor,
+    b: &dyn Fn(&str) -> String,
+) -> Result<LayerW> {
     let mut l = LayerW {
         attn_norm: up.load(&b("attn_norm.weight"))?,
         ffn_norm: up.load(&b("ffn_norm.weight"))?,
@@ -748,7 +894,15 @@ fn is_oom(e: &CoreError) -> bool {
 impl GlmWeights {
     /// Load every tensor once into device memory. `budget` must already hold a Weights reservation (the caller
     /// reserves the whole engine before calling, so a refusal happens before any allocation).
-    pub fn load(g: &GgufModel, hp: &GlmHparams, load_mtp: bool, verbose: bool) -> Result<Self> {
+    /// `head_first`: token ids whose `output` rows go first (the draft vocabulary; see [`head_permutation`]), or
+    /// None for the file order.
+    pub fn load(
+        g: &GgufModel,
+        hp: &GlmHparams,
+        load_mtp: bool,
+        verbose: bool,
+        head_first: Option<&[u32]>,
+    ) -> Result<Self> {
         let t0 = std::time::Instant::now();
         let mut up = Uploader::new(g)?;
         let (tok_embd, tok_embd_rows) = if embed_on_host() {
@@ -758,7 +912,12 @@ impl GlmWeights {
             (up.load("token_embd.weight")?, None)
         };
         let output_norm = up.load("output_norm.weight")?;
-        let output = up.load("output.weight")?;
+        let output_perm =
+            head_first.and_then(|ids| head_permutation(ids, hp.n_vocab).map(|p| (p, ids.len())));
+        let output = match &output_perm {
+            Some((perm, _)) => up.load_permuted("output.weight", perm)?,
+            None => up.load("output.weight")?,
+        };
         let n_load = if load_mtp { hp.n_layer_all } else { hp.n_layer };
         let mut layers = Vec::with_capacity(n_load);
         let mut mtp_dropped = None;
@@ -803,6 +962,7 @@ impl GlmWeights {
             allocs,
             bytes,
             mtp_dropped,
+            output_perm,
         };
         // fold the indexer weight scale 1/sqrt(idx_dim * idx_heads) (= 1/64, exact) into idx_proj
         let sc = 1.0 / ((hp.idx_dim * hp.idx_heads) as f32).sqrt();
@@ -820,6 +980,26 @@ impl GlmWeights {
         }
         Ok(w)
     }
+}
+
+/// The output-head row order with `first` (the draft vocabulary, in its file order) leading and every other token
+/// ascending after it; None when `first` is empty, covers the whole vocabulary, repeats a token or names one outside
+/// it (the head then stays in file order and the draft head is a gathered copy, as before).
+pub fn head_permutation(first: &[u32], n_vocab: usize) -> Option<Vec<u32>> {
+    if first.is_empty() || first.len() >= n_vocab {
+        return None;
+    }
+    let mut seen = vec![false; n_vocab];
+    for &t in first {
+        let t = t as usize;
+        if t >= n_vocab || seen[t] {
+            return None;
+        }
+        seen[t] = true;
+    }
+    let mut perm = first.to_vec();
+    perm.extend((0..n_vocab as u32).filter(|&t| !seen[t as usize]));
+    Some(perm)
 }
 
 /// Live /proc/meminfo MemAvailable (0 if unreadable).
@@ -913,6 +1093,24 @@ pub fn reserve(
         ids.push(r.id);
     }
     Ok(ids)
+}
+
+#[cfg(test)]
+mod perm_tests {
+    use super::head_permutation;
+
+    #[test]
+    fn head_permutation_orders_and_rejects() {
+        assert_eq!(head_permutation(&[3, 1], 5), Some(vec![3, 1, 0, 2, 4]));
+        assert_eq!(head_permutation(&[], 5), None);
+        assert_eq!(head_permutation(&[1, 1], 5), None);
+        assert_eq!(head_permutation(&[5], 5), None);
+        assert_eq!(head_permutation(&[0, 1, 2, 3, 4], 5), None);
+        let p = head_permutation(&[4, 0], 6).unwrap();
+        let mut s = p.clone();
+        s.sort();
+        assert_eq!(s, (0..6).collect::<Vec<u32>>());
+    }
 }
 
 #[cfg(test)]

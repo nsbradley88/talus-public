@@ -107,6 +107,8 @@ std::mutex g_registry_mu;
 std::mutex g_mmq_q8_buf_mu;
 std::set<const void*> g_mmq_q8_bufs;
 
+bool ctx_skips_blas(const tk_ctx* ctx) noexcept;
+
 bool is_registered_mmq_q8_buf(const void* xq) noexcept {
     if (!xq) return false;
     std::lock_guard<std::mutex> lock(g_mmq_q8_buf_mu);
@@ -389,6 +391,10 @@ struct PrefillStateDeleter {
         if (state->mmq_dense_buf) {
             (void) cudaFree(state->mmq_dense_buf);
             state->mmq_dense_buf = nullptr;
+        }
+        if (state->mmq_ids_buf) {
+            (void) cudaFree(state->mmq_ids_buf);
+            state->mmq_ids_buf = nullptr;
         }
         if (state->dequant_scratch) {
             (void) cudaFree(state->dequant_scratch);
@@ -1046,14 +1052,14 @@ extern "C" tk_status tk_prefill_ctx_init(tk_ctx* ctx) TK_NOEXCEPT {
                 return v != nullptr && v[0] == '1';
             }();
             cublasHandle_t blas_h = nullptr;
-            if (no_blas) {
+            if (no_blas || ctx_skips_blas(ctx)) {
                 state->f16_io = strata::prefill::prompt_f16();
                 state->has_gpu = true;
             } else if (cublasCreate(&blas_h) != CUBLAS_STATUS_SUCCESS) {
                 record_error(ctx, "tk_prefill_ctx_init: cublasCreate/hipblasCreate failed");
                 return TK_ERR_HIPBLAS;
             }
-            if (!no_blas) {
+            if (blas_h != nullptr) {
             state->hipblas_handle = blas_h;
 
             void* ws = nullptr;
@@ -1169,6 +1175,11 @@ extern "C" tk_status tk_prefill_trim(tk_ctx* ctx) TK_NOEXCEPT {
             (void) cudaFree(state.mmq_dense_buf);
             state.mmq_dense_buf = nullptr;
             state.mmq_dense_cap_rows = 0;
+        }
+        if (state.mmq_ids_buf) {
+            (void) cudaFree(state.mmq_ids_buf);
+            state.mmq_ids_buf = nullptr;
+            state.mmq_ids_cap_rows = 0;
         }
         return TK_OK;
     } catch (...) {
@@ -1362,13 +1373,43 @@ extern "C" tk_status tk_prefill_mmq(
         constexpr int64_t kMaxK = 32768;
         const auto up256 = [](size_t v) { return (v + 255u) & ~size_t(255u); };
         const int64_t need_rows = std::max<int64_t>(n_tok, 1024);
+        // glm-mem (#81): this call reads only the identity row ids and the bounds (the activations are the caller's
+        // x_q8_1), so they live in their own small buffer: same values, so the same kernels and output bits, without
+        // the rows x 32768 Q8_1 block (144 MiB at 4096 rows) that mmq_dense_buf reserves in front of them for the
+        // STRATA_DENSE_MMQ path. TALUS_PF_MMQ_IDS=0 = the shared buffer as before.
+        static const bool own_ids = [] {
+            const char* v = std::getenv("TALUS_PF_MMQ_IDS");
+            return v == nullptr || v[0] != '0';
+        }();
+        const int32_t* ident = nullptr;
+        int32_t* bounds = nullptr;
+        if (own_ids) {
+            const auto ids_bounds_off = [&](int64_t rows) { return up256(static_cast<size_t>(rows) * sizeof(int32_t)); };
+            if (!state->mmq_ids_buf || state->mmq_ids_cap_rows < need_rows) {
+                if (state->mmq_ids_buf) {
+                    (void) cudaFree(state->mmq_ids_buf);
+                    state->mmq_ids_buf = nullptr;
+                    state->mmq_ids_cap_rows = 0;
+                }
+                const cudaError_t alloc_err = cudaMalloc(&state->mmq_ids_buf, ids_bounds_off(need_rows) + 256u);
+                if (alloc_err != cudaSuccess) {
+                    record_error(ctx, std::string("tk_prefill_mmq: cudaMalloc failed: ") + cudaGetErrorString(alloc_err));
+                    return (alloc_err == cudaErrorMemoryAllocation) ? TK_ERR_OUT_OF_MEMORY : TK_ERR_HIP;
+                }
+                state->mmq_ids_cap_rows = need_rows;
+                mmq::iota(reinterpret_cast<int32_t*>(state->mmq_ids_buf), need_rows, stream);
+            }
+            ident = reinterpret_cast<const int32_t*>(state->mmq_ids_buf);
+            bounds = reinterpret_cast<int32_t*>(static_cast<uint8_t*>(state->mmq_ids_buf) +
+                                                ids_bounds_off(state->mmq_ids_cap_rows));
+        }
         // the layout (ident / bounds offsets) follows the buffer's capacity, not this call's rows: a smaller call
         // after a larger one must find the identity rows where the allocating call wrote them
         const auto ident_off_for = [&](int64_t rows) { return up256(mmq::q8_bytes(rows, kMaxK)); };
         const auto bounds_off_for = [&](int64_t rows) {
             return ident_off_for(rows) + up256(static_cast<size_t>(rows) * sizeof(int32_t));
         };
-        if (!state->mmq_dense_buf || state->mmq_dense_cap_rows < need_rows) {
+        if (!own_ids && (!state->mmq_dense_buf || state->mmq_dense_cap_rows < need_rows)) {
             if (state->mmq_dense_buf) {
                 (void) cudaFree(state->mmq_dense_buf);
                 state->mmq_dense_buf = nullptr;
@@ -1385,13 +1426,12 @@ extern "C" tk_status tk_prefill_mmq(
                 need_rows,
                 stream);
         }
-        const size_t ident_off = ident_off_for(state->mmq_dense_cap_rows);
-        const size_t bounds_off = bounds_off_for(state->mmq_dense_cap_rows);
-
-        const int32_t* ident =
-            reinterpret_cast<const int32_t*>(static_cast<const uint8_t*>(state->mmq_dense_buf) + ident_off);
-        int32_t* bounds =
-            reinterpret_cast<int32_t*>(static_cast<uint8_t*>(state->mmq_dense_buf) + bounds_off);
+        if (!own_ids) {
+            const size_t ident_off = ident_off_for(state->mmq_dense_cap_rows);
+            const size_t bounds_off = bounds_off_for(state->mmq_dense_cap_rows);
+            ident = reinterpret_cast<const int32_t*>(static_cast<const uint8_t*>(state->mmq_dense_buf) + ident_off);
+            bounds = reinterpret_cast<int32_t*>(static_cast<uint8_t*>(state->mmq_dense_buf) + bounds_off);
+        }
         mmq::set_bounds(bounds, static_cast<int32_t>(n_tok), stream);
 
         mmq::Product p;
@@ -1912,6 +1952,31 @@ extern "C" tk_status tk_attn_prefill_fa(
         return TK_OK;
     } catch (...) {
         return translate_current_exception(ctx, "tk_attn_prefill_fa");
+    }
+}
+
+// glm-mem (#81): contexts whose engine never calls the BLAS paths (GLM: MMQ / tp_moe / w16 only) skip the hipBLAS
+// and hipBLASLt handles and their 32 MiB workspace, as STRATA_PREFILL_NO_BLAS=1 does process-wide. Call before the
+// context's first prefill call; a BLAS path on such a context returns TK_ERR_HIPBLAS (fails loudly, never silently).
+namespace {
+std::mutex g_no_blas_mu;
+std::set<const tk_ctx*> g_no_blas_ctx;
+bool ctx_skips_blas(const tk_ctx* ctx) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_no_blas_mu);
+        return g_no_blas_ctx.count(ctx) != 0;
+    } catch (...) {
+        return false;
+    }
+}
+}  // namespace
+
+extern "C" void tk_prefill_ctx_skip_blas(tk_ctx* ctx) noexcept {
+    if (!ctx) return;
+    try {
+        std::lock_guard<std::mutex> lock(g_no_blas_mu);
+        g_no_blas_ctx.insert(ctx);
+    } catch (...) {
     }
 }
 

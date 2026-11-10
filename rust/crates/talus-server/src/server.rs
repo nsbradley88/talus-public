@@ -8,7 +8,7 @@ use crate::engine::{
 };
 use crate::frontend::{
     anthropic_to_messages, forced_call, openai_to_messages, render_chat_prompt, tool_choice_of,
-    unmark_think_literals, Event, EventKind, OutputParser,
+    unmark_think_literals, Event, EventKind, OutputParser, ParserState,
 };
 use crate::json::{next_hex_id, unix_timestamp_secs, JsonValue};
 use crate::prometheus::{
@@ -3526,6 +3526,8 @@ struct ChatRunOutput {
     events: Vec<Event>,
     completion_tokens: usize,
     reasoning_tokens: usize,
+    /// Tokens of the answer: text or a tool call, including tokens whose text the parser held back before it came out.
+    answer_tokens: usize,
     /// Share of the decode time before the first answer (non-reasoning) token, from the server's token arrival
     /// times (0 without reasoning, 1 without an answer).
     reasoning_share: f64,
@@ -3535,8 +3537,9 @@ struct ChatRunOutput {
 
 impl ChatRunOutput {
     /// Bench extension E4: `usage.completion_tokens_details.reasoning_tokens` and the reasoning/answer split of
-    /// `timings` (`reasoning_n` + `answer_n` = `predicted_n`; `reasoning_ms` + `answer_ms` = `predicted_ms`, split at
-    /// the arrival of the first answer token). Only adds keys.
+    /// `timings`: `reasoning_n` and `answer_n` count the tokens of each channel, so together they can be less than
+    /// `predicted_n` (`</think>`, the newlines after it and other tokens that end up in neither are in no count);
+    /// `reasoning_ms` + `answer_ms` = `predicted_ms`, split at the arrival of the first answer token. Only adds keys.
     fn add_channel_detail(&self, usage: &mut JsonValue, timings: &mut JsonValue) {
         usage.insert(
             "completion_tokens_details",
@@ -3552,7 +3555,10 @@ impl ChatRunOutput {
         let total_ms = timings.get_f64("predicted_ms").unwrap_or(0.0);
         let r_ms = EngineTimings::round1(total_ms * self.reasoning_share.clamp(0.0, 1.0));
         timings.insert("reasoning_n", JsonValue::from(r_n));
-        timings.insert("answer_n", JsonValue::from(total_n - r_n));
+        timings.insert(
+            "answer_n",
+            JsonValue::from(self.answer_tokens.min(total_n - r_n)),
+        );
         timings.insert("reasoning_ms", JsonValue::from(r_ms));
         timings.insert(
             "answer_ms",
@@ -3577,7 +3583,8 @@ where
         state.config.tool_call_recovery,
         true,
     )
-    .with_reasoning_rescue(state.config.reasoning_recovery);
+    .with_reasoning_rescue(state.config.reasoning_recovery)
+    .with_tight_recovery(state.config.tool_call_recovery_tight);
     let mut detok = Detokenizer::new(&state.tokenizer);
     let mut stop_matcher = if prep.stops.is_empty() {
         None
@@ -3587,6 +3594,9 @@ where
     let mut all_events = Vec::new();
     let mut out_tokens = 0usize;
     let mut reasoning_tokens = 0usize;
+    let mut answer_tokens = 0usize;
+    // tokens whose text the parser holds in the answer; they count once that text comes out
+    let mut held_answer_tokens = 0usize;
     // arrival of the first token, the first answer token and the last token (reasoning/answer time split)
     let mut t_first: Option<Instant> = None;
     let mut t_answer: Option<Instant> = None;
@@ -3674,10 +3684,19 @@ where
                 let now = Instant::now();
                 t_first.get_or_insert(now);
                 t_last = Some(now);
-                if evs.iter().any(|e| e.kind == EventKind::Reasoning) {
+                let has_reasoning = evs.iter().any(|e| e.kind == EventKind::Reasoning);
+                let in_call =
+                    matches!(parser.state, ParserState::Call | ParserState::ReasoningCall);
+                let is_answer = in_call || evs.iter().any(|e| e.kind != EventKind::Reasoning);
+                if is_answer {
+                    t_answer.get_or_insert(now);
+                }
+                if has_reasoning {
                     reasoning_tokens += 1;
-                } else if t_answer.is_none() && !evs.is_empty() {
-                    t_answer = Some(now);
+                } else if is_answer {
+                    answer_tokens += 1 + std::mem::take(&mut held_answer_tokens);
+                } else if parser.state == ParserState::Content && parser.holds_text() {
+                    held_answer_tokens += 1;
                 }
                 if let Some(lp) = lp {
                     let r = evs.iter().any(|e| e.kind == EventKind::Reasoning);
@@ -3713,6 +3732,9 @@ where
         let tail = detok.flush();
         if !tail.is_empty() {
             let evs = parser.feed(&tail);
+            if evs.iter().any(|e| e.kind != EventKind::Reasoning) {
+                answer_tokens += std::mem::take(&mut held_answer_tokens);
+            }
             let _ = emit_filtered(
                 evs,
                 &mut stop_matcher,
@@ -3724,6 +3746,9 @@ where
     }
     if !client_aborted {
         let end_evs = parser.finish();
+        if end_evs.iter().any(|e| e.kind != EventKind::Reasoning) {
+            answer_tokens += std::mem::take(&mut held_answer_tokens);
+        }
         let _ = emit_filtered(
             end_evs,
             &mut stop_matcher,
@@ -3762,6 +3787,7 @@ where
         events: all_events,
         completion_tokens: out_tokens,
         reasoning_tokens,
+        answer_tokens,
         reasoning_share,
         timings,
         stop_sequence: stopped_by_word,
@@ -3787,55 +3813,122 @@ fn json_values_over(v: &JsonValue, max: usize) -> bool {
     !count(v, &mut left)
 }
 
-/// One schema compile at a time. A request that panicked while holding it leaves nothing to protect, so poison is ignored.
-fn schema_compile_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+/// How often a request queued for a schema compile checks that its client is still there.
+const SCHEMA_QUEUE_POLL: Duration = Duration::from_millis(100);
+
+/// The turn of one schema compile: compiles run one at a time. Returned when dropped, also by a panic.
+struct SchemaCompileTurn;
+
+static SCHEMA_COMPILE_BUSY: Mutex<bool> = Mutex::new(false);
+static SCHEMA_COMPILE_FREE: std::sync::Condvar = std::sync::Condvar::new();
+
+impl Drop for SchemaCompileTurn {
+    fn drop(&mut self) {
+        *SCHEMA_COMPILE_BUSY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = false;
+        SCHEMA_COMPILE_FREE.notify_one();
+    }
+}
+
+/// Wait for the compile turn; `None` if `client_gone` says nobody is waiting for the result any more.
+fn schema_compile_turn(client_gone: &dyn Fn() -> bool) -> Option<SchemaCompileTurn> {
+    let mut queued = false;
+    loop {
+        let mut busy = SCHEMA_COMPILE_BUSY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !*busy {
+            *busy = true;
+            drop(busy);
+            let turn = SchemaCompileTurn;
+            // an idle server never looks: this costs only requests that had to wait
+            return (!(queued && client_gone())).then_some(turn);
+        }
+        let (held, wait) = SCHEMA_COMPILE_FREE
+            .wait_timeout(busy, SCHEMA_QUEUE_POLL)
+            .unwrap_or_else(|e| e.into_inner());
+        drop(held);
+        queued = true;
+        if wait.timed_out() && client_gone() {
+            return None;
+        }
+    }
+}
+
+/// Has the client closed its side, or the connection failed? Data still unread (a pipelined request) means no.
+fn client_has_left(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut byte = [0u8; 1];
+    let peeked = stream.peek(&mut byte);
+    let _ = stream.set_nonblocking(false);
+    match peeked {
+        Ok(n) => n == 0,
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ),
+    }
 }
 
 /// E6: the schema of `response_format` (`json_schema`, or `json_object` as `{"type":"object"}`), checked and
 /// compacted by `talus_text::json_grammar::prepare`. `Ok(None)` = no constraint requested (absent, null, `text`).
 pub fn response_format_schema(req: &JsonValue) -> Result<Option<String>, String> {
+    response_format_schema_unless(req, &|| false).unwrap_or(Ok(None))
+}
+
+/// [`response_format_schema`], or `None` if `client_gone` turned true while waiting for the compile turn. Only a
+/// `json_schema` compile takes that turn.
+fn response_format_schema_unless(
+    req: &JsonValue,
+    client_gone: &dyn Fn() -> bool,
+) -> Option<Result<Option<String>, String>> {
     let Some(rf) = req.get("response_format").filter(|v| !v.is_null()) else {
-        return Ok(None);
+        return Some(Ok(None));
     };
     // before the copies below
     if json_values_over(rf, MAX_RESPONSE_FORMAT_VALUES) {
-        return Err(format!(
+        return Some(Err(format!(
             "response_format: too large (more than {MAX_RESPONSE_FORMAT_VALUES} JSON values)"
-        ));
+        )));
     }
-    // held for the copy and the compile only: this function returns before any engine work
-    let _one = schema_compile_lock();
-    let rf = crate::frontend::to_serde_value(rf);
-    let kind = rf.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let kind = rf.get_str("type").unwrap_or("");
     let schema = match kind {
-        "text" => return Ok(None),
-        "json_object" => serde_json::json!({"type": "object"}),
-        "json_schema" => {
-            let js = rf.get("json_schema");
-            match js
-                .and_then(|j| j.get("schema"))
-                .or_else(|| rf.get("schema"))
-            {
-                Some(s) => s.clone(),
-                None => {
-                    return Err(
-                        "response_format: json_schema.schema is required for type json_schema"
-                            .to_string(),
-                    )
-                }
-            }
+        "text" => return Some(Ok(None)),
+        "json_object" => {
+            let object = serde_json::json!({"type": "object"});
+            return Some(
+                talus_text::json_grammar::prepare(&object)
+                    .map(Some)
+                    .map_err(|e| format!("response_format: {e}")),
+            );
         }
+        "json_schema" => rf
+            .get("json_schema")
+            .and_then(|j| j.get("schema"))
+            .or_else(|| rf.get("schema")),
         other => {
-            return Err(format!(
+            return Some(Err(format!(
                 "response_format: type must be text, json_object or json_schema (got {other:?})"
-            ))
+            )))
         }
     };
-    talus_text::json_grammar::prepare(&schema)
-        .map(Some)
-        .map_err(|e| format!("response_format: {e}"))
+    let Some(schema) = schema else {
+        return Some(Err(
+            "response_format: json_schema.schema is required for type json_schema".to_string(),
+        ));
+    };
+    // held for the copy and the compile only: this function returns before any engine work
+    let _turn = schema_compile_turn(client_gone)?;
+    // one copy: the schema alone is converted, and the compiler takes it instead of copying it again
+    let schema = crate::frontend::to_serde_value(schema);
+    Some(
+        talus_text::json_grammar::prepare_owned(schema)
+            .map(Some)
+            .map_err(|e| format!("response_format: {e}")),
+    )
 }
 
 fn handle_openai_chat(
@@ -3852,7 +3945,12 @@ fn handle_openai_chat(
     };
     // E6: grammar-constrained output. Thinking is turned off for these requests (the whole reply is the JSON value);
     // json_object stays ignored on engines without support (as before), json_schema gets an honest 400 there.
-    let json_schema = match response_format_schema(req) {
+    let client = &*stream;
+    let Some(schema) = response_format_schema_unless(req, &|| client_has_left(client)) else {
+        // nobody to answer: the connection closes here
+        return Ok(());
+    };
+    let json_schema = match schema {
         Ok(None) => None,
         Ok(Some(_)) if !state.engine.supports_json_schema() => {
             let is_object = req
@@ -4891,18 +4989,48 @@ mod mempr_tests {
 
     #[test]
     fn schema_compile_lock_survives_a_panic() {
-        use super::{response_format_schema, schema_compile_lock, JsonValue};
+        use super::{response_format_schema, schema_compile_turn, JsonValue};
         let t = std::thread::spawn(|| {
-            let _held = schema_compile_lock();
-            panic!("while holding the lock");
+            let _held = schema_compile_turn(&|| false);
+            panic!("while holding the turn");
         });
         assert!(t.join().is_err());
-        drop(schema_compile_lock());
+        drop(schema_compile_turn(&|| false));
         let req = JsonValue::parse(
             r#"{"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object"}}}}"#,
         )
         .unwrap();
         assert!(response_format_schema(&req).unwrap().is_some());
+    }
+
+    /// Only a `json_schema` compile takes the turn, and a request waiting for it stops when its client has left.
+    #[test]
+    fn schema_compile_turn_is_for_json_schema_only() {
+        use super::{response_format_schema_unless, schema_compile_turn, JsonValue};
+        let held = schema_compile_turn(&|| false).unwrap();
+        let gone: &dyn Fn() -> bool = &|| true;
+        let of = |rf: &str| JsonValue::parse(&format!(r#"{{"response_format":{rf}}}"#)).unwrap();
+        for (rf, schema) in [
+            (r#"{"type":"text"}"#, false),
+            (r#"{"type":"json_object"}"#, true),
+        ] {
+            let got = response_format_schema_unless(&of(rf), gone)
+                .unwrap()
+                .unwrap();
+            assert_eq!(got.is_some(), schema, "{rf}");
+        }
+        for rf in [r#"{"type":"other"}"#, "3", r#"{"type":"json_schema"}"#] {
+            assert!(response_format_schema_unless(&of(rf), gone)
+                .unwrap()
+                .is_err());
+        }
+        let real = of(r#"{"type":"json_schema","json_schema":{"schema":{"type":"object"}}}"#);
+        assert!(response_format_schema_unless(&real, gone).is_none());
+        drop(held);
+        assert!(response_format_schema_unless(&real, &|| false)
+            .unwrap()
+            .unwrap()
+            .is_some());
     }
 
     #[test]

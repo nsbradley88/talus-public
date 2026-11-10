@@ -140,15 +140,21 @@ fn client_for(
 /// What the server says about itself; fields it does not expose are recorded as unavailable. On talus-server the
 /// `build` fingerprint of `/v1/talus/status` (engine/kernels/weights sha256, commit, run-config sha256, numerics
 /// environment) is recorded, and hashing of the weight files is requested (`?hash=weights`; it runs in the
-/// background and is cached by the server, so [`refresh_build`] after the model's cases picks the hashes up).
-pub fn fingerprint(c: &Client) -> Value {
+/// background and is cached by the server, so [`refresh_build`] after the model's cases picks the hashes up). A
+/// cached hash is valid while the file's metadata is unchanged; `verify` has the server read those files again.
+pub fn fingerprint(c: &Client, verify: bool) -> Value {
     let get = |p: &str| match c.get(p) {
         Ok(r) if r.status == 200 => Some(r.body),
         _ => None,
     };
     let models = get("/v1/models");
     let props = get("/props");
-    let status = get("/v1/talus/status?hash=weights").or_else(|| get("/v1/talus/status"));
+    let hash = if verify {
+        "/v1/talus/status?hash=weights&verify=1"
+    } else {
+        "/v1/talus/status?hash=weights"
+    };
+    let status = get(hash).or_else(|| get("/v1/talus/status"));
     let model_ids: Vec<Value> = models
         .as_ref()
         .and_then(|m| m["data"].as_array().cloned())
@@ -1002,7 +1008,7 @@ pub fn run(
                     if let Some(t) = &ep.talus {
                         ensure_selection(&ctl, &ep.id, t, poll, &cancel, progress)?;
                     }
-                    fp["server"] = fingerprint(&ctl);
+                    fp["server"] = fingerprint(&ctl, ep.verify_weights);
                     art.write_json(&format!("{sub}/fingerprint.json"), &fp["server"])?;
                 } else {
                     fp["server"] = std::fs::read_to_string(&fp_file)

@@ -3,7 +3,8 @@
 # SPDX-License-Identifier: MIT
 #
 # build_sidecar.sh GGUF OUTDIR : the Qwen3.8-27B W4A4 prompt sidecars (tp_w4i, docs/MODELS.md) from scratch, on CPU.
-#   <OUTDIR>/<stem>.w4i       FFN of layers 48-63 (release default, quality-gated; ~2.0 GiB)
+#   Both files are format v2. The default sidecar is format v3 (W4I3): build it with tools/w4i/q4q (q4q/README.md).
+#   <OUTDIR>/<stem>.w4i       FFN of layers 48-63, format v2 (opt-in, `TALUS_Q27_W4I=auto`; quality-gated; ~2.0 GiB)
 #   <OUTDIR>/<stem>.fast.w4i  FFN of all 64 layers (opt-in "fast" profile, failed the gate; ~8.2 GiB)
 # Steps: 1. calibration token ids from public sources (calib.py: llama.cpp b11062 + license texts, 149.5K tokens);
 #        2. per quarter of the layers: a llama.cpp CPU forward (actdump) dumps the FFN inputs, hess_acc.py sums

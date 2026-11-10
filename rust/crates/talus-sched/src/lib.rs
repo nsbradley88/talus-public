@@ -187,6 +187,14 @@ pub fn requests_waiting() -> bool {
     LINES_WAITING.load(Ordering::Acquire) > 0
 }
 
+/// When the last non-empty protocol line was pushed.
+static LAST_LINE_ARRIVAL: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// When the last request line arrived (K31: how long a request waited for after-reply work, for the engine log).
+pub fn last_line_arrival() -> Option<std::time::Instant> {
+    *LAST_LINE_ARRIVAL.lock().unwrap()
+}
+
 fn took_line(line: &Option<String>) {
     if line.as_deref().is_some_and(|l| !l.is_empty()) {
         // every non-empty line was counted when it was pushed
@@ -246,6 +254,7 @@ impl RequestQueue {
                 self.cancel.reset();
             }
             st.active_or_queued += 1;
+            *LAST_LINE_ARRIVAL.lock().unwrap() = Some(std::time::Instant::now());
             LINES_WAITING.fetch_add(1, Ordering::AcqRel);
         }
         st.lines.push_back(line.to_string());

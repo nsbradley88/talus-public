@@ -10,8 +10,20 @@
 //!   background thread started by the first status request.
 //! - Larger files (the model weights, up to 100+ GB) are hashed only when a client asks for it
 //!   (`GET /v1/talus/status?hash=weights`, local peer or API key), at the lowest CPU priority and without
-//!   filling the page cache. Results are cached in `<control-dir>/fingerprints.json` keyed by
-//!   (path, size, mtime), so a restart does not hash again.
+//!   filling the page cache. Results are cached per user (`~/.cache/talus/fingerprints.json`, run-config key
+//!   `hash_cache`) and in `<control-dir>/fingerprints.json`, so neither a restart nor a new control directory reads
+//!   the weights again.
+//!
+//! What a sha256 here proves. A hash read in this run (`sha256_source: "read"`): those were the file's bytes at
+//! `hashed_at`, and the file's identity did not change during the read. A cached hash (`"cache"`): those were the
+//! bytes at `hashed_at`, and since then the path, size, mtime, ctime, device and inode are all unchanged. ctime is
+//! the kernel's and `touch` cannot restore it, so any write or metadata change through the filesystem misses the
+//! cache, and a replaced or restored file does too. It does not prove the bytes on the medium are still the same:
+//! bit rot, a raw block-device write or a repaired filesystem leave the metadata alone. `?hash=weights&verify=1`
+//! reads everything again and reports a difference as `error`. Neither form proves which bytes the engine has
+//! mapped: the status re-reads the metadata and drops a hash whose file changed, but an engine started before the
+//! change keeps its pages. Nor is a sha256 a statement about where the file came from (`talus setup` checks that
+//! against the release's pinned hashes).
 
 use crate::config::ServerConfig;
 use crate::json::JsonValue;
@@ -27,7 +39,36 @@ pub const CACHE_FILE: &str = "fingerprints.json";
 /// Prefixes of the environment variables that select numerics / kernels.
 pub const ENV_PREFIXES: &[&str] = &["TALUS_", "STRATA_", "GLM_", "MIMO_"];
 /// Run-config keys left out of `run_config_sha256` (secrets; the TUI's selection record with its timestamp).
-const CONFIG_KEYS_SKIPPED: &[&str] = &["api_key", crate::control::SELECTION_KEY];
+const CONFIG_KEYS_SKIPPED: &[&str] = &["api_key", "hash_cache", crate::control::SELECTION_KEY];
+/// Entries kept in a hash cache file (newest hashes first): more than one host's models and their old builds.
+const CACHE_MAX_ENTRIES: usize = 512;
+
+/// What a cached hash is tied to: all of it must be unchanged for the hash to be reused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileId {
+    path: String,
+    size: u64,
+    mtime_ns: i128,
+    ctime_ns: i128,
+    dev: u64,
+    ino: u64,
+}
+
+/// A row of the hash cache.
+#[derive(Clone, Debug, PartialEq)]
+struct CacheRow {
+    id: FileId,
+    sha256: String,
+    /// When the bytes were read, seconds since the epoch.
+    hashed_at: u64,
+}
+
+fn now_s() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FileEntry {
@@ -37,7 +78,17 @@ pub struct FileEntry {
     pub size: u64,
     /// Modification time, nanoseconds since the epoch (cache key); reported in seconds.
     pub mtime_ns: i128,
+    /// Change time (ns), device and inode: the rest of the cache key.
+    pub ctime_ns: i128,
+    pub dev: u64,
+    pub ino: u64,
     pub sha256: Option<String>,
+    /// When the bytes behind `sha256` were read, seconds since the epoch.
+    pub hashed_at: Option<u64>,
+    /// `sha256` came from the hash cache, not from reading the file in this run.
+    pub from_cache: bool,
+    /// `?verify=1`: the cached hash this read must reproduce.
+    pub expected: Option<String>,
     pub hashing: bool,
     pub error: Option<String>,
 }
@@ -54,23 +105,66 @@ impl FileEntry {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_nanos() as i128)
             .unwrap_or(0);
+        #[cfg(unix)]
+        let (ctime_ns, dev, ino) = {
+            use std::os::unix::fs::MetadataExt;
+            (
+                md.ctime() as i128 * 1_000_000_000 + md.ctime_nsec() as i128,
+                md.dev(),
+                md.ino(),
+            )
+        };
+        #[cfg(not(unix))]
+        let (ctime_ns, dev, ino) = (0, 0, 0);
         Some(Self {
             arg: arg.map(str::to_string),
             path: path.to_path_buf(),
             size: md.len(),
             mtime_ns,
+            ctime_ns,
+            dev,
+            ino,
             sha256: None,
+            hashed_at: None,
+            from_cache: false,
+            expected: None,
             hashing: false,
             error: None,
         })
     }
 
-    fn key(&self) -> (String, u64, i128) {
-        (
-            self.path.to_string_lossy().into_owned(),
-            self.size,
-            self.mtime_ns,
-        )
+    fn id(&self) -> FileId {
+        FileId {
+            path: self.path.to_string_lossy().into_owned(),
+            size: self.size,
+            mtime_ns: self.mtime_ns,
+            ctime_ns: self.ctime_ns,
+            dev: self.dev,
+            ino: self.ino,
+        }
+    }
+
+    /// Stat the file again; a file that changed since it was hashed loses its hash.
+    fn refresh(&mut self) {
+        let Some(now) = Self::stat(None, &self.path) else {
+            self.sha256 = None;
+            self.hashed_at = None;
+            self.from_cache = false;
+            self.error = Some("the file is no longer there".to_string());
+            return;
+        };
+        if now.id() != self.id() {
+            self.size = now.size;
+            self.mtime_ns = now.mtime_ns;
+            self.ctime_ns = now.ctime_ns;
+            self.dev = now.dev;
+            self.ino = now.ino;
+            self.sha256 = None;
+            self.hashed_at = None;
+            self.from_cache = false;
+            self.expected = None;
+            self.error = None;
+        }
     }
 
     fn to_json(&self) -> JsonValue {
@@ -93,6 +187,15 @@ impl FileEntry {
             ),
             ("hashing", JsonValue::from(self.hashing)),
         ]);
+        if self.sha256.is_some() {
+            o.insert(
+                "sha256_source",
+                if self.from_cache { "cache" } else { "read" },
+            );
+            if let Some(t) = self.hashed_at {
+                o.insert("hashed_at", JsonValue::from(t));
+            }
+        }
         if let Some(a) = &self.arg {
             o.insert("arg", a.as_str());
         }
@@ -164,7 +267,29 @@ fn resolve(p: &str, cwd: Option<&Path>) -> PathBuf {
     }
 }
 
-/// Every run-config argument that names an existing regular file, with the flag before it (deduplicated by path).
+/// All shards of a split GGUF named by any of them (`x-00001-of-00004.gguf`), empty for any other file. The run config
+/// names only one, usually a first shard of a few MiB, and the tensors are in the others.
+fn split_shards(p: &Path) -> Vec<PathBuf> {
+    let parse = || -> Option<(String, usize, usize, usize)> {
+        let name = p.file_name()?.to_str()?;
+        let (head, total) = name.strip_suffix(".gguf")?.rsplit_once("-of-")?;
+        let (stem, no) = head.rsplit_once('-')?;
+        let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+        if !digits(total) || !digits(no) {
+            return None;
+        }
+        Some((stem.to_string(), no.len(), total.len(), total.parse().ok()?))
+    };
+    let Some((stem, w_no, w_total, total)) = parse().filter(|x| x.3 <= 9999) else {
+        return Vec::new();
+    };
+    (1..=total)
+        .map(|i| p.with_file_name(format!("{stem}-{i:0w_no$}-of-{total:0w_total$}.gguf")))
+        .collect()
+}
+
+/// Every run-config argument that names an existing regular file, with the flag before it (deduplicated by path); a
+/// split GGUF counts with all its shards.
 pub fn weight_files(cfg: &ServerConfig) -> Vec<FileEntry> {
     let cwd = cfg.cwd.as_deref();
     let mut out: Vec<FileEntry> = Vec::new();
@@ -173,11 +298,12 @@ pub fn weight_files(cfg: &ServerConfig) -> Vec<FileEntry> {
             return;
         }
         let p = resolve(value, cwd);
-        if out.iter().any(|e| e.path == p) {
-            return;
-        }
-        if let Some(e) = FileEntry::stat(arg, &p) {
-            out.push(e);
+        let mut paths = vec![p.clone()];
+        paths.extend(split_shards(&p));
+        for p in paths {
+            if !out.iter().any(|e| e.path == p) {
+                out.extend(FileEntry::stat(arg, &p));
+            }
         }
     };
     if !cfg.model_path.is_empty() {
@@ -398,6 +524,30 @@ impl Inner {
     }
 }
 
+/// Where hashes are kept: the control directory (if any), and per user so that a new control directory or none at all
+/// reuses them. Run-config key `hash_cache`: another file, or "" for none. A mock server has no per-user cache unless
+/// asked.
+fn hash_cache_paths(cfg: &ServerConfig) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = cfg.control_dir.iter().map(|d| d.join(CACHE_FILE)).collect();
+    match cfg.raw_config.get_str("hash_cache") {
+        Some("") => {}
+        Some(p) => v.push(PathBuf::from(p)),
+        None if cfg.mock_mode => {}
+        None => {
+            let base = std::env::var_os("XDG_CACHE_HOME")
+                .filter(|d| !d.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .filter(|d| !d.is_empty())
+                        .map(|h| PathBuf::from(h).join(".cache"))
+                });
+            v.extend(base.map(|b| b.join("talus").join(CACHE_FILE)));
+        }
+    }
+    v
+}
+
 pub struct Fingerprint {
     inner: Mutex<Inner>,
     meta: BuildMeta,
@@ -405,10 +555,14 @@ pub struct Fingerprint {
     run_config: (String, &'static str),
     run_config_path: Option<PathBuf>,
     env: Vec<(String, String)>,
-    cache_path: Option<PathBuf>,
+    /// The hash caches: `<control-dir>/fingerprints.json` and the per-user one (see [`hash_cache_paths`]).
+    cache_paths: Vec<PathBuf>,
     /// One hashing thread at a time.
     busy: AtomicBool,
     small_started: AtomicBool,
+    /// A client asked for the large files: stays set, so a request that finds the small files being hashed is not lost.
+    want_large: AtomicBool,
+    verified: AtomicBool,
 }
 
 impl Fingerprint {
@@ -438,88 +592,175 @@ impl Fingerprint {
             run_config: run_config_sha256(cfg),
             run_config_path: cfg.config_path.clone(),
             env: numerics_env(std::env::vars(), &cfg.engine_env),
-            cache_path: cfg.control_dir.as_ref().map(|d| d.join(CACHE_FILE)),
+            cache_paths: hash_cache_paths(cfg),
             busy: AtomicBool::new(false),
             small_started: AtomicBool::new(false),
+            want_large: AtomicBool::new(false),
+            verified: AtomicBool::new(false),
         };
         fp.apply_cache();
         fp
     }
 
-    fn read_cache(&self) -> Vec<(String, u64, i128, String)> {
-        let Some(t) = self
-            .cache_path
-            .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-        else {
-            return Vec::new();
-        };
-        let Ok(v) = JsonValue::parse(&t) else {
-            return Vec::new();
-        };
-        v.get("files")
-            .and_then(JsonValue::as_array)
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|e| {
-                Some((
-                    e.get_str("path")?.to_string(),
-                    e.get_u64("size")?,
-                    e.get_str("mtime_ns")?.parse::<i128>().ok()?,
-                    e.get_str("sha256")?.to_string(),
-                ))
-            })
-            .collect()
+    /// Every row of every cache file. Rows of the old format (no ctime) are not trusted: they get hashed once more.
+    fn read_cache(&self) -> Vec<CacheRow> {
+        let mut rows = Vec::new();
+        for path in &self.cache_paths {
+            let Some(v) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|t| JsonValue::parse(&t).ok())
+            else {
+                continue;
+            };
+            rows.extend(
+                v.get("files")
+                    .and_then(JsonValue::as_array)
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|e| {
+                        Some(CacheRow {
+                            id: FileId {
+                                path: e.get_str("path")?.to_string(),
+                                size: e.get_u64("size")?,
+                                mtime_ns: e.get_str("mtime_ns")?.parse().ok()?,
+                                ctime_ns: e.get_str("ctime_ns")?.parse().ok()?,
+                                dev: e.get_u64("dev")?,
+                                ino: e.get_u64("ino")?,
+                            },
+                            sha256: e.get_str("sha256")?.to_string(),
+                            hashed_at: e.get_u64("hashed_at")?,
+                        })
+                    }),
+            );
+        }
+        rows
     }
 
     fn apply_cache(&self) {
         let cache = self.read_cache();
         let mut g = self.inner.lock().unwrap();
         for e in g.entries_mut() {
-            let k = e.key();
-            if let Some(c) = cache.iter().find(|c| (&c.0, c.1, c.2) == (&k.0, k.1, k.2)) {
-                e.sha256 = Some(c.3.clone());
+            let id = e.id();
+            if let Some(c) = cache
+                .iter()
+                .filter(|c| c.id == id)
+                .max_by_key(|c| c.hashed_at)
+            {
+                e.sha256 = Some(c.sha256.clone());
+                e.hashed_at = Some(c.hashed_at);
+                e.from_cache = true;
             }
         }
     }
 
-    /// Merge `done` into the cache file (entries of other files are kept).
+    /// Merge `done` into the cache files (entries of other files are kept).
     fn write_cache(&self, done: &[FileEntry]) {
-        let Some(path) = &self.cache_path else {
+        if self.cache_paths.is_empty() {
             return;
-        };
+        }
         let mut all = self.read_cache();
         for e in done {
-            let Some(sha) = &e.sha256 else { continue };
-            let k = e.key();
-            all.retain(|c| c.0 != k.0);
-            all.push((k.0, k.1, k.2, sha.clone()));
+            let (Some(sha), Some(at)) = (&e.sha256, e.hashed_at) else {
+                continue;
+            };
+            all.push(CacheRow {
+                id: e.id(),
+                sha256: sha.clone(),
+                hashed_at: at,
+            });
         }
+        // one row per path, its newest hash
+        all.sort_by_key(|c| std::cmp::Reverse(c.hashed_at));
+        let mut seen = std::collections::BTreeSet::new();
+        all.retain(|c| seen.insert(c.id.path.clone()));
+        all.truncate(CACHE_MAX_ENTRIES);
         let files: Vec<JsonValue> = all
             .into_iter()
-            .map(|(p, s, m, h)| {
+            .map(|c| {
                 JsonValue::obj(vec![
-                    ("path", JsonValue::from(p)),
-                    ("size", JsonValue::from(s)),
-                    ("mtime_ns", JsonValue::from(m.to_string())),
-                    ("sha256", JsonValue::from(h)),
+                    ("path", JsonValue::from(c.id.path)),
+                    ("size", JsonValue::from(c.id.size)),
+                    ("mtime_ns", JsonValue::from(c.id.mtime_ns.to_string())),
+                    ("ctime_ns", JsonValue::from(c.id.ctime_ns.to_string())),
+                    ("dev", JsonValue::from(c.id.dev)),
+                    ("ino", JsonValue::from(c.id.ino)),
+                    ("sha256", JsonValue::from(c.sha256)),
+                    ("hashed_at", JsonValue::from(c.hashed_at)),
                 ])
             })
             .collect();
         let body = JsonValue::obj(vec![
-            ("version", JsonValue::from(1u64)),
+            ("version", JsonValue::from(2u64)),
             ("files", JsonValue::Array(files)),
-        ]);
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, body.to_json_pretty()).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
+        ])
+        .to_json_pretty();
+        for path in &self.cache_paths {
+            if let Some(d) = path.parent() {
+                let _ = std::fs::create_dir_all(d);
+            }
+            let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
+            if std::fs::write(&tmp, &body).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+    }
+
+    /// Mark what is due for hashing, and return it with the identity each file has now.
+    fn take_todo(&self) -> Vec<(PathBuf, FileId)> {
+        let large = self.want_large.load(Ordering::SeqCst);
+        let mut g = self.inner.lock().unwrap();
+        g.entries_mut()
+            .filter(|e| e.sha256.is_none() && e.error.is_none() && (large || e.size <= SMALL_FILE))
+            .map(|e| {
+                e.hashing = true;
+                (e.path.clone(), e.id())
+            })
+            .collect()
+    }
+
+    fn hash_files(&self, todo: Vec<(PathBuf, FileId)>) {
+        for (p, id) in todo {
+            let r = sha256_file(&p);
+            // the identity from before the read must still hold, or the hash may be of neither version
+            let same = FileEntry::stat(None, &p).is_some_and(|now| now.id() == id);
+            let done: Vec<FileEntry> = {
+                let mut g = self.inner.lock().unwrap();
+                let mut done = Vec::new();
+                for e in g.entries_mut().filter(|e| e.path == p) {
+                    e.hashing = false;
+                    let expected = e.expected.take();
+                    match &r {
+                        Ok(h) if same => {
+                            if let Some(x) = expected.filter(|x| x != h) {
+                                e.error = Some(format!(
+                                    "the file's bytes no longer match its cached sha256 {x} with its metadata unchanged"
+                                ));
+                            }
+                            e.sha256 = Some(h.clone());
+                            e.hashed_at = Some(now_s());
+                            e.from_cache = false;
+                            done.push(e.clone());
+                        }
+                        Ok(_) => {
+                            e.error = Some("the file changed while it was being hashed".to_string())
+                        }
+                        Err(err) => e.error = Some(err.to_string()),
+                    }
+                }
+                done
+            };
+            // file by file: a server stopped halfway keeps what it read
+            self.write_cache(&done);
         }
     }
 
     /// Start hashing what is not hashed yet in a background thread: small files only, or every file with
-    /// `include_large`. Returns false when a hashing thread is already running.
+    /// `include_large` (remembered if a thread is running: that thread takes them next). Returns false when a hashing
+    /// thread is already running.
     pub fn start_hashing(self: &Arc<Self>, include_large: bool) -> bool {
-        if !include_large && self.small_started.swap(true, Ordering::SeqCst) {
+        if include_large {
+            self.want_large.store(true, Ordering::SeqCst);
+        } else if self.small_started.swap(true, Ordering::SeqCst) {
             return false;
         }
         if self.busy.swap(true, Ordering::SeqCst) {
@@ -529,17 +770,16 @@ impl Fingerprint {
             }
             return false;
         }
-        let todo: Vec<PathBuf> = {
+        {
             let mut g = self.inner.lock().unwrap();
-            g.entries_mut()
-                .filter(|e| e.sha256.is_none() && (include_large || e.size <= SMALL_FILE))
-                .map(|e| {
-                    e.hashing = true;
-                    e.error = None;
-                    e.path.clone()
-                })
-                .collect()
-        };
+            for e in g.entries_mut() {
+                e.refresh();
+                if include_large && e.sha256.is_none() && e.path.exists() {
+                    e.error = None; // a failed read gets another try when a client asks
+                }
+            }
+        }
+        let todo = self.take_todo();
         if todo.is_empty() {
             self.busy.store(false, Ordering::SeqCst);
             return true;
@@ -549,27 +789,44 @@ impl Fingerprint {
             .name("talus-fingerprint".to_string())
             .spawn(move || {
                 lower_thread_priority();
-                let mut done = Vec::new();
-                for p in todo {
-                    let r = sha256_file(&p);
-                    let mut g = me.inner.lock().unwrap();
-                    for e in g.entries_mut().filter(|e| e.path == p) {
-                        e.hashing = false;
-                        match &r {
-                            Ok(h) => e.sha256 = Some(h.clone()),
-                            Err(err) => e.error = Some(err.to_string()),
-                        }
-                        done.push(e.clone());
+                let mut todo = todo;
+                loop {
+                    me.hash_files(todo);
+                    todo = me.take_todo();
+                    if !todo.is_empty() {
+                        continue;
                     }
+                    me.busy.store(false, Ordering::SeqCst);
+                    // a request may have come between the last look and clearing `busy`, and left
+                    let again = me.inner.lock().unwrap().entries_mut().any(|e| {
+                        e.sha256.is_none()
+                            && e.error.is_none()
+                            && (me.want_large.load(Ordering::SeqCst) || e.size <= SMALL_FILE)
+                    });
+                    if !again || me.busy.swap(true, Ordering::SeqCst) {
+                        break;
+                    }
+                    todo = me.take_todo();
                 }
-                me.write_cache(&done);
-                me.busy.store(false, Ordering::SeqCst);
             })
             .map(|_| true)
             .unwrap_or_else(|_| {
                 self.busy.store(false, Ordering::SeqCst);
                 false
             })
+    }
+
+    /// `?verify=1`: once per server, read every file whose hash came from the cache again and compare.
+    pub fn verify_cached(&self) {
+        if self.verified.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        for e in g.entries_mut().filter(|e| e.from_cache) {
+            e.expected = e.sha256.take();
+            e.hashed_at = None;
+            e.from_cache = false;
+        }
     }
 
     /// True when every file has a sha256 (or failed) and no thread runs.
@@ -582,7 +839,11 @@ impl Fingerprint {
 
     /// The `build` object. `engine_info` reads keys from the engine's `INFO` lines.
     pub fn to_json(&self, engine_info: &dyn Fn(&str) -> Option<String>) -> JsonValue {
-        let g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap();
+        // a few stat calls: a file replaced since it was hashed must not keep reporting the old hash
+        for e in g.entries_mut().filter(|e| !e.hashing) {
+            e.refresh();
+        }
         let (commit, dirty, source) = match engine_info("commit") {
             Some(c) => (
                 Some(c),
@@ -661,7 +922,7 @@ impl Fingerprint {
             (
                 "hash_large",
                 JsonValue::from(
-                    "GET /v1/talus/status?hash=weights hashes files over 256 MiB (cached by path, size, mtime)",
+                    "GET /v1/talus/status?hash=weights hashes files over 256 MiB (cached by path, size, mtime, ctime, device, inode; sha256_source says which); &verify=1 reads cached files again",
                 ),
             ),
         ])
@@ -749,11 +1010,12 @@ mod tests {
         std::fs::write(d.join("model.gguf"), b"weights-1").unwrap();
         std::fs::write(d.join("mtp.gguf"), b"mtp").unwrap();
         let raw = format!(
-            r#"{{"exe": "{}", "args": ["--model", "{}", "--mtp-gguf", "mtp.gguf", "--ctx", "4096", "--spec-draft-vocab", "/nonexistent/x.bin"], "cwd": "{}", "env": {{"TALUS_A": "1", "TALUS_API_KEY": "sekrit-key-123"}}, "api_key": "sekrit-key-123", "control_dir": "{}"}}"#,
+            r#"{{"exe": "{}", "args": ["--model", "{}", "--mtp-gguf", "mtp.gguf", "--ctx", "4096", "--spec-draft-vocab", "/nonexistent/x.bin"], "cwd": "{}", "env": {{"TALUS_A": "1", "TALUS_API_KEY": "sekrit-key-123"}}, "api_key": "sekrit-key-123", "control_dir": "{}", "hash_cache": "{}"}}"#,
             exe.display(),
             d.join("model.gguf").display(),
             d.display(),
-            d.join("ctl").display()
+            d.join("ctl").display(),
+            d.join("shared.json").display()
         );
         std::fs::create_dir_all(d.join("ctl")).unwrap();
         ServerConfig::from_json(&JsonValue::parse(&raw).unwrap()).unwrap()
@@ -815,6 +1077,193 @@ mod tests {
         std::fs::write(d.join("model.gguf"), b"weights-22").unwrap();
         let fp3 = Fingerprint::new(&cfg);
         assert!(!fp3.complete());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn wait(fp: &Fingerprint) {
+        for _ in 0..3000 {
+            if fp.complete() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("hashing did not finish");
+    }
+
+    fn weight0(fp: &Fingerprint) -> JsonValue {
+        fp.to_json(&|_| None)
+            .get("weights")
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .clone()
+    }
+
+    #[test]
+    fn every_shard_of_a_split_gguf_is_a_weight_file() {
+        let d = tmpdir("split");
+        let mut cfg = cfg_with(&d);
+        for i in 1..=3 {
+            std::fs::write(d.join(format!("m-{i:05}-of-00003.gguf")), format!("s{i}")).unwrap();
+        }
+        // the run config names the first shard, as talus setup writes it
+        cfg.model_path = d.join("m-00001-of-00003.gguf").display().to_string();
+        cfg.engine_args = vec!["--model".into(), cfg.model_path.clone()];
+        let w = weight_files(&cfg);
+        let names: Vec<String> = w
+            .iter()
+            .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "m-00001-of-00003.gguf",
+                "m-00002-of-00003.gguf",
+                "m-00003-of-00003.gguf"
+            ]
+        );
+        assert!(w.iter().all(|e| e.arg.as_deref() == Some("--model")));
+        // not shard names
+        for n in [
+            "m.gguf",
+            "m-of-3.gguf",
+            "a-b-of-00003.gguf",
+            "m-00001-of-00003.bin",
+        ] {
+            assert!(split_shards(Path::new(n)).is_empty(), "{n}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_new_control_dir_reuses_the_hash_and_says_so() {
+        let d = tmpdir("shared");
+        let mut cfg = cfg_with(&d);
+        let fp = Arc::new(Fingerprint::new(&cfg));
+        fp.start_hashing(true);
+        wait(&fp);
+        assert_eq!(weight0(&fp).get_str("sha256_source"), Some("read"));
+        // another control directory, the same weights: nothing to read
+        cfg.control_dir = Some(d.join("ctl2"));
+        std::fs::create_dir_all(d.join("ctl2")).unwrap();
+        let fp2 = Fingerprint::new(&cfg);
+        assert!(fp2.complete());
+        let w = weight0(&fp2);
+        assert_eq!(w.get_str("sha256_source"), Some("cache"));
+        assert_eq!(w.get_str("sha256"), Some(sha256_hex(b"weights-1").as_str()));
+        assert!(w.get_u64("hashed_at").is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_rewrite_that_restores_size_and_mtime_misses_the_cache() {
+        let d = tmpdir("forged");
+        let cfg = cfg_with(&d);
+        let fp = Arc::new(Fingerprint::new(&cfg));
+        fp.start_hashing(true);
+        wait(&fp);
+        // same size, mtime put back: the old (path, size, mtime) key would have reported the old hash
+        let m = d.join("model.gguf");
+        let t = std::fs::metadata(&m).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&m, b"weights-2").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&m)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+        assert_eq!(std::fs::metadata(&m).unwrap().modified().unwrap(), t);
+        let fp2 = Fingerprint::new(&cfg);
+        assert!(weight0(&fp2).get("sha256").unwrap().is_null());
+        // and the running server stops reporting it at the next status
+        assert!(weight0(&fp).get("sha256").unwrap().is_null());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn old_cache_rows_without_ctime_are_not_trusted() {
+        let d = tmpdir("v1");
+        let cfg = cfg_with(&d);
+        let m = d.join("model.gguf");
+        let e = FileEntry::stat(None, &m).unwrap();
+        std::fs::write(
+            d.join("ctl").join(CACHE_FILE),
+            format!(
+                r#"{{"version":1,"files":[{{"path":"{}","size":{},"mtime_ns":"{}","sha256":"{}"}}]}}"#,
+                m.display(),
+                e.size,
+                e.mtime_ns,
+                "0".repeat(64)
+            ),
+        )
+        .unwrap();
+        assert!(weight0(&Fingerprint::new(&cfg))
+            .get("sha256")
+            .unwrap()
+            .is_null());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn verify_reads_again_and_reports_a_difference() {
+        let d = tmpdir("verify");
+        let cfg = cfg_with(&d);
+        let fp = Arc::new(Fingerprint::new(&cfg));
+        fp.start_hashing(true);
+        wait(&fp);
+        // what bit rot looks like from here: the metadata matches, the hash does not (a forged row stands in for it)
+        let cache = d.join("ctl").join(CACHE_FILE);
+        let good = sha256_hex(b"weights-1");
+        let bad = "0".repeat(64);
+        let text = std::fs::read_to_string(&cache).unwrap();
+        assert!(text.contains(&good));
+        std::fs::write(&cache, text.replace(&good, &bad)).unwrap();
+        std::fs::remove_file(d.join("shared.json")).unwrap();
+        let fp2 = Arc::new(Fingerprint::new(&cfg));
+        assert_eq!(weight0(&fp2).get_str("sha256"), Some(bad.as_str()));
+        fp2.verify_cached();
+        assert!(fp2.start_hashing(true));
+        wait(&fp2);
+        let w = weight0(&fp2);
+        assert_eq!(w.get_str("sha256"), Some(good.as_str()));
+        assert_eq!(w.get_str("sha256_source"), Some("read"));
+        assert!(
+            w.get_str("error").unwrap().contains("no longer match"),
+            "{}",
+            w.to_json_string()
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_weights_request_during_small_file_hashing_is_not_lost() {
+        let d = tmpdir("race");
+        // over SMALL_FILE, sparse
+        let big = d.join("model.gguf");
+        let cfg = cfg_with(&d);
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(SMALL_FILE + 1)
+            .unwrap();
+        let fp = Arc::new(Fingerprint::new(&cfg));
+        // the readiness poll's status request has the small files being hashed
+        fp.busy.store(true, Ordering::SeqCst);
+        assert!(!fp.start_hashing(true));
+        assert!(weight0(&fp).get("sha256").unwrap().is_null());
+        // when that thread looks for more work it sees the request: start_hashing(false) stands in for that look
+        fp.busy.store(false, Ordering::SeqCst);
+        assert!(fp.start_hashing(false));
+        for _ in 0..12000 {
+            if !weight0(&fp).get("sha256").unwrap().is_null() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            weight0(&fp).get_str("sha256").unwrap(),
+            sha256_file(&big).unwrap()
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -93,6 +93,109 @@ pub struct GlmConfig {
     pub verbose: bool,
 }
 
+/// lever 4 switches (see GlmEngine::q8p)
+#[derive(Debug, Clone, Copy)]
+pub struct Q8p {
+    pub gate: bool,
+    pub vb: bool,
+    pub y: bool,
+    pub yr: bool,
+    pub sw: bool,
+}
+/// Lever-4 pieces that are disabled in this release: the mHC y copies (GPU memory fault in k_hc_post_mix_moe_pre's
+/// y-copy variant on 2026-11-09, t2-glmbundle-rows2) and the SwiGLU piece (slower than the separate quantize). Setting
+/// their switches logs one warning and leaves them off.
+const Q8P_DISABLED: [&str; 2] = ["GLM_Q8P_Y", "GLM_Q8P_SW"];
+
+impl Q8p {
+    fn from_env() -> Self {
+        let (q, set) = Self::from_lookup(|k| std::env::var(k).ok());
+        if !set.is_empty() {
+            eprintln!(
+                "glm: {} set but disabled in this release (lever 4 mHC y / SwiGLU pieces); they stay off",
+                set.join(", ")
+            );
+        }
+        q
+    }
+
+    /// The switches from `get` (env lookup): GLM_Q8P_GATE / GLM_Q8P_VB default ON (=0 off), GLM_Q8P=0 all off; the
+    /// Q8P_DISABLED pieces are always off. Also returns the disabled switches that were set (for the warning).
+    fn from_lookup(get: impl Fn(&str) -> Option<String>) -> (Self, Vec<&'static str>) {
+        let on = |k: &str| get(k).map(|v| v != "0").unwrap_or(true);
+        let all = on("GLM_Q8P");
+        let set = Q8P_DISABLED
+            .iter()
+            .copied()
+            .filter(|k| get(k).is_some())
+            .collect();
+        (
+            Q8p {
+                gate: all && on("GLM_Q8P_GATE"),
+                vb: all && on("GLM_Q8P_VB"),
+                y: false,
+                yr: false,
+                sw: false,
+            },
+            set,
+        )
+    }
+}
+
+#[cfg(test)]
+mod q8p_tests {
+    use super::Q8p;
+    use std::collections::HashMap;
+
+    fn parse(kv: &[(&str, &str)]) -> (Q8p, Vec<&'static str>) {
+        let m: HashMap<String, String> = kv
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        Q8p::from_lookup(|k| m.get(k).cloned())
+    }
+
+    #[test]
+    fn defaults_gate_and_vb_on_rest_off() {
+        let (q, set) = parse(&[]);
+        assert!(q.gate && q.vb && !q.y && !q.yr && !q.sw);
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn disabled_pieces_stay_off_and_are_reported() {
+        let (q, set) = parse(&[("GLM_Q8P_Y", "1"), ("GLM_Q8P_SW", "1"), ("GLM_Q8P_YR", "1")]);
+        assert!(!q.y && !q.yr && !q.sw);
+        assert!(q.gate && q.vb, "no other behaviour change");
+        assert_eq!(set, vec!["GLM_Q8P_Y", "GLM_Q8P_SW"]);
+    }
+
+    #[test]
+    fn kill_switches_still_work() {
+        let (q, _) = parse(&[("GLM_Q8P", "0")]);
+        assert!(!q.gate && !q.vb);
+        let (q, _) = parse(&[("GLM_Q8P_GATE", "0")]);
+        assert!(!q.gate && q.vb);
+        let (q, _) = parse(&[("GLM_Q8P_VB", "0")]);
+        assert!(q.gate && !q.vb);
+    }
+}
+
+/// One MMQ q8_1 copy of y written by the mHC kernel: at mmq_xq + off, layout (0 D4 / 1 DS4), rows below lim in slices of
+/// s rows (slice r0 = the matrix of its min(s, lim - r0) rows at off + r0 * n_embd / 128 * 144).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct YCopy {
+    off: usize,
+    layout: i32,
+    s: usize,
+    lim: usize,
+}
+
+const MMQ_BLK: usize = 144;
+fn a4k(b: usize) -> usize {
+    b.div_ceil(4096) * 4096
+}
+
 /// Device buffer (bytes) with a typed pointer helper.
 #[derive(Clone, Copy)]
 pub struct Buf {
@@ -148,6 +251,17 @@ fn hc16_env(g: &super::ffi::Tkg) -> i32 {
         if f == 1 { "fp16" } else { "bf16" }
     );
     f
+}
+
+/// glm-mem (#81): prompt windows write the shared expert's output into a buffer that is dead during the FFN block
+/// instead of a whole-window `sh_out` (GLM_SH_ALIAS=0 = the dedicated buffer, as before).
+fn sh_alias_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GLM_SH_ALIAS")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 /// Activation arena: every per-window buffer, sized for TMAX tokens.
@@ -325,6 +439,8 @@ pub struct GlmEngine {
     pub e4_mla: bool,
     /// the next hc_pre already ran inside the last post-mix launch
     pre_done: bool,
+    /// the shared expert's output buffer of the current FFN block (see `sh_buf`)
+    sh_cur: Buf,
     /// rb-num (opt-in, numerics): GLM_HC_BF16=1 (or fp16) / bf16 stores the 4 mHC streams of prompt windows
     /// (t > TMAX) in 16 bits (1 = fp16 saturating, 2 = bf16); math stays fp32. 0 = off (default, fp32 streams)
     pub hc16: i32,
@@ -335,6 +451,10 @@ pub struct GlmEngine {
     gpin: *mut i32,
     /// draft vocabulary ids on the device (index -> token) and, in host-row embedding mode, their embedding rows
     dv_ids_dev: *mut i32,
+    /// glm-mem (#81): with a row-permuted output head (weights.output_perm) the head's logits land in `logits_perm`
+    /// and go back to token order through `head_pos` (token -> head row); null / None for the file order
+    head_pos: *mut i32,
+    logits_perm: Option<Buf>,
     dv_embd: *mut c_void,
     allocs: Vec<*mut c_void>,
     pub logits_host: Vec<f32>,
@@ -352,7 +472,31 @@ pub struct GlmEngine {
     pub dv_ids: Vec<u32>,
     dlog_dev: Buf,
     dlog_pin: *mut f32,
-    mmq_xq: Buf,
+    /// MMQ-layout prompt activations (dense GEMM input; w16 experts: token rows + SwiGLU rows behind them). Sized
+    /// for the default paths at pch() rows; a fallback that needs more (MMQ experts over a whole window) grows it
+    /// (glm-mem #81: it was sized for that fallback, 144 MiB at 4096 rows, unused on the w16 default). Not in `allocs`.
+    mmq_xq: std::cell::Cell<Buf>,
+    /// lever 4  ): byte offset in mmq_xq where the separate quantizes / producer outputs of the current
+    /// phase go (0, except the shared expert of an FFN whose routed-expert y rows were made by the mHC kernel)
+    xq_off: usize,
+    /// lever 4 switches: GLM_Q8P_GATE (KDA gate -> wo) and GLM_Q8P_VB (MLA v_b -> wo) default ON (=0 = the separate
+    /// quantize path); GLM_Q8P=0 = all off. The mHC y (GLM_Q8P_Y / _YR) and SwiGLU (GLM_Q8P_SW) pieces are disabled in
+    /// this release (Q8P_DISABLED): setting them logs a warning and they stay off
+    pub q8p: Q8p,
+    /// MMQ copies of the current a.y that the last mHC kernel wrote (valid until y is rewritten)
+    ycp: [Option<YCopy>; 2],
+    /// the copies the next fused mHC post-mix should write (planned by forward_window) and the xq_off of the block
+    /// that reads them (past the copies)
+    ycp_plan: Option<([Option<YCopy>; 2], usize)>,
+    /// row of the current a.y slice in the window (for_slices / dense_ffn)
+    y_row0: usize,
+    /// lever 4 on the growable mmq_xq (rebase onto the glm-mem trim): end byte of the MMQ rows that are written and
+    /// not yet read: y copies (`l4_cp`, from the mHC kernel until their last reader) and a producer's output (`l4_pr`,
+    /// from the KDA gate / v_b / SwiGLU launch until its GEMM is enqueued). ensure_xq must not grow while either is
+    /// set (debug assertion; release builds copy the live bytes into the new buffer). The windows reserve the lever-4
+    /// size up front (l4_need), so this never happens by construction.
+    l4_cp: std::cell::Cell<usize>,
+    l4_pr: std::cell::Cell<usize>,
     rowsrc: Buf,
     rownat: Buf,
     bounds: Buf,
@@ -409,6 +553,7 @@ impl Drop for GlmEngine {
         for p in self.allocs.drain(..) {
             ffi::dev_free(p);
         }
+        ffi::dev_free(self.mmq_xq.get().p);
         ffi::host_free(self.c.ring);
         if !self.c.big.is_null() {
             ffi::host_free(self.c.big);
@@ -568,7 +713,9 @@ impl GlmEngine {
             fu: gl(2, tp * ff * 4)?,
             fact: gl(2, tp * ff * 4)?,
             factq: gl(2, tp * q8b(ff))?,
-            sh_out: al(t * e * 4)?,
+            // glm-mem (#81): prompt windows put the shared expert's output in a buffer that is free during the FFN
+            // block (sh_buf), so this one holds decode windows only; GLM_SH_ALIAS=0 = a whole-window buffer as before
+            sh_out: al(if sh_alias_on() { TMAX } else { t } * e * 4)?,
             sfg: al(TMAX * ff * 4)?,
             sfu: al(TMAX * ff * 4)?,
             sfact: al(TMAX * ff * 4)?,
@@ -589,7 +736,8 @@ impl GlmEngine {
                 bytes: 0,
             }, // unused
             h: al(t * e * 4)?,
-            hq: al(t * q8b(e))?,
+            // q8 of head rows only: decode windows (t <= TMAX) or the last row of a prompt chunk (glm-mem #81)
+            hq: al(TMAX * q8b(e))?,
             memb: gl(5, tp * e * 4)?,
             mcat: gl(5, tp * 2 * e * 4)?,
             mcatq: gl(5, tp * q8b(2 * e))?,
@@ -847,14 +995,23 @@ impl GlmEngine {
         // MMQ (prefill) activation buffer + routing buffers
         // SAFETY: plain C queries.
         let mmq_bytes = unsafe {
-            (lib.tk.tk_q36_mmq_q8_bytes)((pch() * k) as i64, e.max(hp.n_ff_exp) as i64).max((lib
-                .tk
-                .tk_q36_mmq_q8_bytes)(
-                pch() as i64,
-                (nh * hp.head_v_mla).max(hp.n_ff) as i64,
-            ))
+            let q8 = lib.tk.tk_q36_mmq_q8_bytes;
+            let dense = q8(pch() as i64, (nh * hp.head_v_mla).max(hp.n_ff) as i64);
+            // w16 experts (the default): the window's token rows, then the SwiGLU rows at a 4 KiB offset
+            let w16 = q8(pch() as i64, e as i64).div_ceil(4096) * 4096
+                + q8((pch() * k) as i64, hp.n_ff_exp as i64);
+            // GLM_MMQ_XQ_FULL=1: the earlier size (MMQ experts over a whole window without growing)
+            let full = if std::env::var("GLM_MMQ_XQ_FULL").as_deref() == Ok("1") {
+                q8((pch() * k) as i64, e.max(hp.n_ff_exp) as i64)
+            } else {
+                0
+            };
+            dense.max(w16).max(full)
         };
-        let mmq_xq = alloc(mmq_bytes)?;
+        let mmq_xq = Buf {
+            p: dev_alloc(mmq_bytes)?,
+            bytes: mmq_bytes,
+        };
         if let Some(reg) = lib.register_mmq {
             // SAFETY: registers the buffer as MMQ-layout activations (tk_prefill_moe_mmq dispatch).
             unsafe { reg(mmq_xq.p) };
@@ -870,6 +1027,24 @@ impl GlmEngine {
                 region_bytes as f64 / (1u64 << 20) as f64
             );
         }
+        let (head_pos, logits_perm) = match (&w.output_perm, lib.g.unpermute_f32) {
+            (Some((perm, _)), Some(_)) => {
+                let mut pos = vec![0i32; perm.len()];
+                for (i, &tk) in perm.iter().enumerate() {
+                    pos[tk as usize] = i as i32;
+                }
+                let pd = alloc(perm.len() * 4)?;
+                ffi::h2d(pd.p, pos.as_ptr() as *const c_void, perm.len() * 4)?;
+                (pd.p as *mut i32, Some(alloc(TMAX * hp.n_vocab * 4)?))
+            }
+            (Some(_), None) => {
+                return Err(CoreError::InvalidArgument {
+                    reason: "row-permuted output head needs tkg_unpermute_f32 in libtalus_kernels"
+                        .into(),
+                })
+            }
+            _ => (ptr::null_mut(), None),
+        };
         let hc16 = hc16_env(&lib.g);
         // padded router rows (TALUS_ROUTER_PAD; f32 gate_inp of the MoE layers)
         let rowpad = crate::rowpad::RowPad::register(
@@ -884,7 +1059,7 @@ impl GlmEngine {
                 .collect::<Vec<_>>(),
             false,
         );
-        Ok(Self {
+        let mut eng = Self {
             snap_mid: None,
             _rowpad: rowpad,
             lib,
@@ -941,11 +1116,14 @@ impl GlmEngine {
             e4_kda,
             e4_mla,
             pre_done: false,
+            sh_cur: a.sh_out,
             hc16,
             hc16_win: 0,
             gdev,
             gpin,
             dv_ids_dev: ptr::null_mut(),
+            head_pos,
+            logits_perm,
             dv_embd: ptr::null_mut(),
             fuse_moe_post: std::env::var("GLM_FUSE_MOE_POST")
                 .map(|v| v != "0")
@@ -965,7 +1143,14 @@ impl GlmEngine {
             dv_ids: vec![],
             dlog_dev,
             dlog_pin,
-            mmq_xq,
+            mmq_xq: std::cell::Cell::new(mmq_xq),
+            xq_off: 0,
+            q8p: Q8p::from_env(),
+            ycp: [None, None],
+            ycp_plan: None,
+            y_row0: 0,
+            l4_cp: std::cell::Cell::new(0),
+            l4_pr: std::cell::Cell::new(0),
             rowsrc,
             rownat,
             bounds,
@@ -976,7 +1161,12 @@ impl GlmEngine {
                 .unwrap_or(true),
             graphs: HashMap::new(),
             seen: Default::default(),
-        })
+        };
+        // a row-permuted head carries its draft vocabulary: the draft head is its first rows (no copy)
+        if let Some((perm, n)) = eng.w.output_perm.clone() {
+            eng.set_draft_vocab(&perm[..n])?;
+        }
+        Ok(eng)
     }
 
     #[inline]
@@ -1078,6 +1268,9 @@ impl GlmEngine {
         if t <= TMAX {
             return self.mmvq(w, xq, y, t);
         }
+        if let Some(q) = self.ycopy_for(x, w.ty, w.n_in() as usize, t) {
+            return self.prefill_dense_q(w, q, y, t);
+        }
         self.prefill_dense(w, x, y, t)
     }
 
@@ -1095,18 +1288,25 @@ impl GlmEngine {
             .iter()
             .all(|w| w.ty == ws[0].ty && w.n_in() == ws[0].n_in());
         if t > TMAX && same && self.share_quant {
-            // Prompt chunk: one MMQ-layout quantization of x for all the projections (same type and n_in:
-            // the same q8_1 rows each separate call would produce), then one GEMM each
-            self.mmq_quant(
-                x,
-                ptr::null(),
-                ws[0].ty,
-                ws[0].n_in() as usize,
-                ws[0].n_in() as usize,
-                t,
-            )?;
+            // prompt chunk - one MMQ-layout quantization of x for all the projections (same type and n_in:
+            // the same q8_1 rows each separate call would produce), then one GEMM each. Lever 4: none at all when
+            // the mHC kernel already wrote those rows (a y copy)
+            let q = match self.ycopy_for(x, ws[0].ty, ws[0].n_in() as usize, t) {
+                Some(q) => q,
+                None => {
+                    self.mmq_quant(
+                        x,
+                        ptr::null(),
+                        ws[0].ty,
+                        ws[0].n_in() as usize,
+                        ws[0].n_in() as usize,
+                        t,
+                    )?;
+                    self.xq()
+                }
+            };
             for (w, y) in ws.iter().zip(ys) {
-                self.prefill_dense_q(w, *y, t)?;
+                self.prefill_dense_q(w, q, *y, t)?;
             }
             return Ok(());
         }
@@ -1136,7 +1336,353 @@ impl GlmEngine {
         self.lib.cktk(stv, "tk_mmvq_w32_multi")
     }
 
+    /// lever 4: y was rewritten without MMQ copies (or a new window starts): forget them, quantize at offset 0
+    fn ycp_clear(&mut self) {
+        self.ycp = [None, None];
+        self.xq_off = 0;
+        self.ycp_plan = None;
+        self.l4_cp.set(0);
+    }
+
+    /// lever 4: a producer is about to write MMQ rows up to byte `end` of mmq_xq (live until its GEMM is enqueued)
+    fn l4_hold(&self, end: usize) {
+        debug_assert!(end <= self.mmq_xq.get().bytes);
+        self.l4_pr.set(self.l4_pr.get().max(end));
+    }
+
+    /// lever 4: the producer's GEMM is enqueued (a later grow synchronizes the stream before freeing)
+    fn l4_done(&self) {
+        self.l4_pr.set(0);
+    }
+
+    /// lever 4: bytes of mmq_xq [0, n) that hold rows still to be read (0 = none)
+    fn l4_live(&self) -> usize {
+        self.l4_pr.get().max(self.l4_cp.get())
+    }
+
+    /// lever 4 piece 1: where the KDA output gate writes wo's MMQ rows for a tw-row projection (byte offset xq_off in
+    /// mmq_xq, resolved with mmq_xq.get() at each use; the KDA block quantizes nothing else after q/k/v), and the end
+    /// of those rows; None = the fp32 gate + separate quantize
+    fn gate_mq(&self, wo: &Tensor, tw: usize) -> Option<(usize, i32, usize)> {
+        let hp = &self.w.hp;
+        let lay = self.q8layout(wo.ty);
+        (self.q8p.gate
+            && self.lib.g.kda_gate_mmq.is_some()
+            && hp.head_kda == 128
+            && (lay == 0 || lay == 1)
+            && wo.n_in() as usize == hp.n_head * hp.head_kda
+            && self.xq_off + self.q8m(tw, hp.n_head * hp.head_kda) <= self.mmq_xq.get().bytes)
+            .then(|| {
+                (
+                    self.xq_off,
+                    lay,
+                    self.xq_off + self.q8m(tw, hp.n_head * hp.head_kda),
+                )
+            })
+    }
+
+    /// lever 4 piece 2: where the MLA v_b product writes wo's MMQ rows for a tw-row projection: past the area of the
+    /// q-path / indexer quantizes of one slice (they run between the slices of an E4 window), as a byte offset in
+    /// mmq_xq (resolved with mmq_xq.get() at each use: those quantizes go through ensure_xq) and the end of the rows;
+    /// None = fp32 + quantize
+    fn vb_mq(&self, l: &LayerW, tw: usize) -> Option<(usize, i32, usize)> {
+        let hp = &self.w.hp;
+        let m = &l.mla;
+        let cols = hp.n_head * hp.head_v_mla;
+        let lay = self.q8layout(m.wo.ty);
+        let f = self.lib.g.heads_q8_0_mmq?;
+        let off = self.xq_off + a4k(self.q8m(asub(), hp.n_embd));
+        // SAFETY: probe call (W null: nothing launched).
+        let probe = unsafe {
+            f(
+                ptr::null(),
+                ptr::null(),
+                ptr::null_mut(),
+                lay,
+                0,
+                tw as i32,
+                m.wv_b.ne[2] as i32,
+                m.wv_b.n_in(),
+                m.wv_b.n_out(),
+                tw.min(asub()) as i32,
+                ptr::null_mut(),
+            )
+        };
+        (self.q8p.vb
+            && probe == 0
+            && m.wv_b.ty == gt::Q8_0
+            && m.wo.n_in() as usize == cols
+            && off + self.q8m(tw, cols) <= self.mmq_xq.get().bytes)
+            .then(|| (off, lay, off + self.q8m(tw, cols)))
+    }
+
+    /// lever 4: the extra arguments of tkg_hc_post_mix*_pre_mmq for the planned copies (n, 2 x (ptr, layout, s, lim))
+    #[allow(clippy::type_complexity)]
+    fn ycp_args(&self, cp: &[Option<YCopy>; 2]) -> (i32, [(*mut c_void, i32, i32, i32); 2]) {
+        let mut v = [(ptr::null_mut(), 0, 1, 0); 2];
+        let mut n = 0;
+        for c in cp.iter().flatten() {
+            v[n] = (
+                self.mmq_xq.get().at(c.off),
+                c.layout,
+                c.s as i32,
+                c.lim as i32,
+            );
+            n += 1;
+        }
+        (n as i32, v)
+    }
+
+    /// lever 4: where this phase's quantized activations go (mmq_xq + xq_off)
+    fn xq(&self) -> *mut c_void {
+        self.mmq_xq.get().at(self.xq_off)
+    }
+
+    /// MMQ activation bytes of rows x cols (tk_q36_mmq_q8_bytes)
+    fn q8m(&self, rows: usize, cols: usize) -> usize {
+        // SAFETY: plain C query.
+        unsafe { (self.lib.tk.tk_q36_mmq_q8_bytes)(rows as i64, cols as i64) }
+    }
+
+    /// MMQ activation layout of weights of type `ty` (0 D4, 1 DS4, 2 D2S6)
+    fn q8layout(&self, ty: u32) -> i32 {
+        // SAFETY: plain C query.
+        unsafe { (self.lib.tk.tk_q36_mmq_q8_layout)(ty as i32) }
+    }
+
+    /// lever 4: the MMQ rows tk_q36_mmq_quantize(x, ty, n_in, n_in, t) would write, if the last mHC kernel already wrote
+    /// them (x = the current a.y slice, a matching copy and slice); None = quantize as before.
+    fn ycopy_for(&self, x: *const f32, ty: u32, n_in: usize, t: usize) -> Option<*mut c_void> {
+        let e = self.w.hp.n_embd;
+        if t <= TMAX
+            || n_in != e
+            || x != self.a.y.f() as *const f32
+            || self.ycp.iter().all(|c| c.is_none())
+        {
+            return None;
+        }
+        let lay = self.q8layout(ty);
+        let r0 = self.y_row0;
+        self.ycp.iter().flatten().find_map(|c| {
+            (c.layout == lay && r0 % c.s == 0 && r0 < c.lim && t == c.s.min(c.lim - r0))
+                .then(|| self.mmq_xq.get().at(c.off + r0 * (e / 128) * MMQ_BLK))
+        })
+    }
+
+    /// lever 4: rows of an attention window that run MMQ projections (attn_block: a last slice of at most TMAX rows
+    /// keeps its mat-vec window) and the row count of one MMQ q/k/v slice of a KDA layer
+    fn attn_mmq_rows(&self, recr: bool, t: usize) -> (usize, usize) {
+        let tail = t % asub();
+        let tw = if t > asub() && tail != 0 && tail <= TMAX {
+            t - tail
+        } else {
+            t
+        };
+        let s = if recr && t > asub() && self.e4_kda && tw > asub() {
+            tw
+        } else {
+            asub()
+        };
+        (tw, s)
+    }
+
+    /// lever 4: the MMQ copies of y the fused mHC kernel before layer l's attention should write, and that phase's
+    /// xq_off (copies first, then the phase's own quantizes / producer outputs); None = no copies
+    fn plan_attn(&self, l: &LayerW, t: usize) -> Option<([Option<YCopy>; 2], usize)> {
+        let (cp, end, need) = self.plan_attn_need(l, t)?;
+        (need <= self.mmq_xq.get().bytes).then_some((cp, end))
+    }
+
+    /// plan_attn without the capacity check: (copies, xq_off of the phase, bytes of mmq_xq the phase needs)
+    #[allow(clippy::type_complexity)]
+    fn plan_attn_need(&self, l: &LayerW, t: usize) -> Option<([Option<YCopy>; 2], usize, usize)> {
+        if !self.q8p.y || t <= TMAX || self.lib.g.hc_post_mix_pre_mmq.is_none() {
+            return None;
+        }
+        let hp = &self.w.hp;
+        let e = hp.n_embd;
+        let (tw, s) = self.attn_mmq_rows(l.recr, t);
+        let ok = |lay: i32| lay == 0 || lay == 1;
+        let mut cp = [None, None];
+        let mut end = 0usize;
+        let add = |lay: i32, cp: &mut [Option<YCopy>; 2], end: &mut usize| {
+            let i = if cp[0].is_none() { 0 } else { 1 };
+            cp[i] = Some(YCopy {
+                off: *end,
+                layout: lay,
+                s,
+                lim: tw,
+            });
+            *end = a4k(*end + self.q8m(tw, e));
+        };
+        let reserve = if l.recr {
+            let lay = self.q8layout(l.kda.wq.ty);
+            if !ok(lay) {
+                return None;
+            }
+            add(lay, &mut cp, &mut end);
+            self.q8m(tw, hp.n_head * hp.head_kda)
+        } else {
+            let m = &l.mla;
+            let l0 = self.q8layout(m.wq_a.ty);
+            let l1 = self.q8layout(m.wkv_a.ty);
+            if !ok(l0) {
+                return None;
+            }
+            add(l0, &mut cp, &mut end);
+            if ok(l1) && l1 != l0 {
+                add(l1, &mut cp, &mut end);
+            }
+            a4k(self.q8m(asub(), e)) + self.q8m(tw, hp.n_head * hp.head_v_mla)
+        };
+        Some((cp, end, end + reserve))
+    }
+
+    /// lever 4: as plan_attn for the FFN of layer l: the dense / shared expert rows (PCH-row slices) and, where the
+    /// routed experts take the fp16 path that reads plain D4 token rows (prefill_experts), those rows at offset 0
+    fn plan_ffn(&self, l: &LayerW, t: usize) -> Option<([Option<YCopy>; 2], usize)> {
+        let (cp, end, need) = self.plan_ffn_need(l, t)?;
+        (need <= self.mmq_xq.get().bytes).then_some((cp, end))
+    }
+
+    /// plan_ffn without the final capacity check (the routed copy still needs the w16 path's rows to fit, as that
+    /// path itself checks): (copies, xq_off of the phase, bytes of mmq_xq the phase needs)
+    #[allow(clippy::type_complexity)]
+    fn plan_ffn_need(&self, l: &LayerW, t: usize) -> Option<([Option<YCopy>; 2], usize, usize)> {
+        if !self.q8p.y || t <= TMAX || self.lib.g.hc_post_mix_pre_mmq.is_none() {
+            return None;
+        }
+        let hp = &self.w.hp;
+        let e = hp.n_embd;
+        let f = &l.ffn;
+        let lay = self.q8layout(f.gate.ty);
+        if lay != 0 && lay != 1 {
+            return None;
+        }
+        let mut cp = [None, None];
+        let mut end = 0usize;
+        let mut i = 0;
+        if l.moe && self.q8p.yr {
+            let g = &f.gate_exps;
+            let rows = t * hp.n_expert_used;
+            // SAFETY: plain C query.
+            let w16 =
+                self.lib.g.w16_moe_on.is_some_and(|q| unsafe {
+                    q(g.ty as i32, rows as i64, hp.n_expert as i32) == 1
+                }) && self.lib.g.w16_moe_gu_q8.is_some()
+                    && self.lib.g.w16_moe_down.is_some();
+            let glm_ok = |ty: u32| ty == gt::IQ2_S || ty == gt::IQ3_S;
+            let fits = a4k(self.q8m(t, e)) + self.q8m(rows, hp.n_ff_exp) <= self.mmq_xq.get().bytes;
+            if w16
+                && fits
+                && glm_ok(g.ty)
+                && glm_ok(f.up_exps.ty)
+                && glm_ok(f.down_exps.ty)
+                && f.up_exps.ty == g.ty
+                && f.up_exps.expert_bytes() == g.expert_bytes()
+                && f.up_exps.n_out() == g.n_out()
+                && self.q8layout(g.ty) == 0
+            {
+                cp[0] = Some(YCopy {
+                    off: 0,
+                    layout: 0,
+                    s: t,
+                    lim: t,
+                });
+                end = a4k(self.q8m(t, e));
+                i = 1;
+            }
+        }
+        if !matches!(cp[0], Some(c) if c.layout == lay && c.s == PCH.min(t)) {
+            cp[i] = Some(YCopy {
+                off: end,
+                layout: lay,
+                s: PCH,
+                lim: t,
+            });
+            end = a4k(end + self.q8m(t, e));
+        }
+        let ff = f.gate.n_out() as usize;
+        Some((cp, end, end + self.q8m(t.min(PCH), ff.max(e))))
+    }
+
+    /// lever 4: bytes of mmq_xq the enabled pieces need in a t-row prompt window over `layers` (the largest phase:
+    /// y copies + the phase's own quantizes / producer rows, as plan_attn / plan_ffn / gate_mq / vb_mq /
+    /// dense_ffn_rows check them). Reserved before the first producer writes, so no ensure_xq inside the window
+    /// grows the buffer while lever-4 rows are live. 0 = nothing to reserve (decode windows, all pieces off).
+    fn l4_need(&self, layers: &[LayerW], t: usize, with_y: bool) -> usize {
+        if t <= TMAX {
+            return 0;
+        }
+        let hp = &self.w.hp;
+        let e = hp.n_embd;
+        let mut need = 0usize;
+        for l in layers {
+            let (tw, _) = self.attn_mmq_rows(l.recr, t);
+            let attn = match self.plan_attn_need(l, t).filter(|_| with_y) {
+                Some((_, _, n)) => n,
+                None if l.recr && self.q8p.gate => self.q8m(tw, hp.n_head * hp.head_kda),
+                None if !l.recr && self.q8p.vb => {
+                    a4k(self.q8m(asub(), e)) + self.q8m(tw, hp.n_head * hp.head_v_mla)
+                }
+                None => 0,
+            };
+            let ffn = match self.plan_ffn_need(l, t).filter(|_| with_y) {
+                Some((_, _, n)) => n,
+                None if self.q8p.sw => self.q8m(t.min(PCH), l.ffn.gate.n_out() as usize),
+                None => 0,
+            };
+            need = need.max(attn).max(ffn);
+        }
+        need
+    }
+
+    /// lever 4: reserve l4_need for a t-row window (trunk: layers [0, n_layer) with the y copies; MTP: its layer,
+    /// no copies) before any producer writes
+    fn l4_reserve(&self, layers: &[LayerW], t: usize, mtp: bool) -> Result<()> {
+        // a window that failed half-way may have left a hold behind: nothing of an earlier window is live
+        self.l4_pr.set(0);
+        self.l4_cp.set(0);
+        let n = self.w.hp.n_layer;
+        let need = if mtp {
+            self.l4_need(&layers[n..=n], t, false)
+        } else {
+            self.l4_need(&layers[..n.min(layers.len())], t, true)
+        };
+        self.ensure_xq(need)
+    }
+
     /// MMQ-layout q8_1 of `rows` rows of `x` (gathered through `ids` when non-null) for weights of type `ty`.
+    /// Grow the MMQ activation buffer to `bytes` (prompt paths only; decode graphs never read it): the stream is
+    /// synchronized first, the new buffer registered as MMQ layout, the old one freed.
+    /// Lever 4: never while producer rows / y copies are live (l4_live; the windows reserve their lever-4 size first,
+    /// l4_reserve); a release build that gets there anyway copies the live bytes over instead of losing them.
+    fn ensure_xq(&self, bytes: usize) -> Result<()> {
+        let cur = self.mmq_xq.get();
+        if bytes <= cur.bytes {
+            return Ok(());
+        }
+        let live = self.l4_live();
+        debug_assert!(
+            live == 0,
+            "glm: mmq_xq grows {} -> {bytes} B with {live} B of lever-4 rows live",
+            cur.bytes
+        );
+        ffi::sync(self.stream)?;
+        let p = dev_alloc(bytes)?;
+        if let Some(reg) = self.lib.register_mmq {
+            // SAFETY: registers the buffer as MMQ-layout activations (tk_prefill_moe_mmq dispatch).
+            unsafe { reg(p) };
+        }
+        if live > 0 {
+            ffi::d2d_async(p, cur.p, live.min(cur.bytes), self.stream)?;
+            ffi::sync(self.stream)?;
+        }
+        ffi::dev_free(cur.p);
+        self.mmq_xq.set(Buf { p, bytes });
+        Ok(())
+    }
+
     fn mmq_quant(
         &self,
         x: *const f32,
@@ -1146,13 +1692,17 @@ impl GlmEngine {
         ld: usize,
         rows: usize,
     ) -> Result<()> {
+        // SAFETY: plain C query.
+        let need = unsafe { (self.lib.tk.tk_q36_mmq_q8_bytes)(rows as i64, cols as i64) };
+        // the rows go to mmq_xq + xq_off (lever 4: past the y copies of the phase)
+        self.ensure_xq(self.xq_off + need)?;
         // SAFETY: tk_* C ABI.
         let stv = unsafe {
             (self.lib.tk.tk_q36_mmq_quantize)(
                 self.lib.ctx,
                 x,
                 ids,
-                self.mmq_xq.p,
+                self.xq(),
                 ty as i32,
                 cols as i64,
                 ld as i64,
@@ -1179,7 +1729,7 @@ impl GlmEngine {
             w_cols: w.n_in() as i64,
             expert_bytes: w.expert_bytes(),
             n_experts: w.ne[2] as i32,
-            x_q8_1: self.mmq_xq.p,
+            x_q8_1: self.mmq_xq.get().p,
             bounds_dev: self.bounds.i(),
             ids_dev: self.rownat.i(),
             total_rows: rows as i64,
@@ -1219,7 +1769,7 @@ impl GlmEngine {
             w_cols: gate.n_in() as i64,
             expert_bytes: gate.expert_bytes(),
             n_experts: gate.ne[2] as i32,
-            x_q8_1: self.mmq_xq.p,
+            x_q8_1: self.mmq_xq.get().p,
             bounds_dev: self.bounds.i(),
             ids_dev: self.rownat.i(),
             total_rows: rows as i64,
@@ -1397,6 +1947,7 @@ impl GlmEngine {
         if std::mem::take(&mut self.pre_done) {
             return Ok(());
         }
+        self.ycp_clear();
         let hp = &self.w.hp;
         if self.hc16_win != 0 {
             let f = self.lib.g.hc_pre2_16.unwrap();
@@ -1471,6 +2022,56 @@ impl GlmEngine {
                 self.fuse_hc_pre_pf && self.hc16_win == 0
             };
             if fuse && mode != 2 && self.dump.is_none() {
+                // lever 4: the planned MMQ copies of y written by the same launch (bitwise the separate quantizes)
+                if let (Some((cp, off)), Some(fm)) =
+                    (self.ycp_plan.take(), self.lib.g.hc_post_mix_pre_mmq)
+                {
+                    let hp = &self.w.hp;
+                    let (n, v) = self.ycp_args(&cp);
+                    // SAFETY: tkg C ABI; the copies lie inside mmq_xq (plan_attn / plan_ffn).
+                    let r = unsafe {
+                        fm(
+                            xo,
+                            self.a.xhc.f(),
+                            self.a.pc.f(),
+                            w,
+                            self.a.parts.f(),
+                            t as i32,
+                            hp.n_embd as i32,
+                            mode,
+                            h.scale.f(),
+                            h.base.f(),
+                            norm.f(),
+                            self.a.y.f(),
+                            hp.rms_eps,
+                            hp.rms_eps,
+                            hp.hc_eps,
+                            hp.hc_iters as i32,
+                            self.a.yq.v(),
+                            self.hc_cnt.i(),
+                            n,
+                            v[0].0,
+                            v[0].1,
+                            v[0].2,
+                            v[0].3,
+                            v[1].0,
+                            v[1].1,
+                            v[1].2,
+                            v[1].3,
+                            self.s(),
+                        )
+                    };
+                    if r > 0 {
+                        ck(r, "tkg_hc_post_mix_pre_mmq")?;
+                    }
+                    if r == 0 {
+                        self.pre_done = true;
+                        self.ycp = cp;
+                        self.xq_off = off;
+                        self.l4_cp.set(off);
+                        return Ok(());
+                    }
+                }
                 let hp = &self.w.hp;
                 // SAFETY: tkg C ABI.
                 let r = unsafe {
@@ -1501,6 +2102,7 @@ impl GlmEngine {
                 }
                 if r == 0 {
                     self.pre_done = true;
+                    self.ycp_clear();
                     return Ok(());
                 }
             }
@@ -1560,13 +2162,64 @@ impl GlmEngine {
                 self.fuse_hc_pre_pf && self.hc16_win == 0
             };
             if fuse && self.dump.is_none() {
+                if let (Some((cp, off)), Some(fm)) =
+                    (self.ycp_plan.take(), self.lib.g.hc_post_mix_moe_pre_mmq)
+                {
+                    let hp = &self.w.hp;
+                    let (n, v) = self.ycp_args(&cp);
+                    // SAFETY: tkg C ABI; the copies lie inside mmq_xq (plan_attn).
+                    let r = unsafe {
+                        fm(
+                            self.a.ed.f(),
+                            self.a.ew.f(),
+                            self.a.sh_out.f(),
+                            self.a.xhc.f(),
+                            self.a.pc.f(),
+                            w,
+                            self.a.parts.f(),
+                            t as i32,
+                            hp.n_expert_used as i32,
+                            hp.n_embd as i32,
+                            h.scale.f(),
+                            h.base.f(),
+                            norm.f(),
+                            self.a.y.f(),
+                            hp.rms_eps,
+                            hp.rms_eps,
+                            hp.hc_eps,
+                            hp.hc_iters as i32,
+                            self.a.yq.v(),
+                            self.hc_cnt.i(),
+                            n,
+                            v[0].0,
+                            v[0].1,
+                            v[0].2,
+                            v[0].3,
+                            v[1].0,
+                            v[1].1,
+                            v[1].2,
+                            v[1].3,
+                            self.s(),
+                        )
+                    };
+                    if r > 0 {
+                        ck(r, "tkg_hc_post_mix_moe_pre_mmq")?;
+                    }
+                    if r == 0 {
+                        self.pre_done = true;
+                        self.ycp = cp;
+                        self.xq_off = off;
+                        self.l4_cp.set(off);
+                        return Ok(());
+                    }
+                }
                 let hp = &self.w.hp;
                 // SAFETY: tkg C ABI.
                 let r = unsafe {
                     (self.lib.g.hc_post_mix_moe_pre)(
                         self.a.ed.f(),
                         self.a.ew.f(),
-                        self.a.sh_out.f(),
+                        self.sh_cur.f(),
                         self.a.xhc.f(),
                         self.a.pc.f(),
                         w,
@@ -1592,6 +2245,7 @@ impl GlmEngine {
                 }
                 if r == 0 {
                     self.pre_done = true;
+                    self.ycp_clear();
                     return Ok(());
                 }
             }
@@ -1604,7 +2258,7 @@ impl GlmEngine {
                     f(
                         self.a.ed.f(),
                         self.a.ew.f(),
-                        self.a.sh_out.f(),
+                        self.sh_cur.f(),
                         self.a.xhc.v(),
                         self.a.pc.f(),
                         w,
@@ -1625,7 +2279,7 @@ impl GlmEngine {
                 (self.lib.g.hc_post_mix_moe)(
                     self.a.ed.f(),
                     self.a.ew.f(),
-                    self.a.sh_out.f(),
+                    self.sh_cur.f(),
                     self.a.xhc.f(),
                     self.a.pc.f(),
                     w,
@@ -1827,6 +2481,29 @@ impl GlmEngine {
                     ),
                     "tkg_kda_gate_q8",
                 )?;
+            } else if let Some((mo, lay, mend)) = self.gate_mq(&kw.wo, t) {
+                // lever 4: the gate writes wo's MMQ rows (bitwise the fp32 gate + quantize below)
+                self.l4_hold(mend);
+                ck(
+                    (self.lib.g.kda_gate_mmq.unwrap())(
+                        a.o.f(),
+                        a.g2.f(),
+                        kw.o_norm.f(),
+                        self.mmq_xq.get().at(mo),
+                        lay,
+                        0,
+                        t as i32,
+                        t as i32,
+                        hp.n_head as i32,
+                        hp.head_kda as i32,
+                        hp.rms_eps,
+                        self.s(),
+                    ),
+                    "tkg_kda_gate_mmq",
+                )?;
+                let r = self.prefill_dense_q(&kw.wo, self.mmq_xq.get().at(mo), a.blk_out.f(), t);
+                self.l4_done();
+                return r;
             } else {
                 ck(
                     (self.lib.g.kda_gate)(
@@ -1918,6 +2595,7 @@ impl GlmEngine {
             self.a.y.p = y0.at(r0 * e * 4);
             self.a.yq.p = yq0.at(r0 * q8b(e));
             self.a.blk_out.p = bo0.at(r0 * e * 4);
+            self.y_row0 = r0;
             // SAFETY: the control block holds CTL_TOK - CTL_SUB sub-window positions (PCH / ASUB of them).
             self.c.ctl = unsafe { (self.c.base as *mut i32).add(CTL_SUB + k) };
             self.c.pos0 = pos00 + r0;
@@ -1938,6 +2616,7 @@ impl GlmEngine {
         }
         self.a.y = y0;
         self.a.yq = yq0;
+        self.y_row0 = 0;
         self.a.blk_out = bo0;
         self.c.ctl = ctl0;
         self.c.pos0 = pos00;
@@ -1970,6 +2649,7 @@ impl GlmEngine {
             &[a.qr.f(), a.kr.f(), a.vr.f()],
             tw,
         )?;
+        let gmq = self.gate_mq(&kw.wo, tw);
         self.for_slices(l, il, 0, tw, |me, r0, tt| {
             // SAFETY: row offsets r0 + tt <= tw inside the whole-window buffers (sized for pch() rows with E4).
             let (q, k, v, fa, ga, beta) = unsafe {
@@ -2066,23 +2746,50 @@ impl GlmEngine {
                         "tkg_glm_kda_step",
                     )?;
                 }
-                ck(
-                    (me.lib.g.kda_gate)(
-                        a.o.f(),
-                        a.g2.f(),
-                        kw.o_norm.f(),
-                        q,
-                        tt as i32,
-                        nh as i32,
-                        hk as i32,
-                        hp.rms_eps,
-                        me.s(),
-                    ),
-                    "tkg_kda_gate",
-                )?;
+                if let Some((mo, lay, mend)) = gmq {
+                    // lever 4: rows r0.. of wo's tw-row MMQ activations (live until the wo GEMM below)
+                    me.l4_hold(mend);
+                    ck(
+                        (me.lib.g.kda_gate_mmq.unwrap())(
+                            a.o.f(),
+                            a.g2.f(),
+                            kw.o_norm.f(),
+                            me.mmq_xq.get().at(mo),
+                            lay,
+                            r0 as i32,
+                            tw as i32,
+                            tt as i32,
+                            nh as i32,
+                            hk as i32,
+                            hp.rms_eps,
+                            me.s(),
+                        ),
+                        "tkg_kda_gate_mmq",
+                    )?;
+                } else {
+                    ck(
+                        (me.lib.g.kda_gate)(
+                            a.o.f(),
+                            a.g2.f(),
+                            kw.o_norm.f(),
+                            q,
+                            tt as i32,
+                            nh as i32,
+                            hk as i32,
+                            hp.rms_eps,
+                            me.s(),
+                        ),
+                        "tkg_kda_gate",
+                    )?;
+                }
             }
             Ok(())
         })?;
+        if let Some((mo, _, _)) = gmq {
+            let r = self.prefill_dense_q(&kw.wo, self.mmq_xq.get().at(mo), a.blk_out.f(), tw);
+            self.l4_done();
+            return r;
+        }
         // the gated outputs of every slice now sit in the q rows
         self.proj(&kw.wo, a.qr.f(), a.ogq.v(), a.blk_out.f(), tw)
     }
@@ -2092,11 +2799,23 @@ impl GlmEngine {
     fn dsa_e4(&mut self, l: &LayerW, il: usize, tw: usize) -> Result<()> {
         let a = self.a;
         let vbw = self.w.hp.n_head * self.w.hp.head_v_mla;
+        let vmq = self.vb_mq(l, tw);
         self.for_slices(l, il, 0, tw, |me, r0, tt| {
             // SAFETY: row offset inside the whole-window vb (sized for pch() rows with E4).
             let vb = unsafe { a.vb.f().add(r0 * vbw) };
-            me.dsa_core(l, il, tt, vb)
+            me.dsa_core(
+                l,
+                il,
+                tt,
+                vb,
+                vmq.map(|(o, lay, end)| (o, lay, r0, tw, end)),
+            )
         })?;
+        if let Some((mo, _, _)) = vmq {
+            let r = self.prefill_dense_q(&l.mla.wo, self.mmq_xq.get().at(mo), a.blk_out.f(), tw);
+            self.l4_done();
+            return r;
+        }
         self.proj(&l.mla.wo, a.vb.f(), a.vbq.v(), a.blk_out.f(), tw)
     }
 
@@ -2106,7 +2825,19 @@ impl GlmEngine {
         }
         let hp = self.w.hp.clone();
         let a = self.a;
-        self.dsa_core(l, il, t, a.vb.f())?;
+        let vmq = if t > TMAX { self.vb_mq(l, t) } else { None };
+        self.dsa_core(
+            l,
+            il,
+            t,
+            a.vb.f(),
+            vmq.map(|(o, lay, end)| (o, lay, 0, t, end)),
+        )?;
+        if let Some((mo, _, _)) = vmq {
+            let r = self.prefill_dense_q(&l.mla.wo, self.mmq_xq.get().at(mo), a.blk_out.f(), t);
+            self.l4_done();
+            return r;
+        }
         if t <= TMAX {
             self.quant(a.vb.f(), a.vbq.v(), hp.n_head * hp.head_v_mla, t)?;
         }
@@ -2114,8 +2845,17 @@ impl GlmEngine {
     }
 
     /// MLA/DSA block up to the value projection: q path, indexer + selection, latent cache, sparse attention,
-    /// wv_b into `vb` ([t][n_head][head_v_mla]).
-    fn dsa_core(&mut self, l: &LayerW, il: usize, t: usize, vb: *mut f32) -> Result<()> {
+    /// wv_b into `vb` ([t][n_head][head_v_mla]); lever 4: with `vq` = (offset, layout, row0, ne1, end) wv_b writes its
+    /// rows as wo's MMQ activations instead (rows row0.. of an ne1-row matrix at mmq_xq + offset, resolved at the
+    /// launch: the q path above may go through ensure_xq; the caller probed coverage and releases the hold after wo).
+    fn dsa_core(
+        &mut self,
+        l: &LayerW,
+        il: usize,
+        t: usize,
+        vb: *mut f32,
+        vq: Option<(usize, i32, usize, usize, usize)>,
+    ) -> Result<()> {
         let hp = self.w.hp.clone();
         let a = self.a;
         let m = &l.mla;
@@ -2310,6 +3050,28 @@ impl GlmEngine {
             self.dump_dev("q_abs", il, a.qabs.f(), t * nh * lat)?;
             self.dump_dev("lat", il, a.lat.f(), t * nh * lat)?;
         }
+        if let (Some((off, lay, row0, ne1, end)), Some(f)) = (vq, self.lib.g.heads_q8_0_mmq) {
+            self.l4_hold(end);
+            let dst = self.mmq_xq.get().at(off);
+            // SAFETY: tkg C ABI; dst holds ne1 rows of H * n_out columns (vb_mq).
+            let r = unsafe {
+                f(
+                    m.wv_b.p(),
+                    a.lat.f(),
+                    dst,
+                    lay,
+                    row0 as i32,
+                    ne1 as i32,
+                    m.wv_b.ne[2] as i32,
+                    m.wv_b.n_in(),
+                    m.wv_b.n_out(),
+                    t as i32,
+                    self.s(),
+                )
+            };
+            // probed by vb_mq: -1 here would leave rows unwritten
+            return ck(if r < 0 { 1 } else { r }, "tkg_heads_q8_0_mmq");
+        }
         self.heads(&m.wv_b, a.lat.f(), vb, t)
     }
 
@@ -2403,6 +3165,7 @@ impl GlmEngine {
             let tt = (t - r0).min(PCH);
             self.a.y.p = y0.at(r0 * e * 4);
             self.a.yq.p = yq0.at(r0 * q8b(e));
+            self.y_row0 = r0;
             // SAFETY: out holds t rows of e floats.
             r = self.dense_ffn_rows(f, clamp, unsafe { out.add(r0 * e) }, tt);
             if r.is_err() {
@@ -2411,6 +3174,7 @@ impl GlmEngine {
         }
         self.a.y = y0;
         self.a.yq = yq0;
+        self.y_row0 = 0;
         r
     }
 
@@ -2458,6 +3222,35 @@ impl GlmEngine {
                     "tkg_swiglu_clamp_q8",
                 )?;
             } else {
+                // lever 4: the SwiGLU written as the down projection's MMQ rows (bitwise the fp32 + quantize below)
+                let lay = self.q8layout(f.down.ty);
+                if let (true, Some(fm), true, true) = (
+                    self.q8p.sw,
+                    self.lib.g.swiglu_clamp_mmq,
+                    lay == 0 || lay == 1,
+                    self.xq_off + self.q8m(t, ffd) <= self.mmq_xq.get().bytes,
+                ) {
+                    self.l4_hold(self.xq_off + self.q8m(t, ffd));
+                    let r = fm(
+                        a.fg.f(),
+                        a.fu.f(),
+                        self.xq(),
+                        lay,
+                        t as i32,
+                        ffd as i32,
+                        clamp,
+                        self.s(),
+                    );
+                    if r > 0 {
+                        ck(r, "tkg_swiglu_clamp_mmq")?;
+                    }
+                    if r == 0 {
+                        let r = self.prefill_dense_q(&f.down, self.xq(), out, t);
+                        self.l4_done();
+                        return r;
+                    }
+                    self.l4_done();
+                }
                 ck(
                     (self.lib.g.swiglu_clamp)(
                         a.fg.f(),
@@ -2474,6 +3267,28 @@ impl GlmEngine {
         self.proj(&f.down, a.fact.f(), a.factq.v(), out, t)
     }
 
+    /// Where the shared expert of layer `il` writes a window of `t` rows. Decode windows: `sh_out`. Prompt windows
+    /// (glm-mem #81, unless GLM_SH_ALIAS=0): trunk layers with the fused combine use `blk_out` (the attention output,
+    /// consumed by the mHC post-mix before the FFN block; the fused combine writes the streams, not blk_out); trunk
+    /// layers on the separate combine use `h` (written only by the head after the last layer; the previous chunk's
+    /// MTP pass has read it); the MTP layer uses `memb` (its embedding rows, consumed before its attention block).
+    /// Same values in another buffer: the same bits.
+    fn sh_buf(&self, il: usize, t: usize) -> Buf {
+        let a = self.a;
+        if t <= TMAX || !sh_alias_on() {
+            return a.sh_out;
+        }
+        if il >= self.w.hp.n_layer {
+            debug_assert!(t * self.w.hp.n_embd * 4 <= a.memb.bytes);
+            return a.memb;
+        }
+        if self.fuse_moe_post && self.dump.is_none() {
+            a.blk_out
+        } else {
+            a.h
+        }
+    }
+
     fn ffn_block(&mut self, l: &LayerW, il: usize, t: usize) -> Result<()> {
         let hp = self.w.hp.clone();
         let a = self.a;
@@ -2484,10 +3299,12 @@ impl GlmEngine {
             return self.dense_ffn(f, clamp_sh, a.blk_out.f(), t);
         }
         // the shared expert runs on the side stream, concurrently with routing and the routed experts
+        let sh = self.sh_buf(il, t);
+        self.sh_cur = sh;
         if t <= TMAX {
-            self.side(|me| me.dense_ffn(f, clamp_sh, a.sh_out.f(), t))?;
+            self.side(|me| me.dense_ffn(f, clamp_sh, sh.f(), t))?;
         } else {
-            self.dense_ffn(f, clamp_sh, a.sh_out.f(), t)?;
+            self.dense_ffn(f, clamp_sh, sh.f(), t)?;
         }
         let k = hp.n_expert_used;
         let nf = hp.n_ff_exp;
@@ -2782,7 +3599,7 @@ impl GlmEngine {
                 (self.lib.g.moe_combine)(
                     a.ed.f(),
                     a.ew.f(),
-                    a.sh_out.f(),
+                    self.sh_cur.f(),
                     a.blk_out.f(),
                     t as i32,
                     k as i32,
@@ -2919,8 +3736,12 @@ impl GlmEngine {
             0
         };
         let layers = std::mem::take(&mut self.w.layers);
+        self.ycp_clear();
         let r = (|| -> Result<()> {
             self.pre_done = false;
+            // lever 4: the window's whole MMQ size before the first producer writes (no grow while rows are live)
+            self.l4_reserve(&layers, t, false)?;
+            self.ycp_plan = self.plan_attn(&layers[0], t);
             self.hc_post_mix(1, Some(&layers[0].hc_attn), Some(&layers[0].attn_norm), t)?;
             for il in 0..hp.n_layer {
                 let l = &layers[il];
@@ -2941,6 +3762,7 @@ impl GlmEngine {
                 self.dump_dev("attn_norm", il, self.a.y.f(), t * e)?;
                 self.attn_block(l, il, t, k_snap)?;
                 self.dump_dev("blk_out", il, self.a.blk_out.f(), t * e)?;
+                self.ycp_plan = self.plan_ffn(l, t);
                 self.hc_post_mix(0, Some(&l.hc_ffn), Some(&l.ffn_norm), t)?;
                 self.dump_dev("hc_attn_post", il, self.a.xhc.f(), t * 4 * e)?;
                 self.hc_pre(&l.hc_ffn, &l.ffn_norm, t)?;
@@ -2949,6 +3771,7 @@ impl GlmEngine {
                 let next_l = layers.get(il + 1).filter(|_| il + 1 < hp.n_layer);
                 let next_hc = next_l.map(|n| &n.hc_attn);
                 let next_norm = next_l.map(|n| &n.attn_norm);
+                self.ycp_plan = next_l.and_then(|n| self.plan_attn(n, t));
                 if l.moe && self.fuse_moe_post && self.dump.is_none() {
                     self.hc_post_mix_moe(next_hc, next_norm, t)?;
                 } else {
@@ -2960,6 +3783,7 @@ impl GlmEngine {
             Ok(())
         })();
         self.w.layers = layers;
+        self.ycp_clear();
         r?;
         if self.hc16_win != 0 {
             let f = self.lib.g.hc_head16.unwrap();
@@ -3000,15 +3824,39 @@ impl GlmEngine {
         self.dump_dev("result_norm", 0, self.a.h.f(), t * e)?;
         if want_logits {
             let out = self.w.output;
-            if t <= TMAX {
+            // a row-permuted head writes head-row order into logits_perm, copied back to token order below
+            let dst = self
+                .logits_perm
+                .map(|b| b.f())
+                .unwrap_or(self.logits_dev.f());
+            let rows = if t <= TMAX {
                 self.quant(self.a.h.f(), self.a.hq.v(), e, t)?;
-                self.mmvq(&out, self.a.hq.v(), self.logits_dev.f(), t)?;
+                self.mmvq(&out, self.a.hq.v(), dst, t)?;
+                t
             } else {
                 // prefill chunk: the last row only (row 0 of the logits buffer)
                 // SAFETY: row t-1 inside the activation buffer.
                 let hrow = unsafe { self.a.h.f().add((t - 1) * e) };
                 self.quant(hrow, self.a.hq.v(), e, 1)?;
-                self.mmvq(&out, self.a.hq.v(), self.logits_dev.f(), 1)?;
+                self.mmvq(&out, self.a.hq.v(), dst, 1)?;
+                1
+            };
+            if self.logits_perm.is_some() {
+                let f = self.lib.g.unpermute_f32.unwrap();
+                // SAFETY: tkg C ABI; both buffers hold TMAX rows of n_vocab, head_pos n_vocab entries.
+                ck(
+                    unsafe {
+                        f(
+                            dst,
+                            self.head_pos,
+                            hp.n_vocab as i32,
+                            rows as i32,
+                            self.logits_dev.f(),
+                            s,
+                        )
+                    },
+                    "tkg_unpermute_f32",
+                )?;
             }
         }
         Ok(())
@@ -3107,28 +3955,57 @@ impl GlmEngine {
     // speculative decoding building blocks
 
     /// Build the draft-vocabulary head (rows of output.weight for `ids`), as llama.cpp `--spec-draft-vocab`.
+    /// With a row-permuted head whose leading rows are exactly `ids` (glm-mem #81) the draft head is those rows
+    /// (no copy); otherwise the rows are gathered into a copy.
     pub fn set_draft_vocab(&mut self, ids: &[u32]) -> Result<()> {
         let out = self.w.output;
         let row_bytes = out.bytes / out.ne[1] as usize;
         let n = ids.len();
-        let dst = dev_alloc(n * row_bytes)?;
-        self.allocs.push(dst);
-        let idd = dev_alloc(n * 4)?;
+        let lead = self
+            .w
+            .output_perm
+            .as_ref()
+            .is_some_and(|(p, k)| *k == n && p[..n] == *ids);
         let iv: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
+        let idd = dev_alloc(n * 4)?;
         ffi::h2d(idd, iv.as_ptr() as *const c_void, n * 4)?;
-        // SAFETY: tkg C ABI.
-        let rc = unsafe {
-            (self.lib.g.gather_rows)(
-                out.p(),
-                row_bytes,
-                idd as *const i32,
-                n as i32,
-                dst,
-                self.s(),
-            )
+        let dst = if lead {
+            out.ptr
+        } else {
+            let dst = dev_alloc(n * row_bytes)?;
+            self.allocs.push(dst);
+            // head rows of the tokens: the token id, or its row in a permuted head
+            let rows_dev = match &self.w.output_perm {
+                Some((perm, _)) => {
+                    let mut pos = vec![0i32; perm.len()];
+                    for (i, &tk) in perm.iter().enumerate() {
+                        pos[tk as usize] = i as i32;
+                    }
+                    let rv: Vec<i32> = ids.iter().map(|&x| pos[x as usize]).collect();
+                    let d = dev_alloc(n * 4)?;
+                    ffi::h2d(d, rv.as_ptr() as *const c_void, n * 4)?;
+                    Some(d)
+                }
+                None => None,
+            };
+            // SAFETY: tkg C ABI.
+            let rc = unsafe {
+                (self.lib.g.gather_rows)(
+                    out.p(),
+                    row_bytes,
+                    rows_dev.unwrap_or(idd) as *const i32,
+                    n as i32,
+                    dst,
+                    self.s(),
+                )
+            };
+            ffi::sync(self.stream)?;
+            if let Some(d) = rows_dev {
+                ffi::dev_free(d);
+            }
+            ck(rc, "tkg_gather_rows")?;
+            dst
         };
-        ffi::sync(self.stream)?;
-        ck(rc, "tkg_gather_rows")?;
         if !self.dv_ids_dev.is_null() {
             ffi::dev_free(self.dv_ids_dev as *mut c_void);
         }
@@ -3458,7 +4335,9 @@ impl GlmEngine {
         let il = hp.n_layer;
         let s = self.s();
         let layers = std::mem::take(&mut self.w.layers);
+        self.ycp_clear();
         let r = (|| -> Result<()> {
+            self.l4_reserve(&layers, t, true)?;
             let l = &layers[il];
             let a = self.a;
             // SAFETY: tkg C ABI.

@@ -165,6 +165,95 @@ __device__ __forceinline__ void q8_1_store_lane(float x, q8_1_blk* blk, int lane
     if (lane == 0) blk->ds = __halves2half2(__float2half(d), __float2half(sum));
 }
 
+// ---- lever 4  , "quantize inside producers", exact): a producer writes the next GEMM's MMQ q8_1
+// activations itself. Format = llama.cpp's block_q8_1_mmq (mmq.cuh): 128 values a block, blocks [col / 128][ne1 rows],
+// 144 bytes = 16 bytes of scales (D4: float d per 32 values; DS4: half2 (d, sum) per 32 values) + 128 int8. Arithmetic =
+// quantize_mmq_q8_1 (quantize.cu): amax = fmaxf over |x| (exact in any order), d_inv = 127 / amax, q = roundf(x d_inv),
+// d = 1 / d_inv; the DS4 sum in that kernel's order: per 4 consecutive values ((x0 + x1) + x2) + x3, then the 8 partials
+// of the 32 by the xor-4 / 2 / 1 butterfly ((p0 + p4) + (p2 + p6)) + ((p1 + p5) + (p3 + p7)). Layout 0 = D4, 1 = DS4
+// (tk_q36_mmq_q8_layout's values). Bitwise tk_q36_mmq_quantize of the fp32 rows the producer would otherwise write.
+constexpr int MMQ_B = 144;
+// one 32-value group spread over a wave (lane = position in the group); blk = the 144-byte block, g = group 0..3
+template <int L>
+__device__ __forceinline__ void mmq_q8_lane_a(float x, float amax, char* blk, int g, int lane, bool ok) {
+    // no contraction: the producer's last multiply must not fuse into the sum (llama sums the stored values)
+#pragma clang fp contract(off)
+    float sum = 0.0f;
+    if constexpr (L == 1) {
+        const float a1 = __shfl_down(x, 1, WS), a2 = __shfl_down(x, 2, WS), a3 = __shfl_down(x, 3, WS);
+        sum = x + a1 + a2 + a3;                 // lane 4p: llama thread p's xi.x + xi.y + xi.z + xi.w
+        sum += __shfl_xor(sum, 16, WS);         // llama's xor 4 / 2 / 1 between threads = xor 16 / 8 / 4 between lanes 4p
+        sum += __shfl_xor(sum, 8, WS);
+        sum += __shfl_xor(sum, 4, WS);
+    }
+    const float d_inv = 127.0f / amax;
+    char4 q;
+    q.x = roundf(x * d_inv);
+    const float d = 1.0f / d_inv;
+    if (!ok) return;
+    blk[16 + 32 * g + lane] = q.x;
+    if (lane == 0) {
+        if constexpr (L == 1) reinterpret_cast<__half2*>(blk)[g] = make_half2(d, sum);
+        else reinterpret_cast<float*>(blk)[g] = d;
+    }
+}
+template <int L>
+__device__ __forceinline__ void mmq_q8_lane(float x, char* blk, int g, int lane, bool ok) {
+    mmq_q8_lane_a<L>(x, warp_max(fabsf(x)), blk, g, lane, ok);
+}
+// up to two MMQ q8_1 copies of a [T][cols] row set, each in row slices of S rows (slice r0 = k S holds rows r0 ..
+// r0 + min(S, T - r0) - 1 as its own matrix of ne1 = that many rows, at byte offset r0 * cols / 128 * 144): what
+// tk_q36_mmq_quantize writes for each slice's rows at that offset. layout 0 = D4, 1 = DS4.
+// Rows at or past lim[o] are not written for copy o.
+struct MmqY {
+    char* p[2];
+    int layout[2];
+    int S[2];
+    int lim[2];
+    int n;
+};
+__device__ __forceinline__ void mmq_y_store(const MmqY& my, float v, int t, int i, int cols, int lane) {
+    const float amax = warp_max(fabsf(v));
+#pragma unroll
+    for (int o = 0; o < 2; ++o) {
+        if (o >= my.n || t >= my.lim[o]) continue;
+        const int S = my.S[o], r0 = t / S * S, ne1 = min(S, my.lim[o] - r0);
+        char* blk = my.p[o] + ((size_t) r0 * (cols / 128) + (size_t) (i / 128) * ne1 + (t - r0)) * MMQ_B;
+        if (my.layout[o] == 1) mmq_q8_lane_a<1>(v, amax, blk, (i % 128) / 32, lane, true);
+        else mmq_q8_lane_a<0>(v, amax, blk, (i % 128) / 32, lane, true);
+    }
+}
+// llama's own lane shape: 4 consecutive values a lane, 8 aligned lanes a 32-value group; iqs = column % 128
+template <int L>
+__device__ __forceinline__ void mmq_q8_store4(float4 xi, char* blk, int iqs, bool ok) {
+#pragma clang fp contract(off)
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+#pragma unroll
+    for (int off = 4; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, WS));
+    float sum = 0.0f;
+    if constexpr (L == 1) {
+        sum = xi.x + xi.y + xi.z + xi.w;
+#pragma unroll
+        for (int off = 4; off > 0; off >>= 1) sum += __shfl_xor(sum, off, WS);
+    }
+    const float d_inv = 127.0f / amax;
+    char4 q;
+    q.x = roundf(xi.x * d_inv);
+    q.y = roundf(xi.y * d_inv);
+    q.z = roundf(xi.z * d_inv);
+    q.w = roundf(xi.w * d_inv);
+    const float d = 1.0f / d_inv;
+    if (!ok) return;
+    reinterpret_cast<char4*>(blk + 16)[iqs / 4] = q;
+    if (iqs % 32 == 0) {
+        if constexpr (L == 1) reinterpret_cast<__half2*>(blk)[iqs / 32] = make_half2(d, sum);
+        else reinterpret_cast<float*>(blk)[iqs / 32] = d;
+    }
+}
+
 // one block (256) per token; warp 0 computes the mixes / Sinkhorn with lane-parallel reductions
 __global__ __launch_bounds__(256) void k_hc_pre(const float* __restrict__ xhc, const float* __restrict__ parts,
                                                 int nsplit, const float* __restrict__ scale,
@@ -339,6 +428,27 @@ __global__ void k_swiglu_clamp(const float* g, const float* __restrict__ u, floa
     }
 }
 
+// lever 4: k_swiglu_clamp's values (same expression per element) written as the MMQ q8_1 rows of a [rows][cols] matrix
+// (cols % 512 == 0) in quantize_mmq_q8_1's own thread shape: grid (rows, cols / 512), 128 threads, 4 values each.
+template <int L>
+__global__ __launch_bounds__(128) void k_swiglu_clamp_mmq(const float* __restrict__ g, const float* __restrict__ u,
+                                                          char* __restrict__ mq, int cols, int ne1, float limit) {
+    const int row = blockIdx.x;
+    const int i0 = (128 * blockIdx.y + threadIdx.x) * 4;
+    const float4 g4 = *reinterpret_cast<const float4*>(g + (size_t) row * cols + i0);
+    const float4 u4 = *reinterpret_cast<const float4*>(u + (size_t) row * cols + i0);
+    const float gs[4] = {g4.x, g4.y, g4.z, g4.w}, us[4] = {u4.x, u4.y, u4.z, u4.w};
+    float o[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float gv = gs[j], uv = us[j];
+        if (limit > 0.0f) { gv = fminf(gv, limit); uv = fminf(fmaxf(uv, -limit), limit); }
+        o[j] = gv / (1.0f + expf(-gv)) * uv;
+    }
+    char* blk = mq + ((size_t) (i0 / 128) * ne1 + row) * MMQ_B;
+    mmq_q8_store4<L>(make_float4(o[0], o[1], o[2], o[3]), blk, i0 % 128, true);
+}
+
 __device__ __forceinline__ void q4k_scale_min(int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
     if (j < 4) { d = q[j] & 63; m = q[j + 4] & 63; }
     else { d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
@@ -406,9 +516,13 @@ __global__ void k_kda_conv(const float* __restrict__ q, const float* __restrict_
 }
 
 // one wave per (t, h), D = 128
-__global__ __launch_bounds__(256) void k_kda_gate(const float* __restrict__ o, const float* __restrict__ g2,
-                                                  const float* __restrict__ w, float* __restrict__ out, int rows,
-                                                  int D, float eps) {
+// MQ (lever 4, ): instead of the fp32 rows, the wo projection's MMQ q8_1 activations (layout L: 0 = D4, 1 =
+// DS4): row r = (t, h) is block h of matrix row row0 + t (ne1 rows a block column), its 4 groups of 32 = j. The values
+// are the MQ = 0 kernel's (same source lines), quantized as quantize_mmq_q8_1 does (mmq_q8_lane).
+template <int MQ>
+__global__ __launch_bounds__(256) void k_kda_gate_t(const float* __restrict__ o, const float* __restrict__ g2,
+                                                    const float* __restrict__ w, float* __restrict__ out, int rows,
+                                                    int D, float eps, char* __restrict__ mq, int H, int row0, int ne1) {
     const int r = blockIdx.x * (blockDim.x / WS) + (threadIdx.x / WS);
     const int lane = threadIdx.x & 31;
     if (r >= rows) return;
@@ -422,7 +536,14 @@ __global__ __launch_bounds__(256) void k_kda_gate(const float* __restrict__ o, c
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const int i = lane + j * WS;
-        out[(size_t) r * D + i] = v[j] * s * w[i] * sigmoidf_(g2[(size_t) r * D + i]);
+        const float val = v[j] * s * w[i] * sigmoidf_(g2[(size_t) r * D + i]);
+        if constexpr (MQ == 0) {
+            out[(size_t) r * D + i] = val;
+        } else {
+            const int t = r / H, h = r - t * H;
+            char* blk = mq + ((size_t) h * ne1 + row0 + t) * MMQ_B;
+            mmq_q8_lane<MQ - 1>(val, blk, j, lane, true);
+        }
     }
 }
 
@@ -1779,12 +1900,14 @@ __global__ __launch_bounds__(256) void k_hc_pre2(const ST* __restrict__ xhc, con
 
 // k_hc_pre2's work for token t in one block (the head's last mix block): the mixes / Sinkhorn once (k_hc_pre2
 // runs them identically in each of its HC_NS blocks; block 0 stores pc), then every slice in k_hc_pre2's order.
+// MQY (lever 4): y also written as the MMQ q8_1 copies of `my` (mmq_y_store), MQY = false: the code as before.
+template <bool MQY = false>
 __device__ __forceinline__ void hc_pre2_block(const float* __restrict__ xhc, const float* __restrict__ parts,
                                               const float* __restrict__ scale, const float* __restrict__ base,
                                               const float* __restrict__ norm_w, float* __restrict__ y,
                                               float* __restrict__ pc, int n_embd, float rms_eps, float norm_eps,
                                               float hc_eps, int iters, q8_1_blk* __restrict__ yq, const int t,
-                                              float* pre_s, float& s_norm) {
+                                              float* pre_s, float& s_norm, const MmqY& my = MmqY{}) {
     constexpr int HC = 4;
 
     const int p = 0;
@@ -1859,6 +1982,7 @@ __device__ __forceinline__ void hc_pre2_block(const float* __restrict__ xhc, con
                 const float v = (a[u][0] * p0 + a[u][1] * p1 + a[u][2] * p2 + a[u][3] * p3) * sn * wn[u];
                 yt[i] = v;
                 if (yq) q8_1_store_lane(v, yq + ((size_t) t * n_embd + i) / 32, threadIdx.x & 31);
+                if constexpr (MQY) mmq_y_store(my, v, t, i, n_embd, threadIdx.x & 31);
             }
         }
         return;
@@ -1869,15 +1993,16 @@ __device__ __forceinline__ void hc_pre2_block(const float* __restrict__ xhc, con
         const float v = (xt[i] * p0 + xt[n_embd + i] * p1 + xt[2 * n_embd + i] * p2 + xt[3 * n_embd + i] * p3) * sn * norm_w[i];
         yt[i] = v;
         if (yq) q8_1_store_lane(v, yq + ((size_t) t * n_embd + i) / 32, threadIdx.x & 31);
+        if constexpr (MQY) mmq_y_store(my, v, t, i, n_embd, threadIdx.x & 31);
     }
 }
 
-template <int MODE>
+template <int MODE, bool MQY = false>
 __global__ __launch_bounds__(256) void k_hc_post_mix_pre(const float* __restrict__ xo, float* xhc,
                                                      const float* __restrict__ pc, const block_q8_0* __restrict__ w,
                                                      float* __restrict__ parts, int n_embd, const float* __restrict__ scale, const float* __restrict__ base, const float* __restrict__ norm_w,
     float* __restrict__ y, float rms_eps, float norm_eps, float hc_eps, int iters, q8_1_blk* __restrict__ yq,
-    int* __restrict__ cnt) {
+    int* __restrict__ cnt, const MmqY my) {
     constexpr int M = 24, NV = M + 10;
     __shared__ float sh[NV][8];
     const int p = blockIdx.x, t = blockIdx.y;
@@ -1965,17 +2090,17 @@ __global__ __launch_bounds__(256) void k_hc_post_mix_pre(const float* __restrict
     __threadfence();
     __shared__ float pre_s2[4];
     __shared__ float s_norm2;
-    hc_pre2_block(xhc, parts, scale, base, norm_w, y, const_cast<float*>(pc), n_embd, rms_eps, norm_eps, hc_eps, iters, yq, t, pre_s2, s_norm2);
+    hc_pre2_block<MQY>(xhc, parts, scale, base, norm_w, y, const_cast<float*>(pc), n_embd, rms_eps, norm_eps, hc_eps, iters, yq, t, pre_s2, s_norm2, my);
     if (threadIdx.x == 0) cnt[t] = 0;
 }
 
-template <typename EY = float>
+template <typename EY = float, bool MQY = false>
 __global__ __launch_bounds__(256) void k_hc_post_mix_moe_pre(const EY* __restrict__ ey, const float* __restrict__ ew,
                                                          const float* __restrict__ sh_out, float* xhc,
                                                          const float* __restrict__ pc, const block_q8_0* __restrict__ w,
                                                          float* __restrict__ parts, int k, int n_embd, const float* __restrict__ scale, const float* __restrict__ base, const float* __restrict__ norm_w,
     float* __restrict__ y, float rms_eps, float norm_eps, float hc_eps, int iters, q8_1_blk* __restrict__ yq,
-    int* __restrict__ cnt) {
+    int* __restrict__ cnt, const MmqY my) {
     constexpr int M = 24, NV = M + 10;
     __shared__ float sh[NV][8];
     const int p = blockIdx.x, t = blockIdx.y;
@@ -2052,7 +2177,7 @@ __global__ __launch_bounds__(256) void k_hc_post_mix_moe_pre(const EY* __restric
     __threadfence();
     __shared__ float pre_s2[4];
     __shared__ float s_norm2;
-    hc_pre2_block(xhc, parts, scale, base, norm_w, y, const_cast<float*>(pc), n_embd, rms_eps, norm_eps, hc_eps, iters, yq, t, pre_s2, s_norm2);
+    hc_pre2_block<MQY>(xhc, parts, scale, base, norm_w, y, const_cast<float*>(pc), n_embd, rms_eps, norm_eps, hc_eps, iters, yq, t, pre_s2, s_norm2, my);
     if (threadIdx.x == 0) cnt[t] = 0;
 }
 
@@ -2317,6 +2442,10 @@ struct WideQ8 {
     int n_out[3];
     int n_mats;
     int H;
+    // lever 4 (k_wide_q8_wmma MQ, heads form only): the [T][H n_out] outputs as MMQ q8_1 rows mq_row0 + t of an
+    // mq_ne1-row matrix (no fp32 store)
+    char* mq;
+    int mq_row0, mq_ne1;
 };
 // PF (GLM_MVW_PF=0 = off): the 8 tokens' x loads of a K step issued together before their FMAs (the same
 // expressions in the same order per accumulator: bitwise; the PF = false form waits for each token's loads in turn)
@@ -2783,6 +2912,12 @@ namespace talus::prefill { extern int g_w16_ed16; }
 typedef _Float16 n2h16 __attribute__((ext_vector_type(16)));
 typedef float n2f8 __attribute__((ext_vector_type(8)));
 constexpr int N2_KC = 128, N2_RS = N2_KC + 8;   // K chunk (4 Q8_0 blocks) and the staged row stride (halves)
+// ST (glm-wideq8, default ON, GLM_N2_ST=0 = off): the 64 x 64 output tile goes through LDS and out as whole 64-float
+// row segments per token (the direct form stored 2 adjacent floats per token from each lane: 16 tokens 32 KiB apart per
+// instruction, ~40 GB/s at the KDA f_b / g_b shape). Same values, other store path: bitwise.
+// MQ (lever 4; 0 = off, 1 = D4, 2 = DS4): the staged tile is quantized as quantize_mmq_q8_1 would quantize the fp32 rows
+// (its thread shape: 4 consecutive values a lane, 8 lanes a 32-value group) into m.mq; nothing else is stored.
+template <bool ST, int MQ = 0>
 __global__ __launch_bounds__(256) void k_wide_q8_wmma(WideQ8 m, int n_in, int T) {
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
     __shared__ __attribute__((aligned(16))) _Float16 sa[64][N2_RS];
@@ -2866,14 +3001,41 @@ __global__ __launch_bounds__(256) void k_wide_q8_wmma(WideQ8 m, int n_in, int T)
             }
         }
     }
+    if constexpr (ST || MQ != 0) {
+        // the staged halves are free now (last WMMA read them before this barrier): [64 tokens][64 rows + 1] floats
+        static_assert(sizeof(sh) >= 64 * 65 * sizeof(float), "output tile fits the staged x");
+        float (*so)[65] = reinterpret_cast<float (*)[65]>(&sh[0][0]);
+        __syncthreads();
 #pragma unroll
-    for (int j = 0; j < 2; ++j) {
-        const int t = t0 + wt + 16 * j + l16;
-        if (t >= T) continue;
+        for (int j = 0; j < 2; ++j)
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const int r = r0 + wr + 2 * i + hi;
-            if (r < n_out) Y[(size_t) t * yts + r] = acc[j][i];
+            for (int i = 0; i < 8; ++i) so[wt + 16 * j + l16][wr + 2 * i + hi] = acc[j][i];
+        __syncthreads();
+        if constexpr (MQ != 0) {
+            // 64 tokens x 2 groups of 32 columns: lane task e = (token, group, 4-value quarter)
+            const int cb = g * n_out + r0;   // heads form: column of row r0 in the [T][H n_out] output
+            for (int e = tid; e < 64 * 2 * 8; e += 256) {
+                const int tt = e >> 4, rr = (e & 15) * 4, t = t0 + tt, c = cb + rr;
+                const float4 xi = make_float4(so[tt][rr], so[tt][rr + 1], so[tt][rr + 2], so[tt][rr + 3]);
+                char* blk = m.mq + ((size_t) (c / 128) * m.mq_ne1 + m.mq_row0 + t) * MMQ_B;
+                mmq_q8_store4<MQ - 1>(xi, blk, c % 128, t < T);
+            }
+            return;
+        }
+        for (int e = tid; e < 64 * 64; e += 256) {
+            const int tt = e >> 6, rr = e & 63, t = t0 + tt, r = r0 + rr;
+            if (t < T && r < n_out) Y[(size_t) t * yts + r] = so[tt][rr];
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int t = t0 + wt + 16 * j + l16;
+            if (t >= T) continue;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int r = r0 + wr + 2 * i + hi;
+                if (r < n_out) Y[(size_t) t * yts + r] = acc[j][i];
+            }
         }
     }
 #else
@@ -2889,7 +3051,9 @@ static bool wide_q8_launch(const WideQ8& m, int n_groups, int n_out_max, int n_i
     static const bool n2 = [] { const char* e = std::getenv("GLM_N2"); return !e || e[0] != '0'; }();   // default ON (GLM_N2=0 = fp32 wide kernels)
     if (n2 && n_out_max % 64 == 0) {   // fp16 WMMA (default on, output-changing)
         const dim3 g((unsigned) (n_out_max / 64), (unsigned) ((T + 63) / 64), (unsigned) n_groups);
-        hipLaunchKernelGGL(k_wide_q8_wmma, g, dim3(256), 0, st, m, n_in, T);
+        static const bool st_on = [] { const char* e = std::getenv("GLM_N2_ST"); return !e || e[0] != '0'; }();
+        if (st_on) hipLaunchKernelGGL(k_wide_q8_wmma<true>, g, dim3(256), 0, st, m, n_in, T);
+        else hipLaunchKernelGGL(k_wide_q8_wmma<false>, g, dim3(256), 0, st, m, n_in, T);
         return true;
     }
     const unsigned ty = (unsigned) ((T + MVW_TT - 1) / MVW_TT);
@@ -2994,7 +3158,23 @@ int tkg_kda_gate(const float* o, const float* g2, const float* w, float* out, in
                  void* s) {
     if (D != 128) return err(hipErrorInvalidValue);
     const int rows = T * H;
-    hipLaunchKernelGGL(k_kda_gate, dim3((rows + 7) / 8), dim3(256), 0, S(s), o, g2, w, out, rows, D, eps);
+    hipLaunchKernelGGL(k_kda_gate_t<0>, dim3((rows + 7) / 8), dim3(256), 0, S(s), o, g2, w, out, rows, D, eps,
+                       (char*) nullptr, H, 0, 0);
+    return last();
+}
+
+// lever 4: tkg_kda_gate written as the MMQ q8_1 rows row0 .. row0 + T - 1 of a [ne1]-row matrix of H * 128 columns
+// (layout 0 = D4, 1 = DS4); bitwise tkg_kda_gate + tk_q36_mmq_quantize over the ne1 rows. No fp32 output.
+int tkg_kda_gate_mmq(const float* o, const float* g2, const float* w, void* mq, int layout, int row0, int ne1, int T,
+                     int H, int D, float eps, void* s) {
+    if (D != 128 || (layout != 0 && layout != 1) || row0 < 0 || row0 + T > ne1 || (H * D) % 512) return -1;
+    const int rows = T * H;
+    if (layout == 1)
+        hipLaunchKernelGGL(k_kda_gate_t<2>, dim3((rows + 7) / 8), dim3(256), 0, S(s), o, g2, w, (float*) nullptr, rows,
+                           D, eps, static_cast<char*>(mq), H, row0, ne1);
+    else
+        hipLaunchKernelGGL(k_kda_gate_t<1>, dim3((rows + 7) / 8), dim3(256), 0, S(s), o, g2, w, (float*) nullptr, rows,
+                           D, eps, static_cast<char*>(mq), H, row0, ne1);
     return last();
 }
 
@@ -3048,6 +3228,21 @@ int tkg_mmvq_ids_f32(int type, const void* w, size_t expert_bytes, const int32_t
     } else {
         return err(hipErrorInvalidValue);
     }
+    return last();
+}
+
+// glm-mem (#81): logits of a head whose rows were stored permuted (draft vocabulary first) back in token order:
+// dst[r * n + j] = src[r * n + pos[j]], a pure copy (the head's per-row dot products are the same bits in any row order)
+__global__ void k_unpermute_f32(const float* __restrict__ src, const int32_t* __restrict__ pos, int n,
+                                float* __restrict__ dst) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t r = blockIdx.y;
+    if (j < n) dst[r * n + j] = src[r * n + pos[j]];
+}
+
+int tkg_unpermute_f32(const float* src, const int32_t* pos, int n, int rows, float* dst, void* s) {
+    if (n <= 0 || rows <= 0) return err(hipErrorInvalidValue);
+    hipLaunchKernelGGL(k_unpermute_f32, dim3((n + 255) / 256, rows), dim3(256), 0, S(s), src, pos, n, dst);
     return last();
 }
 
@@ -3173,6 +3368,45 @@ int tkg_heads_q8_0(const void* W, const float* x, float* y, int H, int n_in, int
         case 7: hipLaunchKernelGGL((k_heads_q8_0<7>), g, dim3(256), 0, S(s), w, x, y, H, n_in, n_out); break;
         default: hipLaunchKernelGGL((k_heads_q8_0<8>), g, dim3(256), 0, S(s), w, x, y, H, n_in, n_out); break;
     }
+    return last();
+}
+
+// lever 4: tkg_heads_q8_0 for a prompt chunk with the [T][H n_out] outputs written only as the MMQ q8_1 rows row0 ..
+// row0 + T - 1 of an ne1-row matrix (layout 0 = D4, 1 = DS4): bitwise tkg_heads_q8_0 + tk_q36_mmq_quantize, where the
+// fp16 WMMA wide kernel (N2) is the one tkg_heads_q8_0 would run; -1 = not covered (nothing launched).
+int tkg_heads_q8_0_mmq(const void* W, const float* x, void* mq, int layout, int row0, int ne1, int H, int n_in, int n_out,
+                       int T, void* s) {
+    static const bool n2 = [] { const char* e = std::getenv("GLM_N2"); return !e || e[0] != '0'; }();
+    static const bool heads_tile = [] { const char* e = std::getenv("GLM_MV_HEADS"); return e && std::atoi(e) > 0; }();
+    if (T <= 8 || n_in % 256 || n_in > 512 || n_out % 64 || (H * n_out) % 512 || !glm_mv_wide_on() || !n2 ||
+        heads_tile || (layout != 0 && layout != 1) || row0 < 0 || row0 + T > ne1)
+        return -1;
+    if (!W) return 0;   // probe: covered
+    WideQ8 m{};
+    m.w[0] = static_cast<const block_q8_0*>(W);
+    m.x[0] = x;
+    m.y[0] = nullptr;
+    m.n_out[0] = n_out;
+    m.n_mats = 0;
+    m.H = H;
+    m.mq = static_cast<char*>(mq);
+    m.mq_row0 = row0;
+    m.mq_ne1 = ne1;
+    const dim3 g((unsigned) (n_out / 64), (unsigned) ((T + 63) / 64), (unsigned) H);
+    if (layout == 1) hipLaunchKernelGGL((k_wide_q8_wmma<true, 2>), g, dim3(256), 0, S(s), m, n_in, T);
+    else hipLaunchKernelGGL((k_wide_q8_wmma<true, 1>), g, dim3(256), 0, S(s), m, n_in, T);
+    return last();
+}
+
+// lever 4: tkg_swiglu_clamp over [rows][cols] written only as the MMQ q8_1 rows of a rows-row matrix (layout 0 = D4,
+// 1 = DS4; cols % 512 == 0): bitwise tkg_swiglu_clamp + tk_q36_mmq_quantize. -1 = not covered.
+int tkg_swiglu_clamp_mmq(const float* g, const float* u, void* mq, int layout, int rows, int cols, float limit, void* s) {
+    if (cols % 512 || rows < 1 || (layout != 0 && layout != 1)) return -1;
+    const dim3 gr((unsigned) rows, (unsigned) (cols / 512));
+    if (layout == 1)
+        hipLaunchKernelGGL(k_swiglu_clamp_mmq<1>, gr, dim3(128), 0, S(s), g, u, static_cast<char*>(mq), cols, rows, limit);
+    else
+        hipLaunchKernelGGL(k_swiglu_clamp_mmq<0>, gr, dim3(128), 0, S(s), g, u, static_cast<char*>(mq), cols, rows, limit);
     return last();
 }
 
@@ -3324,10 +3558,67 @@ int tkg_hc_post_mix_pre(const float* xo, float* xhc, float* pc, const void* w_ne
     auto* q = static_cast<q8_1_blk*>(yq);
     if (first == 1)
         hipLaunchKernelGGL((k_hc_post_mix_pre<1>), g, dim3(256), 0, S(s), xo, xhc, pc, w, parts, n_embd, scale, base,
-                           norm_w, y, rms_eps, norm_eps, hc_eps, iters, q, cnt);
+                           norm_w, y, rms_eps, norm_eps, hc_eps, iters, q, cnt, MmqY{});
     else
         hipLaunchKernelGGL((k_hc_post_mix_pre<0>), g, dim3(256), 0, S(s), xo, xhc, pc, w, parts, n_embd, scale, base,
-                           norm_w, y, rms_eps, norm_eps, hc_eps, iters, q, cnt);
+                           norm_w, y, rms_eps, norm_eps, hc_eps, iters, q, cnt, MmqY{});
+    return last();
+}
+
+// lever 4: tkg_hc_post_mix_pre / tkg_hc_post_mix_moe_pre that also write y as up to two MMQ q8_1 copies (n_mq, then
+// per copy: dst, layout (0 = D4, 1 = DS4), slice rows S, row limit lim; see MmqY): bitwise tk_q36_mmq_quantize of each
+// S-row slice of y below lim at that slice's offset. n_embd % 512 == 0. -1 = not covered (nothing launched).
+static bool mmq_y_args(MmqY& my, int n, void* p0, int l0, int s0, int m0, void* p1, int l1, int s1, int m1, int n_embd) {
+    if (n < 1 || n > 2 || n_embd % 512) return false;
+    my = MmqY{};
+    my.n = n;
+    void* p[2] = {p0, p1};
+    const int l[2] = {l0, l1}, sz[2] = {s0, s1}, lm[2] = {m0, m1};
+    for (int o = 0; o < n; ++o) {
+        if (!p[o] || (l[o] != 0 && l[o] != 1) || sz[o] < 1 || lm[o] < 0) return false;
+        my.p[o] = static_cast<char*>(p[o]);
+        my.layout[o] = l[o];
+        my.S[o] = sz[o];
+        my.lim[o] = lm[o];
+    }
+    return true;
+}
+int tkg_hc_post_mix_pre_mmq(const float* xo, float* xhc, float* pc, const void* w_next, float* parts, int T, int n_embd,
+                            int first, const float* scale, const float* base, const float* norm_w, float* y, float rms_eps,
+                            float norm_eps, float hc_eps, int iters, void* yq, int* cnt, int n_mq, void* mq0, int lay0,
+                            int s0, int lim0, void* mq1, int lay1, int s1, int lim1, void* s) {
+    if (n_embd % (HC_NS * 2) || (n_embd / HC_NS) % 32 || !w_next || first == 2) return -1;
+    MmqY my;
+    if (!mmq_y_args(my, n_mq, mq0, lay0, s0, lim0, mq1, lay1, s1, lim1, n_embd)) return -1;
+    const dim3 g(HC_NS, T);
+    const block_q8_0* w = static_cast<const block_q8_0*>(w_next);
+    auto* q = static_cast<q8_1_blk*>(yq);
+    if (first == 1)
+        hipLaunchKernelGGL((k_hc_post_mix_pre<1, true>), g, dim3(256), 0, S(s), xo, xhc, pc, w, parts, n_embd, scale, base,
+                           norm_w, y, rms_eps, norm_eps, hc_eps, iters, q, cnt, my);
+    else
+        hipLaunchKernelGGL((k_hc_post_mix_pre<0, true>), g, dim3(256), 0, S(s), xo, xhc, pc, w, parts, n_embd, scale, base,
+                           norm_w, y, rms_eps, norm_eps, hc_eps, iters, q, cnt, my);
+    return last();
+}
+int tkg_hc_post_mix_moe_pre_mmq(const float* ey, const float* ew, const float* shexp, float* xhc, float* pc,
+                                const void* w_next, float* parts, int T, int k, int n_embd, const float* scale,
+                                const float* base, const float* norm_w, float* y, float rms_eps, float norm_eps,
+                                float hc_eps, int iters, void* yq, int* cnt, int n_mq, void* mq0, int lay0, int s0,
+                                int lim0, void* mq1, int lay1, int s1, int lim1, void* s) {
+    if (n_embd % (HC_NS * 2) || (n_embd / HC_NS) % 32 || !w_next) return -1;
+    MmqY my;
+    if (!mmq_y_args(my, n_mq, mq0, lay0, s0, lim0, mq1, lay1, s1, lim1, n_embd)) return -1;
+    const dim3 g(HC_NS, T);
+    if (std::exchange(talus::prefill::g_w16_ed16, 0)) {   // the expert rows are fp16
+        hipLaunchKernelGGL((k_hc_post_mix_moe_pre<_Float16, true>), g, dim3(256), 0, S(s), reinterpret_cast<const _Float16*>(ey), ew,
+                           shexp, xhc, pc, static_cast<const block_q8_0*>(w_next), parts, k, n_embd, scale, base, norm_w, y,
+                           rms_eps, norm_eps, hc_eps, iters, static_cast<q8_1_blk*>(yq), cnt, my);
+        return last();
+    }
+    hipLaunchKernelGGL((k_hc_post_mix_moe_pre<float, true>), g, dim3(256), 0, S(s), ey, ew, shexp, xhc, pc,
+                       static_cast<const block_q8_0*>(w_next), parts, k, n_embd, scale, base, norm_w, y, rms_eps,
+                       norm_eps, hc_eps, iters, static_cast<q8_1_blk*>(yq), cnt, my);
     return last();
 }
 
@@ -3340,12 +3631,12 @@ int tkg_hc_post_mix_moe_pre(const float* ey, const float* ew, const float* shexp
     if (std::exchange(talus::prefill::g_w16_ed16, 0)) {   // the expert rows are fp16
         hipLaunchKernelGGL(k_hc_post_mix_moe_pre<_Float16>, g, dim3(256), 0, S(s), reinterpret_cast<const _Float16*>(ey), ew, shexp,
                            xhc, pc, static_cast<const block_q8_0*>(w_next), parts, k, n_embd, scale, base, norm_w, y, rms_eps,
-                           norm_eps, hc_eps, iters, static_cast<q8_1_blk*>(yq), cnt);
+                           norm_eps, hc_eps, iters, static_cast<q8_1_blk*>(yq), cnt, MmqY{});
         return last();
     }
     hipLaunchKernelGGL(k_hc_post_mix_moe_pre<float>, g, dim3(256), 0, S(s), ey, ew, shexp, xhc, pc,
                        static_cast<const block_q8_0*>(w_next), parts, k, n_embd, scale, base, norm_w, y, rms_eps,
-                       norm_eps, hc_eps, iters, static_cast<q8_1_blk*>(yq), cnt);
+                       norm_eps, hc_eps, iters, static_cast<q8_1_blk*>(yq), cnt, MmqY{});
     return last();
 }
 

@@ -402,7 +402,7 @@ impl Q36Engine {
         let e = self.d_model();
         let t = n_tok;
         let q8 = self.q8_src == self.h as *const f32 && self.q8_n == e && self.q8_tok == t;
-        let dbg_on = !self.dbg.is_null() && self.dbg_row + t <= 16;
+        let dbg_on = !self.dbg.is_null() && (self.dbg_row + t) as usize <= super::engine::Q27_VMAX;
         let rec = CutRec {
             t,
             verify,
@@ -582,7 +582,7 @@ impl Q36Engine {
             for (k, li) in (lo_w..n).enumerate() {
                 let dst = unsafe {
                     self.dbg
-                        .add((li * 16 + rec.dbg_row as usize) * (e as usize))
+                        .add((li * super::engine::Q27_VMAX + rec.dbg_row as usize) * (e as usize))
                 };
                 hcopy(
                     dst.cast(),

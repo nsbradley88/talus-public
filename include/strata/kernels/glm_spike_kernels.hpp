@@ -91,6 +91,13 @@ hipError_t glm_mmvq_ids_f32(
 //   dtb:   [S_v, H] FP32 (dt_bias for prologue)
 //   a:     [H] FP32 (A_log/A scale for prologue)
 //   dst:   [S_v, H, T] FP32 attention output
+// glm-kda4 bench / dispatch entries: v3 (8 waves x 8 columns) and v4 (one column per lane), prompt windows
+hipError_t glm_kda_step_v3(const float* q, const float* k, const float* v, const float* g, const float* beta, float* state,
+                           const int32_t* ids, const float* dtb, const float* a, float* dst, int H, int T, int K_snap,
+                           int n_B, float scale, bool prologue, float pro_lb, float pro_l2_eps, hipStream_t stream);
+hipError_t glm_kda_step_v4(const float* q, const float* k, const float* v, const float* g, const float* beta, float* state,
+                           const int32_t* ids, const float* dtb, const float* a, float* dst, int H, int T, int K_snap,
+                           int n_B, float scale, bool prologue, float pro_lb, float pro_l2_eps, hipStream_t stream);
 hipError_t glm_kda_step(
     const float* q,
     const float* k,

@@ -18,8 +18,12 @@
 //! item text (exact for strings without escapes and for integers).
 
 use serde_json::{Map, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::borrow::Cow;
+use std::collections::hash_map::{Entry, RandomState};
+use std::collections::{HashMap, VecDeque};
+use std::hash::BuildHasher;
+use std::rc::Rc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// Whitespace bytes allowed between two JSON tokens (bounds the "endless newlines" failure of constrained decoding).
 pub const WS_MAX: u8 = 16;
@@ -65,27 +69,29 @@ const KEYWORDS: &[&str] = &[
 ];
 const ANNOTATIONS: &[&str] = &["title", "description", "$schema", "$comment"];
 
-#[derive(Clone, Debug)]
+/// A node of the compiled graph. Its lists live in tables of the [`Grammar`], so a node is small whatever it holds, and
+/// equal neighbours share them.
+#[derive(Clone, Copy, Debug)]
 enum Node {
     Never,
-    Union(Vec<u32>),
-    Lit(Vec<Vec<u8>>),
+    /// `Grammar::alts[start..][..len]`
+    Union {
+        start: u32,
+        len: u32,
+    },
+    /// Text ids, `Grammar::lit_ids[start..][..len]`
+    Lit {
+        start: u32,
+        len: u32,
+    },
     Str {
         min: u32,
         max: u32,
     },
-    Num {
-        int: bool,
-        lo: f64,
-        lo_ex: bool,
-        hi: f64,
-        hi_ex: bool,
-    },
-    Obj {
-        props: Vec<(Vec<u8>, u32)>,
-        required: u64,
-        additional: u32,
-    },
+    /// `Grammar::nums`
+    Num(u32),
+    /// `Grammar::objs`
+    Obj(u32),
     Arr {
         items: u32,
         min: u32,
@@ -94,9 +100,35 @@ enum Node {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+struct NumNode {
+    int: bool,
+    lo: f64,
+    lo_ex: bool,
+    hi: f64,
+    hi_ex: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ObjNode {
+    /// (key text id, node), `Grammar::props[start..][..len]`
+    start: u32,
+    len: u32,
+    required: u64,
+    additional: u32,
+}
+
 /// A compiled schema plus its per-state mask memo.
 pub struct Grammar {
     nodes: Vec<Node>,
+    alts: Vec<u32>,
+    lit_ids: Vec<u32>,
+    /// Text `i` is `text[text_off[i]..text_off[i + 1]]`; each distinct text is stored once.
+    text_off: Vec<u32>,
+    text: Vec<u8>,
+    nums: Vec<NumNode>,
+    objs: Vec<ObjNode>,
+    props: Vec<(u32, u32)>,
     root: u32,
     memo: Mutex<HashMap<State, Arc<Vec<u64>>>>,
 }
@@ -115,9 +147,14 @@ impl std::fmt::Debug for Grammar {
 
 /// Checks `schema` and returns its compact form without annotations: what the server forwards to the engine.
 pub fn prepare(schema: &Value) -> Result<String, String> {
-    let stripped = strip_annotations(schema);
-    compile_value(&stripped)?;
-    serde_json::to_string(&stripped).map_err(|e| e.to_string())
+    prepare_owned(schema.clone())
+}
+
+/// [`prepare`] for a schema the caller no longer needs, so no second copy of it exists while it compiles.
+pub fn prepare_owned(mut schema: Value) -> Result<String, String> {
+    strip_annotations(&mut schema);
+    compile_value(&schema)?;
+    serde_json::to_string(&schema).map_err(|e| e.to_string())
 }
 
 /// Compiles a schema given as JSON text (the engine side of [`prepare`]).
@@ -127,63 +164,319 @@ pub fn compile(schema_json: &str) -> Result<Grammar, String> {
     compile_value(&v)
 }
 
-fn strip_annotations(s: &Value) -> Value {
-    match s {
-        Value::Object(o) => {
-            let mut out = Map::new();
-            for (k, v) in o {
-                if ANNOTATIONS.contains(&k.as_str()) {
-                    continue;
+fn strip_annotations(s: &mut Value) {
+    let Value::Object(o) = s else {
+        return;
+    };
+    o.retain(|k, _| !ANNOTATIONS.contains(&k.as_str()));
+    for (k, v) in o.iter_mut() {
+        match k.as_str() {
+            "properties" => {
+                if let Value::Object(p) = v {
+                    p.values_mut().for_each(strip_annotations);
                 }
-                let nv = match k.as_str() {
-                    "properties" => match v {
-                        Value::Object(p) => Value::Object(
-                            p.iter()
-                                .map(|(pk, pv)| (pk.clone(), strip_annotations(pv)))
-                                .collect(),
-                        ),
-                        _ => v.clone(),
-                    },
-                    "items" | "additionalProperties" => strip_annotations(v),
-                    "anyOf" | "oneOf" | "allOf" => match v {
-                        Value::Array(a) => Value::Array(a.iter().map(strip_annotations).collect()),
-                        _ => v.clone(),
-                    },
-                    _ => v.clone(),
-                };
-                out.insert(k.clone(), nv);
             }
-            Value::Object(out)
+            "items" | "additionalProperties" => strip_annotations(v),
+            "anyOf" | "oneOf" | "allOf" => {
+                if let Value::Array(a) = v {
+                    a.iter_mut().for_each(strip_annotations);
+                }
+            }
+            _ => {}
         }
-        _ => s.clone(),
     }
 }
 
 fn compile_value(v: &Value) -> Result<Grammar, String> {
-    let mut c = Compiler {
-        nodes: Vec::new(),
-        any: None,
-        work: 0,
-        retained: 0,
-    };
-    let root = c.schema(v, 0)?;
+    let mut c = Compiler::new();
+    let root = c.schema(&View::Raw(v), 0)?;
     if matches!(c.nodes[root as usize], Node::Never) {
         return Err("json_schema: the schema admits no value".into());
     }
+    c.nodes.shrink_to_fit();
+    c.alts.shrink_to_fit();
+    c.lit_ids.shrink_to_fit();
+    c.text_off.shrink_to_fit();
+    c.text.shrink_to_fit();
+    c.nums.shrink_to_fit();
+    c.objs.shrink_to_fit();
+    c.props.shrink_to_fit();
     Ok(Grammar {
         nodes: c.nodes,
+        alts: c.alts,
+        lit_ids: c.lit_ids,
+        text_off: c.text_off,
+        text: c.text,
+        nums: c.nums,
+        objs: c.objs,
+        props: c.props,
         root,
         memo: Mutex::new(HashMap::new()),
     })
 }
 
+/// A schema while it compiles: a part of the request as it stands, or what a merge built on top of such parts. Merged
+/// schemas only hold references, so one that stays alive through recursion costs its own top level, not a copy of
+/// everything below it.
+#[derive(Clone)]
+enum View<'a> {
+    Raw(&'a Value),
+    Arr(Rc<Vec<View<'a>>>),
+    Obj(Rc<Vec<(&'a str, View<'a>)>>),
+}
+
+/// The entries of an object [`View`], in order.
+#[derive(Clone, Copy)]
+enum Entries<'v, 'a> {
+    Raw(&'a Map<String, Value>),
+    Built(&'v [(&'a str, View<'a>)]),
+}
+
+enum EntryIter<'v, 'a> {
+    Raw(serde_json::map::Iter<'a>),
+    Built(std::slice::Iter<'v, (&'a str, View<'a>)>),
+}
+
+impl<'a> Iterator for EntryIter<'_, 'a> {
+    type Item = (&'a str, View<'a>);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            EntryIter::Raw(i) => i.next().map(|(k, v)| (k.as_str(), View::Raw(v))),
+            EntryIter::Built(i) => i.next().map(|(k, v)| (*k, v.clone())),
+        }
+    }
+}
+
+impl<'v, 'a> Entries<'v, 'a> {
+    fn iter(self) -> EntryIter<'v, 'a> {
+        match self {
+            Entries::Raw(m) => EntryIter::Raw(m.iter()),
+            Entries::Built(e) => EntryIter::Built(e.iter()),
+        }
+    }
+
+    fn len(self) -> usize {
+        match self {
+            Entries::Raw(m) => m.len(),
+            Entries::Built(e) => e.len(),
+        }
+    }
+
+    /// Linear on a built object: for objects whose keys were checked (at most [`KEYWORDS`] of them).
+    fn get(self, k: &str) -> Option<View<'a>> {
+        match self {
+            Entries::Raw(m) => m.get(k).map(View::Raw),
+            Entries::Built(e) => e.iter().find(|(x, _)| *x == k).map(|(_, v)| v.clone()),
+        }
+    }
+}
+
+/// The items of an array [`View`].
+#[derive(Clone, Copy)]
+enum Items<'v, 'a> {
+    Raw(&'a [Value]),
+    Built(&'v [View<'a>]),
+}
+
+impl<'v, 'a> Items<'v, 'a> {
+    fn len(self) -> usize {
+        match self {
+            Items::Raw(a) => a.len(),
+            Items::Built(a) => a.len(),
+        }
+    }
+
+    fn get(self, i: usize) -> View<'a> {
+        match self {
+            Items::Raw(a) => View::Raw(&a[i]),
+            Items::Built(a) => a[i].clone(),
+        }
+    }
+
+    fn iter(self) -> impl Iterator<Item = View<'a>> + use<'v, 'a> {
+        (0..self.len()).map(move |i| self.get(i))
+    }
+}
+
+impl<'a> View<'a> {
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            View::Raw(v) => v.as_bool(),
+            _ => None,
+        }
+    }
+
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            View::Raw(v) => v.as_f64(),
+            _ => None,
+        }
+    }
+
+    fn as_u64(&self) -> Option<u64> {
+        match self {
+            View::Raw(v) => v.as_u64(),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> Option<&'a str> {
+        match self {
+            View::Raw(v) => v.as_str(),
+            _ => None,
+        }
+    }
+
+    fn entries(&self) -> Option<Entries<'_, 'a>> {
+        match self {
+            View::Raw(Value::Object(m)) => Some(Entries::Raw(m)),
+            View::Obj(e) => Some(Entries::Built(e)),
+            _ => None,
+        }
+    }
+
+    fn items(&self) -> Option<Items<'_, 'a>> {
+        match self {
+            View::Raw(Value::Array(a)) => Some(Items::Raw(a)),
+            View::Arr(a) => Some(Items::Built(a)),
+            _ => None,
+        }
+    }
+
+    /// The JSON value. Borrowed for a part of the request, which literals, `required` names and comparisons always are.
+    fn value(&self) -> Cow<'a, Value> {
+        match self {
+            View::Raw(v) => Cow::Borrowed(v),
+            View::Arr(a) => Cow::Owned(Value::Array(
+                a.iter().map(|x| x.value().into_owned()).collect(),
+            )),
+            View::Obj(e) => Cow::Owned(Value::Object(
+                e.iter()
+                    .map(|(k, x)| (k.to_string(), x.value().into_owned()))
+                    .collect(),
+            )),
+        }
+    }
+
+    /// What copying this value would cost: see [`value_cost`].
+    fn cost(&self) -> usize {
+        match self {
+            View::Raw(v) => value_cost(v),
+            View::Arr(a) => 1 + a.iter().map(View::cost).sum::<usize>(),
+            View::Obj(e) => {
+                1 + e
+                    .iter()
+                    .map(|(k, x)| k.len() / WORK_BYTES + x.cost())
+                    .sum::<usize>()
+            }
+        }
+    }
+}
+
+/// The values merging writes, which have no place in the request.
+struct MadeValues {
+    bools: [Value; 2],
+    types: [Value; 7],
+}
+
+static MADE: LazyLock<MadeValues> = LazyLock::new(|| MadeValues {
+    bools: [Value::Bool(false), Value::Bool(true)],
+    types: Ty::ALL.map(|t| Value::from(t.name())),
+});
+
+fn made_bool<'a>(b: bool) -> View<'a> {
+    View::Raw(&MADE.bools[b as usize])
+}
+
+/// An object being merged: same order rules as the map it replaces (replacing keeps the position, removing moves the
+/// last entry into the gap). Large ones get an index, which goes away with the builder.
+struct ObjBuilder<'a> {
+    ents: Vec<(&'a str, View<'a>)>,
+    index: Option<HashMap<&'a str, u32>>,
+}
+
+const OBJ_INDEX_FROM: usize = 16;
+
+impl<'a> ObjBuilder<'a> {
+    fn new(from: Entries<'_, 'a>, extra: usize) -> Self {
+        let mut ents = Vec::with_capacity(from.len().saturating_add(extra));
+        ents.extend(from.iter());
+        ObjBuilder { ents, index: None }
+    }
+
+    fn pos(&mut self, k: &str) -> Option<usize> {
+        if self.ents.len() <= OBJ_INDEX_FROM {
+            return self.ents.iter().position(|(x, _)| *x == k);
+        }
+        let ents = &self.ents;
+        self.index
+            .get_or_insert_with(|| {
+                ents.iter()
+                    .enumerate()
+                    .map(|(i, (x, _))| (*x, i as u32))
+                    .collect()
+            })
+            .get(k)
+            .map(|&i| i as usize)
+    }
+
+    fn get(&mut self, k: &str) -> Option<View<'a>> {
+        self.pos(k).map(|i| self.ents[i].1.clone())
+    }
+
+    fn insert(&mut self, k: &'a str, v: View<'a>) {
+        match self.pos(k) {
+            Some(i) => self.ents[i].1 = v,
+            None => {
+                if let Some(ix) = &mut self.index {
+                    ix.insert(k, self.ents.len() as u32);
+                }
+                self.ents.push((k, v));
+            }
+        }
+    }
+
+    fn swap_remove(&mut self, k: &str) -> Option<View<'a>> {
+        let i = self.pos(k)?;
+        let (_, v) = self.ents.swap_remove(i);
+        if let Some(ix) = &mut self.index {
+            ix.remove(k);
+            if let Some((moved, _)) = self.ents.get(i) {
+                ix.insert(*moved, i as u32);
+            }
+        }
+        Some(v)
+    }
+
+    fn finish(mut self) -> View<'a> {
+        self.ents.shrink_to_fit();
+        View::Obj(Rc::new(self.ents))
+    }
+}
+
 struct Compiler {
     nodes: Vec<Node>,
+    alts: Vec<u32>,
+    lit_ids: Vec<u32>,
+    text_off: Vec<u32>,
+    text: Vec<u8>,
+    nums: Vec<NumNode>,
+    objs: Vec<ObjNode>,
+    props: Vec<(u32, u32)>,
     any: Option<u32>,
     /// Spent so far, against [`MAX_COMPILE_WORK`].
     work: u64,
-    /// Encoded bytes held in nodes so far, against [`MAX_RETAINED_BYTES`].
+    /// Encoded bytes stored in nodes so far, repeats included, against [`MAX_RETAINED_BYTES`].
     retained: usize,
+    /// Text hash to text id. A taken slot whose text differs moves on to the next hash value.
+    interned: HashMap<u64, u32>,
+    hasher: RandomState,
+    /// Per text id: the literal set that last used it, to keep each set's literals distinct.
+    lit_seen: Vec<u32>,
+    lit_set: u32,
+    scratch: Vec<u8>,
+    /// The list of the last literal node, in `lit_ids`.
+    last_lit: Option<(u32, u32)>,
 }
 
 /// Bytes of text that cost one unit of work.
@@ -217,128 +510,197 @@ fn json_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
-fn type_matches(t: &str, v: &Value) -> bool {
-    match t {
-        "object" => v.is_object(),
-        "array" => v.is_array(),
-        "string" => v.is_string(),
-        "boolean" => v.is_boolean(),
-        "null" => v.is_null(),
-        "number" => v.is_number(),
-        "integer" => match v {
-            Value::Number(n) => {
-                n.is_i64() || n.is_u64() || n.as_f64().is_some_and(|f| f.fract() == 0.0)
-            }
-            _ => false,
-        },
-        _ => false,
+/// A JSON type name.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Ty {
+    Object,
+    Array,
+    String,
+    Number,
+    Boolean,
+    Null,
+    Integer,
+}
+
+impl Ty {
+    const ALL: [Ty; 7] = [
+        Ty::Object,
+        Ty::Array,
+        Ty::String,
+        Ty::Number,
+        Ty::Boolean,
+        Ty::Null,
+        Ty::Integer,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Ty::Object => "object",
+            Ty::Array => "array",
+            Ty::String => "string",
+            Ty::Number => "number",
+            Ty::Boolean => "boolean",
+            Ty::Null => "null",
+            Ty::Integer => "integer",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Ty> {
+        Ty::ALL.into_iter().find(|t| t.name() == s)
+    }
+
+    fn matches(self, v: &Value) -> bool {
+        match self {
+            Ty::Object => v.is_object(),
+            Ty::Array => v.is_array(),
+            Ty::String => v.is_string(),
+            Ty::Boolean => v.is_boolean(),
+            Ty::Null => v.is_null(),
+            Ty::Number => v.is_number(),
+            Ty::Integer => match v {
+                Value::Number(n) => {
+                    n.is_i64() || n.is_u64() || n.as_f64().is_some_and(|f| f.fract() == 0.0)
+                }
+                _ => false,
+            },
+        }
+    }
+
+    fn view<'a>(self) -> View<'a> {
+        View::Raw(&MADE.types[self as usize])
     }
 }
 
-const ALL_TYPES: &[&str] = &["object", "array", "string", "number", "boolean", "null"];
+/// The types of a schema with no `type`, in compile order.
+const ALL_TYPES: [Ty; 6] = [
+    Ty::Object,
+    Ty::Array,
+    Ty::String,
+    Ty::Number,
+    Ty::Boolean,
+    Ty::Null,
+];
 
-fn type_list(v: &Value) -> Result<Vec<String>, String> {
-    let ok = |s: &str| ALL_TYPES.contains(&s) || s == "integer";
-    match v {
-        Value::String(s) if ok(s) => Ok(vec![s.clone()]),
-        Value::Array(a) if !a.is_empty() => a
+fn type_list(v: &View) -> Result<Vec<Ty>, String> {
+    if let Some(s) = v.as_str() {
+        if let Some(t) = Ty::parse(s) {
+            return Ok(vec![t]);
+        }
+    }
+    match v.items() {
+        Some(a) if a.len() > 0 => a
             .iter()
-            .map(|t| match t.as_str() {
-                Some(s) if ok(s) => Ok(s.to_string()),
-                _ => Err(format!("json_schema: bad type {t}")),
+            .map(|t| match t.as_str().and_then(Ty::parse) {
+                Some(x) => Ok(x),
+                None => Err(format!("json_schema: bad type {}", t.value())),
             })
             .collect(),
-        _ => Err(format!("json_schema: bad type {v}")),
+        _ => Err(format!("json_schema: bad type {}", v.value())),
     }
 }
 
 /// allOf-style merge of two schemas (the subset that has a clean intersection).
-fn merge(c: &mut Compiler, a: &Value, b: &Value) -> Result<Value, String> {
-    c.spend(value_cost(a).saturating_add(value_cost(b)))?;
-    let (ao, bo) = match (a, b) {
-        (Value::Bool(true), x) | (x, Value::Bool(true)) => return Ok(x.clone()),
-        (Value::Bool(false), _) | (_, Value::Bool(false)) => return Ok(Value::Bool(false)),
-        (Value::Object(ao), Value::Object(bo)) => (ao, bo),
-        _ => return Err("json_schema: a schema must be an object or a boolean".into()),
+fn merge<'a>(c: &mut Compiler, a: &View<'a>, b: &View<'a>) -> Result<View<'a>, String> {
+    c.spend(a.cost().saturating_add(b.cost()))?;
+    match (a.as_bool(), b.as_bool()) {
+        (Some(true), _) => return Ok(b.clone()),
+        (_, Some(true)) => return Ok(a.clone()),
+        (Some(false), _) | (_, Some(false)) => return Ok(made_bool(false)),
+        _ => {}
+    }
+    let (Some(ao), Some(bo)) = (a.entries(), b.entries()) else {
+        return Err("json_schema: a schema must be an object or a boolean".into());
     };
-    let mut out = ao.clone();
-    for (k, vb) in bo {
-        let Some(va) = ao.get(k) else {
-            out.insert(k.clone(), vb.clone());
+    let mut out = ObjBuilder::new(ao, bo.len());
+    // `out` only differs from `a` at the key being merged, and at `allOf` (combinators collect there)
+    let a_all_of = ao.get("allOf");
+    for (k, vb) in bo.iter() {
+        let in_a = if k == "allOf" {
+            a_all_of.clone()
+        } else {
+            out.get(k)
+        };
+        let Some(va) = in_a else {
+            out.insert(k, vb);
             continue;
         };
-        let nv = match k.as_str() {
+        let nv = match k {
             "type" => {
-                let ta = type_list(va)?;
-                let tb = type_list(vb)?;
+                let ta = type_list(&va)?;
+                let tb = type_list(&vb)?;
                 c.spend(ta.len().saturating_mul(tb.len()))?;
-                let mut t = Vec::new();
-                for x in &ta {
-                    for y in &tb {
-                        let r = match (x.as_str(), y.as_str()) {
+                let mut t: Vec<Ty> = Vec::new();
+                for &x in &ta {
+                    for &y in &tb {
+                        let r = match (x, y) {
                             (p, q) if p == q => Some(p),
-                            ("integer", "number") | ("number", "integer") => Some("integer"),
+                            (Ty::Integer, Ty::Number) | (Ty::Number, Ty::Integer) => {
+                                Some(Ty::Integer)
+                            }
                             _ => None,
                         };
                         if let Some(r) = r {
-                            if !t.contains(&Value::from(r)) {
-                                t.push(Value::from(r));
+                            if !t.contains(&r) {
+                                t.push(r);
                             }
                         }
                     }
                 }
                 if t.is_empty() {
-                    return Ok(Value::Bool(false));
+                    return Ok(made_bool(false));
                 }
-                Value::Array(t)
+                View::Arr(Rc::new(t.into_iter().map(Ty::view).collect()))
             }
             "enum" => {
-                let (Some(ea), Some(eb)) = (va.as_array(), vb.as_array()) else {
+                let (Some(ea), Some(eb)) = (va.items(), vb.items()) else {
                     return Err("json_schema: enum must be a list".into());
                 };
                 c.spend(ea.len().saturating_mul(eb.len()))?;
-                Value::Array(
+                View::Arr(Rc::new(
                     ea.iter()
-                        .filter(|x| eb.iter().any(|y| json_eq(x, y)))
-                        .cloned()
+                        .filter(|x| eb.iter().any(|y| json_eq(&x.value(), &y.value())))
                         .collect(),
-                )
+                ))
             }
             "const" => {
-                if !json_eq(va, vb) {
-                    return Ok(Value::Bool(false));
+                if !json_eq(&va.value(), &vb.value()) {
+                    return Ok(made_bool(false));
                 }
-                va.clone()
+                va
             }
             "properties" => {
-                let (Some(pa), Some(pb)) = (va.as_object(), vb.as_object()) else {
+                let (Some(pa), Some(pb)) = (va.entries(), vb.entries()) else {
                     return Err("json_schema: properties must be an object".into());
                 };
-                let mut m = pa.clone();
-                for (pk, pv) in pb {
-                    let nv = match pa.get(pk) {
-                        Some(x) => merge(c, x, pv)?,
-                        None => pv.clone(),
+                let mut m = ObjBuilder::new(pa, pb.len());
+                for (pk, pv) in pb.iter() {
+                    let nv = match m.get(pk) {
+                        Some(x) => merge(c, &x, &pv)?,
+                        None => pv,
                     };
-                    m.insert(pk.clone(), nv);
+                    m.insert(pk, nv);
                 }
-                Value::Object(m)
+                m.finish()
             }
             "required" => {
-                let mut r = va.as_array().cloned().unwrap_or_default();
-                let added = vb.as_array().map_or(0, Vec::len);
+                let mut r: Vec<View<'a>> = va
+                    .items()
+                    .map_or_else(Vec::new, |x| x.iter().collect::<Vec<_>>());
+                let added = vb.items().map_or(0, Items::len);
                 c.spend(r.len().saturating_add(added).saturating_mul(added))?;
-                for x in vb.as_array().into_iter().flatten() {
-                    if !r.contains(x) {
-                        r.push(x.clone());
+                if let Some(names) = vb.items() {
+                    for x in names.iter() {
+                        if !r.iter().any(|y| y.value() == x.value()) {
+                            r.push(x);
+                        }
                     }
                 }
-                Value::Array(r)
+                View::Arr(Rc::new(r))
             }
-            "items" => merge(c, va, vb)?,
+            "items" => merge(c, &va, &vb)?,
             "additionalProperties" => {
-                if json_eq(va, vb) {
-                    va.clone()
+                if json_eq(&va.value(), &vb.value()) {
+                    va
                 } else {
                     return Err(
                         "json_schema: allOf with different additionalProperties is not supported"
@@ -349,51 +711,76 @@ fn merge(c: &mut Compiler, a: &Value, b: &Value) -> Result<Value, String> {
             "minItems" | "minLength" | "minimum" | "exclusiveMinimum" => {
                 let (x, y) = (va.as_f64().unwrap_or(0.0), vb.as_f64().unwrap_or(0.0));
                 if x >= y {
-                    va.clone()
+                    va
                 } else {
-                    vb.clone()
+                    vb
                 }
             }
             "maxItems" | "maxLength" | "maximum" | "exclusiveMaximum" => {
                 let (x, y) = (va.as_f64().unwrap_or(0.0), vb.as_f64().unwrap_or(0.0));
                 if x <= y {
-                    va.clone()
+                    va
                 } else {
-                    vb.clone()
+                    vb
                 }
             }
-            "uniqueItems" => Value::Bool(va == &Value::Bool(true) || vb == &Value::Bool(true)),
+            "uniqueItems" => made_bool(va.as_bool() == Some(true) || vb.as_bool() == Some(true)),
             "anyOf" | "oneOf" | "allOf" => {
                 // keep both: a nested allOf of the two combinators
-                let mut m = Map::new();
-                m.insert(k.clone(), vb.clone());
-                let prev = out.remove("allOf");
-                let mut all = match prev {
-                    Some(Value::Array(a)) => a,
-                    _ => Vec::new(),
+                let one = View::Obj(Rc::new(vec![(k, vb)]));
+                let mut all: Vec<View<'a>> = match out.swap_remove("allOf") {
+                    Some(prev) => prev.items().map_or_else(Vec::new, |x| x.iter().collect()),
+                    None => Vec::new(),
                 };
-                all.push(Value::Object(m));
-                out.insert("allOf".into(), Value::Array(all));
+                all.push(one);
+                out.insert("allOf", View::Arr(Rc::new(all)));
                 continue;
             }
-            _ => va.clone(),
+            _ => va,
         };
-        out.insert(k.clone(), nv);
+        out.insert(k, nv);
     }
-    Ok(Value::Object(out))
+    Ok(out.finish())
 }
 
-fn as_u32(v: Option<&Value>, dflt: u32) -> Result<u32, String> {
+fn as_u32(v: Option<View>, dflt: u32) -> Result<u32, String> {
     match v {
         None => Ok(dflt),
         Some(x) => x
             .as_u64()
             .map(|n| n.min(u32::MAX as u64 - 1) as u32)
-            .ok_or_else(|| format!("json_schema: expected a non-negative integer, got {x}")),
+            .ok_or_else(|| {
+                format!(
+                    "json_schema: expected a non-negative integer, got {}",
+                    x.value()
+                )
+            }),
     }
 }
 
 impl Compiler {
+    fn new() -> Self {
+        Compiler {
+            nodes: Vec::new(),
+            alts: Vec::new(),
+            lit_ids: Vec::new(),
+            text_off: vec![0],
+            text: Vec::new(),
+            nums: Vec::new(),
+            objs: Vec::new(),
+            props: Vec::new(),
+            any: None,
+            work: 0,
+            retained: 0,
+            interned: HashMap::new(),
+            hasher: RandomState::new(),
+            lit_seen: Vec::new(),
+            lit_set: 0,
+            scratch: Vec::new(),
+            last_lit: None,
+        }
+    }
+
     fn spend(&mut self, n: usize) -> Result<(), String> {
         self.work = self.work.saturating_add(n as u64);
         if self.work > MAX_COMPILE_WORK {
@@ -411,15 +798,78 @@ impl Compiler {
         Ok(())
     }
 
-    fn key(&mut self, k: &str) -> Result<Vec<u8>, String> {
+    /// The id of text `b`, stored once however many nodes use it.
+    fn intern(&mut self, b: &[u8]) -> u32 {
+        let mut h = self.hasher.hash_one(b);
+        loop {
+            match self.interned.entry(h) {
+                Entry::Occupied(e) => {
+                    let id = *e.get() as usize;
+                    let (s, t) = (self.text_off[id] as usize, self.text_off[id + 1] as usize);
+                    if &self.text[s..t] == b {
+                        return id as u32;
+                    }
+                    h = h.wrapping_add(1);
+                }
+                Entry::Vacant(e) => {
+                    let id = (self.text_off.len() - 1) as u32;
+                    self.text.extend_from_slice(b);
+                    self.text_off.push(self.text.len() as u32);
+                    e.insert(id);
+                    return id;
+                }
+            }
+        }
+    }
+
+    fn key(&mut self, k: &str) -> Result<u32, String> {
         let b = key_bytes(k);
         self.retain(b.len())?;
-        Ok(b)
+        Ok(self.intern(&b))
     }
 
     fn push(&mut self, n: Node) -> u32 {
         self.nodes.push(n);
         (self.nodes.len() - 1) as u32
+    }
+
+    /// A literal node over the ids added to `lit_ids` from `start`; the same list as the last node's is shared.
+    fn push_lit(&mut self, start: usize) -> u32 {
+        let len = self.lit_ids.len() - start;
+        if let Some((s, l)) = self.last_lit {
+            if l as usize == len && self.lit_ids[s as usize..][..len] == self.lit_ids[start..] {
+                self.lit_ids.truncate(start);
+                return self.push(Node::Lit { start: s, len: l });
+            }
+        }
+        self.last_lit = Some((start as u32, len as u32));
+        self.push(Node::Lit {
+            start: start as u32,
+            len: len as u32,
+        })
+    }
+
+    fn fixed_lit(&mut self, texts: &[&[u8]]) -> u32 {
+        let start = self.lit_ids.len();
+        for t in texts {
+            let id = self.intern(t);
+            self.lit_ids.push(id);
+        }
+        self.push_lit(start)
+    }
+
+    fn push_num(&mut self, n: NumNode) -> u32 {
+        let same = self.nums.last().is_some_and(|l| {
+            l.int == n.int
+                && l.lo_ex == n.lo_ex
+                && l.hi_ex == n.hi_ex
+                && l.lo.to_bits() == n.lo.to_bits()
+                && l.hi.to_bits() == n.hi.to_bits()
+        });
+        if !same {
+            self.nums.push(n);
+        }
+        self.push(Node::Num((self.nums.len() - 1) as u32))
     }
 
     fn any(&mut self) -> u32 {
@@ -428,11 +878,7 @@ impl Compiler {
         }
         let a = self.push(Node::Never);
         self.any = Some(a);
-        let o = self.push(Node::Obj {
-            props: Vec::new(),
-            required: 0,
-            additional: a,
-        });
+        let o = self.push_obj(&[], 0, a);
         let r = self.push(Node::Arr {
             items: a,
             min: 0,
@@ -440,28 +886,28 @@ impl Compiler {
             unique: false,
         });
         let s = self.push(Node::Str { min: 0, max: NONE });
-        let n = self.push(Node::Num {
+        let n = self.push_num(NumNode {
             int: false,
             lo: f64::NEG_INFINITY,
             lo_ex: false,
             hi: f64::INFINITY,
             hi_ex: false,
         });
-        let l = self.push(Node::Lit(vec![
-            b"true".to_vec(),
-            b"false".to_vec(),
-            b"null".to_vec(),
-        ]));
-        self.nodes[a as usize] = Node::Union(vec![o, r, s, n, l]);
+        let l = self.fixed_lit(&[b"true", b"false", b"null"]);
+        let start = self.alts.len() as u32;
+        self.alts.extend([o, r, s, n, l]);
+        self.nodes[a as usize] = Node::Union { start, len: 5 };
         a
     }
 
     fn union(&mut self, alts: Vec<u32>) -> u32 {
-        let mut flat = Vec::new();
+        let mut flat = Vec::with_capacity(alts.len());
         for a in alts {
-            match &self.nodes[a as usize] {
+            match self.nodes[a as usize] {
                 Node::Never => {}
-                Node::Union(xs) if Some(a) != self.any => flat.extend(xs.iter().copied()),
+                Node::Union { start, len } if Some(a) != self.any => {
+                    flat.extend_from_slice(&self.alts[start as usize..][..len as usize])
+                }
                 _ => flat.push(a),
             }
         }
@@ -469,51 +915,60 @@ impl Compiler {
         match flat.len() {
             0 => self.push(Node::Never),
             1 => flat[0],
-            _ => self.push(Node::Union(flat)),
+            len => {
+                let start = self.alts.len() as u32;
+                self.alts.extend_from_slice(&flat);
+                self.push(Node::Union {
+                    start,
+                    len: len as u32,
+                })
+            }
         }
     }
 
-    fn schema(&mut self, s: &Value, depth: usize) -> Result<u32, String> {
+    fn schema<'a>(&mut self, s: &View<'a>, depth: usize) -> Result<u32, String> {
         if depth > MAX_DEPTH {
             return Err("json_schema: nested too deeply".into());
         }
         self.spend(1)?;
-        let o = match s {
-            Value::Bool(true) => return Ok(self.any()),
-            Value::Bool(false) => return Ok(self.push(Node::Never)),
-            Value::Object(o) => o,
-            _ => return Err("json_schema: a schema must be an object or a boolean".into()),
+        match s.as_bool() {
+            Some(true) => return Ok(self.any()),
+            Some(false) => return Ok(self.push(Node::Never)),
+            None => {}
+        }
+        let Some(o) = s.entries() else {
+            return Err("json_schema: a schema must be an object or a boolean".into());
         };
-        for k in o.keys() {
-            if !KEYWORDS.contains(&k.as_str()) {
+        for (k, _) in o.iter() {
+            if !KEYWORDS.contains(&k) {
                 return Err(format!("json_schema: unsupported schema keyword {k:?}"));
             }
         }
         if let Some(all) = o.get("allOf") {
             let arr = all
-                .as_array()
-                .filter(|a| !a.is_empty())
+                .items()
+                .filter(|a| a.len() > 0)
                 .ok_or("json_schema: allOf must be a non-empty list")?;
-            let mut base = o.clone();
-            base.remove("allOf");
-            let mut m = Value::Object(base);
-            for x in arr {
-                m = merge(self, &m, x)?;
+            let mut base = ObjBuilder::new(o, 0);
+            base.swap_remove("allOf");
+            let mut m = base.finish();
+            for x in arr.iter() {
+                m = merge(self, &m, &x)?;
             }
             return self.schema(&m, depth + 1);
         }
         for comb in ["anyOf", "oneOf"] {
             if let Some(alts) = o.get(comb) {
                 let arr = alts
-                    .as_array()
-                    .filter(|a| !a.is_empty())
+                    .items()
+                    .filter(|a| a.len() > 0)
                     .ok_or(format!("json_schema: {comb} must be a non-empty list"))?;
-                let mut base = o.clone();
-                base.remove(comb);
-                let base = Value::Object(base);
+                let mut base = ObjBuilder::new(o, 0);
+                base.swap_remove(comb);
+                let base = base.finish();
                 let mut ids = Vec::new();
-                for a in arr {
-                    let m = merge(self, &base, a)?;
+                for a in arr.iter() {
+                    let m = merge(self, &base, &a)?;
                     ids.push(self.schema(&m, depth + 1)?);
                 }
                 return Ok(self.union(ids));
@@ -522,16 +977,16 @@ impl Compiler {
         self.typed(o, depth)
     }
 
-    fn typed(&mut self, o: &Map<String, Value>, depth: usize) -> Result<u32, String> {
-        let mut types: Vec<String> = match o.get("type") {
-            Some(t) => type_list(t)?,
-            None => ALL_TYPES.iter().map(|s| s.to_string()).collect(),
+    fn typed<'a>(&mut self, o: Entries<'_, 'a>, depth: usize) -> Result<u32, String> {
+        let mut types: Vec<Ty> = match o.get("type") {
+            Some(t) => type_list(&t)?,
+            None => ALL_TYPES.to_vec(),
         };
         self.spend(types.len())?;
-        if types.iter().any(|t| t == "number") {
-            types.retain(|t| t != "integer");
+        if types.contains(&Ty::Number) {
+            types.retain(|t| *t != Ty::Integer);
         }
-        let num = |k: &str| o.get(k).and_then(Value::as_f64);
+        let num = |k: &str| o.get(k).and_then(|v| v.as_f64());
         let (mut lo, mut lo_ex) = (f64::NEG_INFINITY, false);
         if let Some(m) = num("minimum") {
             lo = m;
@@ -556,30 +1011,36 @@ impl Compiler {
         let smax = as_u32(o.get("maxLength"), NONE)?;
 
         // enum / const: a literal set, filtered by the declared type(s) and the scalar bounds
-        let mut lits: Option<Vec<Value>> = None;
+        let mut lits: Option<Vec<View<'a>>> = None;
         if let Some(e) = o.get("enum") {
-            self.spend(value_cost(e))?;
+            self.spend(e.cost())?;
             lits = Some(
-                e.as_array()
+                e.items()
                     .ok_or("json_schema: enum must be a list")?
-                    .clone(),
+                    .iter()
+                    .collect(),
             );
         }
         if let Some(c) = o.get("const") {
-            self.spend(value_cost(c))?;
+            self.spend(c.cost())?;
             lits = Some(match lits {
-                Some(l) => l.into_iter().filter(|x| json_eq(x, c)).collect(),
-                None => vec![c.clone()],
+                Some(l) => {
+                    let cv = c.value();
+                    l.into_iter().filter(|x| json_eq(&x.value(), &cv)).collect()
+                }
+                None => vec![c],
             });
         }
         if let Some(l) = lits {
-            let mut out = Vec::new();
-            let mut seen = HashSet::new();
+            let start = self.lit_ids.len();
             let mut distinct = types.clone();
             distinct.sort_unstable();
             distinct.dedup();
-            for v in l {
-                let t_ok = distinct.iter().any(|t| type_matches(t, &v));
+            self.lit_set += 1;
+            let mut enc = std::mem::take(&mut self.scratch);
+            for x in l {
+                let v = x.value();
+                let t_ok = distinct.iter().any(|t| t.matches(&v));
                 if !t_ok {
                     continue;
                 }
@@ -594,24 +1055,30 @@ impl Compiler {
                         continue;
                     }
                 }
-                let enc = serde_json::to_vec(&v).map_err(|e| e.to_string())?;
-                if !seen.contains(&enc) {
+                enc.clear();
+                serde_json::to_writer(&mut enc, &*v).map_err(|e| e.to_string())?;
+                let id = self.intern(&enc) as usize;
+                if self.lit_seen.len() <= id {
+                    self.lit_seen.resize(id + 1, 0);
+                }
+                if self.lit_seen[id] != self.lit_set {
+                    self.lit_seen[id] = self.lit_set;
                     self.retain(enc.len())?;
-                    seen.insert(enc.clone());
-                    out.push(enc);
+                    self.lit_ids.push(id as u32);
                 }
             }
-            return Ok(if out.is_empty() {
+            self.scratch = enc;
+            return Ok(if self.lit_ids.len() == start {
                 self.push(Node::Never)
             } else {
-                self.push(Node::Lit(out))
+                self.push_lit(start)
             });
         }
 
         let mut ids = Vec::new();
-        for t in &types {
-            let id = match t.as_str() {
-                "string" => {
+        for t in types.iter().copied() {
+            let id = match t {
+                Ty::String => {
                     if smax != NONE && smin > smax {
                         continue;
                     }
@@ -620,24 +1087,24 @@ impl Compiler {
                         max: smax,
                     })
                 }
-                "number" | "integer" => {
+                Ty::Number | Ty::Integer => {
                     if lo > hi {
                         continue;
                     }
-                    self.push(Node::Num {
-                        int: t == "integer",
+                    self.push_num(NumNode {
+                        int: t == Ty::Integer,
                         lo,
                         lo_ex,
                         hi,
                         hi_ex,
                     })
                 }
-                "boolean" => self.push(Node::Lit(vec![b"true".to_vec(), b"false".to_vec()])),
-                "null" => self.push(Node::Lit(vec![b"null".to_vec()])),
-                "object" => self.object(o, depth)?,
-                "array" => {
+                Ty::Boolean => self.fixed_lit(&[b"true", b"false"]),
+                Ty::Null => self.fixed_lit(&[b"null"]),
+                Ty::Object => self.object(o, depth)?,
+                Ty::Array => {
                     let items = match o.get("items") {
-                        Some(i) => self.schema(i, depth + 1)?,
+                        Some(i) => self.schema(&i, depth + 1)?,
                         None => self.any(),
                     };
                     let min = as_u32(o.get("minItems"), 0)?;
@@ -652,59 +1119,61 @@ impl Compiler {
                         items,
                         min,
                         max,
-                        unique: o.get("uniqueItems") == Some(&Value::Bool(true)),
+                        unique: o.get("uniqueItems").and_then(|u| u.as_bool()) == Some(true),
                     })
                 }
-                _ => continue,
             };
             ids.push(id);
         }
         Ok(self.union(ids))
     }
 
-    fn object(&mut self, o: &Map<String, Value>, depth: usize) -> Result<u32, String> {
+    fn object<'a>(&mut self, o: Entries<'_, 'a>, depth: usize) -> Result<u32, String> {
         let additional = match o.get("additionalProperties") {
-            None | Some(Value::Bool(true)) => self.any(),
-            Some(Value::Bool(false)) => NONE,
-            Some(s) => {
-                let a = self.schema(s, depth + 1)?;
-                if matches!(self.nodes[a as usize], Node::Never) {
-                    NONE
-                } else {
-                    a
+            None => self.any(),
+            Some(s) => match s.as_bool() {
+                Some(true) => self.any(),
+                Some(false) => NONE,
+                None => {
+                    let a = self.schema(&s, depth + 1)?;
+                    if matches!(self.nodes[a as usize], Node::Never) {
+                        NONE
+                    } else {
+                        a
+                    }
                 }
-            }
+            },
         };
-        let mut props: Vec<(Vec<u8>, u32)> = Vec::new();
-        let mut names: Vec<String> = Vec::new();
+        let mut props: Vec<(u32, u32)> = Vec::new();
+        let mut names: Vec<&'a str> = Vec::new();
         if let Some(p) = o.get("properties") {
             let p = p
-                .as_object()
+                .entries()
                 .ok_or("json_schema: properties must be an object")?;
-            for (k, v) in p {
+            for (k, v) in p.iter() {
                 self.spend(k.len() / WORK_BYTES)?;
-                let id = self.schema(v, depth + 1)?;
-                names.push(k.clone());
+                let id = self.schema(&v, depth + 1)?;
+                names.push(k);
                 props.push((self.key(k)?, id));
             }
         }
         let mut required = 0u64;
         if let Some(r) = o.get("required") {
             let r = r
-                .as_array()
+                .items()
                 .ok_or("json_schema: required must be a list of strings")?;
-            for x in r {
+            for x in r.iter() {
                 let k = x
                     .as_str()
                     .ok_or("json_schema: required must be a list of strings")?;
                 self.spend(names.len().saturating_add(k.len() / WORK_BYTES))?;
-                let i = match names.iter().position(|n| n == k) {
+                let i = match names.iter().position(|n| *n == k) {
                     Some(i) => i,
                     None => {
                         if additional == NONE {
                             return Ok(self.push(Node::Never));
                         }
-                        names.push(k.to_string());
+                        names.push(k);
                         props.push((self.key(k)?, additional));
                         names.len() - 1
                     }
@@ -720,11 +1189,27 @@ impl Compiler {
                 "json_schema: at most {MAX_PROPS} properties per object"
             ));
         }
-        Ok(self.push(Node::Obj {
-            props,
-            required,
-            additional,
-        }))
+        Ok(self.push_obj(&props, required, additional))
+    }
+
+    /// An object node; the same contents as the last one's are shared.
+    fn push_obj(&mut self, props: &[(u32, u32)], required: u64, additional: u32) -> u32 {
+        let same = self.objs.last().is_some_and(|l| {
+            l.required == required
+                && l.additional == additional
+                && self.props[l.start as usize..][..l.len as usize] == *props
+        });
+        if !same {
+            let start = self.props.len() as u32;
+            self.props.extend_from_slice(props);
+            self.objs.push(ObjNode {
+                start,
+                len: props.len() as u32,
+                required,
+                additional,
+            });
+        }
+        self.push(Node::Obj((self.objs.len() - 1) as u32))
     }
 }
 
@@ -871,10 +1356,33 @@ fn num_feasible(t: &[u8], int: bool, lo: f64, lo_ex: bool, hi: f64, hi_ex: bool)
 }
 
 impl Grammar {
-    fn lits(&self, node: u32) -> &[Vec<u8>] {
-        match &self.nodes[node as usize] {
-            Node::Lit(l) => l,
+    fn text_of(&self, id: u32) -> &[u8] {
+        let i = id as usize;
+        &self.text[self.text_off[i] as usize..self.text_off[i + 1] as usize]
+    }
+
+    /// The text ids of a literal node.
+    fn lits(&self, node: u32) -> &[u32] {
+        match self.nodes[node as usize] {
+            Node::Lit { start, len } => &self.lit_ids[start as usize..][..len as usize],
             _ => &[],
+        }
+    }
+
+    fn num_of(&self, node: u32) -> Option<NumNode> {
+        match self.nodes[node as usize] {
+            Node::Num(i) => Some(self.nums[i as usize]),
+            _ => None,
+        }
+    }
+
+    fn obj_of(&self, node: u32) -> Option<(ObjNode, &[(u32, u32)])> {
+        match self.nodes[node as usize] {
+            Node::Obj(i) => {
+                let o = self.objs[i as usize];
+                Some((o, &self.props[o.start as usize..][..o.len as usize]))
+            }
+            _ => None,
         }
     }
 
@@ -905,18 +1413,19 @@ impl Grammar {
                         return;
                     }
                     let w = *ws;
-                    match &self.nodes[node as usize] {
+                    match self.nodes[node as usize] {
                         Node::Never => {}
-                        Node::Union(alts) => {
-                            for &a in alts {
+                        Node::Union { start, len } => {
+                            for &a in &self.alts[start as usize..][..len as usize] {
                                 let mut c2 = c.clone();
                                 *c2.last_mut().unwrap() = Frame::Val { node: a, ws: w };
                                 self.step(c2, b, out);
                             }
                         }
-                        Node::Lit(ls) => {
+                        Node::Lit { .. } => {
+                            let ls = self.lits(node);
                             let alts: Vec<u16> = (0..ls.len() as u16)
-                                .filter(|&i| ls[i as usize][0] == b)
+                                .filter(|&i| self.text_of(ls[i as usize])[0] == b)
                                 .collect();
                             if !alts.is_empty() {
                                 *top = Frame::Lit { node, alts, pos: 1 };
@@ -934,22 +1443,23 @@ impl Grammar {
                                 out.push((c, ti));
                             }
                         }
-                        Node::Num {
-                            int,
-                            lo,
-                            lo_ex,
-                            hi,
-                            hi_ex,
-                        } => {
+                        Node::Num(i) => {
+                            let NumNode {
+                                int,
+                                lo,
+                                lo_ex,
+                                hi,
+                                hi_ex,
+                            } = self.nums[i as usize];
                             if b == b'-' || b.is_ascii_digit() {
                                 let t = vec![b];
-                                if num_feasible(&t, *int, *lo, *lo_ex, *hi, *hi_ex) {
+                                if num_feasible(&t, int, lo, lo_ex, hi, hi_ex) {
                                     *top = Frame::Num { node, text: t };
                                     out.push((c, ti));
                                 }
                             }
                         }
-                        Node::Obj { .. } => {
+                        Node::Obj(_) => {
                             if b == b'{' {
                                 *top = Frame::Obj {
                                     node,
@@ -983,11 +1493,13 @@ impl Grammar {
                 Frame::Lit { node, alts, pos } => {
                     let ls = self.lits(*node);
                     let p = *pos as usize;
-                    let complete = alts.iter().any(|&i| ls[i as usize].len() == p);
+                    let complete = alts
+                        .iter()
+                        .any(|&i| self.text_of(ls[i as usize]).len() == p);
                     let ext: Vec<u16> = alts
                         .iter()
                         .copied()
-                        .filter(|&i| ls[i as usize].len() > p && ls[i as usize][p] == b)
+                        .filter(|&i| self.text_of(ls[i as usize]).get(p) == Some(&b))
                         .collect();
                     if complete {
                         let mut c2 = c.clone();
@@ -1090,13 +1602,13 @@ impl Grammar {
                     return;
                 }
                 Frame::Num { node, text } => {
-                    let Node::Num {
+                    let Some(NumNode {
                         int,
                         lo,
                         lo_ex,
                         hi,
                         hi_ex,
-                    } = self.nodes[*node as usize]
+                    }) = self.num_of(*node)
                     else {
                         return;
                     };
@@ -1135,11 +1647,14 @@ impl Grammar {
                     cur,
                     extra,
                 } => {
-                    let Node::Obj {
+                    let Some((
+                        ObjNode {
+                            required,
+                            additional,
+                            ..
+                        },
                         props,
-                        required,
-                        additional,
-                    } = &self.nodes[*node as usize]
+                    )) = self.obj_of(*node)
                     else {
                         return;
                     };
@@ -1147,7 +1662,7 @@ impl Grammar {
                         .iter()
                         .enumerate()
                         .any(|(i, _)| *seen & (1u64 << i) == 0);
-                    let key_possible = *additional != NONE || unseen;
+                    let key_possible = additional != NONE || unseen;
                     match *ph {
                         0 | 3 | 4 => {
                             if is_ws(b) {
@@ -1165,7 +1680,7 @@ impl Grammar {
                                     *kesc = 0;
                                     out.push((c, ti));
                                 }
-                                (b'}', 0 | 3) if *seen & required == *required => {
+                                (b'}', 0 | 3) if *seen & required == required => {
                                     c.pop();
                                     out.push((c, ti));
                                 }
@@ -1178,7 +1693,7 @@ impl Grammar {
                             }
                         }
                         1 => {
-                            let open = *additional != NONE;
+                            let open = additional != NONE;
                             if *kesc > 0 {
                                 // inside an escape of a free-form key
                                 let ok = match *kesc {
@@ -1205,14 +1720,17 @@ impl Grammar {
                                     (k, _) => k + 1,
                                 };
                                 key.push(b);
-                                if !open && !props.iter().any(|(p, _)| p.starts_with(key)) {
+                                if !open
+                                    && !props.iter().any(|(p, _)| self.text_of(*p).starts_with(key))
+                                {
                                     return;
                                 }
                                 out.push((c, ti));
                                 return;
                             }
                             if b == b'"' {
-                                let hit = props.iter().position(|(p, _)| p == key);
+                                let hit =
+                                    props.iter().position(|(p, _)| self.text_of(*p) == &key[..]);
                                 match hit {
                                     Some(i) => {
                                         if *seen & (1u64 << i) != 0 {
@@ -1242,7 +1760,7 @@ impl Grammar {
                             }
                             if !open
                                 && !props.iter().enumerate().any(|(i, (p, _))| {
-                                    *seen & (1u64 << i) == 0 && p.starts_with(key)
+                                    *seen & (1u64 << i) == 0 && self.text_of(*p).starts_with(key)
                                 })
                             {
                                 return;
@@ -1259,7 +1777,7 @@ impl Grammar {
                             }
                             if b == b':' {
                                 let child = if *cur == NONE {
-                                    *additional
+                                    additional
                                 } else {
                                     *seen |= 1u64 << *cur;
                                     props[*cur as usize].1
@@ -1345,10 +1863,14 @@ impl Grammar {
         if let Some(Frame::Lit { node, alts, pos }) = c.last() {
             let ls = self.lits(*node);
             let p = *pos as usize;
-            let all_done = alts.iter().all(|&i| ls[i as usize].len() == p);
-            let last_digit = alts
+            let all_done = alts
                 .iter()
-                .any(|&i| ls[i as usize].last().is_some_and(u8::is_ascii_digit));
+                .all(|&i| self.text_of(ls[i as usize]).len() == p);
+            let last_digit = alts.iter().any(|&i| {
+                self.text_of(ls[i as usize])
+                    .last()
+                    .is_some_and(u8::is_ascii_digit)
+            });
             if all_done && !last_digit {
                 c.pop();
             }
@@ -1430,16 +1952,17 @@ impl Grammar {
             [] => true,
             [Frame::Lit { node, alts, pos }] => {
                 let ls = self.lits(*node);
-                alts.iter().any(|&i| ls[i as usize].len() == *pos as usize)
+                alts.iter()
+                    .any(|&i| self.text_of(ls[i as usize]).len() == *pos as usize)
             }
-            [Frame::Num { node, text }] => match self.nodes[*node as usize] {
-                Node::Num {
+            [Frame::Num { node, text }] => match self.num_of(*node) {
+                Some(NumNode {
                     lo,
                     lo_ex,
                     hi,
                     hi_ex,
                     ..
-                } => {
+                }) => {
                     num_complete(text)
                         && std::str::from_utf8(text)
                             .ok()
@@ -1478,8 +2001,8 @@ impl Grammar {
                     ph: 1,
                     kesc: 0,
                     ..
-                } => match &self.nodes[*node as usize] {
-                    Node::Obj { additional, .. } if *additional != NONE => NONE,
+                } => match self.obj_of(*node) {
+                    Some((o, _)) if o.additional != NONE => NONE,
                     _ => return None,
                 },
                 _ => return None,
@@ -1745,8 +2268,12 @@ mod tests {
 
     fn lits(schema: &Value) -> Vec<Vec<u8>> {
         let g = compile_value(schema).unwrap();
-        match &g.nodes[g.root as usize] {
-            Node::Lit(l) => l.clone(),
+        match g.nodes[g.root as usize] {
+            Node::Lit { .. } => g
+                .lits(g.root)
+                .iter()
+                .map(|&i| g.text_of(i).to_vec())
+                .collect(),
             n => panic!("not a literal set: {n:?}"),
         }
     }
@@ -1768,6 +2295,43 @@ mod tests {
         assert_eq!(lits(&s), want);
     }
 
+    #[test]
+    fn nodes_stay_small() {
+        assert!(std::mem::size_of::<Node>() <= 16);
+    }
+
+    /// Merging an object larger than the small-object path: replaced, added and required keys all still work.
+    #[test]
+    fn merging_wide_objects() {
+        let mut wide = Map::new();
+        for i in 0..40 {
+            wide.insert(format!("p{i}"), json!({"type":"integer"}));
+        }
+        let s = json!({"allOf":[
+            {"type":"object","properties":wide,"required":["p1"]},
+            {"properties":{"p3":{"minimum":0},"new":{"type":"null"}},"required":["new","p1"]},
+        ]});
+        assert!(accepts(&s, r#"{"p39":1,"new":null,"p1":2,"p3":3}"#));
+        assert!(!prefix_ok(&s, r#"{"p3":-1"#));
+        assert!(!accepts(&s, r#"{"p39":1,"p1":2}"#));
+    }
+
+    #[test]
+    fn unsupported_key_of_an_alternative_is_named() {
+        let e = prepare(&json!({"type":"string","anyOf":[{"x1":1,"x2":2}]})).unwrap_err();
+        assert!(e.contains("\"x1\""), "{e}");
+    }
+
+    /// Text is stored once, whatever repeats it, and each literal set still lists its own literals.
+    #[test]
+    fn repeated_text_is_shared() {
+        let s = json!({"type":["array","array","array"],"items":{"enum":["a","b",1]}});
+        let g = compile_value(&s).unwrap();
+        assert_eq!(g.text_off.len() - 1, 3);
+        assert!(accepts(&s, r#"["a",1,"b"]"#));
+        assert!(!prefix_ok(&s, r#"["c"#));
+    }
+
     /// What people send stays well inside the limit: a wide union over a large shared base, deep nesting.
     #[test]
     fn large_ordinary_schemas_still_compile() {
@@ -1781,13 +2345,8 @@ mod tests {
             .map(|i| json!({"properties":{"kind":{"const":format!("k{i}")}},"required":["kind"]}))
             .collect();
         let s = json!({"type":"object","properties":props,"anyOf":alts});
-        let mut c = Compiler {
-            nodes: Vec::new(),
-            any: None,
-            work: 0,
-            retained: 0,
-        };
-        c.schema(&s, 0).unwrap();
+        let mut c = Compiler::new();
+        c.schema(&View::Raw(&s), 0).unwrap();
         assert!(c.work < MAX_COMPILE_WORK / 2, "{}", c.work);
     }
 

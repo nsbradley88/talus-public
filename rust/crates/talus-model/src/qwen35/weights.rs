@@ -2732,8 +2732,61 @@ impl Q36Model {
         {
             model.init_draft_vocab_head_from_gguf(f, mtp_f)?;
         }
+        if head_stage {
+            model.release_mtp_full_head();
+        }
 
         Ok(model)
+    }
+
+    /// (#75): with a draft-vocabulary head sliced from the MTP sidecar's full output head (`dv_head`, built by
+    /// `init_draft_vocab_head` from `mtp_w.shared_head`), nothing reads the full head again: `draft_head()`,
+    /// `draft_head_rows`, `draft_head_step` and the DFlash2 fallback head all take `dv_head` first, and the drafter's
+    /// vocabulary size comes from it. Free it (546 MB for the 27B's Q3_K `output.weight`, 5120 x 248320) before the
+    /// automatic context is planned. Output unchanged: the freed rows were already copied. `TALUS_Q27_KEEP_MTP_HEAD=1`
+    /// keeps it. Returns the bytes freed.
+    pub fn release_mtp_full_head(&mut self) -> usize {
+        let keep = std::env::var("TALUS_Q27_KEEP_MTP_HEAD").is_ok_and(|v| v == "1");
+        let head = self.mtp_w.shared_head;
+        if keep
+            || self.dv_head.is_null()
+            || self.dv_buf.is_null()
+            || head.is_null()
+            || self.draft_vocab <= 0
+        {
+            return 0;
+        }
+        let p = head.ptr.cast_mut();
+        if p.is_null() || self.mtp_head.d.cast::<c_void>() != head.ptr {
+            return 0;
+        }
+        let Some(i) = self.allocs.iter().position(|&a| a == p) else {
+            return 0; // (inside an arena: not separately freeable)
+        };
+        self.allocs.swap_remove(i);
+        let mut j = 0;
+        while j < self.packed.len() {
+            let (orig, pk, _) = self.packed[j];
+            if orig == head.ptr {
+                mmvq_wide_release(orig);
+                tk_q36_q8_0_packed_unregister(orig);
+                if !pk.is_null() && pk != orig.cast_mut() {
+                    unsafe {
+                        let _ = hipFree(pk);
+                    }
+                }
+                self.packed.swap_remove(j);
+            } else {
+                j += 1;
+            }
+        }
+        unsafe {
+            let _ = hipFree(p);
+        }
+        self.mtp_w.shared_head = Tens::null();
+        self.mtp_w.mtp_head = Mat::null();
+        self.mtp_head = Mat::null();
+        head.bytes
     }
 
     pub fn try_load_mtp_from(

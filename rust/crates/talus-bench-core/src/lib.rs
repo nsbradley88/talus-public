@@ -51,6 +51,7 @@ pub fn smoke_config(
         api_key_env: api_key_env.map(str::to_string),
         frozen: None,
         talus: t,
+        verify_weights: false,
         provenance: Default::default(),
     };
     let cand_level = candidate_level.unwrap_or("fast");

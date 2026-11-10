@@ -195,6 +195,7 @@ pub fn plane_selected(spec: &str, layer: usize, plane: usize) -> bool {
     false
 }
 
+#[derive(Debug, Clone)]
 pub struct W4iEntry {
     pub name: String,
     pub n: u32,

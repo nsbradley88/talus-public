@@ -4,6 +4,11 @@
 //! Prompt cache (talus-livecold exact policy): the recurrent state (KDA + conv) is snapshotted only on the prompt
 //! chunk grid (multiples of `GRID` tokens, written by prefill) and never restored from decode-written state; the
 //! position-indexed caches (MLA latent, indexer keys / pooled keys, MTP block) are reused up to the snapshot.
+//!
+//! Exact resend  , v0.1.7): the last prompt pass also leaves a prompt-END record (recurrent state, the
+//! trunk h of row n-1, the last row's logits). A request whose prompt equals it resumes AT the end with no re-read, so
+//! its reply equals the first send's byte for byte (the grid snapshot path re-read the tail in another chunk shape and
+//! changed the prompt-end logits). TALUS_GLM_RESEND_LOGITS=0 turns it off.
 
 use std::io::Write;
 use std::time::Instant;
@@ -32,6 +37,31 @@ pub(crate) fn snap_grid() -> usize {
     })
 }
 
+/// the exact-resend switch (default on; `0` / `false` / `off` turns it off).
+pub(crate) fn resend_logits_on(v: Option<&str>) -> bool {
+    !matches!(v.map(str::trim), Some("0") | Some("false") | Some("off"))
+}
+
+/// may an exact resend of a prompt of `n` tokens resume at its end? Every position-indexed cache row
+/// below n is the end record's pass's own (generation writes rows >= n only) except the indexer key|gate ring (`ring`
+/// rows, position p in row p mod ring): the decode step that pools the group holding n-1 reads its rows from
+/// n - n % kpool on, so nothing the last request wrote (`written` = one past its highest position, drafts included)
+/// may have wrapped onto them.
+pub(crate) fn end_resume_ok(n: usize, written: usize, kpool: usize, ring: usize) -> bool {
+    n > 0 && kpool > 0 && written <= n - n % kpool + ring
+}
+
+/// Prompt-end record of the last prompt pass that read rows.
+struct EndSnap {
+    /// prompt length (0 = no valid record)
+    pos: usize,
+    hash: u64,
+    h_prev: Vec<f32>,
+    logits: Vec<f32>,
+    /// recurrent state (KDA + conv, `snap_save` layout), allocated on first use
+    buf: Option<Buf>,
+}
+
 struct Snap {
     pos: usize,
     hash: u64,
@@ -47,6 +77,11 @@ pub struct GlmBackend {
     hist: Vec<u32>,
     snaps: Vec<Snap>,
     max_snaps: usize,
+    /// prompt-end record and its switch (off with the prompt cache, GLM_PROMPT_SNAPS=0)
+    end: EndSnap,
+    resend_on: bool,
+    /// one past the highest position written since the end record was taken (verify windows included)
+    written: usize,
     clock: u64,
     log: bool,
     /// TALUS_MEM_SHED_EVERY: 1 = every class, or a comma list of graphs,snapshots,pcache,arenas
@@ -71,12 +106,23 @@ impl GlmBackend {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1);
+        let resend_on = max_snaps > 0
+            && resend_logits_on(std::env::var("TALUS_GLM_RESEND_LOGITS").ok().as_deref());
         Self {
             eng,
             cfg,
             hist: vec![],
             snaps: vec![],
             max_snaps,
+            end: EndSnap {
+                pos: 0,
+                hash: 0,
+                h_prev: vec![],
+                logits: vec![],
+                buf: None,
+            },
+            resend_on,
+            written: 0,
             clock: 0,
             log: std::env::var("GLM_SERVE_LOG").is_ok(),
             shed_every: std::env::var("TALUS_MEM_SHED_EVERY")
@@ -105,6 +151,20 @@ impl GlmBackend {
                 l += 1;
             }
         }
+        // an exact resend of the prompt the end record belongs to resumes at its end
+        let n = prompt.len();
+        let resend = self.resend_on
+            && cmd.use_cache
+            && l == n
+            && self.end.pos == n
+            && self.end.buf.is_some()
+            && self.end.hash == hash_prefix(&prompt)
+            && end_resume_ok(
+                n,
+                self.written,
+                self.eng.w.hp.kpool,
+                talus_model::glm::engine::KG_RING,
+            );
         let l = l.min(prompt.len() - 1);
         // the newest snapshot at or below l whose prefix matches
         let mut best: Option<usize> = None;
@@ -117,7 +177,20 @@ impl GlmBackend {
             }
         }
         let mut seq = SeqPos::default();
+        if resend {
+            best = None;
+        }
+        if !resend {
+            // the record is about to be overwritten (or the state moves under it): invalid until this pass ends
+            self.end.pos = 0;
+        }
         match best {
+            _ if resend => {
+                let buf = self.end.buf.expect("checked");
+                self.eng.snap_restore(&buf)?;
+                seq.n_past = n;
+                seq.h_prev = self.end.h_prev.clone();
+            }
             Some(i) => {
                 let buf = self.snaps[i].buf;
                 self.eng.snap_restore(&buf)?;
@@ -139,10 +212,12 @@ impl GlmBackend {
         let points: Vec<usize> = [last_grid, last_grid.saturating_sub(grid)]
             .into_iter()
             .take(self.max_snaps.max(1))
-            .filter(|&g| g > reuse && g > 0)
+            .filter(|&g| g > reuse && g > 0 && !resend)
             .collect();
         let mtp = self.cfg.mtp;
-        let first = {
+        let first = if resend {
+            self.end.logits.clone()
+        } else {
             // the snapshot copy must happen at the point itself (the state moves on with the next window)
             let snaps = &mut self.snaps;
             let max_snaps = self.max_snaps;
@@ -202,6 +277,18 @@ impl GlmBackend {
                 &mut cb2,
             )?
         };
+        if !resend && self.resend_on {
+            // record this pass's end (stream-ordered copy of the state the reply starts from)
+            if self.end.buf.is_none() {
+                self.end.buf = Some(self.eng.snap_alloc()?);
+            }
+            let buf = self.end.buf.expect("allocated");
+            self.eng.snap_save(&buf)?;
+            self.end.h_prev = seq.h_prev.clone();
+            self.end.logits = first.clone();
+            self.end.hash = hash_prefix(&prompt);
+            self.end.pos = n;
+        }
         if std::env::var("GLM_LOGITS_HASH").as_deref() == Ok("1") {
             // diagnostics (rd-mempr warm vs cold): FNV-1a over the bits of the last prompt token's logits
             let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -248,6 +335,10 @@ impl GlmBackend {
         })?;
         // committed history: the prompt + the generated tokens the trunk has processed
         let processed = seq.n_past - n0;
+        // verify windows write up to TMAX rows past the committed position; the bound covers every request since the
+        // end record was taken (each resend of it writes from n on again)
+        let w = seq.n_past + talus_model::glm::engine::TMAX;
+        self.written = if resend { self.written.max(w) } else { w };
         self.hist = prompt.clone();
         self.hist
             .extend_from_slice(&gen[..processed.min(gen.len())]);
@@ -305,6 +396,13 @@ impl talus_mem::pressure::Shed for GlmBackend {
                 for s in std::mem::take(&mut self.snaps) {
                     if self.eng.snap_free(&s.buf).is_ok() {
                         n += s.buf.bytes as u64;
+                    }
+                }
+                // the prompt-end record goes with them (a resend then re-reads its tail)
+                self.end.pos = 0;
+                if let Some(b) = self.end.buf.take() {
+                    if self.eng.snap_free(&b).is_ok() {
+                        n += b.bytes as u64;
                     }
                 }
                 n
@@ -381,6 +479,7 @@ impl EngineProtocolBackend for GlmBackend {
             out.flush()?;
             // state is unknown after an error: drop the history so the next request starts cold
             self.hist.clear();
+            self.end.pos = 0;
             if talus_mem::pressure::is_insufficient_memory(&e.to_string()) {
                 // what the failed request may have left behind: the snapshot slot it was filling is invalid anyway
                 self.snaps.retain(|s| s.pos != usize::MAX);
@@ -425,4 +524,30 @@ pub fn run(argv: &[String]) -> i32 {
     let _ = eng.reset();
     let mut be = GlmBackend::new(eng, c);
     talus_sched::serve_stdio(&mut be)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{end_resume_ok, resend_logits_on};
+
+    #[test]
+    fn glm_resend_switch() {
+        assert!(resend_logits_on(None));
+        assert!(resend_logits_on(Some("1")));
+        assert!(resend_logits_on(Some("")));
+        assert!(!resend_logits_on(Some("0")));
+        assert!(!resend_logits_on(Some(" off")));
+        assert!(!resend_logits_on(Some("false")));
+    }
+
+    #[test]
+    fn glm_resend_ring_bound() {
+        // the pool group holding row n-1 starts at n - n % 4; nothing written may wrap onto it (ring 4096)
+        assert!(end_resume_ok(2009, 2009 + 64 + 8, 4, 4096));
+        assert!(end_resume_ok(2009, 2008 + 4096, 4, 4096));
+        assert!(!end_resume_ok(2009, 2008 + 4096 + 1, 4, 4096));
+        assert!(end_resume_ok(2008, 2008 + 4096, 4, 4096));
+        assert!(!end_resume_ok(2008, 2008 + 4097, 4, 4096));
+        assert!(!end_resume_ok(0, 0, 4, 4096));
+    }
 }

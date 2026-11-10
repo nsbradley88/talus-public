@@ -14,6 +14,7 @@ pub mod config;
 pub mod doctor;
 pub mod download;
 pub mod exec;
+pub mod lifecycle;
 pub mod manifest;
 pub mod paths;
 pub mod plan;

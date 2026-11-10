@@ -390,7 +390,8 @@ pub fn presets_json(state: &ServiceState) -> JsonValue {
 }
 
 /// [`handle_get`] with the query string: `GET /v1/talus/status?hash=weights` also starts hashing the large weight
-/// files (from this computer, or with an API key configured, as for apply).
+/// files (from this computer, or with an API key configured, as for apply); `&verify=1` reads files whose hash came
+/// from the cache again.
 pub fn handle_get_query(
     path: &str,
     query: &str,
@@ -407,6 +408,9 @@ pub fn handle_get_query(
                 )
                 .body,
             );
+        }
+        if query.split('&').any(|q| q == "verify=1") {
+            state.fingerprint.verify_cached();
         }
         let _ = state.fingerprint.start_hashing(true);
     }

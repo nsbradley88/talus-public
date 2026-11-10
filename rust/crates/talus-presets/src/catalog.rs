@@ -323,13 +323,18 @@ const FN_CTX: [Choice; 4] = [
     },
 ];
 
-// A native pack needs --spec T >= 2 (the verify window), so drafting stops by dropping the MTP runtime and the
-// suffix drafter instead (`--spec 0` refuses to start).
+// A native pack needs --spec T >= 2 (the verify window), so drafting stops by dropping the MTP runtime, the suffix
+// drafter and the long copies instead (`--spec 0` refuses to start). The same run config as
+// `talus setup` with the drafters off: the copy proposer depends on neither --mtp nor --suffix-draft.
 const FN_SPEC: [Choice; 2] = toggle(&[
     Edit::Remove("--mtp"),
     Edit::Remove("--mtp-window"),
     Edit::Remove("--mtp-draft-vocab"),
+    Edit::Remove("--mtp-q4"),
+    Edit::Remove("--spec-min-p"),
+    Edit::Arg("--spec", "2"),
     Edit::Arg("--suffix-draft", "0"),
+    Edit::Env("TALUS_COPY", "0"),
 ]);
 const FN_SUFFIX: [Choice; 2] = toggle(&[Edit::Arg("--suffix-draft", "0")]);
 const FN_SSAMP: [Choice; 2] = toggle(&[Edit::Env("STRATA_SPEC_PROB", "0")]);
@@ -343,10 +348,10 @@ const FN_VOCAB: [Choice; 2] = [
     Choice {
         value: "full",
         label: "Full (best for non-English, e.g. Chinese)",
-        edits: &[Edit::Remove("--mtp-draft-vocab")],
+        edits: &[Edit::Remove("--mtp-draft-vocab"), Edit::Remove("--mtp-q4")],
     },
 ];
-const FN_HC16: [Choice; 2] = opt_in(&[Edit::Env("TALUS_FN_HC_BF16", "2")]);
+const FN_HC16: [Choice; 2] = toggle(&[Edit::Env("TALUS_FN_HC_BF16", "0")]);
 const FN_NUM: [Choice; 2] = toggle(&[
     Edit::Env("STRATA_PF_W16", "0"),
     Edit::Env("STRATA_PF_HCDOWN", "0"),
@@ -373,7 +378,7 @@ const FN_OPTIONS: &[TuneOption] = &[
         description:
             "The MTP head guesses the next few tokens and the model checks them all in one pass.",
         tradeoff: "Off: answers come out much slower. The output is identical either way.",
-        switch: "--mtp DIR (off: without --mtp, --suffix-draft 0)",
+        switch: "--mtp DIR (off: without --mtp, --spec 2 --suffix-draft 0 TALUS_COPY=0)",
         group: Group::Common,
         quality: Quality::Exact,
         default: ON,
@@ -446,11 +451,11 @@ const FN_OPTIONS: &[TuneOption] = &[
         id: "hc16",
         label: "16-bit HC streams",
         description: "Keeps the prompt path's hyper-connection streams in 16 bits: faster prompts.",
-        tradeoff: "Failed our quality gate: the most likely next token changes far more often. Off by default.",
-        switch: "TALUS_FN_HC_BF16=2",
+        tradeoff: "Rounding-level; passed our quality gates (BF16 KL, needle, agentic, soak). On by default since v0.1.7.",
+        switch: "TALUS_FN_HC_BF16=0",
         group: Group::Accuracy,
-        quality: Quality::Reduced,
-        default: OFF,
+        quality: Quality::Gated,
+        default: ON,
         choices: &FN_HC16,
         requires: None,
     },
@@ -796,10 +801,10 @@ pub static MODELS: &[ModelSpec] = &[
         min_free_gib: 8,
         license: "Qwen Community License 1.0 (commercial services need a license from Qwen)",
         options: FN_OPTIONS,
-        reference: &[("numerics", OFF)],
-        reference_note: "Turns off the rounding-level speed-ups: exact reference output, slower.",
-        fast: &[("hc16", ON)],
-        fast_note: "Turns on 16-bit HC streams: faster prompts, but it failed our quality gate (the top token changes far more often).",
+        reference: &[("numerics", OFF), ("hc16", OFF)],
+        reference_note: "Turns off the rounding-level speed-ups and the 16-bit HC streams: exact reference output, slower.",
+        fast: &[],
+        fast_note: "No quality-reducing opt-in is recommended for Qwen3.8-Flash-Next. Fast is the same as Balanced.",
     },
     ModelSpec {
         id: "glm-5.3-flash",

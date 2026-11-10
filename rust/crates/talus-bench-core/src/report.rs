@@ -654,6 +654,35 @@ fn file_cell(f: &Value) -> String {
     }
 }
 
+/// Under the table: which weight hashes were not read in this run, and any error (a `verify_weights` mismatch).
+fn weight_provenance(s: &mut String, models: &[&Value]) {
+    let mut cached = 0;
+    let mut read = 0;
+    for x in models {
+        for f in x["server"]["talus_status"]["build"]["weights"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            match f["sha256_source"].as_str() {
+                Some("cache") => cached += 1,
+                Some("read") => read += 1,
+                _ => {}
+            }
+            if let Some(e) = f["error"].as_str() {
+                let name = f["path"].as_str().unwrap_or("?");
+                let _ = writeln!(s, "\n**Weight file problem:** {name}: {e}.");
+            }
+        }
+    }
+    if cached > 0 {
+        let _ = writeln!(
+            s,
+            "\nWeight hashes: {read} read in this run, {cached} from the server's hash cache (bytes read earlier; path, size, mtime, ctime and inode unchanged since. Set `verify_weights` to read them again)."
+        );
+    }
+}
+
 /// One row per fingerprint field of talus-server's `/v1/talus/status` `build` (bench extension E3), one column per
 /// model; a field whose value differs from the reference's is marked **changed**.
 fn fingerprint_table(s: &mut String, m: &Value) {
@@ -769,6 +798,7 @@ fn fingerprint_table(s: &mut String, m: &Value) {
         "Numerics environment",
         builds.iter().map(|b| env(b)).collect(),
     );
+    weight_provenance(s, &models);
     if !missing.is_empty() {
         let _ = writeln!(
             s,
@@ -819,6 +849,43 @@ mod fingerprint_tests {
             "run_config_sha256": "cc".repeat(32),
             "numerics_env": {"GLM_PCH": env},
         })
+    }
+
+    #[test]
+    fn cached_weight_hashes_and_errors_are_stated() {
+        let w = |src: &str, e: Value| json!({"weights": [{"path": "/m/a.gguf", "sha256": "dd".repeat(32), "sha256_source": src, "error": e}]});
+        let mut s = String::new();
+        fingerprint_table(&mut s, &manifest(vec![w("read", Value::Null)]));
+        assert!(!s.contains("hash cache"), "{s}");
+        let mut s = String::new();
+        fingerprint_table(
+            &mut s,
+            &manifest(vec![
+                w("cache", Value::Null),
+                w("read", json!("no longer match")),
+            ]),
+        );
+        assert!(
+            s.contains("1 read in this run, 1 from the server's hash cache"),
+            "{s}"
+        );
+        assert!(
+            s.contains("**Weight file problem:** /m/a.gguf: no longer match."),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn verify_weights_defaults_off_and_stays_out_of_old_settings() {
+        let mut ep: crate::config::Endpoint =
+            serde_json::from_value(json!({"id": "a", "kind": "http"})).unwrap();
+        assert!(!ep.verify_weights);
+        assert!(serde_json::to_value(&ep)
+            .unwrap()
+            .get("verify_weights")
+            .is_none());
+        ep.verify_weights = true;
+        assert_eq!(serde_json::to_value(&ep).unwrap()["verify_weights"], true);
     }
 
     fn manifest(builds: Vec<Value>) -> Value {

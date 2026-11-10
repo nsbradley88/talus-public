@@ -20,3 +20,5 @@ talus-presets = { path = "../talus-presets" }
 serde_json = "1"
 sha2 = "0.10"
 
+[dev-dependencies]
+talus-bench-core = { path = "../talus-bench-core" }

@@ -11,7 +11,12 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::ptr;
 
-use super::engine::{hip_alloc_zeroed, hip_host_alloc_zeroed, Q36Engine};
+use super::engine::{hip_alloc_zeroed, hip_host_alloc_zeroed, Q36Engine, Q27_VMAX};
+
+/// talus#78: pinned-host slots (i32) of a window's tokens, its picks and the n-gram drafts (Q27_VMAX each).
+const HPIN_WIN: usize = 128;
+const HPIN_PICK: usize = 160;
+const HPIN_NG: usize = 192;
 use super::ffi::*;
 use super::weights::{
     hip_check, hip_malloc_bytes, meta_f32_or, meta_i64_or, qtype_row_bytes, Mat, GGML_TYPE_Q8_0,
@@ -3607,7 +3612,10 @@ impl Q36Engine {
     }
 
     pub fn ensure_verify_graph(&mut self, n: usize) -> Result<hipGraphExec_t> {
-        ensure!(n >= 1 && n <= 16, "verify graph n must be in 1..=16");
+        ensure!(
+            n >= 1 && n <= self.vt_max.max(16) as usize,
+            "verify graph n must be in 1..=vt_max"
+        );
         if !self.gv[n].is_null() {
             return Ok(self.gv[n]);
         }
@@ -4160,8 +4168,8 @@ impl Q36Engine {
     pub fn spec_verify_window(
         &mut self,
         D_out: &mut i32,
-        win: &mut [i32; 16],
-        picks: &mut [i32; 16],
+        win: &mut [i32; Q27_VMAX],
+        picks: &mut [i32; Q27_VMAX],
     ) {
         let samp_on = unsafe { (*self.ds_h).tau > 0.0 };
         if self.dl.stop_mode() && self.last_mtp && self.win_t > 1 {
@@ -4179,7 +4187,7 @@ impl Q36Engine {
                 _ => self.dl.keep_dfl(top_slice, self.win_t - 1, samp_on),
             };
         }
-        let T = self.win_t.clamp(1, 16);
+        let T = self.win_t.clamp(1, Q27_VMAX as i32);
         *D_out = T - 1;
         let idx = T as usize;
         if self.opts.use_graph && !self.model().hybrid && self.gA[idx].is_null() {
@@ -4198,14 +4206,14 @@ impl Q36Engine {
         }
         unsafe {
             let _ = hipMemcpyAsync(
-                self.hpin.add(16).cast::<c_void>(),
+                self.hpin.add(HPIN_WIN).cast::<c_void>(),
                 self.tok_d.cast::<c_void>(),
                 (T as usize) * 4,
                 HIP_MEMCPY_DEVICE_TO_HOST,
                 self.s_main,
             );
             let _ = hipMemcpyAsync(
-                self.hpin.add(32).cast::<c_void>(),
+                self.hpin.add(HPIN_PICK).cast::<c_void>(),
                 self.pick_v.cast::<c_void>(),
                 (T as usize) * 4,
                 HIP_MEMCPY_DEVICE_TO_HOST,
@@ -4213,8 +4221,8 @@ impl Q36Engine {
             );
             let _ = hipStreamSynchronize(self.s_main);
             for i in 0..(T as usize) {
-                win[i] = *self.hpin.add(16 + i);
-                picks[i] = *self.hpin.add(32 + i);
+                win[i] = *self.hpin.add(HPIN_WIN + i);
+                picks[i] = *self.hpin.add(HPIN_PICK + i);
             }
         }
     }
@@ -4222,7 +4230,7 @@ impl Q36Engine {
     /// Advance a DFlash2 speculative round (`Engine::dfl_advance` in `q36_engine.cu:1874-1906`).
     pub fn dfl_advance(&mut self, a: i32, xn: i32, ng_opt: Option<&[i32]>, mrows: bool) {
         let E = self.d_model() as usize;
-        let T = self.win_t.clamp(1, 16);
+        let T = self.win_t.clamp(1, Q27_VMAX as i32);
         let t_idx = T as usize;
         let use_ng = ng_opt.is_some_and(|ng| !ng.is_empty());
         let samp_on = unsafe { (*self.ds_h).tau > 0.0 };
@@ -4255,7 +4263,7 @@ impl Q36Engine {
         }
         if use_ng {
             let ng = ng_opt.unwrap();
-            let ng_len = ng.len().min(15);
+            let ng_len = ng.len().min((self.vt_cap() - 1).max(1) as usize);
             let slot_null = if run_mrows {
                 self.gD0m[t_idx].is_null()
             } else {
@@ -4340,11 +4348,11 @@ impl Q36Engine {
             }
             unsafe {
                 for i in 0..ng_len {
-                    *self.hpin.add(64 + i) = ng[i];
+                    *self.hpin.add(HPIN_NG + i) = ng[i];
                 }
                 let _ = hipMemcpyAsync(
                     self.tok_d.add(1).cast::<c_void>(),
-                    self.hpin.add(64).cast::<c_void>(),
+                    self.hpin.add(HPIN_NG).cast::<c_void>(),
                     ng_len * 4,
                     HIP_MEMCPY_HOST_TO_DEVICE,
                     self.s_main,
@@ -4452,8 +4460,14 @@ impl Q36Engine {
 
     /// Advance a speculative round after accepting `a` drafts and bonus `xn` (`Engine::spec_advance` in `q36_engine.cu:1797-1848`).
     pub fn spec_advance_window(&mut self, a: i32, xn: i32, mut D: i32, ng_opt: Option<&[i32]>) {
+        // K1b: without the fused commit (STRATA_FUSED=0) nothing in the next window's forward pass commits this one's
+        // accepted rows, so they go in here, while the verify buffers still hold them. gdn_pending is overwritten below
+        // and spec_finish_window commits only its own window.
+        if !self.fused && self.model().dense {
+            self.commit(a + 1);
+        }
         let E = self.d_model() as usize;
-        let T = self.win_t.clamp(1, 16);
+        let T = self.win_t.clamp(1, Q27_VMAX as i32);
         let t_idx = T as usize;
         let samp_on = unsafe { (*self.ds_h).tau > 0.0 };
         if self.last_mtp && self.dl.want_conf() {
@@ -4515,7 +4529,7 @@ impl Q36Engine {
             );
         }
         if let Some(ng) = ng_opt.filter(|s| !s.is_empty()) {
-            let ng_len = ng.len().min(15);
+            let ng_len = ng.len().min((self.vt_cap() - 1).max(1) as usize);
             let slot_null = if inj {
                 self.gB0i[t_idx].is_null()
             } else {
@@ -4600,11 +4614,11 @@ impl Q36Engine {
             }
             unsafe {
                 for i in 0..ng_len {
-                    *self.hpin.add(64 + i) = ng[i];
+                    *self.hpin.add(HPIN_NG + i) = ng[i];
                 }
                 let _ = hipMemcpyAsync(
                     self.tok_d.add(1).cast::<c_void>(),
-                    self.hpin.add(64).cast::<c_void>(),
+                    self.hpin.add(HPIN_NG).cast::<c_void>(),
                     ng_len * 4,
                     HIP_MEMCPY_HOST_TO_DEVICE,
                     self.s_main,
@@ -5177,8 +5191,8 @@ impl Q36Engine {
         let mut tr_prev: Option<(std::time::Instant, String)> = None;
         loop {
             let mut d_cur = D_init;
-            let mut win = [0i32; 16];
-            let mut picks = [0i32; 16];
+            let mut win = [0i32; Q27_VMAX];
+            let mut picks = [0i32; Q27_VMAX];
             let tr0 = std::time::Instant::now();
             if let Some((t0, line)) = tr_prev.take() {
                 eprintln!("{line} rms {:.3}", (tr0 - t0).as_secs_f64() * 1000.0);
@@ -5411,7 +5425,10 @@ impl Q36Engine {
                 return;
             }
 
-            let k_max = (self.gemm_t - 1).min(self.ng_kmax).clamp(1, 15);
+            // talus#78: n-gram / copy windows up to vt_max rows (16 = v0.1.6: k_max 15)
+            let k_max = (self.vt_cap() - 1)
+                .min(self.ng_kmax)
+                .clamp(1, Q27_VMAX as i32 - 1);
             let mut ng_vec = if let Some(ref mut ng) = ngram {
                 ng.propose_ctx(recent, k_max, self.ng_kmin)
             } else {

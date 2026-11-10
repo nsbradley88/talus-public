@@ -156,11 +156,15 @@ pub fn run_config(m: &ModelInstall, ch: &Choices, c: &Ctx) -> Value {
                     "--mtp-draft-vocab",
                     &p(c.side_file("data/draft_vocab_en.bin")),
                 ]);
+                // Fewer bytes per draft step, logits unchanged (checked bit for bit).
+                a(&["--mtp-q4", "head"]);
             } else {
                 // the native pack always decodes in verify windows: the engine refuses to start without --spec T
-                // (T >= 2). With no --mtp and no prompt lookup every window holds one token: plain decode 
-                // (--spec 2 without --mtp starts)
+                // (T >= 2). With no --mtp, no prompt lookup and no long copies every window holds one token: plain
+                // decode. TALUS_COPY=0 is part of that: the copy proposer does not depend on --mtp or --suffix-draft and
+                // would widen this --spec 2 to 16-row windows (qwen4exp::engine::widen_verify_for_copy).
                 a(&["--spec", "2", "--suffix-draft", "0"]);
+                env.insert("TALUS_COPY".into(), json!("0"));
             }
             a(&["--max-context", "262144", "--kv", "int8"]);
             // no STRATA_HIPBLASLT_TUNING (talus#50): the kernel library finds the hipBLASLt table for the running
@@ -189,8 +193,12 @@ pub fn run_config(m: &ModelInstall, ch: &Choices, c: &Ctx) -> Value {
         }
         "glm-5.3-flash" => {
             a(&["--model", &main, "--ctx", "65536"]);
+            // the MTP (NextN) layer is part of the GLM weights and on by default: the drafters off must say so, leaving
+            // out only the draft vocabulary keeps the MTP drafting from its full head
             if drafters {
                 a(&["--draft-vocab", &f(Role::DraftVocab, 0)]);
+            } else {
+                a(&["--no-mtp"]);
             }
             (
                 vec!["<|user|>", "<|observation|>", "<|endoftext|>"],
@@ -379,6 +387,19 @@ mod tests {
     use super::*;
     use crate::manifest;
 
+    /// `--mtp-q4 head` builds the 4-bit draft head at load from the main GGUF's head rows (pinned in the manifest)
+    /// over the token subset in data/draft_vocab_en.bin. That subset is pinned here: it is the file the head's
+    /// evidence  #3, the desktop: 9,370 logits rows bitwise, greedy 9/9) ran with.
+    #[test]
+    fn flash_next_q4_draft_head_inputs_are_pinned() {
+        let dv = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../data/draft_vocab_en.bin");
+        assert_eq!(
+            crate::download::sha256_file(&dv, None).unwrap(),
+            "369151522226a5edaa5f12cfd1e2ae7db8f4fbdbd222f3dcf327dced9597fb25"
+        );
+    }
+
     const ON: Choices = Choices {
         drafters: true,
         w4i: false,
@@ -469,7 +490,7 @@ mod tests {
             "--pack /m/x/pack --native /m/x/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf"
         ));
         assert!(fa.contains(
-            "--mtp /m/x/mtp/rt --mtp-window 8192 --mtp-draft-vocab /t/src/data/draft_vocab_en.bin"
+            "--mtp /m/x/mtp/rt --mtp-window 8192 --mtp-draft-vocab /t/src/data/draft_vocab_en.bin --mtp-q4 head"
         ));
         assert!(fa.ends_with("--max-context 262144 --kv int8"));
         assert_eq!(fx["env"]["STRATA_PF_FUSED"], json!("1"));
@@ -477,6 +498,19 @@ mod tests {
         assert!(fx["env"].get("STRATA_HIPBLASLT_TUNING").is_none());
         assert_eq!(fx["tokenizer"], json!("/m/x/pack/tokenizer"));
         assert!(native_pack_problems(&fx).is_empty());
+    }
+
+    /// GLM's MTP layer is in the main weights and on unless --no-mtp says otherwise.
+    #[test]
+    fn glm_drafters_off_means_no_mtp() {
+        let c = ctx();
+        let m = manifest::get("glm-5.3-flash").unwrap();
+        let off = args(&run_config(m, &OFF, &c));
+        assert!(off.iter().any(|x| x == "--no-mtp"), "{off:?}");
+        assert!(!off.iter().any(|x| x == "--draft-vocab"), "{off:?}");
+        let on = args(&run_config(m, &ON, &c));
+        assert!(!on.iter().any(|x| x == "--no-mtp"), "{on:?}");
+        assert!(on.iter().any(|x| x == "--draft-vocab"), "{on:?}");
     }
 
     /// Flash-Next with the drafters off: no MTP and no prompt lookup, but still --spec (T >= 2) and --prefill, or
@@ -495,6 +529,10 @@ mod tests {
             assert!(!a.iter().any(|x| x == k), "{k} with the drafters off");
         }
         assert!(native_pack_problems(&fx0).is_empty());
+        // plain decode: TALUS_COPY=0, or the copy proposer widens --spec 2 to 16-row windows; only with the drafters off
+        assert_eq!(fx0["env"]["TALUS_COPY"], json!("0"));
+        let fx1 = run_config(manifest::get("qwen3.8-flash-next").unwrap(), &ON, &c);
+        assert!(fx1["env"].get("TALUS_COPY").is_none());
         // and every other model's drafters-off config is free of native-pack problems too
         for id in [
             "qwen3.8-27b",

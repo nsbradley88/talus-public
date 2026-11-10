@@ -413,3 +413,140 @@ fn test_dfctx_and_drafter_pick_depth_policy() {
     dp.fallback(2048);
     assert_eq!(dp.n_fallback, 1);
 }
+
+/// : the 27B's load plan with its real sizes: int8 prompt weights 26.1 GiB, KV 105.5 KiB/token with int8 KV.
+mod mem_plan {
+    use super::super::engine::{q27_mem_plan, q27_pick_context, Q27_AUTO_RESERVE_GIB};
+
+    const GIB: f64 = 1_073_741_824.0;
+    const I8: f64 = 26.05 * GIB;
+    const PT: f64 = 105.5 * 1024.0;
+
+    #[test]
+    fn ladder_at_the_measured_memory() {
+        // 128 GB box (99.9 GiB free above the floor): 256K
+        assert_eq!(q27_pick_context(99.9 * GIB, I8, PT).ctx, 262_144);
+        // 62 GiB budget (v0.1.3 rc1, cap-v013rc1.log): needs 35.6 of 36.9, margin 1.3 GiB
+        let p = q27_pick_context(36.9 * GIB, I8, PT);
+        assert_eq!(p.ctx, 65_536);
+        assert!(p.i8_fits());
+        assert!((p.margin / GIB - 1.25).abs() < 0.1, "{}", p.margin / GIB);
+        // the middle step exists: 26.05 + 13.2 + 3 = 42.25
+        assert_eq!(q27_pick_context(43.0 * GIB, I8, PT).ctx, 131_072);
+    }
+
+    /// Short of the reserve: the plan stays at the smallest step and says so; the engine decides on the int8 weights.
+    #[test]
+    fn short_of_the_reserve_keeps_the_smallest_context() {
+        for desktop in [1.5, 2.0, 3.0, 4.0, 5.0, 8.0] {
+            let p = q27_pick_context((36.9 - desktop) * GIB, I8, PT);
+            assert_eq!(p.ctx, 65_536, "{desktop}");
+            assert!(!p.i8_fits(), "{desktop}");
+        }
+    }
+
+    /// The plan's test keeps the whole reserve, and more memory never fails it.
+    #[test]
+    fn int8_decision_is_monotonic_and_keeps_the_reserve() {
+        let reserve = Q27_AUTO_RESERVE_GIB * GIB;
+        for ctx in [65_536, 131_072, 262_144] {
+            let mut was_fit = false;
+            for tenth in 0..1300 {
+                let head = f64::from(tenth) / 10.0 * GIB;
+                let p = q27_mem_plan(head, I8, PT, ctx);
+                if p.i8_fits() {
+                    assert!(head - I8 - PT * f64::from(ctx) >= reserve);
+                    was_fit = true;
+                } else {
+                    assert!(!was_fit, "lost int8 with more memory at {head}");
+                }
+            }
+            assert!(was_fit);
+        }
+    }
+
+    #[test]
+    fn exact_threshold() {
+        let need = q27_mem_plan(0.0, I8, PT, 65_536).need;
+        assert!(q27_mem_plan(need, I8, PT, 65_536).i8_fits());
+        assert!(!q27_mem_plan(need - 1.0, I8, PT, 65_536).i8_fits());
+        // TALUS_PF_I8=0: nothing to place, the context only needs its KV cache and the reserve
+        assert_eq!(q27_pick_context(33.0 * GIB, 0.0, PT).ctx, 262_144);
+    }
+}
+
+// (#75): the 64 GB plan. Byte counts from the probe / RRAM fallback logs on the shipped 27B
+// (UD-IQ4_XS, MTP + DFlash2 drafters) at the 62 GiB simulation (TALUS_MEM_LIMIT_MIB=63488).
+const GIB_F: f64 = (1u64 << 30) as f64;
+/// int8 expansion of all 399 trunk matrices (`total_reserved` in the budget refusal line)
+const Q27_I8_ALL: usize = 27_976_007_680;
+/// int8 expansion of the default sidecar's 48 FFN matrices (layers 48-63: 32 IQ4_XS, 14 Q5_K, 2 Q4_K)
+const Q27_I8_W4_48: usize = 4_991_221_760;
+/// the default sidecar's request (weights + packed activations, `requested` in the refusal line)
+const Q27_W4_DEFAULT: usize = 2_217_627_648;
+
+#[test]
+fn test_q27_kv_bytes_per_token_score_scratch_only_with_vc() {
+    use super::engine::q27_kv_bytes_per_token;
+    use super::kv8::KV8_CELL_BYTES;
+    // 16 attention layers + the MTP layer, kv_dim 1024 (f16 row 2048 B), 4 KV heads, 24 heads
+    let kv8 = 17 * 4 * KV8_CELL_BYTES;
+    let fa = q27_kv_bytes_per_token(17, 2048, false, kv8, 24);
+    let legacy = q27_kv_bytes_per_token(17, 2048, true, kv8, 24);
+    assert_eq!(fa, 17 * 2048 * 2 + kv8);
+    // the legacy path keeps the std-layout V copy and the score scratch (16 x 24 x (4 + 2) B per token)
+    assert_eq!(legacy - fa, 17 * 2048 + 16 * 24 * 6);
+    // the planner's 105 KiB/token at 64K (6.6 GiB in the logs) now counts 2304 B/token less
+    assert_eq!(fa, 107_840 - 2_304);
+}
+
+#[test]
+fn test_q27_prompt_weights_w4_replaces_its_int8_copies() {
+    use super::engine::q27_prompt_weight_bytes;
+    assert_eq!(q27_prompt_weight_bytes(Q27_I8_ALL, 0, 0), Q27_I8_ALL);
+    let p = q27_prompt_weight_bytes(Q27_I8_ALL, Q27_I8_W4_48, Q27_W4_DEFAULT);
+    // 26.05 - 4.65 + 2.07 = 23.47 GiB: the sidecar costs 2.58 GiB less than the int8 copies it replaces
+    assert_eq!(Q27_I8_ALL - p, Q27_I8_W4_48 - Q27_W4_DEFAULT);
+    assert!((p as f64 / GIB_F - 23.47).abs() < 0.01);
+}
+
+#[test]
+fn test_q27_auto_context_64gb_and_128gb_with_default_sidecar() {
+    use super::engine::{q27_pick_context, q27_prompt_weight_bytes};
+    let per_tok_old = 107_840.0;
+    let per_tok_new = (107_840 - 2_304) as f64;
+    let prompt_old = Q27_I8_ALL as f64;
+    let prompt_new = q27_prompt_weight_bytes(Q27_I8_ALL, Q27_I8_W4_48, Q27_W4_DEFAULT) as f64;
+    // 62 GiB simulation: 36.9 GiB free above the floor at the plan d0), plus the freed MTP full head (521 MiB)
+    let head_old = 36.9 * GIB_F;
+    let head_new = head_old + 546_304_000.0;
+    let p_old = q27_pick_context(head_old, prompt_old, per_tok_old);
+    let (c_old, need_old) = (p_old.ctx, p_old.need);
+    let p_new = q27_pick_context(head_new, prompt_new, per_tok_new);
+    let (c_new, need_new) = (p_new.ctx, p_new.need);
+    assert_eq!((c_old, c_new), (65_536, 65_536));
+    // the old plan left 1.2 GiB above its need and the W4 sidecar outside it; the new one has the sidecar inside and
+    // 4.3 GiB of margin
+    assert!(((head_old - need_old) / GIB_F - 1.26).abs() < 0.05);
+    let m_new = (head_new - need_new) / GIB_F;
+    assert!(m_new > 4.0 && m_new < 4.6, "margin {m_new}");
+    // 128K still does not fit at 62 GiB (it needs ~39.6 GiB with the sidecar)
+    assert!(prompt_new + per_tok_new * 131_072.0 + 3.0 * GIB_F > head_new);
+    // 128 GB: 256K as before (99.9 GiB free above the floor)
+    assert_eq!(
+        q27_pick_context(99.9 * GIB_F, prompt_new, per_tok_new).ctx,
+        262_144
+    );
+    assert_eq!(
+        q27_pick_context(99.9 * GIB_F, prompt_old, per_tok_old).ctx,
+        262_144
+    );
+    // at no head does the new plan pick a shorter context than the old one
+    let mut h = 30.0 * GIB_F;
+    while h < 110.0 * GIB_F {
+        let o = q27_pick_context(h, prompt_old, per_tok_old).ctx;
+        let n = q27_pick_context(h, prompt_new, per_tok_new).ctx;
+        assert!(n >= o, "head {:.2} GiB: {n} < {o}", h / GIB_F);
+        h += 0.05 * GIB_F;
+    }
+}

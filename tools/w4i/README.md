@@ -5,9 +5,13 @@ the feed-forward of layers 48-63 when a `.w4i` file sits next to the GGUF (docs/
 The file holds int4 copies of those weights, quantized with GPTQ in the rotated basis the kernel uses. These tools
 rebuild the files from scratch on a CPU.
 
+**This recipe produces format v2 files.** The current default is format v3 (header `W4I3`); its recipe is in
+[q4q/README.md](q4q/README.md). Talus uses a v2 `.w4i` file only with `TALUS_Q27_W4I=auto` (and the fast profile with
+`TALUS_Q27_W4I=fast`).
+
 | File | Layers | Size | Use |
 |---|---|---|---|
-| `Qwen3.8-27B-UD-IQ4_XS.w4i` | FFN of 48-63 | about 2.0 GiB | release default (passed the quality gate) |
+| `Qwen3.8-27B-UD-IQ4_XS.w4i` | FFN of 48-63 | about 2.0 GiB | format v2: opt-in `TALUS_Q27_W4I=auto` (passed the quality gate; the default is now the v3 file) |
 | `Qwen3.8-27B-UD-IQ4_XS.fast.w4i` | FFN of 0-63 | about 8.0 GiB | opt-in fast profile `TALUS_Q27_W4I=fast` (failed the gate) |
 
 Our files (2026-10-28, built with this recipe on an AMD EPYC, numpy 2.4.4):
@@ -56,4 +60,5 @@ slightly different bytes; the calibration ids do not.
 ## Quality
 
 The default (layers 48-63) passed the 27B gates for prompt-path changes (docs/METHODOLOGY.md): KL to llama.cpp's
-CPU backend on 4K prompts 0.00539 against the exact path's 0.00436 = x1.24 (limit x1.35), and passed the needle, agentic, and tier-1 A/B gates (see docs/RESULTS.md). The fast profile (all layers) measured 0.01269 = x2.91: it failed the gate and is opt-in (see docs/MODELS.md).
+CPU backend on 4K prompts 0.00539 against the exact path's 0.00436 = x1.24 (limit x1.35), needle and agentic tests, tier-1 A/B
+without regressions. The fast profile (all layers) measured 0.01269 = x2.91 (prompts about a third faster at 2K and 32K): it failed the gate and is opt-in.

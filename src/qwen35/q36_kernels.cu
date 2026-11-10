@@ -1,6 +1,8 @@
 // src/qwen35/q36_kernels.cu - Extracted __global__ kernels and host launchers from q36_engine.cu,
 // plus C ABI entry points (tk_q36_*) for libtalus_kernels.so.
 #include "strata/qwen35/q36_kernels.hpp"
+
+#include <stdexcept>
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_router.hpp"
@@ -212,26 +214,30 @@ __global__ void k_gdn_ab(const float* Wa, const float* Wb, const float* x, const
 }
 /// Talus: k_gdn_ab with one block per output row (8 waves split n_in, the waves' partial sums added in order) and every
 /// one of the T <= 8 rows of x against each weight load.  grid (2 HV), block 256; n_in % 1024 == 0.
-__device__ __forceinline__ void gdn_ab_body(int o, const float* Wa, const float* Wb, const float* x, const float* dt,
-                                            const float* ssm_a, float* alpha, float* beta, int n_in, int HV, int T) {
-    __shared__ float part[8][16];
+/// talus#78: MAXT = the most rows one call takes (16: the <= 16-row verify / decode kernels, unchanged; 32: the
+/// k_*_w32 twins for verify windows of 17..32 rows).  Each row's sum is the same operations in the same order for any
+/// MAXT (per-row accumulators), so a row is bitwise the 16-row instance's.  Rows >= MAXT were silently dropped before.
+template<int MAXT>
+__device__ __forceinline__ void gdn_ab_body_t(int o, const float* Wa, const float* Wb, const float* x, const float* dt,
+                                              const float* ssm_a, float* alpha, float* beta, int n_in, int HV, int T) {
+    __shared__ float part[8][MAXT];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const bool isb = o >= HV;
     const int r = isb ? o - HV : o;
     const int q4 = n_in / 4, per = q4 / 8;   // float4s per wave
     const float4* wr = (const float4*) ((isb ? Wb : Wa) + (size_t) r * n_in) + warp * per;
-    float acc[16] = {};
+    float acc[MAXT] = {};
     for (int i = lane; i < per; i += 32) {
         const float4 a = wr[i];
 #pragma unroll
-        for (int t = 0; t < 16; ++t) {
+        for (int t = 0; t < MAXT; ++t) {
             if (t >= T) break;
             const float4 b = ((const float4*) (x + (size_t) t * n_in))[warp * per + i];
             acc[t] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
         }
     }
 #pragma unroll
-    for (int t = 0; t < 16; ++t) {
+    for (int t = 0; t < MAXT; ++t) {
         if (t >= T) break;
         float v = acc[t];
 #pragma unroll
@@ -247,9 +253,18 @@ __device__ __forceinline__ void gdn_ab_body(int o, const float* Wa, const float*
     if (isb) beta[(size_t) t * HV + r] = sigm(v);
     else alpha[(size_t) t * HV + r] = softplus(v + dt[r]) * ssm_a[r];
 }
+__device__ __forceinline__ void gdn_ab_body(int o, const float* Wa, const float* Wb, const float* x, const float* dt,
+                                            const float* ssm_a, float* alpha, float* beta, int n_in, int HV, int T) {
+    gdn_ab_body_t<16>(o, Wa, Wb, x, dt, ssm_a, alpha, beta, n_in, HV, T);
+}
 __global__ void __launch_bounds__(256) k_gdn_ab2(const float* Wa, const float* Wb, const float* x, const float* dt,
                                                  const float* ssm_a, float* alpha, float* beta, int n_in, int HV, int T) {
     gdn_ab_body(blockIdx.x, Wa, Wb, x, dt, ssm_a, alpha, beta, n_in, HV, T);
+}
+__global__ void __launch_bounds__(256) k_gdn_ab2_w32(const float* Wa, const float* Wb, const float* x, const float* dt,
+                                                     const float* ssm_a, float* alpha, float* beta, int n_in, int HV,
+                                                     int T) {
+    gdn_ab_body_t<32>(blockIdx.x, Wa, Wb, x, dt, ssm_a, alpha, beta, n_in, HV, T);
 }
 __global__ void k_add(float* x, const float* y, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -1552,6 +1567,21 @@ __global__ void __launch_bounds__(256) k_conv_ab(float* hist, const float* qkv, 
     }
     gdn_ab_body(blockIdx.x - nconv, Wa, Wb, x, dt, ssm_a, alpha, beta, n_in, HV, T);
 }
+/// talus#78: k_conv_ab for 17..32 rows (the alpha / beta part with 32 row accumulators; conv part identical).
+__global__ void __launch_bounds__(256) k_conv_ab_w32(float* hist, const float* qkv, const float* w, float* hc, int C,
+                                                 int qk_heads, float eps, int T, bool write, GdnPend pd, const float* Wa,
+                                                 const float* Wb, const float* x, const float* dt, const float* ssm_a,
+                                                 float* alpha, float* beta, int n_in, int HV) {
+    __shared__ float part[8];
+    const int nconv = C / 256;
+    if ((int) blockIdx.x < nconv) {
+        const int hb = threadIdx.x >> 7;
+        conv_body(hist, qkv, w, hc, C, (int) blockIdx.x * 2 + hb < qk_heads, eps, T, write, pd,
+                  blockIdx.x * 256 + threadIdx.x, part + hb * 4);
+        return;
+    }
+    gdn_ab_body_t<32>(blockIdx.x - nconv, Wa, Wb, x, dt, ssm_a, alpha, beta, n_in, HV, T);
+}
 
 /// Talus prefill: k_conv_seq for a prompt chunk with every token in parallel (the 4-tap conv is not recurrent): grid
 /// (C / 128, T), block 128; the same arithmetic per output.  The history is then moved by k_conv_hist.
@@ -2000,7 +2030,9 @@ void launch_gdn_ab(int T, cudaStream_t st, const float* Wa, const float* Wb, con
 
 void launch_gdn_ab2(cudaStream_t st, const float* Wa, const float* Wb, const float* x, const float* dt,
                     const float* ssm_a, float* alpha, float* beta, int n_in, int HV, int T) {
-    k_gdn_ab2<<<2 * HV, 256, 0, st>>>(Wa, Wb, x, dt, ssm_a, alpha, beta, n_in, HV, T);
+    if (T > 32) throw std::invalid_argument("gdn_ab2: at most 32 rows");
+    if (T > 16) k_gdn_ab2_w32<<<2 * HV, 256, 0, st>>>(Wa, Wb, x, dt, ssm_a, alpha, beta, n_in, HV, T);
+    else k_gdn_ab2<<<2 * HV, 256, 0, st>>>(Wa, Wb, x, dt, ssm_a, alpha, beta, n_in, HV, T);
 }
 
 void launch_add(cudaStream_t st, float* x, const float* y, int64_t n) {
@@ -2144,8 +2176,13 @@ void launch_conv_seq(cudaStream_t st, float* hist, const float* qkv, const float
 void launch_conv_ab(cudaStream_t st, float* hist, const float* qkv, const float* w, float* hc, int C, int qk_heads,
                     float eps, int T, bool write, GdnPend pd, const float* Wa, const float* Wb, const float* x,
                     const float* dt, const float* ssm_a, float* alpha, float* beta, int n_in, int HV) {
-    k_conv_ab<<<C / 256 + 2 * HV, 256, 0, st>>>(hist, qkv, w, hc, C, qk_heads, eps, T, write, pd, Wa, Wb, x, dt,
-                                                ssm_a, alpha, beta, n_in, HV);
+    if (T > 32) throw std::invalid_argument("conv_ab: at most 32 rows");
+    if (T > 16)
+        k_conv_ab_w32<<<C / 256 + 2 * HV, 256, 0, st>>>(hist, qkv, w, hc, C, qk_heads, eps, T, write, pd, Wa, Wb, x, dt,
+                                                        ssm_a, alpha, beta, n_in, HV);
+    else
+        k_conv_ab<<<C / 256 + 2 * HV, 256, 0, st>>>(hist, qkv, w, hc, C, qk_heads, eps, T, write, pd, Wa, Wb, x, dt,
+                                                    ssm_a, alpha, beta, n_in, HV);
 }
 
 void launch_conv_par(cudaStream_t st, const float* hist, const float* qkv, const float* w, float* h, int C,

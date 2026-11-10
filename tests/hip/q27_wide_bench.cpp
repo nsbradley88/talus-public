@@ -173,7 +173,8 @@ int main(int argc, char** argv) {
     mem_guard("weights", 12);
     std::size_t packed = 0;
     bool want_twp = false;
-    for (const char* v : {"twp", "tws", "trp"}) want_twp |= std::find(variants.begin(), variants.end(), v) != variants.end();
+    for (const char* v : {"twp", "tws", "trp", "w32x2", "tw32", "tw32p", "tw32s", "tw32ps", "lds"})
+        want_twp |= std::find(variants.begin(), variants.end(), v) != variants.end();
     if (want_twp) {
         for (Tensor* x : pass) {
             if (k::native_mmvq_tw_prepare(x->type, x->d, int(x->ne0), int(x->ne1))) packed += 1;
@@ -182,32 +183,68 @@ int main(int argc, char** argv) {
         std::printf("tile-plane copies: %zu matrices, %.3f GB extra device memory\n", packed, k::native_mmvq_tw_packed_bytes() / 1e9);
     }
     mem_guard("packed", 8);
-    // activations: Q8_1 of random normals, 16 columns per distinct n_in
+    // activations: Q8_1 of random normals, 32 columns per distinct n_in (talus#78: widths up to 32)
+    constexpr int kMaxCols = 32;
     std::mt19937 rng(1234);
     std::normal_distribution<float> nd(0.0f, 1.0f);
     std::map<int, void*> xq;
     for (Tensor* x : pass) {
         const int n_in = int(x->ne0);
         if (xq.count(n_in)) continue;
-        std::vector<float> h(std::size_t(n_in) * 16);
+        std::vector<float> h(std::size_t(n_in) * kMaxCols);
         for (auto& v : h) v = nd(rng);
         float* xf;
         CK(hipMalloc(&xf, h.size() * 4));
         CK(hipMemcpy(xf, h.data(), h.size() * 4, hipMemcpyHostToDevice));
         void* q;
-        CK(hipMalloc(&q, k::native_q8_1_bytes(n_in, 16)));
-        k::native_quantize_q8_1(xf, q, n_in, 16, st);
+        // (the library's ncols check stops at 16: the columns are contiguous and n_in % 32 == 0, so 32 columns quantize as
+        // one vector of 32 n_in, the same bytes; tk_quantize_q8_1 does the same)
+        CK(hipMalloc(&q, k::native_q8_1_bytes(n_in, 1) * kMaxCols));
+        k::native_quantize_q8_1(xf, q, n_in * kMaxCols, 1, st);
         CK(hipStreamSynchronize(st));
         CK(hipFree(xf));
         xq[n_in] = q;
     }
     std::size_t ymax = 0;
-    for (Tensor* x : pass) ymax = std::max<std::size_t>(ymax, std::size_t(x->ne1) * 16);
+    for (Tensor* x : pass) ymax = std::max<std::size_t>(ymax, std::size_t(x->ne1) * kMaxCols);
     float *y, *yr;
     CK(hipMalloc(&y, ymax * 4));
     CK(hipMalloc(&yr, ymax * 4));
     auto tw_mode_of = [](const std::string& v) { return v == "twp" ? 2 : v == "tws" ? 4 : v == "trp" ? 3 : 1; };
+    // talus#78 variants (every width; <= 16 columns they all run today's path):
+    //   w32x2 = today's path (the shipped cells, w32 tsum epilogue at 2..8; above 16 columns chunks of 16, i.e. one weight
+    //           pass per chunk), tw32 / tw32p / tw32s / tw32ps = above 16 the one-launch tiles, mode 5 / 6 / 7 / 8, on the
+    //           copy when registered (types without a tile: today's chunks), lds = above 16 the tile table + the LDS-staged
+    //           kernel for Q3_K / Q6_K / Q8_0 / IQ4_NL.
+    auto is78 = [](const std::string& v) { return v == "w32x2" || v == "tw32" || v == "tw32p" || v == "tw32s" || v == "tw32ps" || v == "lds"; };
+    auto today = [&](Tensor* x, int n, const void* xin, float* out) {
+        const std::size_t cb = k::native_q8_1_bytes(int(x->ne0), 1);
+        k::native_mmvq_set_w32_ts(1);
+        k::native_mmvq_tw_set(-1);
+        for (int c0 = 0; c0 < n; c0 += 16) {
+            const int nc = std::min(16, n - c0);
+            const void* xc = static_cast<const uint8_t*>(xin) + std::size_t(c0) * cb;
+            float* oc = out + std::size_t(c0) * x->ne1;
+            if (!k::native_mmvq_tw(x->type, x->d, xc, oc, int(x->ne0), int(x->ne1), nc, st))
+                k::native_mmvq(x->type, x->d, xc, oc, int(x->ne0), int(x->ne1), nc, st);
+        }
+        k::native_mmvq_set_w32_ts(0);
+    };
+    auto run78 = [&](const std::string& v, Tensor* x, int n, const void* xin, float* out) {
+        if (n > 16 && v != "w32x2") {
+            k::native_mmvq_tw32_set(v == "tw32" ? 5 : v == "tw32p" ? 6 : v == "tw32s" ? 7 : v == "tw32ps" ? 8 : -1);
+            k::native_mmvq_lds_wide_set(v == "lds" ? 1 : 0);
+            const bool ok = k::native_mmvq_tw32(x->type, x->d, xin, out, int(x->ne0), int(x->ne1), n, st) ||
+                            k::native_mmvq_lds_wide(x->type, x->d, xin, out, int(x->ne0), int(x->ne1), n, st);
+            k::native_mmvq_tw32_set(-1);
+            k::native_mmvq_lds_wide_set(-1);
+            if (ok) return;
+        }
+        today(x, n, xin, out);
+    };
     auto run = [&](const std::string& v, Tensor* x, int n, const void* xin, float* out) {
+        if (is78(v)) { run78(v, x, n, xin, out); return; }
+        if (n > 16) return;   // (the rd-wide variants take <= 16 columns)
         k::native_mmvq_set_w32_ts(v == "w32ts" ? 1 : 0);
         if (v == "w32" || v == "w32ts") { k::native_mmvq_tw_set(0); k::native_mmvq(x->type, x->d, xin, out, int(x->ne0), int(x->ne1), n, st); return; }
         k::native_mmvq_tw_set(tw_mode_of(v));
@@ -253,6 +290,8 @@ int main(int argc, char** argv) {
             }
         k::native_mmvq_tw_set(-1);
         k::native_mmvq_set_w32_ts(0);
+        std::printf("MB DONE\n");
+        std::fflush(stdout);
     }
     int bad = 0, checks = 0;
     if (mode == "exact" || mode == "all") {
@@ -263,7 +302,7 @@ int main(int argc, char** argv) {
             if ((l >= lo && l <= hi) || x->name == "output.weight") sel[x->name] = x;
             else if (!sel.count("#" + key)) sel["#" + key] = x;
         }
-        std::printf("\nexact: %zu matrices, widths 1..16, variants", sel.size());
+        std::printf("\nexact: %zu matrices, widths 1..16 (talus#78 variants 1..32), variants", sel.size());
         for (auto& v : variants) std::printf(" %s", v.c_str());
         std::printf(" (+ multi)\n");
         std::vector<float> hr, hy;
@@ -274,16 +313,16 @@ int main(int argc, char** argv) {
             const uint8_t* xin = static_cast<const uint8_t*>(xq[n_in]);
             k::native_mmvq_tw_set(0);
             k::native_mmvq_set_w32_ts(0);
-            for (int c = 0; c < 16; ++c) k::native_mmvq(x->type, x->d, xin + c * cb, yr + std::size_t(c) * n_out, n_in, n_out, 1, st);
+            for (int c = 0; c < kMaxCols; ++c) k::native_mmvq(x->type, x->d, xin + c * cb, yr + std::size_t(c) * n_out, n_in, n_out, 1, st);
             CK(hipStreamSynchronize(st));
-            hr.resize(std::size_t(n_out) * 16);
+            hr.resize(std::size_t(n_out) * kMaxCols);
             CK(hipMemcpy(hr.data(), yr, hr.size() * 4, hipMemcpyDeviceToHost));
             std::printf("  %-34s %-7s %6d x %-6d ref fnv %016llx\n", x->name.c_str(), type_name(x->type), n_in, n_out,
                         (unsigned long long) fnv(hr.data(), hr.size() * 4));
             std::vector<std::string> vs = variants;
             for (const char* m : {"multi", "multi-tws", "multi-trp", "multi-w32ts"}) vs.push_back(m);
             for (const auto& v : vs)
-                for (int n = 1; n <= 16; ++n) {
+                for (int n = 1; n <= (is78(v) ? kMaxCols : 16); ++n) {
                     CK(hipMemset(y, 0xff, std::size_t(n_out) * n * 4));
                     if (v.rfind("multi", 0) == 0) {   // the matrix three times in one launch (as gate + up / q, k, v would be)
                         const void* ws[3] = {x->d, x->d, x->d};
@@ -320,6 +359,8 @@ int main(int argc, char** argv) {
         }
         std::printf("exact: %d of %d (matrix, variant, width) checks bitwise equal to the 1-column reference: %s\n", checks - bad,
                     checks, bad ? "FAIL" : "PASS");
+        if (bad) std::printf("EXACT FAIL %d\n", bad);
+        else std::printf("EXACT PASS\n");
     }
     std::printf("MemAvailable at end: %.1f GiB\n", mem_avail_kb() / 1048576.0);
     return bad ? 3 : 0;

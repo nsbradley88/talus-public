@@ -6,6 +6,7 @@
 //! grouped GEMM over all 288 experts, one launch per product: gate, up, down), MMQ-layout activations from
 //! `tk_q36_mmq_quantize` gathered through the device route sort, no host syncs.
 
+use std::ffi::c_void;
 use std::ptr;
 
 use talus_core_api::Result;
@@ -31,18 +32,25 @@ impl GlmEngine {
             w.n_in() as usize,
             t,
         )?;
-        self.prefill_dense_q(w, y, t)
+        self.prefill_dense_q(w, self.xq(), y, t)
     }
 
-    /// The GEMM half of `prefill_dense`: x already quantized (MMQ layout for `w.ty`) in mmq_xq.
-    pub(super) fn prefill_dense_q(&self, w: &Tensor, y: *mut f32, t: usize) -> Result<()> {
+    /// The GEMM half of `prefill_dense`: x already quantized (MMQ layout for `w.ty`, t rows) at `xq` (mmq_xq + an
+    /// offset: the phase's quantize area, a y copy of the mHC kernel or a producer's output; lever 4).
+    pub(super) fn prefill_dense_q(
+        &self,
+        w: &Tensor,
+        xq: *const c_void,
+        y: *mut f32,
+        t: usize,
+    ) -> Result<()> {
         // SAFETY: tk_* C ABI.
         let stv = unsafe {
             (self.lib.tk.tk_prefill_mmq)(
                 self.lib.ctx,
                 std::mem::transmute::<i32, ffi::tk_qtype>(w.ty as i32),
                 w.p(),
-                self.mmq_xq.p,
+                xq,
                 y,
                 t as i64,
                 w.n_out() as i64,
@@ -58,6 +66,25 @@ impl GlmEngine {
     /// (rows in natural (token, slot) order). Expert types: those `tk_prefill_moe_mmq` takes (IQ2_S / IQ3_S trunk,
     /// Q2_K / Q3_K MTP layer).
     pub(super) fn prefill_experts(
+        &mut self,
+        f: &FfnW,
+        t: usize,
+        k: usize,
+        nf: usize,
+        clamp_e: f32,
+    ) -> Result<()> {
+        // lever 4: the routed products use mmq_xq from offset 0 (a y copy for them sits there, see plan_ffn)
+        let off = std::mem::replace(&mut self.xq_off, 0);
+        let r = self.prefill_experts_at0(f, t, k, nf, clamp_e);
+        self.xq_off = off;
+        // the routed experts are the last readers of the FFN phase's y copies (the shared expert ran before them;
+        // moe_combine and the next mHC kernel read none): drop them, so nothing refers to rows a later grow frees
+        self.ycp = [None, None];
+        self.l4_cp.set(0);
+        r
+    }
+
+    fn prefill_experts_at0(
         &self,
         f: &FfnW,
         t: usize,
@@ -107,9 +134,12 @@ impl GlmEngine {
                     )
                 };
                 let off = (xb + 4095) / 4096 * 4096;
-                if off + hb <= self.mmq_xq.bytes {
-                    self.mmq_quant(a.y.f(), ptr::null(), gate_t, e, e, t)?;
-                    let hq = self.mmq_xq.at(off);
+                if off + hb <= self.mmq_xq.get().bytes {
+                    // lever 4: the fused mHC kernel may have written these rows already (a y copy at offset 0)
+                    if self.ycopy_for(a.y.f(), gate_t, e, t) != Some(self.mmq_xq.get().p) {
+                        self.mmq_quant(a.y.f(), ptr::null(), gate_t, e, e, t)?;
+                    }
+                    let hq = self.mmq_xq.get().at(off);
                     // SAFETY: tkg C ABI; xq holds t rows, hq rows x nf fits behind them (checked).
                     let r = unsafe {
                         gu(
@@ -120,7 +150,7 @@ impl GlmEngine {
                             nf as i32,
                             e as i32,
                             hp.n_expert as i32,
-                            self.mmq_xq.p,
+                            self.mmq_xq.get().p,
                             self.rowsrc.i(),
                             t as i64,
                             self.bounds.i(),
@@ -161,6 +191,9 @@ impl GlmEngine {
                 }
             }
         }
+        // lever 4: no y copy is read past this point (the shared expert read its copy; this path quantizes the routed
+        // rows itself), so these quantizes may grow mmq_xq (MTP Q2_K experts, w16 off): nothing live is lost
+        self.l4_cp.set(0);
         self.mmq_quant(a.y.f(), self.rowsrc.i(), gate_t, e, e, rows)?;
         // gate, up and SwiGLU in one tp_moe launch when covered (bitwise the separate path below)
         let fused = self.moe_product_gu(

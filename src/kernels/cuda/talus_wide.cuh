@@ -391,6 +391,295 @@ __global__ void native_mmvq_tr_multi_kernel(TwMulti m, const Q81Block* __restric
     tr_body<X, NC, PACKED>(m.w[i], x, m.y[i], n_in, m.n_out[i], b - m.start[i]);
 }
 
+// ---- talus#78: one launch for 17..32 columns (27B copy windows past 16 rows) ----
+// Two 16-column tiles of the same 16 weight rows.  A column's value is fixed by the row's chain order (sb = c, c + 4,
+// ...), the exact int dot per sub-block, the pinned epilogue (tw_acc0 / xt_kq8_val), the staged chain sums and the
+// tree - none of which depends on the other columns of the launch.  So column 16 t + k here is bitwise column k of a
+// 16-column tile on x + 16 t (mbx: bitwise the 1-column wave32 result).  New kernels only: tw_body and friends stay
+// as built (their ISA must not change).
+// A (tw32_body): one wave runs both column tiles of its chain; the weight sub-block is loaded and decoded once and fed
+// to the WMMAs of both tiles (acc[2][8][8]).  B (tw32p_body, 8 waves): wave w runs chain w & 3 of column tile w >> 2 as
+// tw_body does; the two waves of a chain read the same weight bytes in one workgroup (DRAM sees them once), decode
+// twice, and keep tw_body's register count.
+template<typename X, bool PACKED, bool SPLIT>
+__device__ __forceinline__ void tw32_body(const uint8_t* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
+                                          int n_in, int n_out, int ncols, int rt) {
+#if STRATA_XT_W11
+    typedef int i4 __attribute__((ext_vector_type(4)));
+    typedef int i8 __attribute__((ext_vector_type(8)));
+    __shared__ float2 cs[4][8][2][16];   // per wave, sub-block, column tile: (d8, activation sum), slot as tw_body
+    __shared__ float part[8][8][32];     // the chains' staged reduction, one column tile at a time
+    const int tid = int(threadIdx.x), lane = tid & 31, wave = tid >> 5, l16 = lane & 15, hi = lane >> 4;
+    const int row = rt * tw::kTileRows + l16;
+    const int rowc = min(row, n_out - 1);
+    const int bpr = n_in / 256, xs = n_in / 32;
+    const Q81Block* __restrict__ xc0 = x + std::size_t(l16 < ncols ? l16 : 0) * xs;
+    const Q81Block* __restrict__ xc1 = x + std::size_t(16 + l16 < ncols ? 16 + l16 : 0) * xs;
+    float acc[2][8][8];
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+#pragma unroll
+            for (int v = 0; v < 8; ++v) acc[t][j][v] = 0.0f;
+    for (int sb = wave; sb < bpr; sb += 4) {
+        X rec;
+        if constexpr (PACKED) {
+            const tw::Loader<true, X::BS> L{w + (std::size_t(rt) * bpr + sb) * (tw::kTileRows * X::BS), l16};
+            rec.load(L);
+        } else {
+            const tw::Loader<false, X::BS> L{w + (std::size_t(rowc) * bpr + sb) * X::BS, 0};
+            rec.load(L);
+        }
+        float dw = 0.0f, dmx = 0.0f, ndmy = 0.0f;
+        if constexpr (X::kind == 0) {
+            dw = __half2float(__ushort_as_half((unsigned short) rec.d16()));
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                cs[wave][j][0][(l16 & 1) * 8 + (l16 >> 1)] = make_float2(__low2float(xc0[8 * sb + j].ds), 0.0f);
+                cs[wave][j][1][(l16 & 1) * 8 + (l16 >> 1)] = make_float2(__low2float(xc1[8 * sb + j].ds), 0.0f);
+            }
+            __builtin_amdgcn_wave_barrier();
+            __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
+        } else {
+            const float2 dm = __half22float2(*reinterpret_cast<const half2*>(&rec.dm));
+            dmx = dm.x;
+            ndmy = -dm.y;
+        }
+        tw_static_for<0, 8>([&](auto jc) {
+            constexpr int j = decltype(jc)::value;
+            int bv[8];   // the weight operand: decoded once for both column tiles
+            if constexpr (SPLIT && X::kSplit) tw_dec_split(rec, j, hi, bv);
+            else rec.dec(j, bv);
+            const i4 b0 = i4{bv[0], bv[1], bv[2], bv[3]}, b1 = i4{bv[4], bv[5], bv[6], bv[7]};
+            tw_static_for<0, 2>([&](auto tc) {
+                constexpr int t = decltype(tc)::value;
+                const Q81Block* __restrict__ xb = (t == 0 ? xc0 : xc1) + 8 * sb + j;
+                const int4* u4 = reinterpret_cast<const int4*>(xb->qs);
+                const int4 p0 = u4[0], p1 = u4[1];
+                const i4 a0 = i4{p0.x, p0.y, p0.z, p0.w}, a1 = i4{p1.x, p1.y, p1.z, p1.w};
+                if constexpr (X::kind == 1) {
+                    int dot2 = 0;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) dot2 = STRATA_DP4A(0x01010101, a0[i], dot2);
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) dot2 = STRATA_DP4A(0x01010101, a1[i], dot2);
+                    const float d8 = __low2float(xb->ds);
+                    cs[wave][j][t][(l16 & 1) * 8 + (l16 >> 1)] = make_float2(d8, float(dot2));
+                    __builtin_amdgcn_wave_barrier();
+                    __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
+                }
+                const i8 z = {0, 0, 0, 0, 0, 0, 0, 0};
+                i8 dA, dB = z;
+                if constexpr (X::kHalves) {
+                    dA = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, z, false);
+                    dB = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, z, false);
+                } else {
+                    dA = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, z, false);
+                    dA = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, dA, false);
+                }
+                const float4* cp = reinterpret_cast<const float4*>(&cs[wave][j][t][hi * 8]);
+                const float4 c0 = cp[0], c1 = cp[1], c2 = cp[2], c3 = cp[3];
+                const float cd8[8] = {c0.x, c0.z, c1.x, c1.z, c2.x, c2.z, c3.x, c3.z};
+                if constexpr (X::kind == 0) {
+#pragma unroll
+                    for (int v = 0; v < 8; ++v) acc[t][j][v] = tw_acc0(acc[t][j][v], dw, cd8[v], rec.sumi(j, dA[v], dB[v]));
+                } else {
+                    const float cs2[8] = {c0.y, c0.w, c1.y, c1.w, c2.y, c2.w, c3.y, c3.w};
+                    int sc, m;
+                    rec.scale_min(j, sc, m);
+                    const float scf = float(sc), mf = float(m);
+#pragma unroll
+                    for (int v = 0; v < 8; ++v)
+                        acc[t][j][v] = __fadd_rn(acc[t][j][v], xt_kq8_val(float(dA[v]), cs2[v], scf, mf, cd8[v], dmx, ndmy));
+                    __builtin_amdgcn_wave_barrier();
+                    __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
+                }
+#if TALUS_TW_SCHED
+                __builtin_amdgcn_sched_barrier(0);   // one column tile's operands live at a time
+#endif
+            });
+        });
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
+    }
+    // the chains meet per column tile exactly as in tw_body (part reused: a barrier before each tile's first put)
+    tw_static_for<0, 2>([&](auto tc) {
+        constexpr int t = decltype(tc)::value;
+        auto put = [&](int wv) {
+            if (wave == wv)
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+#pragma unroll
+                    for (int v = 0; v < 8; ++v) part[j][v][lane] = acc[t][j][v];
+        };
+        auto add = [&](int wv) {
+            if (wave == wv)
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+#pragma unroll
+                    for (int v = 0; v < 8; ++v) acc[t][j][v] = acc[t][j][v] + part[j][v][lane];
+        };
+        __syncthreads();
+        put(2); __syncthreads(); add(0); __syncthreads();
+        put(3); __syncthreads(); add(1); __syncthreads();
+        put(1); __syncthreads(); add(0);
+        if (wave == 0 && row < n_out) {
+#pragma unroll
+            for (int v = 0; v < 8; ++v) {
+                const float s = ((acc[t][0][v] + acc[t][4][v]) + (acc[t][2][v] + acc[t][6][v])) +
+                                ((acc[t][1][v] + acc[t][5][v]) + (acc[t][3][v] + acc[t][7][v]));
+                const int col = 16 * t + 2 * v + hi;
+                if (col < ncols) y[std::size_t(col) * n_out + row] = s;
+            }
+        }
+    });
+#else
+    (void) w; (void) x; (void) y; (void) n_in; (void) n_out; (void) ncols; (void) rt;
+#endif
+}
+template<typename X, bool PACKED, bool SPLIT>
+__device__ __forceinline__ void tw32p_body(const uint8_t* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
+                                           int n_in, int n_out, int ncols, int rt) {
+#if STRATA_XT_W11
+    typedef int i4 __attribute__((ext_vector_type(4)));
+    typedef int i8 __attribute__((ext_vector_type(8)));
+    __shared__ float2 cs[8][8][16];       // per wave (8), as tw_body's per wave
+    __shared__ float part[2][8][8][32];   // per column tile group
+    const int tid = int(threadIdx.x), lane = tid & 31, wv8 = tid >> 5, l16 = lane & 15, hi = lane >> 4;
+    const int wave = wv8 & 3, ct = wv8 >> 2;   // chain, column tile
+    const int row = rt * tw::kTileRows + l16;
+    const int rowc = min(row, n_out - 1);
+    const int bpr = n_in / 256, xs = n_in / 32;
+    const int col0 = 16 * ct + l16;
+    const Q81Block* __restrict__ xc = x + std::size_t(col0 < ncols ? col0 : 0) * xs;
+    float acc[8][8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+#pragma unroll
+        for (int v = 0; v < 8; ++v) acc[j][v] = 0.0f;
+    for (int sb = wave; sb < bpr; sb += 4) {
+        X rec;
+        if constexpr (PACKED) {
+            const tw::Loader<true, X::BS> L{w + (std::size_t(rt) * bpr + sb) * (tw::kTileRows * X::BS), l16};
+            rec.load(L);
+        } else {
+            const tw::Loader<false, X::BS> L{w + (std::size_t(rowc) * bpr + sb) * X::BS, 0};
+            rec.load(L);
+        }
+        float dw = 0.0f, dmx = 0.0f, ndmy = 0.0f;
+        if constexpr (X::kind == 0) {
+            dw = __half2float(__ushort_as_half((unsigned short) rec.d16()));
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float d8 = __low2float(xc[8 * sb + j].ds);
+                cs[wv8][j][(l16 & 1) * 8 + (l16 >> 1)] = make_float2(d8, 0.0f);
+            }
+            __builtin_amdgcn_wave_barrier();
+            __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
+        } else {
+            const float2 dm = __half22float2(*reinterpret_cast<const half2*>(&rec.dm));
+            dmx = dm.x;
+            ndmy = -dm.y;
+        }
+        tw_static_for<0, 8>([&](auto jc) {
+            constexpr int j = decltype(jc)::value;
+            const Q81Block* __restrict__ xb = xc + 8 * sb + j;
+            const int4* u4 = reinterpret_cast<const int4*>(xb->qs);
+            const int4 p0 = u4[0], p1 = u4[1];
+            const i4 a0 = i4{p0.x, p0.y, p0.z, p0.w}, a1 = i4{p1.x, p1.y, p1.z, p1.w};
+            if constexpr (X::kind == 1) {
+                int dot2 = 0;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) dot2 = STRATA_DP4A(0x01010101, a0[i], dot2);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) dot2 = STRATA_DP4A(0x01010101, a1[i], dot2);
+                const float d8 = __low2float(xb->ds);
+                cs[wv8][j][(l16 & 1) * 8 + (l16 >> 1)] = make_float2(d8, float(dot2));
+                __builtin_amdgcn_wave_barrier();
+                __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
+            }
+            int bv[8];
+            if constexpr (SPLIT && X::kSplit) tw_dec_split(rec, j, hi, bv);
+            else rec.dec(j, bv);
+            const i4 b0 = i4{bv[0], bv[1], bv[2], bv[3]}, b1 = i4{bv[4], bv[5], bv[6], bv[7]};
+            const i8 z = {0, 0, 0, 0, 0, 0, 0, 0};
+            i8 dA, dB = z;
+            if constexpr (X::kHalves) {
+                dA = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, z, false);
+                dB = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, z, false);
+            } else {
+                dA = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, z, false);
+                dA = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, dA, false);
+            }
+            const float4* cp = reinterpret_cast<const float4*>(&cs[wv8][j][hi * 8]);
+            const float4 c0 = cp[0], c1 = cp[1], c2 = cp[2], c3 = cp[3];
+            const float cd8[8] = {c0.x, c0.z, c1.x, c1.z, c2.x, c2.z, c3.x, c3.z};
+            if constexpr (X::kind == 0) {
+#pragma unroll
+                for (int v = 0; v < 8; ++v) acc[j][v] = tw_acc0(acc[j][v], dw, cd8[v], rec.sumi(j, dA[v], dB[v]));
+            } else {
+                const float cs2[8] = {c0.y, c0.w, c1.y, c1.w, c2.y, c2.w, c3.y, c3.w};
+                int sc, m;
+                rec.scale_min(j, sc, m);
+                const float scf = float(sc), mf = float(m);
+#pragma unroll
+                for (int v = 0; v < 8; ++v)
+                    acc[j][v] = __fadd_rn(acc[j][v], xt_kq8_val(float(dA[v]), cs2[v], scf, mf, cd8[v], dmx, ndmy));
+                __builtin_amdgcn_wave_barrier();
+                __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
+            }
+#if TALUS_TW_SCHED
+            __builtin_amdgcn_sched_barrier(0);
+#endif
+        });
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
+    }
+    // each column tile group's chains meet as in tw_body (same put / add order; the barriers are shared)
+    float (*pt)[8][32] = part[ct];
+    auto put = [&](int c) {
+        if (wave == c)
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+#pragma unroll
+                for (int v = 0; v < 8; ++v) pt[j][v][lane] = acc[j][v];
+    };
+    auto add = [&](int c) {
+        if (wave == c)
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+#pragma unroll
+                for (int v = 0; v < 8; ++v) acc[j][v] = acc[j][v] + pt[j][v][lane];
+    };
+    put(2); __syncthreads(); add(0); __syncthreads();
+    put(3); __syncthreads(); add(1); __syncthreads();
+    put(1); __syncthreads(); add(0);
+    if (wave == 0 && row < n_out) {
+#pragma unroll
+        for (int v = 0; v < 8; ++v) {
+            const float s = ((acc[0][v] + acc[4][v]) + (acc[2][v] + acc[6][v])) + ((acc[1][v] + acc[5][v]) + (acc[3][v] + acc[7][v]));
+            const int col = 16 * ct + 2 * v + hi;
+            if (col < ncols) y[std::size_t(col) * n_out + row] = s;
+        }
+    }
+#else
+    (void) w; (void) x; (void) y; (void) n_in; (void) n_out; (void) ncols; (void) rt;
+#endif
+}
+template<typename X, bool PACKED, bool SPLIT>
+__launch_bounds__(128)
+__global__ void native_mmvq_tw32_kernel(const uint8_t* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
+                                        int n_in, int n_out, int ncols) {
+    tw32_body<X, PACKED, SPLIT>(w, x, y, n_in, n_out, ncols, int(blockIdx.x));
+}
+template<typename X, bool PACKED, bool SPLIT>
+__launch_bounds__(256)
+__global__ void native_mmvq_tw32p_kernel(const uint8_t* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
+                                         int n_in, int n_out, int ncols) {
+    tw32p_body<X, PACKED, SPLIT>(w, x, y, n_in, n_out, ncols, int(blockIdx.x));
+}
+
 // ---- repack on the device (load time): one thread per (row, superblock) block copies its fields into the tile planes
 template<int BS>
 __global__ void native_mmvq_tw_pack_kernel(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst, int bpr, int n_out,
