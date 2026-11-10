@@ -558,6 +558,32 @@ pub fn anthropic_to_messages_with_effort(
         let role = m
             .get_str("role")
             .ok_or_else(|| "message is missing 'role'".to_string())?;
+        if role == "system" || role == "developer" {
+            // Anthropic's own system prompt is the top-level `system`, but clients send system messages in `messages`
+            // too: Claude Code puts its "# Environment" block there as messages[1], after the first user turn.  Passed
+            // through, that is a system turn in the middle of the conversation, which Qwen's chat templates refuse
+            // ("System message must be at the beginning.", a 400 for every such request).  The same rule as
+            // openai_to_messages: before the first conversation turn the text joins the system prompt, after it the
+            // message becomes a user turn, in its place.
+            let txt = text_of_content(m.get("content"))?;
+            if !txt.trim().is_empty() {
+                if out.is_empty() {
+                    out.push(JsonValue::obj(vec![
+                        ("role", JsonValue::from("system")),
+                        ("content", JsonValue::from(txt)),
+                    ]));
+                } else if out.len() == 1 && out[0].get_str("role") == Some("system") {
+                    let joined = format!("{}\n\n{}", out[0].get_str("content").unwrap_or(""), txt);
+                    out[0].insert("content", JsonValue::from(joined));
+                } else {
+                    out.push(JsonValue::obj(vec![
+                        ("role", JsonValue::from("user")),
+                        ("content", JsonValue::from(txt)),
+                    ]));
+                }
+            }
+            continue;
+        }
         let blocks = match m.get("content") {
             None | Some(JsonValue::Null) => Vec::new(),
             Some(JsonValue::Str(s)) => {
@@ -1756,6 +1782,112 @@ mod content_part_tests {
             Ok(_) => panic!("an Anthropic image block was accepted"),
         };
         assert_eq!(e, "image input is not supported by this model");
+    }
+
+    fn roles_and_contents(msgs: &[JsonValue]) -> Vec<(String, String)> {
+        msgs.iter()
+            .map(|m| {
+                (
+                    m.get_str("role").unwrap_or("").to_string(),
+                    m.get_str("content").unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn anthropic_system_message_after_the_first_turn_becomes_a_user_turn() {
+        // Claude Code's shape: the top-level system, then the user's turn, then its "# Environment" block as a
+        // system message.  No system turn may follow a conversation turn (Qwen's templates refuse it).
+        let req = parts(
+            r##"{"max_tokens":8,"system":[{"type":"text","text":"You are Claude Code."}],"messages":[
+                {"role":"user","content":[{"type":"text","text":"fix the bug"}]},
+                {"role":"system","content":"# Environment\nPlatform: linux"},
+                {"role":"assistant","content":[{"type":"text","text":"ok"}]},
+                {"role":"user","content":"thanks"}]}"##,
+        );
+        let (msgs, _, _) = anthropic_to_messages(&req, false).expect("accepted");
+        let got = roles_and_contents(&msgs);
+        let want: Vec<(String, String)> = [
+            ("system", "You are Claude Code."),
+            ("user", "fix the bug"),
+            ("user", "# Environment\nPlatform: linux"),
+            ("assistant", "ok"),
+            ("user", "thanks"),
+        ]
+        .iter()
+        .map(|(r, c)| (r.to_string(), c.to_string()))
+        .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn anthropic_leading_system_messages_join_the_system_prompt() {
+        // before any conversation turn: one system prompt, the top-level one first
+        let req = parts(
+            r#"{"max_tokens":8,"system":"top","messages":[
+                {"role":"system","content":[{"type":"text","text":"first"}]},
+                {"role":"developer","content":"second"},
+                {"role":"system","content":"  "},
+                {"role":"user","content":"hi"}]}"#,
+        );
+        let (msgs, _, _) = anthropic_to_messages(&req, false).expect("accepted");
+        assert_eq!(
+            roles_and_contents(&msgs),
+            vec![
+                ("system".to_string(), "top\n\nfirst\n\nsecond".to_string()),
+                ("user".to_string(), "hi".to_string()),
+            ]
+        );
+        // without a top-level system the first such message starts the system prompt
+        let req = parts(
+            r#"{"max_tokens":8,"messages":[{"role":"system","content":"only"},{"role":"user","content":"hi"}]}"#,
+        );
+        let (msgs, _, _) = anthropic_to_messages(&req, false).expect("accepted");
+        assert_eq!(
+            roles_and_contents(&msgs),
+            vec![
+                ("system".to_string(), "only".to_string()),
+                ("user".to_string(), "hi".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn anthropic_claude_code_request_renders_with_the_qwen_template() {
+        // serve/chat_template.jinja (Qwen3.8-Flash-Next's) raises on a system message after the first turn
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .unwrap()
+            .to_path_buf();
+        let tpl = talus_text::ChatTemplate::from_file(repo_root.join("serve/chat_template.jinja"))
+            .expect("template compiles");
+        let req = parts(
+            r##"{"max_tokens":8,"system":[{"type":"text","text":"You are Claude Code."}],
+                "tools":[{"name":"Read","description":"read a file","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}],
+                "messages":[
+                {"role":"user","content":[{"type":"text","text":"fix the bug"}]},
+                {"role":"system","content":"# Environment\nPlatform: linux"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"path":"a.php"}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"<?php echo 1;"}]}]}"##,
+        );
+        let (msgs, tools, _) = anthropic_to_messages(&req, false).expect("accepted");
+        let s_msgs: Vec<serde_json::Value> = msgs.iter().map(to_serde_value).collect();
+        let s_tools: Option<Vec<serde_json::Value>> =
+            tools.map(|ts| ts.iter().map(to_serde_value).collect());
+        let rendered = tpl
+            .render(&s_msgs, s_tools.as_deref(), true, None)
+            .expect("the template accepts the conversation");
+        let env = rendered
+            .find("# Environment")
+            .expect("the environment block is kept");
+        assert!(
+            rendered[..env].ends_with("<|im_start|>user\n"),
+            "{rendered}"
+        );
+        assert!(rendered.find("fix the bug").unwrap() < env);
+        assert_eq!(rendered.matches("<|im_start|>system").count(), 1);
     }
 }
 
