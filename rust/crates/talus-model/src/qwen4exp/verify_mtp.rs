@@ -388,6 +388,7 @@ type FnMtpPrepare = unsafe extern "C" fn(
     usize,
 ) -> c_int;
 type FnPleRows = unsafe extern "C" fn(*mut c_void, *const i32, c_int, *mut i32, *mut u32) -> c_int;
+type FnPlePrefetch = unsafe extern "C" fn(*mut c_void, *const u32, c_int) -> c_int;
 type FnPleGather =
     unsafe extern "C" fn(*mut c_void, *const u32, usize, *mut f32, *mut c_char, usize) -> c_int;
 type FnSample = unsafe extern "C" fn(
@@ -606,6 +607,28 @@ type FnKIdx = unsafe extern "C" fn(
 ) -> c_int;
 type FnEnvFlags = unsafe extern "C" fn() -> c_int;
 
+/// S8: the PLE rows of `n` tokens hashed here (weights/ple.rs), sliding `prev`, then the library's table prefetch;
+/// the library hashes on an older build. 0 = done.
+unsafe fn ple_rows_host(
+    f: &P4Ffi,
+    ss: *mut c_void,
+    tokens: *const i32,
+    n: c_int,
+    prev: &mut [i32; 2],
+    rows: *mut u32,
+) -> c_int {
+    let Some(prefetch) = f.ple_prefetch else {
+        return (f.ple_rows)(ss, tokens, n, prev.as_mut_ptr(), rows);
+    };
+    let n_u = n as usize;
+    super::weights::ngram_rows_advance(
+        std::slice::from_raw_parts(tokens, n_u),
+        prev,
+        std::slice::from_raw_parts_mut(rows, n_u * PLE_N_HEADS),
+    );
+    prefetch(ss, rows, n)
+}
+
 #[derive(Clone, Copy)]
 struct P4Ffi {
     serve_hooks: FnHooks,
@@ -620,6 +643,8 @@ struct P4Ffi {
     ver_release: FnVerRelease,
     mtp_prepare: FnMtpPrepare,
     ple_rows: FnPleRows,
+    /// S8: the host hashes, the library prefetches (older library: `ple_rows`)
+    ple_prefetch: Option<FnPlePrefetch>,
     ple_gather: FnPleGather,
     sample_tokens: FnSample,
     sample_tokens_spec: FnSampleSpec,
@@ -686,6 +711,7 @@ fn p4_ffi(kernels: &Qwen4ExpKernels) -> Option<&'static P4Ffi> {
                     ver_release: load_sym_from(h, "tk_qwen4exp_p4_ver_release")?,
                     mtp_prepare: load_sym_from(h, "tk_qwen4exp_p4_mtp_prepare")?,
                     ple_rows: load_sym_from(h, "tk_qwen4exp_p4_ple_rows")?,
+                    ple_prefetch: load_sym_from(h, "tk_qwen4exp_p4_ple_prefetch").ok(),
                     ple_gather: load_sym_from(h, "tk_qwen4exp_p4_ple_gather")?,
                     sample_tokens: load_sym_from(h, "tk_qwen4exp_p4_sample_tokens")?,
                     sample_tokens_spec: load_sym_from(h, "tk_qwen4exp_p4_sample_tokens_spec")?,
@@ -1414,7 +1440,18 @@ impl RustVerifier {
         }
         let mut eb = err_buf();
         // Piece 3's recorder (decode.rs, through its hook), else Verifier::record_window
-        let rec = (self.f.record_window)(self.v.ver, t, eb.as_mut_ptr(), eb.len());
+        //  S8: called directly; a decline falls to the C++ recorder)
+        let rec = match super::decode::record_direct(
+            self.v.ver,
+            t,
+            cs as *mut c_void,
+            eb.as_mut_ptr(),
+            eb.len(),
+        ) {
+            1 => 0,
+            0 => (self.f.record_window)(self.v.ver, t, eb.as_mut_ptr(), eb.len()),
+            e => e,
+        };
         let mut graph: hip_sys::hipGraph_t = std::ptr::null_mut();
         let ce = hip_sys::hipStreamEndCapture(cs, &mut graph);
         if rec != 0 {
@@ -1797,14 +1834,8 @@ impl RustVerifier {
         let do_ple = v.ple_on != 0;
         if do_ple {
             let mut prev = [*v.ple_prev, *v.ple_prev.add(1)];
-            if (self.f.ple_rows)(
-                v.ple_ss,
-                tokens.as_ptr(),
-                t,
-                prev.as_mut_ptr(),
-                self.ple_rows.as_mut_ptr(),
-            ) != 0
-            {
+            let rows = self.ple_rows.as_mut_ptr();
+            if ple_rows_host(self.f, v.ple_ss, tokens.as_ptr(), t, &mut prev, rows) != 0 {
                 return Err("verify: the PLE rows could not be hashed".into());
             }
         }
@@ -2651,13 +2682,8 @@ impl RustMtp {
             return;
         }
         let one = [tok];
-        (self.f.ple_rows)(
-            self.v.ple_ss,
-            one.as_ptr(),
-            1,
-            prev.as_mut_ptr(),
-            self.rows16.as_mut_ptr(),
-        );
+        let rows = self.rows16.as_mut_ptr();
+        ple_rows_host(self.f, self.v.ple_ss, one.as_ptr(), 1, prev, rows);
     }
 
     unsafe fn wait_out(&self, j: usize) {

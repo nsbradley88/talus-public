@@ -286,16 +286,17 @@ One control with three levels. It sets the options in the "Accuracy" group and l
 
 | Model | Reference turns off | Fast turns on |
 |---|---|---|
-| Qwen3.8-27B | flash prompt attention (`TALUS_PF_FA=0`); 4-bit prompt math is already off by default | 4-bit prompt math in all 64 layers (`TALUS_Q27_W4I=fast`, needs the 8.0 GiB `.fast.w4i` file): faster prompts, but it failed the quality gate |
+| Qwen3.8-27B | flash prompt attention and 4-bit prompt math (`TALUS_PF_FA=0 TALUS_Q27_W4I=0`) | 4-bit prompt math in all 64 layers (`TALUS_Q27_W4I=fast`, needs the 8.0 GiB `.fast.w4i` file): faster prompts, but it failed the quality gate |
 | Qwen3.8-Flash-Next | fp16 prompt experts, merged long-prompt projections, tuned decode layouts (`STRATA_PF_W16=0 STRATA_PF_HCDOWN=0 STRATA_MMVQ_KQ8=0 STRATA_MMVQ_W32=0`) | 16-bit HC streams (`TALUS_FN_HC_BF16=2`): faster prompts, but it failed the quality gate (the top token changes far more often) |
 | GLM-5.3-Flash | fp16 prompt experts, 4096-row chunks, two-pass sparse prompt attention and fp16 prompt projections (`STRATA_PF_W16_MOE=0 GLM_PCH=2048 GLM_SPARSE_2P=0 GLM_N2=0 GLM_N3=0`) | nothing recommended |
 | MiMo-V2.6-Flash | wave32 expert mat-vecs and WMMA prompt attention (`STRATA_IDS_W32=0 TALUS_MIMO_FA=0`) | low-bit expert prompt kernel (`MIMO_IQ1M_TPMOE=1`): faster prompts, but it failed the quality gate |
 | Laguna-S-2.1 | sparse attention past 32K (no `--sparse`) and served-speed mode (`TALUS_LAGUNA_LSRV=0`) | batched verify (`TALUS_LAGUNA_VERIFY_GEMM=9`): much faster edits, but it failed the quality gate (outputs change; edits lost doc comments in tests) |
 
-On Qwen3.8-27B, the 4-bit prompt math opt-in (`TALUS_Q27_W4I=auto`) uses `<model>.w4i` and Fast (`TALUS_Q27_W4I=fast`)
-uses `<model>.fast.w4i` if those files are placed next to the GGUF ([MODELS.md](MODELS.md#qwen38-27b)); when a file is
+On Qwen3.8-27B, 4-bit prompt math is on by default when `<model>.w4i` (format v3, which `talus setup` downloads) sits
+next to the GGUF, and Fast (`TALUS_Q27_W4I=fast`) uses `<model>.fast.w4i` if that file is placed there
+([MODELS.md](MODELS.md#qwen38-27b)); when a file is
 absent, the TUI shows "weights not installed" on that option, the server refuses that choice, and Fast stays Balanced.
-Without `<model>.w4i` (or by default, when `TALUS_Q27_W4I` is unset or `0`) the engine reads prompts on the exact int8
+Without `<model>.w4i`, or with `TALUS_Q27_W4I=0`, the engine reads prompts on the exact int8
 path.
 
 Exact speed-ups, the ones that leave the output bit-identical, stay on at every level and are not shown.

@@ -885,6 +885,9 @@ impl MimoEngine {
                 std::env::set_var("STRATA_IDS_W32", "1");
             }
         }
+        // the C side's former ensure_q36_env defaults, now applied here  S3)
+        talus_kernels::knobs::q36_env();
+        crate::pf_plans::w32_startup_check(lib.tk_mmvq_w32_table_plan);
         unsafe {
             let _ = (lib.tk_q36_mmq_built)();
         }
@@ -1955,7 +1958,7 @@ impl MimoEngine {
                 // the int8 prefill cache (same output bits as tk_prefill_mmq)
                 if let Some(&(qs, ws, mode)) = i8c.get(&(w.dev as usize)) {
                     let rc = unsafe {
-                        (lib.talus_pf_i8gemm)(
+                        lib.pf_i8gemm_v(
                             qs as *const i8,
                             ws as *const f32,
                             n as i32,
@@ -1966,6 +1969,7 @@ impl MimoEngine {
                             y_f32,
                             n as i64,
                             stream,
+                            crate::pf_plans::i8gemm(mode),
                         )
                     };
                     if rc == 0 {
@@ -2001,7 +2005,8 @@ impl MimoEngine {
                     unsafe { (q8_a_ptr as *const u8).add(c0 * q8_row_bytes) as *const c_void };
                 check_tk(
                     unsafe {
-                        (lib.tk_mmvq)(
+                        crate::pf_plans::mmvq(
+                            &lib,
                             ctx,
                             w.qtype,
                             w.dev,
@@ -2617,7 +2622,16 @@ impl MimoEngine {
                             self.trace.swa_sinks_calls += 1;
                             check_tk(
                                 unsafe {
-                                    (lib.tk_attn_swa_sinks_q8)(
+                                    // S6: the launch plan from the host
+                                    let plan = super::attn_plan::swa_plan(
+                                        !gpu.k_scale[il].is_null() && !gpu.v_scale[il].is_null(),
+                                        true,
+                                        head_dim_k as i32,
+                                        nb as i32,
+                                        n_head_q as i32,
+                                        n_head_kv as i32,
+                                    );
+                                    lib.attn_swa_sinks_planned(
                                         ctx,
                                         q_cur,
                                         gpu.k_pool[il],
@@ -2639,6 +2653,10 @@ impl MimoEngine {
                                         0,
                                         stream,
                                         gpu.q8_a,
+                                        ptr::null_mut(),
+                                        0,
+                                        ptr::null_mut(),
+                                        &plan,
                                     )
                                 },
                                 "tk_attn_swa_sinks_q8",
@@ -2647,7 +2665,17 @@ impl MimoEngine {
                             self.trace.full_k192_v128_calls += 1;
                             check_tk(
                                 unsafe {
-                                    (lib.tk_attn_k192_v128_q8)(
+                                    // S6: the launch plan from the host
+                                    let plan = super::attn_plan::k192_plan(
+                                        !gpu.k_scale[il].is_null() && !gpu.v_scale[il].is_null(),
+                                        !gpu.attn_scratch.is_null(),
+                                        nb as i32,
+                                        n_head_q as i32,
+                                        n_head_kv as i32,
+                                        kv_stride as i32,
+                                        0,
+                                    );
+                                    lib.attn_k192_v128_planned(
                                         ctx,
                                         q_cur,
                                         gpu.k_pool[il],
@@ -2665,6 +2693,7 @@ impl MimoEngine {
                                         0,
                                         stream,
                                         gpu.q8_a,
+                                        &plan,
                                     )
                                 },
                                 "tk_attn_k192_v128_q8",
@@ -2679,11 +2708,22 @@ impl MimoEngine {
                         let mut written = 0i32;
                         check_tk(
                             unsafe {
-                                (lib.tk_attn_swa_sinks_mmq)(
+                                // S6: the launch plan from the host
+                                let plan = super::attn_plan::swa_plan(
+                                    false,
+                                    true,
+                                    head_dim_k as i32,
+                                    nb as i32,
+                                    n_head_q as i32,
+                                    n_head_kv as i32,
+                                );
+                                lib.attn_swa_sinks_planned(
                                     ctx,
                                     q_cur,
                                     gpu.k_pool[il],
                                     gpu.v_pool[il],
+                                    ptr::null(),
+                                    ptr::null(),
                                     layer.attn_sinks.dev as *const f32,
                                     gpu.att_raw,
                                     gpu.attn_scratch,
@@ -2696,10 +2736,13 @@ impl MimoEngine {
                                     kv_stride as i32,
                                     scale,
                                     chunk_pos_dev,
+                                    0,
+                                    stream,
+                                    ptr::null_mut(),
                                     gpu.q8_a,
                                     wo_layout,
                                     &mut written,
-                                    stream,
+                                    &plan,
                                 )
                             },
                             "tk_attn_swa_sinks_mmq",
@@ -2712,7 +2755,16 @@ impl MimoEngine {
                             self.trace.swa_sinks_calls += 1;
                             check_tk(
                                 unsafe {
-                                    (lib.tk_attn_swa_sinks)(
+                                    // S6: the launch plan from the host
+                                    let plan = super::attn_plan::swa_plan(
+                                        !gpu.k_scale[il].is_null() && !gpu.v_scale[il].is_null(),
+                                        true,
+                                        head_dim_k as i32,
+                                        nb as i32,
+                                        n_head_q as i32,
+                                        n_head_kv as i32,
+                                    );
+                                    lib.attn_swa_sinks_planned(
                                         ctx,
                                         q_cur,
                                         gpu.k_pool[il],
@@ -2733,6 +2785,11 @@ impl MimoEngine {
                                         chunk_pos_dev,
                                         0,
                                         stream,
+                                        ptr::null_mut(),
+                                        ptr::null_mut(),
+                                        0,
+                                        ptr::null_mut(),
+                                        &plan,
                                     )
                                 },
                                 "tk_attn_swa_sinks",
@@ -2741,7 +2798,17 @@ impl MimoEngine {
                             self.trace.full_k192_v128_calls += 1;
                             check_tk(
                                 unsafe {
-                                    (lib.tk_attn_k192_v128)(
+                                    // S6: the launch plan from the host
+                                    let plan = super::attn_plan::k192_plan(
+                                        !gpu.k_scale[il].is_null() && !gpu.v_scale[il].is_null(),
+                                        !gpu.attn_scratch.is_null(),
+                                        nb as i32,
+                                        n_head_q as i32,
+                                        n_head_kv as i32,
+                                        kv_stride as i32,
+                                        0,
+                                    );
+                                    lib.attn_k192_v128_planned(
                                         ctx,
                                         q_cur,
                                         gpu.k_pool[il],
@@ -2758,6 +2825,8 @@ impl MimoEngine {
                                         chunk_pos_dev,
                                         0,
                                         stream,
+                                        ptr::null_mut(),
+                                        &plan,
                                     )
                                 },
                                 "tk_attn_k192_v128",
@@ -3036,7 +3105,8 @@ impl MimoEngine {
                         if layer.ffn_gate_inp.qtype == TK_QTYPE_F32 {
                             check_tk(
                                 unsafe {
-                                    (lib.tk_f32_matmul)(
+                                    crate::pf_plans::f32_matmul(
+                                        &lib,
                                         ctx,
                                         layer.ffn_gate_inp.dev as *const f32,
                                         gpu.xn,
@@ -3070,7 +3140,8 @@ impl MimoEngine {
                                 };
                                 check_tk(
                                     unsafe {
-                                        (lib.tk_mmvq)(
+                                        crate::pf_plans::mmvq(
+                                            &lib,
                                             ctx,
                                             layer.ffn_gate_inp.qtype,
                                             layer.ffn_gate_inp.dev,
@@ -3226,7 +3297,7 @@ impl MimoEngine {
                                 )?;
                                 check_tk(
                                     unsafe {
-                                        (lib.tk_moe_add_slots)(
+                                        lib.moe_add_slots_v(
                                             ctx,
                                             gpu.m_out,
                                             gpu.zero_shared_dev,
@@ -3237,6 +3308,12 @@ impl MimoEngine {
                                             d as i32,
                                             top_k as i32,
                                             stream,
+                                            talus_kernels::plans::moe_add_slots_variant(
+                                                gpu.m_out as usize,
+                                                gpu.zero_shared_dev as usize,
+                                                gpu.moe_y as usize,
+                                                d as i32,
+                                            ),
                                         )
                                     },
                                     "tk_moe_add_slots(moe_decode.m_out)",
@@ -3274,7 +3351,7 @@ impl MimoEngine {
                             } else {
                                 check_tk(
                                     unsafe {
-                                        (lib.tk_moe_add_slots)(
+                                        lib.moe_add_slots_v(
                                             ctx,
                                             x_cur,
                                             gpu.zero_shared_dev,
@@ -3285,6 +3362,12 @@ impl MimoEngine {
                                             d as i32,
                                             top_k as i32,
                                             stream,
+                                            talus_kernels::plans::moe_add_slots_variant(
+                                                x_cur as usize,
+                                                gpu.zero_shared_dev as usize,
+                                                gpu.moe_y as usize,
+                                                d as i32,
+                                            ),
                                         )
                                     },
                                     "tk_moe_add_slots(moe_out_no_norm)",
@@ -3443,12 +3526,19 @@ impl MimoEngine {
                             };
                             // gate, up, SiLU-mul and the down input's q8_1 quantize in one tp_moe
                             // launch when covered (bitwise; TK_ERR_UNSUPPORTED = nothing launched)
+                            // the activation layouts  S4): q8_b holds MMQ rows when the gate/up input was
+                            // quantized for MMQ (mmq_gu_ok), plain gathered q8_1 rows otherwise; the down input is MMQ
+                            // whenever mmq_down_ok (fused gu_q8 output, swiglu_q8_mmq or tk_q36_mmq_quantize), else
+                            // tk_swiglu_quantize_q8_1's plain rows
+                            let gu_layout = mmq_gu_ok as i32;
+                            let down_layout = mmq_down_ok as i32;
                             let fused_gu_q8 = mmq_down_ok
                                 && layer.exp_up.qtype == layer.exp_gate.qtype
                                 && layer.exp_up.expert_bytes == layer.exp_gate.expert_bytes
                                 && {
                                     let st = unsafe {
-                                        (lib.tk_prefill_moe_mmq_gu_q8)(
+                                        crate::pf_plans::moe_mmq_gu_q8(
+                                            &lib,
                                             ctx,
                                             &prod_gate,
                                             layer.exp_up.dev,
@@ -3458,6 +3548,7 @@ impl MimoEngine {
                                             // value) go there; q8_b still holds the gate/up input being read
                                             gpu.f1 as *mut c_void,
                                             (nb * top_k) as i64,
+                                            gu_layout,
                                             stream,
                                         )
                                     };
@@ -3476,11 +3567,13 @@ impl MimoEngine {
                                     && layer.exp_up.expert_bytes == layer.exp_gate.expert_bytes
                                     && {
                                         let st = unsafe {
-                                            (lib.tk_prefill_moe_mmq_gu)(
+                                            crate::pf_plans::moe_mmq_gu(
+                                                &lib,
                                                 ctx,
                                                 &prod_gate,
                                                 layer.exp_up.dev,
                                                 0.0,
+                                                gu_layout,
                                                 stream,
                                             )
                                         };
@@ -3493,7 +3586,11 @@ impl MimoEngine {
                                     });
                             if !fused_gu {
                                 check_tk(
-                                    unsafe { (lib.tk_prefill_moe_mmq)(ctx, &prod_gate, stream) },
+                                    unsafe {
+                                        crate::pf_plans::moe_mmq(
+                                            &lib, ctx, &prod_gate, gu_layout, stream,
+                                        )
+                                    },
                                     "tk_prefill_moe_mmq(exp_gate)",
                                 )?;
                                 if mmq_gu_ok && layer.exp_up.qtype != layer.exp_gate.qtype {
@@ -3523,7 +3620,11 @@ impl MimoEngine {
                                     }
                                 }
                                 check_tk(
-                                    unsafe { (lib.tk_prefill_moe_mmq)(ctx, &prod_up, stream) },
+                                    unsafe {
+                                        crate::pf_plans::moe_mmq(
+                                            &lib, ctx, &prod_up, gu_layout, stream,
+                                        )
+                                    },
                                     "tk_prefill_moe_mmq(exp_up)",
                                 )?;
                             }
@@ -3615,7 +3716,15 @@ impl MimoEngine {
                                 y_scale_dev: ptr::null(),
                             };
                             check_tk(
-                                unsafe { (lib.tk_prefill_moe_mmq)(ctx, &prod_down, stream) },
+                                unsafe {
+                                    crate::pf_plans::moe_mmq(
+                                        &lib,
+                                        ctx,
+                                        &prod_down,
+                                        down_layout,
+                                        stream,
+                                    )
+                                },
                                 "tk_prefill_moe_mmq(exp_down)",
                             )?;
                             if !layer.post_ffn_norm.is_null() {
@@ -3628,7 +3737,7 @@ impl MimoEngine {
                                 )?;
                                 check_tk(
                                     unsafe {
-                                        (lib.tk_moe_add_slots)(
+                                        lib.moe_add_slots_v(
                                             ctx,
                                             gpu.m_out,
                                             gpu.zero_shared_dev,
@@ -3639,6 +3748,12 @@ impl MimoEngine {
                                             d as i32,
                                             top_k as i32,
                                             stream,
+                                            talus_kernels::plans::moe_add_slots_variant(
+                                                gpu.m_out as usize,
+                                                gpu.zero_shared_dev as usize,
+                                                gpu.moe_y as usize,
+                                                d as i32,
+                                            ),
                                         )
                                     },
                                     "tk_moe_add_slots(m_out)",
@@ -3674,7 +3789,7 @@ impl MimoEngine {
                             } else {
                                 check_tk(
                                     unsafe {
-                                        (lib.tk_moe_add_slots)(
+                                        lib.moe_add_slots_v(
                                             ctx,
                                             x_cur,
                                             gpu.zero_shared_dev,
@@ -3685,6 +3800,12 @@ impl MimoEngine {
                                             d as i32,
                                             top_k as i32,
                                             stream,
+                                            talus_kernels::plans::moe_add_slots_variant(
+                                                x_cur as usize,
+                                                gpu.zero_shared_dev as usize,
+                                                gpu.moe_y as usize,
+                                                d as i32,
+                                            ),
                                         )
                                     },
                                     "tk_moe_add_slots(x)",
@@ -4216,7 +4337,8 @@ impl MimoEngine {
                 )?;
                 check_tk(
                     unsafe {
-                        (lib.tk_mmvq)(
+                        crate::pf_plans::mmvq(
+                            &lib,
                             ctx,
                             layer.wq.qtype,
                             layer.wq.dev,
@@ -4232,7 +4354,8 @@ impl MimoEngine {
                 )?;
                 check_tk(
                     unsafe {
-                        (lib.tk_mmvq)(
+                        crate::pf_plans::mmvq(
+                            &lib,
                             ctx,
                             layer.wk.qtype,
                             layer.wk.dev,
@@ -4248,7 +4371,8 @@ impl MimoEngine {
                 )?;
                 check_tk(
                     unsafe {
-                        (lib.tk_mmvq)(
+                        crate::pf_plans::mmvq(
+                            &lib,
                             ctx,
                             layer.wv.qtype,
                             layer.wv.dev,
@@ -4360,7 +4484,16 @@ impl MimoEngine {
                 };
                 check_tk(
                     unsafe {
-                        (lib.tk_attn_swa_sinks)(
+                        // S6: the launch plan from the host
+                        let plan = super::attn_plan::swa_plan(
+                            false,
+                            false,
+                            k_pool_dim as i32,
+                            b_rows as i32,
+                            n_head as i32,
+                            n_kv as i32,
+                        );
+                        lib.attn_swa_sinks_planned(
                             ctx,
                             gpu.q,
                             df_gpu.k_pool[dl],
@@ -4381,6 +4514,11 @@ impl MimoEngine {
                             df_gpu.bpos_dev,
                             -2,
                             stream,
+                            ptr::null_mut(),
+                            ptr::null_mut(),
+                            0,
+                            ptr::null_mut(),
+                            &plan,
                         )
                     },
                     "tk_attn_swa_sinks(dflash)",
@@ -4401,7 +4539,8 @@ impl MimoEngine {
                 )?;
                 check_tk(
                     unsafe {
-                        (lib.tk_mmvq)(
+                        crate::pf_plans::mmvq(
+                            &lib,
                             ctx,
                             layer.wo.qtype,
                             layer.wo.dev,

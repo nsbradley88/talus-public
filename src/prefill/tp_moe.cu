@@ -23,6 +23,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "strata/kernels/variant_trace.hpp"   // S1
 
 namespace talus::prefill {
 namespace {
@@ -1142,7 +1143,7 @@ int g_moe_ver = -1;   // talus-pf-bench: the version under test (moe_set_version
 
 /// the kernel version of a product: talus-pf-bench's, TP_MOE_VER, or the tune row's for grouped products (one expert -
 /// the dense tk_prefill_mmq route - keeps v6 until measured); a K tail always takes v6
-int moe_version_for(const MoeProduct& p) {
+static int moe_version_lib(const MoeProduct& p) {
     static const int ver_env = [] { const char* e = std::getenv("TP_MOE_VER"); return e ? std::atoi(e) : -1; }();
     static const int ver_arch = tp_tune_current().moe_ver;
     int ver0 = g_moe_ver >= 0 ? g_moe_ver : ver_env >= 0 ? ver_env : (p.n_experts > 1 ? ver_arch : 0);
@@ -1153,6 +1154,13 @@ int moe_version_for(const MoeProduct& p) {
     if (g_moe_ver < 0 && ver_env < 0 && ver0 == 73 && v74_min > 0 && p.n_experts > 1 && p.total_rows >= (int64_t) v74_min * p.n_experts)
         ver0 = 74;
     return p.k % MMQ_ITER_K != 0 ? 6 : ver0;
+}
+// S10: the host's version for the products of this thread's export call (talus_kernels::tune::moe_version), checked
+// against the rule above for one release; < 0: the rule above
+static thread_local int g_host_moe_ver = -1;
+int moe_version_for(const MoeProduct& p) {
+    const int lib = moe_version_lib(p);
+    return g_host_moe_ver < 0 ? lib : strata::kernels::vtrace::plan_choose("moe_version", g_host_moe_ver, lib);
 }
 
 // TP_MOE_KTAIL_SKIP=0 (A/B): a K tail's blocks past k run as before (in-place products never take this: moe_inplace_ok)
@@ -1179,6 +1187,7 @@ bool launch_gu(const MoeProduct& p, cudaStream_t s) {
         return false;
     } else {
         const dim3 grid((unsigned) ((p.max_rows + 95) / 96), (unsigned) (p.n / 64), (unsigned) p.n_experts);
+        TALUS_VTRACE("pf_moe_gu", p.q8_out != nullptr ? "q8_out" : "f32", (int) type, moe_version_for(p), p.n_experts > 1 ? 1 : 0, p.n);
 #define TP_GU_ARGS (const char*) p.w, p.expert_bytes, p.k, (const char*) p.xq, p.bounds, p.ids, (int) p.total_rows, p.dst, p.ld_dst, \
                    (const char*) p.w_up, p.swiglu_limit, moe_kern_args(p)
         if (p.q8_out != nullptr) {   // SwiGLU -> the down projection's q8_1 rows (v73 body only)
@@ -1214,6 +1223,7 @@ void launch(const MoeProduct& p, cudaStream_t s) {
     static const int q4k_split = [] { const char* e = std::getenv("TP_Q4K_SPLIT"); return e ? std::atoi(e) : 2; }();
     const int ver = moe_version_for(p);
     const bool small = p.total_rows < 32 * (int64_t) p.n_experts;
+    TALUS_VTRACE("pf_moe", "launch", (int) type, ver, (small ? 2 : 0) + (p.n_experts > 1 ? 1 : 0), q4k_split);
 #define TP_MOE5_ARGS (const char*) p.w, p.expert_bytes, p.k, (const char*) p.xq, p.bounds, p.ids, (int) p.total_rows, p.dst, p.ld_dst
     if constexpr (type == GGML_TYPE_Q4_K) {
         if (q4k_split == 0 || (q4k_split == 1 && p.n_experts > 1)) {
@@ -1299,6 +1309,7 @@ bool moe_inplace_ok(int t, int n, int k) {
 }
 
 void moe_set_version(int v) { g_moe_ver = v; }
+void moe_host_version(int v) { g_host_moe_ver = v; }
 
 /// one-expert (dense) Q6_K product on tp_moe mode 4 (MMQ's Q6_K tile + mma arithmetic, bitwise MMQ); false =
 /// not covered (another type / shape, grouped products, no K-quant MMQ, TP_Q6K unset) - the caller keeps MMQ.
@@ -1310,6 +1321,7 @@ bool moe_gemm_q6k_dense(const MoeProduct& p, void* stream) {
     if (!on || p.type != GGML_TYPE_Q6_K || p.n_experts != 1 || p.w_up != nullptr || p.n % 128 != 0 || p.k <= 0 ||
         p.k % MMQ_ITER_K != 0 || p.max_rows <= 0)
         return false;
+    TALUS_VTRACE("pf_moe", "q6k_dense", (int) p.type, p.n, p.k);
     launch<GGML_TYPE_Q6_K, 4>(p, (cudaStream_t) stream);
     return cudaGetLastError() == cudaSuccess;
 #else
@@ -1362,6 +1374,7 @@ bool moe_gemm_iq1m_q8_1(const MoeProduct& p, void* stream) {
     // phase 2, TP_MOE_IQ1M_ONE (default 1; 0 = the 2-tile kernel): one C tile per wave, 16 waves per 64 routed
     // rows, the leaf's activations staged in LDS (169 VGPRs vs 249; bench GU 2048 tok: 46.6 -> 42.8 ms; bitwise)
     static const bool one = [] { const char* v = std::getenv("TP_MOE_IQ1M_ONE"); return v == nullptr || v[0] != '0'; }();
+    TALUS_VTRACE("pf_moe_iq1m", p.w_up != nullptr ? "gu" : "one", t, one ? 1 : 0, ldsg ? 1 : 0, p.n);
     if (one && t == 64 && !ldsg) {
         if (p.w_up != nullptr) k_moe1m<4, true, 64, false, true><<<gg, dim3(32, 16), 0, s>>>(TP_1M_ARGS);
         else k_moe1m<4, false, 64, false, true><<<gs, dim3(32, 16), 0, s>>>(TP_1M_ARGS);

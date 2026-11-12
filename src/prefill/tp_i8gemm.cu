@@ -6,6 +6,7 @@
 //
 // Copyright (c) 2026 nsbradley88
 // SPDX-License-Identifier: MIT
+#include "strata/kernels/variant_trace.hpp"   // S1
 #include "strata/prefill/tp_i8gemm.hpp"
 #include "strata/prefill/tp_tune.hpp"
 
@@ -1423,14 +1424,23 @@ bool launch_v10(const I8Mat& w, const char* x, int T, float* dst, int64_t ld, hi
 
 }  // namespace
 
-void i8gemm(const I8Mat& w, const void* xq, int T, float* dst, int64_t ld_dst, void* stream) {
-    if (T <= 0) return;
-    const dim3 grid((unsigned) ((T + 127) / 128), (unsigned) (w.n / 128));
+// S9: the rule (the Rust host's copy: talus_kernels::tune::i8gemm_variant)
+int i8gemm_plan(int mode) {
     static const int env = [] { const char* e = std::getenv("TP_I8_VARIANT"); return e ? std::atoi(e) : 0; }();
     const TpTune& tune = tp_tune_current();
-    const int mv = tune.i8_mode_variant[w.mode % 3];
-    int v = env ? env : mv ? mv : tune.i8_variant;
-    if (w.mode != 0 && v < 6) v = 6;   // (modes 1 / 2: the LDS kernels only)
+    const int mv = tune.i8_mode_variant[mode % 3];
+    const int v = env ? env : mv ? mv : tune.i8_variant;
+    return mode != 0 && v < 6 ? 6 : v;   // (modes 1 / 2: the LDS kernels only)
+}
+int swq8_plan(int mode) {
+    static const int env = [] { const char* v = std::getenv("TP_I8_VARIANT"); return v ? std::atoi(v) : 0; }();
+    return env ? env : tp_tune_current().i8_mode_variant[mode % 3];
+}
+
+void i8gemm(const I8Mat& w, const void* xq, int T, float* dst, int64_t ld_dst, void* stream, int variant) {
+    if (T <= 0) return;
+    const dim3 grid((unsigned) ((T + 127) / 128), (unsigned) (w.n / 128));
+    int v = variant < 0 ? i8gemm_plan(w.mode) : variant;
     const hipStream_t s = (hipStream_t) stream;
     const char* x = (const char*) xq;
     if (v >= 100 && v < 200) {   // v10 shapes (falls back to v7 when the shape does not divide)
@@ -1472,7 +1482,8 @@ void i8gemm(const I8Mat& w, const void* xq, int T, float* dst, int64_t ld_dst, v
             case 194: ok = launch_v10<4, 2, 2, 4, 4, false, 512 | 256 | 128>(w, x, T, dst, ld_dst, s); break;
             default: break;
         }
-        if (ok) return;
+        if (ok) { TALUS_VTRACE("pf_i8gemm", "v10", v, w.mode, w.n, w.k); return; }
+        TALUS_VTRACE("pf_i8gemm", "v10_fallback_v7", v, w.mode, w.n, w.k);
         v = 7;
     }
     if (v >= 90 && v < 96) {   // v9 shapes (falls back to v7 when the shape does not divide)
@@ -1486,7 +1497,8 @@ void i8gemm(const I8Mat& w, const void* xq, int T, float* dst, int64_t ld_dst, v
             case 95: ok = launch_v9<8, 1, 1, 8, 4>(w, x, T, dst, ld_dst, s); break;   // 128 x 128, 8 row waves, 1 x 8
             default: break;
         }
-        if (ok) return;
+        if (ok) { TALUS_VTRACE("pf_i8gemm", "v9", v, w.mode, w.n, w.k); return; }
+        TALUS_VTRACE("pf_i8gemm", "v9_fallback_v7", v, w.mode, w.n, w.k);
         v = 7;
     }
     if (v >= 80 && v < 90) {   // v8 block shapes (falls back to v7 when the shape does not divide)
@@ -1501,9 +1513,11 @@ void i8gemm(const I8Mat& w, const void* xq, int T, float* dst, int64_t ld_dst, v
             case 87: ok = launch_v8<2, 4, 2, 2, 2>(w, x, T, dst, ld_dst, s); break;   // 64 x 128 waves 2 x 4, 2 x 2 tiles
             default: break;
         }
-        if (ok) return;
+        if (ok) { TALUS_VTRACE("pf_i8gemm", "v8", v, w.mode, w.n, w.k); return; }
+        TALUS_VTRACE("pf_i8gemm", "v8_fallback_v7", v, w.mode, w.n, w.k);
         v = 7;
     }
+    TALUS_VTRACE("pf_i8gemm", "base", v, w.mode, w.n, w.k);
     switch (v) {
         case 1: k_i8gemm<2, 4, false><<<grid, 256, 0, s>>>(w.qs, w.ws, x, dst, w.k, T, ld_dst); break;
         case 3: k_i8gemm<4, 2, true><<<grid, 256, 0, s>>>(w.qs, w.ws, x, dst, w.k, T, ld_dst); break;
@@ -1555,15 +1569,14 @@ size_t I8Cache::add(const void* w, int ggml_type, int n, int k, void* stream) {
 namespace talus::prefill {
 namespace {
 template <int EPI>
-void launch_swq8(const I8Mat& w, const char* x, int T, const SwiQ8& e, hipStream_t s) {
+void launch_swq8(const I8Mat& w, const char* x, int T, const SwiQ8& e, hipStream_t s, int variant) {
     // v106's shape (tp_tune gfx1151: 128 x 128, waves 4 x 2, a wave 2 x 4 tiles, KS 4, scales at use)
     constexpr int WGN = 4, WGT = 2, WM = 2, WT = 4, KS = 4, BN = 16 * WGN * WM, BT = 16 * WGT * WT, NT = 32 * WGN * WGT;
     const dim3 grid((unsigned) ((T + BT - 1) / BT), (unsigned) (w.n / BN));
     (void) BN;
     // the up GEMM follows its mode's i8 variant (TP_I8_VARIANT / tp_tune i8_mode_variant) for the v10
     // schedules 117 (OPT 40, occupancy-6 budget), 119 (OPT 1024), 121 (both); the same per-element arithmetic and order
-    static const int env = [] { const char* v = std::getenv("TP_I8_VARIANT"); return v ? std::atoi(v) : 0; }();
-    const int mv = env ? env : tp_tune_current().i8_mode_variant[w.mode % 3];
+    const int mv = variant < 0 ? swq8_plan(w.mode) : variant;
     auto go = [&]<int M>() -> bool {
         if (mv == 117) k_i8v10_swq8w6<M, WGN, WGT, WM, WT, KS, false, EPI, 40><<<grid, NT, 0, s>>>(w.qs, w.ws, x, w.k, T, w.n, e);
         else if (mv == 119) k_i8v10_swq8w6<M, WGN, WGT, WM, WT, KS, false, EPI, 1024><<<grid, NT, 0, s>>>(w.qs, w.ws, x, w.k, T, w.n, e);
@@ -1571,6 +1584,7 @@ void launch_swq8(const I8Mat& w, const char* x, int T, const SwiQ8& e, hipStream
         else return false;
         return true;
     };
+    TALUS_VTRACE("pf_swq8", (mv == 117 || mv == 119 || mv == 121) ? "w6" : "v10", mv, w.mode, w.n, EPI);
     if ((w.mode == 0 && go.template operator()<0>()) || (w.mode == 1 && go.template operator()<1>()) ||
         (w.mode == 2 && go.template operator()<2>()))
         return;
@@ -1585,8 +1599,8 @@ void launch_swq8(const I8Mat& w, const char* x, int T, const SwiQ8& e, hipStream
 /// down projection's activations, `layout` = mmq_q8_1_ds_layout of the down weights: 0 D4, 1 DS4) - bitwise
 /// talus_pf_i8gemm into u followed by talus_pf_swiglu_q8_mmq(g, u).  g: the gate projection [T][ldg] FP32.
 /// -1 (nothing launched): shape / layout / device not covered (n % 512, k % 256, D2S6), or TALUS_PF_SWQ8=0.
-extern "C" int talus_pf_i8gemm_swiglu_q8(const int8_t* qs, const float* ws, int n, int k, int mode, const void* xq,
-                                         int T, const float* g, int64_t ldg, void* yq, int layout, void* stream) {
+static int i8gemm_swiglu_q8_impl(const int8_t* qs, const float* ws, int n, int k, int mode, const void* xq,
+                                 int T, const float* g, int64_t ldg, void* yq, int layout, void* stream, int variant) {
     static const bool on = [] { const char* e = std::getenv("TALUS_PF_SWQ8"); return e == nullptr || e[0] != '0'; }();
     if (!on || n % 512 != 0 || k % 256 != 0 || mode < 0 || mode > 2 || (layout != 0 && layout != 1) || T <= 0 ||
         ldg % 4 != 0 || ((uintptr_t) g) % 16 != 0 || !talus::prefill::tp_gfx11_wmma())
@@ -1602,13 +1616,29 @@ extern "C" int talus_pf_i8gemm_swiglu_q8(const int8_t* qs, const float* ws, int 
     e.ldg = ldg;
     e.yq = (char*) yq;
     const hipStream_t s = (hipStream_t) stream;
-    if (layout == 1) talus::prefill::launch_swq8<2>(m, (const char*) xq, T, e, s);
-    else talus::prefill::launch_swq8<1>(m, (const char*) xq, T, e, s);
+    if (layout == 1) talus::prefill::launch_swq8<2>(m, (const char*) xq, T, e, s, variant);
+    else talus::prefill::launch_swq8<1>(m, (const char*) xq, T, e, s, variant);
     return 0;
+}
+extern "C" int talus_pf_i8gemm_swiglu_q8(const int8_t* qs, const float* ws, int n, int k, int mode, const void* xq,
+                                         int T, const float* g, int64_t ldg, void* yq, int layout, void* stream) {
+    return i8gemm_swiglu_q8_impl(qs, ws, n, k, mode, xq, T, g, ldg, yq, layout, stream, -1);
+}
+// S9: with the host's kernel variant (talus_kernels::tune), the library's for one release
+extern "C" int talus_pf_i8gemm_swiglu_q8_v(const int8_t* qs, const float* ws, int n, int k, int mode, const void* xq, int T,
+                                           const float* g, int64_t ldg, void* yq, int layout, void* stream, int variant) {
+    int v = -1;
+    if (variant >= 0 && mode >= 0 && mode <= 2)
+        v = strata::kernels::vtrace::plan_choose("talus_pf_i8gemm_swiglu_q8", variant, talus::prefill::swq8_plan(mode));
+    return i8gemm_swiglu_q8_impl(qs, ws, n, k, mode, xq, T, g, ldg, yq, layout, stream, v);
 }
 
 extern "C" int talus_pf_i8gemm(const int8_t* qs, const float* ws, int n, int k, int mode, const void* xq, int T,
                                float* dst, int64_t ld_dst, void* stream) {
+    return talus_pf_i8gemm_v(qs, ws, n, k, mode, xq, T, dst, ld_dst, stream, -1);
+}
+extern "C" int talus_pf_i8gemm_v(const int8_t* qs, const float* ws, int n, int k, int mode, const void* xq, int T,
+                                 float* dst, int64_t ld_dst, void* stream, int variant) {
     if (n % 128 != 0 || k % 256 != 0 || mode < 0 || mode > 2 || !talus::prefill::tp_gfx11_wmma()) return -1;
     talus::prefill::I8Mat m;
     m.mode = mode;
@@ -1616,6 +1646,7 @@ extern "C" int talus_pf_i8gemm(const int8_t* qs, const float* ws, int n, int k, 
     m.ws = const_cast<float*>(ws);
     m.n = n;
     m.k = k;
-    talus::prefill::i8gemm(m, xq, T, dst, ld_dst, stream);
+    talus::prefill::i8gemm(m, xq, T, dst, ld_dst, stream,
+                           variant < 0 ? -1 : strata::kernels::vtrace::plan_choose("talus_pf_i8gemm", variant, talus::prefill::i8gemm_plan(mode)));
     return 0;
 }

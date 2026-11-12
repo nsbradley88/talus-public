@@ -40,7 +40,10 @@ void gather_rows(const void* src, void* dst, const int* idx, int n_rows, size_t 
 
 /// x[t] += shared[t] + sum_j w[t*k+j] * y[map[t*k+j]], j ascending; map, w are device arrays.
 void moe_add_slots(float* x, const float* shared, const float* y, const int* map, const float* w, int n_tok,
-                   int n_embd, int k, void* stream);
+                   int n_embd, int k, void* stream, int variant = -1);
+/// S6: moe_add_slots' kernel choice (1 = float4: TALUS_MOE_ADD4 on, n_embd % 4, x / shared / y 16-byte
+/// aligned; else 0). `variant` < 0 above = computed there.
+int moe_add_slots_variant(const float* x, const float* shared, const float* y, int n_embd);
 
 /// Prompt attention for nq query tokens at positions q_pos0.., causal, over the f16 pools ([pos][n_kv][128]) that
 /// already hold every key up to the last query.  window > 0: keys within `window` positions (self included).
@@ -53,10 +56,13 @@ void moe_add_slots(float* x, const float* shared, const float* y, const int* map
 void prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool, float* out, int nq, int q_pos0,
                  int n_head, int n_kv, int window, void* stream, const int* q_pos0_dev = nullptr, int n_split = 1,
                  float* part_acc = nullptr, float* part_ml = nullptr, bool merge = true, int vt_stride = 0,
-                 const uint16_t* k_scale = nullptr, const uint16_t* v_scale = nullptr);
+                 const uint16_t* k_scale = nullptr, const uint16_t* v_scale = nullptr, int variant = -1);
+/// S6: prompt_attn's tile shape (100 = one query token: QT 1 / KT 32, else LAGUNA_PA_SHAPE, default 1).
+int prompt_attn_variant(int nq);
 
 /// y[t][o] = sum_i w[o][i] * x[t][i] for n_tok rows, F32 weights and accumulation (the batched router).
-void f32_matmul(const float* w, const float* x, float* y, int n_in, int n_out, int n_tok, void* stream);
+void f32_matmul(const float* w, const float* x, float* y, int n_in, int n_out, int n_tok, void* stream, int plan = -1);
+int f32_matmul_plan(int n_in, int n_tok);   // w3 rust-port S7
 
 /// g = silu(g) * u
 void silu_mul(float* g, const float* u, int64_t n, void* stream);
@@ -132,7 +138,10 @@ void router_route(const float* w, const float* x, float* logits, const float* bi
 void prompt_attn_wmma(const float* q, const uint16_t* k_pool, const uint16_t* v_pool, float* out, int nq, int q_pos0,
                       int n_head, int n_kv, int window, void* stream, int vt_stride, const int* q_pos0_dev = nullptr,
                       int n_split = 1, float* part_acc = nullptr, float* part_ml = nullptr,
-                      const uint16_t* k_scale = nullptr, const uint16_t* v_scale = nullptr);
+                      const uint16_t* k_scale = nullptr, const uint16_t* v_scale = nullptr, int variant = -1);
+/// S6: prompt_attn_wmma's kernel (1 = split decode, 2 = shared tiles transposed, 3 = shared tiles,
+/// 4 = per-wave tiles), from TALUS_LAGUNA_ATTN (default 4) or the test hook prompt_attn_set_version.
+int prompt_attn_wmma_variant(int nq, int q_pos0, int n_split, bool has_ksc, bool has_pos_dev);
 
 /// prompt_attn_wmma's prompt kernel: 2 (default, TALUS_LAGUNA_ATTN) = K / V tiles shared by the block,
 /// 1 = per-wave tiles (the original; bitwise the same output); -1 = back to the environment's choice.
@@ -159,7 +168,13 @@ void kv_store_q8(const float* kc, const float* vc, void* k_pool, void* v_pool, u
 void decode_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool, const uint16_t* k_scale,
                  const uint16_t* v_scale, int n_head, int n_kv, int window, int stride, const int* pos_dev, int n_split,
                  float* part_acc, float* part_ml, void* stream, int n_tok = 1, const int* sel = nullptr,
-                 int sel_k = 0, bool sel_per_kv = false, int sel_bs = 64);
+                 int sel_k = 0, bool sel_per_kv = false, int sel_bs = 64, int plan = -1);
+/// S7: the launch shape as one int, (nt * 10 + cap) * 1000 for the grouped kernel (nt tokens per block, cap
+/// resident units; 0 = per-token kernel) + 100 for 64-key tiles + 1 for the token-major grid (rust talus_kernels::plans).
+/// decode_attn's `plan`: the host's (decode_attn_plan's rules), < 0 = computed there.
+int decode_attn_plan(int n_head, int n_kv, int window, int n_tok, bool has_sel);
+/// true while the test hook overrides (talus_laguna_decode_attn_grp) are set: the host's plan does not know them.
+bool decode_attn_hooked();
 /// sel set (sparse_select's output: n_tok x sel_k block indices, or n_tok x n_kv x sel_k with sel_per_kv): attend
 /// only to those 64-key blocks.
 

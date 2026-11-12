@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "strata/kernels/variant_trace.hpp"   // S1
 
 namespace strata::prefill::mmq {
 #if defined(STRATA_KQ_DSO)
@@ -29,6 +30,7 @@ bool kq_ok() {
 #else
     static const bool on = [] {
         const char* v = std::getenv("STRATA_MMQ_KQ");
+        TALUS_VTRACE("env", "STRATA_MMQ_KQ@moe_mmq.kq_ok", v != nullptr && v[0] == '1' ? 1 : 0, v != nullptr ? 1 : 0);
         return v != nullptr && v[0] == '1';
     }();
     return on;

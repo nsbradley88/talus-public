@@ -188,3 +188,117 @@ pub fn ple_probe_decide(rps: f64, explicit: bool) -> i32 {
     }
     0
 }
+
+// ===========================================================================================================
+// The n-gram row hash  S8; `strata::kernels::ngram_rows`, qwen4exp.cpp L1092-1124)
+// ===========================================================================================================
+
+/// `PleConsts`: the artifact's own constants, verbatim from the GGUF dump (ngram.cpp `ple_artifact_consts`), not derived:
+/// `head_offsets` is its own metadata array, so deriving it would hide a mismatch; the test checks the two agree.
+pub const PLE_MULT: [u64; 3] = [23703573157769, 20109073645365, 8052911324071];
+pub const PLE_VOCAB: [u64; 16] = [
+    20000003, 20000023, 20000033, 20000047, 20000059, 20000063, 20000069, 20000077, 20000081,
+    20000093, 20000107, 20000147, 20000153, 20000159, 20000161, 20000171,
+];
+pub const PLE_OFFSET: [u64; 16] = [
+    0, 20000003, 40000026, 60000059, 80000106, 100000165, 120000228, 140000297, 160000374,
+    180000455, 200000548, 220000655, 240000802, 260000955, 280001114, 300001275,
+];
+const PLE_EOS_TOKEN_ID: i32 = 248044;
+
+/// Sixteen row indices of one token from its two predecessors `prev`, OLDEST FIRST (negative: none). The window is built
+/// once and only its prefixes are used: heads 0..8 bigrams, 8..16 trigrams. The cut is evaluated BEFORE the value is stored,
+/// so the position whose predecessor was EOS is itself EOS; products wrap mod 2^64.
+pub fn ngram_rows_one(token: i32, prev: [i32; 2], out: &mut [u32]) {
+    let mut ctx = [i64::from(token), 0, 0];
+    let mut cut = false;
+    for s in 1..3 {
+        let t = if cut { -1 } else { prev[2 - s] };
+        cut = cut || t < 0 || t == PLE_EOS_TOKEN_ID;
+        ctx[s] = i64::from(if cut { PLE_EOS_TOKEN_ID } else { t });
+    }
+    let mut mixed = 0u64;
+    for n in 0..3 {
+        let term = (ctx[n] as u64).wrapping_mul(PLE_MULT[n]);
+        mixed = if n == 0 { term } else { mixed ^ term };
+        if n == 0 {
+            continue;
+        }
+        for g in 0..8 {
+            let h = (n - 1) * 8 + g;
+            out[h] = (mixed % PLE_VOCAB[h] + PLE_OFFSET[h]) as u32;
+        }
+    }
+}
+
+/// [`ngram_rows_one`] over `tokens`, sliding `prev` (`out`: 16 rows per token).
+pub fn ngram_rows_advance(tokens: &[i32], prev: &mut [i32; 2], out: &mut [u32]) {
+    for (tok, rows) in tokens.iter().zip(out.chunks_exact_mut(16)) {
+        ngram_rows_one(*tok, *prev, rows);
+        *prev = [prev[1], *tok];
+    }
+}
+
+#[cfg(test)]
+mod ngram_tests {
+    use super::*;
+
+    const ORACLE: &str = include_str!("../../../../../../src/kernels/ple_oracle_vectors.inc");
+
+    fn array(name: &str) -> Vec<i64> {
+        let key = format!(" {name}[");
+        let at = ORACLE
+            .find(&key)
+            .unwrap_or_else(|| panic!("{name} missing"));
+        let open = at + ORACLE[at..].find('{').unwrap();
+        let close = open + ORACLE[open..].find('}').unwrap();
+        ORACLE[open + 1..close]
+            .split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.parse().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn matches_the_oracle_vectors() {
+        for case in 0..6 {
+            let tokens = array(&format!("case{case}_tokens"));
+            let prev = array(&format!("case{case}_prev"));
+            let rows = array(&format!("case{case}_rows"));
+            assert_eq!(rows.len(), tokens.len() * 16);
+            for (t, tok) in tokens.iter().enumerate() {
+                let mut got = [0u32; 16];
+                ngram_rows_one(
+                    *tok as i32,
+                    [prev[t * 2] as i32, prev[t * 2 + 1] as i32],
+                    &mut got,
+                );
+                let want: Vec<u32> = rows[t * 16..(t + 1) * 16]
+                    .iter()
+                    .map(|v| *v as u32)
+                    .collect();
+                assert_eq!(got.as_slice(), want.as_slice(), "case {case} token {t}");
+            }
+        }
+    }
+
+    #[test]
+    fn offsets_are_the_running_sum() {
+        let mut run = 0;
+        for h in 0..16 {
+            assert_eq!(PLE_OFFSET[h], run);
+            run += PLE_VOCAB[h];
+        }
+    }
+
+    #[test]
+    fn advance_slides_the_window() {
+        let (mut a, mut b) = ([0u32; 32], [0u32; 16]);
+        let mut prev = [-1, 7];
+        ngram_rows_advance(&[8, 9], &mut prev, &mut a);
+        assert_eq!(prev, [8, 9]);
+        ngram_rows_one(9, [7, 8], &mut b);
+        assert_eq!(&a[16..], &b[..]);
+    }
+}

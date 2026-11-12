@@ -172,6 +172,141 @@ pub struct tk_mmvq_item {
     pub n_out: i32,
 }
 
+/// S6: launch plan of `tk_attn_swa_sinks*` (see `talus_kernels.h` `tk_mimo_swa_plan`).
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct tk_mimo_swa_plan {
+    pub kind: i32,
+    pub a: i32,
+    pub b: i32,
+    pub c: i32,
+}
+
+/// S6: `tk_moe_add_slots_v` (the legacy arguments + the host's kernel choice).
+pub type FnMoeAddSlotsV = unsafe extern "C" fn(
+    *mut tk_ctx,
+    *mut f32,
+    *const f32,
+    *const f32,
+    *const i32,
+    *const f32,
+    i32,
+    i32,
+    i32,
+    tk_stream,
+    i32,
+) -> tk_status;
+/// S7: `tk_laguna_decode_attn_v`.
+pub type FnLagunaDecodeAttnV = unsafe extern "C" fn(
+    *mut tk_ctx,
+    *const f32,
+    *const u16,
+    *const u16,
+    *const u16,
+    *const u16,
+    i32,
+    i32,
+    i32,
+    i32,
+    *const i32,
+    i32,
+    *mut f32,
+    *mut f32,
+    i32,
+    *const i32,
+    i32,
+    bool,
+    i32,
+    tk_stream,
+    i32,
+) -> tk_status;
+/// S9: `talus_pf_i8gemm_v`.
+pub type FnPfI8gemmV = unsafe extern "C" fn(
+    *const i8,
+    *const f32,
+    i32,
+    i32,
+    i32,
+    *const c_void,
+    i32,
+    *mut f32,
+    i64,
+    *mut c_void,
+    i32,
+) -> c_int;
+/// S9: `talus_pf_i8gemm_swiglu_q8_v`.
+pub type FnPfI8gemmSwiglu8V = unsafe extern "C" fn(
+    *const i8,
+    *const f32,
+    i32,
+    i32,
+    i32,
+    *const c_void,
+    i32,
+    *const f32,
+    i64,
+    *mut c_void,
+    i32,
+    *mut c_void,
+    i32,
+) -> c_int;
+/// S6: `tk_laguna_prompt_attn_v`.
+pub type FnLagunaPromptAttnV = unsafe extern "C" fn(
+    *mut tk_ctx,
+    *const f32,
+    *const u16,
+    *const u16,
+    *mut f32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    *const i32,
+    i32,
+    *mut f32,
+    *mut f32,
+    bool,
+    i32,
+    *const u16,
+    *const u16,
+    tk_stream,
+    i32,
+) -> tk_status;
+/// S6: `tk_laguna_prompt_attn_wmma_v`.
+pub type FnLagunaPromptAttnWmmaV = unsafe extern "C" fn(
+    *mut tk_ctx,
+    *const f32,
+    *const u16,
+    *const u16,
+    *mut f32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    *const i32,
+    i32,
+    *mut f32,
+    *mut f32,
+    *const u16,
+    *const u16,
+    tk_stream,
+    i32,
+) -> tk_status;
+
+/// S6: launch plan of `tk_attn_k192_v128` (see `talus_kernels.h` `tk_mimo_k192_plan`).
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct tk_mimo_k192_plan {
+    pub kind: i32,
+    pub splits: i32,
+    pub a: i32,
+    pub b: i32,
+    pub c: i32,
+}
+
 /// Grouped MoE MMQ product descriptor for [`tk_prefill_moe_mmq`] (mirrors `strata::prefill::mmq::Product`).
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -708,6 +843,30 @@ extern "C" {
         sel_bs: i32,
         stream: tk_stream,
     ) -> tk_status;
+    #[allow(clippy::too_many_arguments)]
+    pub fn tk_laguna_decode_attn_v(
+        ctx: *mut tk_ctx,
+        q: *const f32,
+        k_pool: *const u16,
+        v_pool: *const u16,
+        k_scale: *const u16,
+        v_scale: *const u16,
+        n_head: i32,
+        n_kv: i32,
+        window: i32,
+        stride: i32,
+        pos_dev: *const i32,
+        n_split: i32,
+        part_acc: *mut f32,
+        part_ml: *mut f32,
+        n_tok: i32,
+        sel_dev: *const i32,
+        sel_k: i32,
+        sel_per_kv: bool,
+        sel_bs: i32,
+        stream: tk_stream,
+        plan: i32,
+    ) -> tk_status;
     pub fn tk_attn_merge_gate_quant(
         ctx: *mut tk_ctx,
         part_acc: *const f32,
@@ -904,6 +1063,130 @@ extern "C" {
         stream: tk_stream,
         q8_out: *mut c_void,
     ) -> tk_status;
+    pub fn tk_moe_add_slots_v(
+        ctx: *mut tk_ctx,
+        x: *mut f32,
+        shared: *const f32,
+        y: *const f32,
+        map_dev: *const i32,
+        weights_dev: *const f32,
+        n_tok: i32,
+        n_embd: i32,
+        k: i32,
+        stream: tk_stream,
+        variant: i32,
+    ) -> tk_status;
+    #[allow(clippy::too_many_arguments)]
+    pub fn tk_laguna_prompt_attn_v(
+        ctx: *mut tk_ctx,
+        q: *const f32,
+        k_pool: *const u16,
+        v_pool: *const u16,
+        out: *mut f32,
+        nq: i32,
+        q_pos0: i32,
+        n_head: i32,
+        n_kv: i32,
+        window: i32,
+        q_pos0_dev: *const i32,
+        n_split: i32,
+        part_acc: *mut f32,
+        part_ml: *mut f32,
+        merge: bool,
+        vt_stride: i32,
+        k_scale: *const u16,
+        v_scale: *const u16,
+        stream: tk_stream,
+        variant: i32,
+    ) -> tk_status;
+    #[allow(clippy::too_many_arguments)]
+    pub fn tk_laguna_prompt_attn_wmma_v(
+        ctx: *mut tk_ctx,
+        q: *const f32,
+        k_pool: *const u16,
+        v_pool: *const u16,
+        out: *mut f32,
+        nq: i32,
+        q_pos0: i32,
+        n_head: i32,
+        n_kv: i32,
+        window: i32,
+        vt_stride: i32,
+        q_pos0_dev: *const i32,
+        n_split: i32,
+        part_acc: *mut f32,
+        part_ml: *mut f32,
+        k_scale: *const u16,
+        v_scale: *const u16,
+        stream: tk_stream,
+        variant: i32,
+    ) -> tk_status;
+    pub fn tk_attn_swa_sinks_plan(
+        q8_kv: i32,
+        causal: i32,
+        head_dim: i32,
+        n_tok: i32,
+        n_head: i32,
+        n_kv: i32,
+        out: *mut tk_mimo_swa_plan,
+    ) -> tk_status;
+    pub fn tk_attn_swa_sinks_planned(
+        ctx: *mut tk_ctx,
+        q: *const f32,
+        k_pool: *const c_void,
+        v_pool: *const c_void,
+        k_scale: *const u16,
+        v_scale: *const u16,
+        sinks: *const f32,
+        out: *mut f32,
+        scratch: *mut f32,
+        n_tok: i32,
+        n_head: i32,
+        n_kv: i32,
+        head_dim: i32,
+        head_dim_v: i32,
+        window: i32,
+        stride: i32,
+        scale: f32,
+        pos_dev: *const i32,
+        n_split: i32,
+        stream: tk_stream,
+        q8_out: *mut c_void,
+        q8_mmq: *mut c_void,
+        q8_layout: i32,
+        q8_written: *mut i32,
+        plan: *const tk_mimo_swa_plan,
+    ) -> tk_status;
+    pub fn tk_attn_k192_v128_plan(
+        q8_kv: i32,
+        has_scratch: i32,
+        n_tok: i32,
+        n_head: i32,
+        n_kv: i32,
+        stride: i32,
+        n_split: i32,
+        out: *mut tk_mimo_k192_plan,
+    ) -> tk_status;
+    pub fn tk_attn_k192_v128_planned(
+        ctx: *mut tk_ctx,
+        q: *const f32,
+        k_pool: *const c_void,
+        v_pool: *const c_void,
+        k_scale: *const u16,
+        v_scale: *const u16,
+        out: *mut f32,
+        scratch: *mut f32,
+        n_tok: i32,
+        n_head: i32,
+        n_kv: i32,
+        stride: i32,
+        scale: f32,
+        pos_dev: *const i32,
+        n_split: i32,
+        stream: tk_stream,
+        q8_out: *mut c_void,
+        plan: *const tk_mimo_k192_plan,
+    ) -> tk_status;
     pub fn tk_axpy_norm_quant(
         ctx: *mut tk_ctx,
         x: *mut f32,
@@ -1095,6 +1378,33 @@ extern "C" {
         xq_rows: i64,
         stream: tk_stream,
     ) -> tk_status;
+    /// S4: the products above with the activation layout passed by the host (0 plain, 1 MMQ, -1 registry).
+    pub fn tk_prefill_moe_mmq_l(
+        ctx: *mut tk_ctx,
+        product: *const tk_moe_mmq_product,
+        x_layout: i32,
+        stream: tk_stream,
+    ) -> tk_status;
+    pub fn tk_prefill_moe_mmq_gu_l(
+        ctx: *mut tk_ctx,
+        gate: *const tk_moe_mmq_product,
+        w_up: *const c_void,
+        swiglu_limit: f32,
+        x_layout: i32,
+        stream: tk_stream,
+    ) -> tk_status;
+    pub fn tk_prefill_moe_mmq_gu_q8_l(
+        ctx: *mut tk_ctx,
+        gate: *const tk_moe_mmq_product,
+        w_up: *const c_void,
+        swiglu_limit: f32,
+        down_qtype: i32,
+        xq_out: *mut c_void,
+        xq_rows: i64,
+        x_layout: i32,
+        stream: tk_stream,
+    ) -> tk_status;
+    pub fn tk_mmq_q8_buf_registered(xq: *const c_void) -> i32;
     pub fn tk_prefill_moe_mmq_iq(
         ctx: *mut tk_ctx,
         gu_qtype: tk_qtype,
@@ -2121,6 +2431,36 @@ extern "C" {
         ws: *mut f32,
         stream: *mut c_void,
     ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    pub fn talus_pf_i8gemm_v(
+        qs: *const i8,
+        ws: *const f32,
+        n: i32,
+        k: i32,
+        mode: i32,
+        xq: *const c_void,
+        T: i32,
+        dst: *mut f32,
+        ld_dst: i64,
+        stream: *mut c_void,
+        variant: i32,
+    ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    pub fn talus_pf_i8gemm_swiglu_q8_v(
+        qs: *const i8,
+        ws: *const f32,
+        n: i32,
+        k: i32,
+        mode: i32,
+        xq: *const c_void,
+        T: i32,
+        g: *const f32,
+        ldg: i64,
+        yq: *mut c_void,
+        layout: i32,
+        stream: *mut c_void,
+        variant: i32,
+    ) -> c_int;
     pub fn talus_pf_i8gemm(
         qs: *const i8,
         ws: *const f32,
@@ -2871,6 +3211,79 @@ pub struct LibTalusKernels {
         tk_stream,
         *mut c_void,
     ) -> tk_status,
+    /// S6 (optional: absent in an older library).
+    pub tk_moe_add_slots_v: Option<FnMoeAddSlotsV>,
+    pub tk_laguna_prompt_attn_v: Option<FnLagunaPromptAttnV>,
+    pub tk_laguna_decode_attn_v: Option<FnLagunaDecodeAttnV>,
+    pub tk_laguna_prompt_attn_wmma_v: Option<FnLagunaPromptAttnWmmaV>,
+    pub tk_attn_swa_sinks_plan: Option<
+        unsafe extern "C" fn(i32, i32, i32, i32, i32, i32, *mut tk_mimo_swa_plan) -> tk_status,
+    >,
+    #[allow(clippy::type_complexity)]
+    pub tk_attn_swa_sinks_planned: Option<
+        unsafe extern "C" fn(
+            *mut tk_ctx,
+            *const f32,
+            *const c_void,
+            *const c_void,
+            *const u16,
+            *const u16,
+            *const f32,
+            *mut f32,
+            *mut f32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            f32,
+            *const i32,
+            i32,
+            tk_stream,
+            *mut c_void,
+            *mut c_void,
+            i32,
+            *mut i32,
+            *const tk_mimo_swa_plan,
+        ) -> tk_status,
+    >,
+    pub tk_attn_k192_v128_plan: Option<
+        unsafe extern "C" fn(
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            *mut tk_mimo_k192_plan,
+        ) -> tk_status,
+    >,
+    #[allow(clippy::type_complexity)]
+    pub tk_attn_k192_v128_planned: Option<
+        unsafe extern "C" fn(
+            *mut tk_ctx,
+            *const f32,
+            *const c_void,
+            *const c_void,
+            *const u16,
+            *const u16,
+            *mut f32,
+            *mut f32,
+            i32,
+            i32,
+            i32,
+            i32,
+            f32,
+            *const i32,
+            i32,
+            tk_stream,
+            *mut c_void,
+            *const tk_mimo_k192_plan,
+        ) -> tk_status,
+    >,
     pub tk_axpy_norm_quant: unsafe extern "C" fn(
         *mut tk_ctx,
         *mut f32,
@@ -3057,6 +3470,34 @@ pub struct LibTalusKernels {
         i64,
         tk_stream,
     ) -> tk_status,
+    /// S4 (optional: absent in an older library, then the registry exports run; see `moe_mmq_l`).
+    pub tk_prefill_moe_mmq_l: Option<
+        unsafe extern "C" fn(*mut tk_ctx, *const tk_moe_mmq_product, i32, tk_stream) -> tk_status,
+    >,
+    pub tk_prefill_moe_mmq_gu_l: Option<
+        unsafe extern "C" fn(
+            *mut tk_ctx,
+            *const tk_moe_mmq_product,
+            *const c_void,
+            f32,
+            i32,
+            tk_stream,
+        ) -> tk_status,
+    >,
+    pub tk_prefill_moe_mmq_gu_q8_l: Option<
+        unsafe extern "C" fn(
+            *mut tk_ctx,
+            *const tk_moe_mmq_product,
+            *const c_void,
+            f32,
+            i32,
+            *mut c_void,
+            i64,
+            i32,
+            tk_stream,
+        ) -> tk_status,
+    >,
+    pub tk_mmq_q8_buf_registered: Option<unsafe extern "C" fn(*const c_void) -> i32>,
     pub tk_prefill_moe_mmq_iq: unsafe extern "C" fn(
         *mut tk_ctx,
         tk_qtype,
@@ -3993,6 +4434,64 @@ pub struct LibTalusKernels {
     ) -> c_int,
     pub talus_pf_i8x_expand:
         unsafe extern "C" fn(*const c_void, i32, i32, i32, *mut i8, *mut f32, *mut c_void) -> c_int,
+    /// S10 (optional): the library's W32 table lookup.
+    pub tk_mmvq_w32_table_plan: Option<unsafe extern "C" fn(i32, i32) -> i32>,
+    pub tk_mmvq_w32_on: Option<unsafe extern "C" fn() -> i32>,
+    pub tk_prefill_moe_mmq_lv: Option<
+        unsafe extern "C" fn(
+            *mut tk_ctx,
+            *const tk_moe_mmq_product,
+            i32,
+            i32,
+            tk_stream,
+        ) -> tk_status,
+    >,
+    #[allow(clippy::type_complexity)]
+    pub tk_prefill_moe_mmq_gu_lv: Option<
+        unsafe extern "C" fn(
+            *mut tk_ctx,
+            *const tk_moe_mmq_product,
+            *const c_void,
+            f32,
+            i32,
+            i32,
+            i32,
+            tk_stream,
+        ) -> tk_status,
+    >,
+    #[allow(clippy::type_complexity)]
+    pub tk_prefill_moe_mmq_gu_q8_lv: Option<
+        unsafe extern "C" fn(
+            *mut tk_ctx,
+            *const tk_moe_mmq_product,
+            *const c_void,
+            f32,
+            i32,
+            *mut c_void,
+            i64,
+            i32,
+            i32,
+            i32,
+            tk_stream,
+        ) -> tk_status,
+    >,
+    #[allow(clippy::type_complexity)]
+    pub tk_mmvq_v: Option<
+        unsafe extern "C" fn(
+            *mut tk_ctx,
+            tk_qtype,
+            *const c_void,
+            *const c_void,
+            *mut f32,
+            i32,
+            i32,
+            i32,
+            tk_stream,
+            i32,
+        ) -> tk_status,
+    >,
+    pub talus_pf_i8gemm_v: Option<FnPfI8gemmV>,
+    pub talus_pf_i8gemm_swiglu_q8_v: Option<FnPfI8gemmSwiglu8V>,
     pub talus_pf_i8gemm: unsafe extern "C" fn(
         *const i8,
         *const f32,
@@ -4184,6 +4683,410 @@ impl LibTalusKernels {
             Some(sym)
         }
     }
+    /// `tk_moe_add_slots` with the host's kernel choice  S6); the legacy export on an older library.
+    ///
+    /// # Safety
+    /// As `tk_moe_add_slots`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn moe_add_slots_v(
+        &self,
+        ctx: *mut tk_ctx,
+        x: *mut f32,
+        shared: *const f32,
+        y: *const f32,
+        map_dev: *const i32,
+        weights_dev: *const f32,
+        n_tok: i32,
+        n_embd: i32,
+        k: i32,
+        stream: tk_stream,
+        variant: i32,
+    ) -> tk_status {
+        match self.tk_moe_add_slots_v {
+            Some(f) => f(
+                ctx,
+                x,
+                shared,
+                y,
+                map_dev,
+                weights_dev,
+                n_tok,
+                n_embd,
+                k,
+                stream,
+                variant,
+            ),
+            None => (self.tk_moe_add_slots)(
+                ctx,
+                x,
+                shared,
+                y,
+                map_dev,
+                weights_dev,
+                n_tok,
+                n_embd,
+                k,
+                stream,
+            ),
+        }
+    }
+
+    /// `tk_laguna_prompt_attn` with the host's tile shape  S6); the legacy export on an older library.
+    ///
+    /// # Safety
+    /// As `tk_laguna_prompt_attn`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn laguna_prompt_attn_v(
+        &self,
+        ctx: *mut tk_ctx,
+        q: *const f32,
+        k_pool: *const u16,
+        v_pool: *const u16,
+        out: *mut f32,
+        nq: i32,
+        q_pos0: i32,
+        n_head: i32,
+        n_kv: i32,
+        window: i32,
+        q_pos0_dev: *const i32,
+        n_split: i32,
+        part_acc: *mut f32,
+        part_ml: *mut f32,
+        merge: bool,
+        vt_stride: i32,
+        k_scale: *const u16,
+        v_scale: *const u16,
+        stream: tk_stream,
+        variant: i32,
+    ) -> tk_status {
+        match self.tk_laguna_prompt_attn_v {
+            Some(f) => f(
+                ctx, q, k_pool, v_pool, out, nq, q_pos0, n_head, n_kv, window, q_pos0_dev, n_split,
+                part_acc, part_ml, merge, vt_stride, k_scale, v_scale, stream, variant,
+            ),
+            None => (self.tk_laguna_prompt_attn)(
+                ctx, q, k_pool, v_pool, out, nq, q_pos0, n_head, n_kv, window, q_pos0_dev, n_split,
+                part_acc, part_ml, merge, vt_stride, k_scale, v_scale, stream,
+            ),
+        }
+    }
+
+    /// `talus_pf_i8gemm` with the host's kernel variant  S9); the legacy export on an older library.
+    ///
+    /// # Safety
+    /// As `talus_pf_i8gemm`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn pf_i8gemm_v(
+        &self,
+        qs: *const i8,
+        ws: *const f32,
+        n: i32,
+        k: i32,
+        mode: i32,
+        xq: *const c_void,
+        t: i32,
+        dst: *mut f32,
+        ld_dst: i64,
+        stream: *mut c_void,
+        variant: i32,
+    ) -> c_int {
+        match self.talus_pf_i8gemm_v {
+            Some(f) => f(qs, ws, n, k, mode, xq, t, dst, ld_dst, stream, variant),
+            None => (self.talus_pf_i8gemm)(qs, ws, n, k, mode, xq, t, dst, ld_dst, stream),
+        }
+    }
+
+    /// `talus_pf_i8gemm_swiglu_q8` with the host's kernel variant  S9).
+    ///
+    /// # Safety
+    /// As `talus_pf_i8gemm_swiglu_q8`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn pf_i8gemm_swiglu_q8_v(
+        &self,
+        qs: *const i8,
+        ws: *const f32,
+        n: i32,
+        k: i32,
+        mode: i32,
+        xq: *const c_void,
+        t: i32,
+        g: *const f32,
+        ldg: i64,
+        yq: *mut c_void,
+        layout: i32,
+        stream: *mut c_void,
+        variant: i32,
+    ) -> c_int {
+        match self.talus_pf_i8gemm_swiglu_q8_v {
+            Some(f) => f(
+                qs, ws, n, k, mode, xq, t, g, ldg, yq, layout, stream, variant,
+            ),
+            None => (self.talus_pf_i8gemm_swiglu_q8)(
+                qs, ws, n, k, mode, xq, t, g, ldg, yq, layout, stream,
+            ),
+        }
+    }
+
+    /// `tk_laguna_decode_attn` with the host's launch shape  S7); the legacy export on an older library.
+    ///
+    /// # Safety
+    /// As `tk_laguna_decode_attn`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn laguna_decode_attn_v(
+        &self,
+        ctx: *mut tk_ctx,
+        q: *const f32,
+        k_pool: *const u16,
+        v_pool: *const u16,
+        k_scale: *const u16,
+        v_scale: *const u16,
+        n_head: i32,
+        n_kv: i32,
+        window: i32,
+        stride: i32,
+        pos_dev: *const i32,
+        n_split: i32,
+        part_acc: *mut f32,
+        part_ml: *mut f32,
+        n_tok: i32,
+        sel_dev: *const i32,
+        sel_k: i32,
+        sel_per_kv: bool,
+        sel_bs: i32,
+        stream: tk_stream,
+        plan: i32,
+    ) -> tk_status {
+        match self.tk_laguna_decode_attn_v {
+            Some(f) => f(
+                ctx, q, k_pool, v_pool, k_scale, v_scale, n_head, n_kv, window, stride, pos_dev,
+                n_split, part_acc, part_ml, n_tok, sel_dev, sel_k, sel_per_kv, sel_bs, stream,
+                plan,
+            ),
+            None => (self.tk_laguna_decode_attn)(
+                ctx, q, k_pool, v_pool, k_scale, v_scale, n_head, n_kv, window, stride, pos_dev,
+                n_split, part_acc, part_ml, n_tok, sel_dev, sel_k, sel_per_kv, sel_bs, stream,
+            ),
+        }
+    }
+
+    /// `tk_laguna_prompt_attn_wmma` with the host's kernel choice  S6); the legacy export on an older
+    /// library.
+    ///
+    /// # Safety
+    /// As `tk_laguna_prompt_attn_wmma`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn laguna_prompt_attn_wmma_v(
+        &self,
+        ctx: *mut tk_ctx,
+        q: *const f32,
+        k_pool: *const u16,
+        v_pool: *const u16,
+        out: *mut f32,
+        nq: i32,
+        q_pos0: i32,
+        n_head: i32,
+        n_kv: i32,
+        window: i32,
+        vt_stride: i32,
+        q_pos0_dev: *const i32,
+        n_split: i32,
+        part_acc: *mut f32,
+        part_ml: *mut f32,
+        k_scale: *const u16,
+        v_scale: *const u16,
+        stream: tk_stream,
+        variant: i32,
+    ) -> tk_status {
+        match self.tk_laguna_prompt_attn_wmma_v {
+            Some(f) => f(
+                ctx, q, k_pool, v_pool, out, nq, q_pos0, n_head, n_kv, window, vt_stride,
+                q_pos0_dev, n_split, part_acc, part_ml, k_scale, v_scale, stream, variant,
+            ),
+            None => (self.tk_laguna_prompt_attn_wmma)(
+                ctx, q, k_pool, v_pool, out, nq, q_pos0, n_head, n_kv, window, vt_stride,
+                q_pos0_dev, n_split, part_acc, part_ml, k_scale, v_scale, stream,
+            ),
+        }
+    }
+
+    /// Every `tk_attn_swa_sinks*` form with the host's launch plan  S6): `q8_out` non-null = the q8 form,
+    /// `q8_mmq` non-null = the mmq form (`q8_written` receives whether the MMQ rows were written), else the plain form.
+    /// An older library without the planned export runs that form, which computes the same plan itself.
+    ///
+    /// # Safety
+    /// As the corresponding `tk_attn_swa_sinks*` export.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn attn_swa_sinks_planned(
+        &self,
+        ctx: *mut tk_ctx,
+        q: *const f32,
+        k_pool: *const c_void,
+        v_pool: *const c_void,
+        k_scale: *const u16,
+        v_scale: *const u16,
+        sinks: *const f32,
+        out: *mut f32,
+        scratch: *mut f32,
+        n_tok: i32,
+        n_head: i32,
+        n_kv: i32,
+        head_dim: i32,
+        head_dim_v: i32,
+        window: i32,
+        stride: i32,
+        scale: f32,
+        pos_dev: *const i32,
+        n_split: i32,
+        stream: tk_stream,
+        q8_out: *mut c_void,
+        q8_mmq: *mut c_void,
+        q8_layout: i32,
+        q8_written: *mut i32,
+        plan: &tk_mimo_swa_plan,
+    ) -> tk_status {
+        if let Some(f) = self.tk_attn_swa_sinks_planned {
+            return f(
+                ctx, q, k_pool, v_pool, k_scale, v_scale, sinks, out, scratch, n_tok, n_head, n_kv,
+                head_dim, head_dim_v, window, stride, scale, pos_dev, n_split, stream, q8_out,
+                q8_mmq, q8_layout, q8_written, plan,
+            );
+        }
+        if !q8_mmq.is_null() {
+            (self.tk_attn_swa_sinks_mmq)(
+                ctx, q, k_pool, v_pool, sinks, out, scratch, n_tok, n_head, n_kv, head_dim,
+                head_dim_v, window, stride, scale, pos_dev, q8_mmq, q8_layout, q8_written, stream,
+            )
+        } else if !q8_out.is_null() {
+            (self.tk_attn_swa_sinks_q8)(
+                ctx, q, k_pool, v_pool, k_scale, v_scale, sinks, out, scratch, n_tok, n_head, n_kv,
+                head_dim, head_dim_v, window, stride, scale, pos_dev, n_split, stream, q8_out,
+            )
+        } else {
+            (self.tk_attn_swa_sinks)(
+                ctx, q, k_pool, v_pool, k_scale, v_scale, sinks, out, scratch, n_tok, n_head, n_kv,
+                head_dim, head_dim_v, window, stride, scale, pos_dev, n_split, stream,
+            )
+        }
+    }
+
+    /// `tk_attn_k192_v128_q8` (`q8_out` may be null) with the host's launch plan  S6); an older library
+    /// without the planned export runs `tk_attn_k192_v128_q8`, which computes the same plan itself.
+    ///
+    /// # Safety
+    /// As `tk_attn_k192_v128_q8`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn attn_k192_v128_planned(
+        &self,
+        ctx: *mut tk_ctx,
+        q: *const f32,
+        k_pool: *const c_void,
+        v_pool: *const c_void,
+        k_scale: *const u16,
+        v_scale: *const u16,
+        out: *mut f32,
+        scratch: *mut f32,
+        n_tok: i32,
+        n_head: i32,
+        n_kv: i32,
+        stride: i32,
+        scale: f32,
+        pos_dev: *const i32,
+        n_split: i32,
+        stream: tk_stream,
+        q8_out: *mut c_void,
+        plan: &tk_mimo_k192_plan,
+    ) -> tk_status {
+        match self.tk_attn_k192_v128_planned {
+            Some(f) => f(
+                ctx, q, k_pool, v_pool, k_scale, v_scale, out, scratch, n_tok, n_head, n_kv,
+                stride, scale, pos_dev, n_split, stream, q8_out, plan,
+            ),
+            None => (self.tk_attn_k192_v128_q8)(
+                ctx, q, k_pool, v_pool, k_scale, v_scale, out, scratch, n_tok, n_head, n_kv,
+                stride, scale, pos_dev, n_split, stream, q8_out,
+            ),
+        }
+    }
+
+    /// `tk_prefill_moe_mmq` with the activation layout from the host (`x_layout`: 0 plain q8_1, 1 MMQ). Falls back
+    /// to the registry export on an older library. S4.
+    ///
+    /// # Safety
+    /// As `tk_prefill_moe_mmq`.
+    pub unsafe fn moe_mmq_l(
+        &self,
+        ctx: *mut tk_ctx,
+        product: *const tk_moe_mmq_product,
+        x_layout: i32,
+        stream: tk_stream,
+    ) -> tk_status {
+        match self.tk_prefill_moe_mmq_l {
+            Some(f) => f(ctx, product, x_layout, stream),
+            None => (self.tk_prefill_moe_mmq)(ctx, product, stream),
+        }
+    }
+
+    /// `tk_prefill_moe_mmq_gu` with the activation layout from the host. S4.
+    ///
+    /// # Safety
+    /// As `tk_prefill_moe_mmq_gu`.
+    pub unsafe fn moe_mmq_gu_l(
+        &self,
+        ctx: *mut tk_ctx,
+        gate: *const tk_moe_mmq_product,
+        w_up: *const c_void,
+        swiglu_limit: f32,
+        x_layout: i32,
+        stream: tk_stream,
+    ) -> tk_status {
+        match self.tk_prefill_moe_mmq_gu_l {
+            Some(f) => f(ctx, gate, w_up, swiglu_limit, x_layout, stream),
+            None => (self.tk_prefill_moe_mmq_gu)(ctx, gate, w_up, swiglu_limit, stream),
+        }
+    }
+
+    /// `tk_prefill_moe_mmq_gu_q8` with the activation layout from the host. S4.
+    ///
+    /// # Safety
+    /// As `tk_prefill_moe_mmq_gu_q8`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn moe_mmq_gu_q8_l(
+        &self,
+        ctx: *mut tk_ctx,
+        gate: *const tk_moe_mmq_product,
+        w_up: *const c_void,
+        swiglu_limit: f32,
+        down_qtype: i32,
+        xq_out: *mut c_void,
+        xq_rows: i64,
+        x_layout: i32,
+        stream: tk_stream,
+    ) -> tk_status {
+        match self.tk_prefill_moe_mmq_gu_q8_l {
+            Some(f) => f(
+                ctx,
+                gate,
+                w_up,
+                swiglu_limit,
+                down_qtype,
+                xq_out,
+                xq_rows,
+                x_layout,
+                stream,
+            ),
+            None => (self.tk_prefill_moe_mmq_gu_q8)(
+                ctx,
+                gate,
+                w_up,
+                swiglu_limit,
+                down_qtype,
+                xq_out,
+                xq_rows,
+                stream,
+            ),
+        }
+    }
+
     /// Dynamically load `libtalus_kernels.so` from `path` using `dlopen`/`dlsym` and resolve all
     /// Contract v0 entry points.
     #[cfg(unix)]
@@ -4279,6 +5182,15 @@ impl LibTalusKernels {
                     tk_attn_swa_sinks_q8: load_sym(handle, "tk_attn_swa_sinks_q8")?,
                     tk_attn_k192_v128: load_sym(handle, "tk_attn_k192_v128")?,
                     tk_attn_k192_v128_q8: load_sym(handle, "tk_attn_k192_v128_q8")?,
+                    tk_attn_k192_v128_plan: load_sym(handle, "tk_attn_k192_v128_plan").ok(),
+                    tk_attn_swa_sinks_plan: load_sym(handle, "tk_attn_swa_sinks_plan").ok(),
+                    tk_moe_add_slots_v: load_sym(handle, "tk_moe_add_slots_v").ok(),
+                    tk_laguna_prompt_attn_v: load_sym(handle, "tk_laguna_prompt_attn_v").ok(),
+                    tk_laguna_decode_attn_v: load_sym(handle, "tk_laguna_decode_attn_v").ok(),
+                    tk_laguna_prompt_attn_wmma_v: load_sym(handle, "tk_laguna_prompt_attn_wmma_v")
+                        .ok(),
+                    tk_attn_swa_sinks_planned: load_sym(handle, "tk_attn_swa_sinks_planned").ok(),
+                    tk_attn_k192_v128_planned: load_sym(handle, "tk_attn_k192_v128_planned").ok(),
                     tk_mimo_rope_qk_store: load_sym(handle, "tk_mimo_rope_qk_store")?,
                     tk_axpy_norm_quant: load_sym(handle, "tk_axpy_norm_quant")?,
                     tk_dsa_decode_indexer: load_sym(handle, "tk_dsa_decode_indexer")?,
@@ -4294,6 +5206,10 @@ impl LibTalusKernels {
                     tk_prefill_moe_mmq: load_sym(handle, "tk_prefill_moe_mmq")?,
                     tk_prefill_moe_mmq_gu: load_sym(handle, "tk_prefill_moe_mmq_gu")?,
                     tk_prefill_moe_mmq_gu_q8: load_sym(handle, "tk_prefill_moe_mmq_gu_q8")?,
+                    tk_prefill_moe_mmq_l: load_sym(handle, "tk_prefill_moe_mmq_l").ok(),
+                    tk_prefill_moe_mmq_gu_l: load_sym(handle, "tk_prefill_moe_mmq_gu_l").ok(),
+                    tk_prefill_moe_mmq_gu_q8_l: load_sym(handle, "tk_prefill_moe_mmq_gu_q8_l").ok(),
+                    tk_mmq_q8_buf_registered: load_sym(handle, "tk_mmq_q8_buf_registered").ok(),
                     tk_prefill_moe_mmq_iq: load_sym(handle, "tk_prefill_moe_mmq_iq")?,
 
                     tk_q8_1_bytes: load_sym(handle, "tk_q8_1_bytes")?,
@@ -4404,6 +5320,16 @@ impl LibTalusKernels {
                     tk_q36_expert_grouped: load_sym(handle, "tk_q36_expert_grouped")?,
                     talus_pf_fa_prefill: load_sym(handle, "talus_pf_fa_prefill")?,
                     talus_pf_i8x_expand: load_sym(handle, "talus_pf_i8x_expand")?,
+                    tk_mmvq_w32_table_plan: load_sym(handle, "tk_mmvq_w32_table_plan").ok(),
+                    tk_mmvq_w32_on: load_sym(handle, "tk_mmvq_w32_on").ok(),
+                    tk_prefill_moe_mmq_lv: load_sym(handle, "tk_prefill_moe_mmq_lv").ok(),
+                    tk_prefill_moe_mmq_gu_lv: load_sym(handle, "tk_prefill_moe_mmq_gu_lv").ok(),
+                    tk_prefill_moe_mmq_gu_q8_lv: load_sym(handle, "tk_prefill_moe_mmq_gu_q8_lv")
+                        .ok(),
+                    tk_mmvq_v: load_sym(handle, "tk_mmvq_v").ok(),
+                    talus_pf_i8gemm_v: load_sym(handle, "talus_pf_i8gemm_v").ok(),
+                    talus_pf_i8gemm_swiglu_q8_v: load_sym(handle, "talus_pf_i8gemm_swiglu_q8_v")
+                        .ok(),
                     talus_pf_i8gemm: load_sym(handle, "talus_pf_i8gemm")?,
                     talus_pf_moe_gemm: load_sym(handle, "talus_pf_moe_gemm")
                         .unwrap_or(fallback_talus_pf_moe_gemm),
@@ -4535,6 +5461,14 @@ impl LibTalusKernels {
             tk_attn_swa_sinks_q8,
             tk_attn_k192_v128,
             tk_attn_k192_v128_q8,
+            tk_attn_k192_v128_plan: Some(tk_attn_k192_v128_plan),
+            tk_attn_swa_sinks_plan: Some(tk_attn_swa_sinks_plan),
+            tk_moe_add_slots_v: Some(tk_moe_add_slots_v),
+            tk_laguna_prompt_attn_v: Some(tk_laguna_prompt_attn_v),
+            tk_laguna_decode_attn_v: Some(tk_laguna_decode_attn_v),
+            tk_laguna_prompt_attn_wmma_v: Some(tk_laguna_prompt_attn_wmma_v),
+            tk_attn_swa_sinks_planned: Some(tk_attn_swa_sinks_planned),
+            tk_attn_k192_v128_planned: Some(tk_attn_k192_v128_planned),
             tk_mimo_rope_qk_store,
             tk_axpy_norm_quant,
             tk_dsa_decode_indexer,
@@ -4548,6 +5482,10 @@ impl LibTalusKernels {
             tk_prefill_moe_mmq,
             tk_prefill_moe_mmq_gu,
             tk_prefill_moe_mmq_gu_q8,
+            tk_prefill_moe_mmq_l: Some(tk_prefill_moe_mmq_l),
+            tk_prefill_moe_mmq_gu_l: Some(tk_prefill_moe_mmq_gu_l),
+            tk_prefill_moe_mmq_gu_q8_l: Some(tk_prefill_moe_mmq_gu_q8_l),
+            tk_mmq_q8_buf_registered: Some(tk_mmq_q8_buf_registered),
             tk_prefill_moe_mmq_iq,
             tk_q8_1_bytes,
             tk_swiglu_quantize_q8_1,
@@ -4650,6 +5588,14 @@ impl LibTalusKernels {
             tk_q36_expert_grouped,
             talus_pf_fa_prefill,
             talus_pf_i8x_expand,
+            tk_mmvq_w32_table_plan: None,
+            tk_mmvq_w32_on: None,
+            tk_prefill_moe_mmq_lv: None,
+            tk_prefill_moe_mmq_gu_lv: None,
+            tk_prefill_moe_mmq_gu_q8_lv: None,
+            tk_mmvq_v: None,
+            talus_pf_i8gemm_v: Some(talus_pf_i8gemm_v),
+            talus_pf_i8gemm_swiglu_q8_v: Some(talus_pf_i8gemm_swiglu_q8_v),
             talus_pf_i8gemm,
             talus_pf_moe_gemm,
             talus_pf_swiglu_q8_mmq,
@@ -4962,6 +5908,10 @@ tk_status tk_laguna_decode_attn(tk_ctx* ctx, const float* q, const uint16_t* k_p
     (void)ctx; (void)q; (void)k_pool; (void)v_pool; (void)k_scale; (void)v_scale; (void)n_head; (void)n_kv; (void)window; (void)stride; (void)pos_dev; (void)n_split; (void)part_acc; (void)part_ml; (void)n_tok; (void)sel_dev; (void)sel_k; (void)sel_per_kv; (void)sel_bs; (void)stream;
     return TK_OK;
 }
+tk_status tk_laguna_decode_attn_v(tk_ctx* ctx, const float* q, const uint16_t* k_pool, const uint16_t* v_pool, const uint16_t* k_scale, const uint16_t* v_scale, int32_t n_head, int32_t n_kv, int32_t window, int32_t stride, const int32_t* pos_dev, int32_t n_split, float* part_acc, float* part_ml, int32_t n_tok, const int32_t* sel_dev, int32_t sel_k, bool sel_per_kv, int32_t sel_bs, tk_stream stream, int32_t plan) {
+    (void)plan;
+    return tk_laguna_decode_attn(ctx, q, k_pool, v_pool, k_scale, v_scale, n_head, n_kv, window, stride, pos_dev, n_split, part_acc, part_ml, n_tok, sel_dev, sel_k, sel_per_kv, sel_bs, stream);
+}
 tk_status tk_attn_merge_gate_quant(tk_ctx* ctx, const float* part_acc, const float* part_ml, const float* g, void* q8_out, int32_t n_head, int32_t n_split, int32_t n_tok, tk_stream stream) {
     (void)ctx; (void)part_acc; (void)part_ml; (void)g; (void)q8_out; (void)n_head; (void)n_split; (void)n_tok; (void)stream;
     return TK_OK;
@@ -5015,6 +5965,39 @@ tk_status tk_attn_k192_v128(tk_ctx* ctx, const float* q, const void* k_pool, con
     (void)ctx; (void)q; (void)k_pool; (void)v_pool; (void)k_scale; (void)v_scale; (void)out; (void)scratch; (void)n_tok; (void)n_head; (void)n_kv; (void)stride; (void)scale; (void)pos_dev; (void)n_split; (void)stream;
     return TK_OK;
 }
+tk_status tk_moe_add_slots_v(tk_ctx* ctx, float* x, const float* shared, const float* y, const int32_t* map_dev, const float* weights_dev, int32_t n_tok, int32_t n_embd, int32_t k, tk_stream stream, int32_t variant) {
+    (void)variant;
+    return tk_moe_add_slots(ctx, x, shared, y, map_dev, weights_dev, n_tok, n_embd, k, stream);
+}
+tk_status tk_laguna_prompt_attn_v(tk_ctx* ctx, const float* q, const uint16_t* k_pool, const uint16_t* v_pool, float* out, int32_t nq, int32_t q_pos0, int32_t n_head, int32_t n_kv, int32_t window, const int32_t* q_pos0_dev, int32_t n_split, float* part_acc, float* part_ml, bool merge, int32_t vt_stride, const uint16_t* k_scale, const uint16_t* v_scale, tk_stream stream, int32_t variant) {
+    (void)variant;
+    return tk_laguna_prompt_attn(ctx, q, k_pool, v_pool, out, nq, q_pos0, n_head, n_kv, window, q_pos0_dev, n_split, part_acc, part_ml, merge, vt_stride, k_scale, v_scale, stream);
+}
+tk_status tk_laguna_prompt_attn_wmma_v(tk_ctx* ctx, const float* q, const uint16_t* k_pool, const uint16_t* v_pool, float* out, int32_t nq, int32_t q_pos0, int32_t n_head, int32_t n_kv, int32_t window, int32_t vt_stride, const int32_t* q_pos0_dev, int32_t n_split, float* part_acc, float* part_ml, const uint16_t* k_scale, const uint16_t* v_scale, tk_stream stream, int32_t variant) {
+    (void)variant;
+    return tk_laguna_prompt_attn_wmma(ctx, q, k_pool, v_pool, out, nq, q_pos0, n_head, n_kv, window, vt_stride, q_pos0_dev, n_split, part_acc, part_ml, k_scale, v_scale, stream);
+}
+tk_status tk_attn_swa_sinks_plan(int32_t q8_kv, int32_t causal, int32_t head_dim, int32_t n_tok, int32_t n_head, int32_t n_kv, tk_mimo_swa_plan* out) {
+    (void)q8_kv; (void)causal; (void)head_dim; (void)n_tok; (void)n_head; (void)n_kv;
+    if (!out) return TK_ERR_NULL_PTR;
+    memset(out, 0, sizeof *out);
+    return TK_OK;
+}
+tk_status tk_attn_swa_sinks_planned(tk_ctx* ctx, const float* q, const void* k_pool, const void* v_pool, const uint16_t* k_scale, const uint16_t* v_scale, const float* sinks, float* out, float* scratch, int32_t n_tok, int32_t n_head, int32_t n_kv, int32_t head_dim, int32_t head_dim_v, int32_t window, int32_t stride, float scale, const int32_t* pos_dev, int32_t n_split, tk_stream stream, void* q8_out, void* q8_mmq, int32_t q8_layout, int32_t* q8_written, const tk_mimo_swa_plan* plan) {
+    (void)ctx; (void)q; (void)k_pool; (void)v_pool; (void)k_scale; (void)v_scale; (void)sinks; (void)out; (void)scratch; (void)n_tok; (void)n_head; (void)n_kv; (void)head_dim; (void)head_dim_v; (void)window; (void)stride; (void)scale; (void)pos_dev; (void)n_split; (void)stream; (void)q8_out; (void)q8_mmq; (void)q8_layout; (void)plan;
+    if (q8_written) *q8_written = 0;
+    return TK_OK;
+}
+tk_status tk_attn_k192_v128_plan(int32_t q8_kv, int32_t has_scratch, int32_t n_tok, int32_t n_head, int32_t n_kv, int32_t stride, int32_t n_split, tk_mimo_k192_plan* out) {
+    (void)q8_kv; (void)has_scratch; (void)n_tok; (void)n_head; (void)n_kv; (void)stride; (void)n_split;
+    if (!out) return TK_ERR_NULL_PTR;
+    memset(out, 0, sizeof *out);
+    return TK_OK;
+}
+tk_status tk_attn_k192_v128_planned(tk_ctx* ctx, const float* q, const void* k_pool, const void* v_pool, const uint16_t* k_scale, const uint16_t* v_scale, float* out, float* scratch, int32_t n_tok, int32_t n_head, int32_t n_kv, int32_t stride, float scale, const int32_t* pos_dev, int32_t n_split, tk_stream stream, void* q8_out, const tk_mimo_k192_plan* plan) {
+    (void)plan;
+    return tk_attn_k192_v128_q8(ctx, q, k_pool, v_pool, k_scale, v_scale, out, scratch, n_tok, n_head, n_kv, stride, scale, pos_dev, n_split, stream, q8_out);
+}
 tk_status tk_attn_k192_v128_q8(tk_ctx* ctx, const float* q, const void* k_pool, const void* v_pool, const uint16_t* k_scale, const uint16_t* v_scale, float* out, float* scratch, int32_t n_tok, int32_t n_head, int32_t n_kv, int32_t stride, float scale, const int32_t* pos_dev, int32_t n_split, tk_stream stream, void* q8_out) {
     (void)ctx; (void)q; (void)k_pool; (void)v_pool; (void)k_scale; (void)v_scale; (void)out; (void)scratch; (void)n_tok; (void)n_head; (void)n_kv; (void)stride; (void)scale; (void)pos_dev; (void)n_split; (void)stream; (void)q8_out;
     return TK_OK;
@@ -5065,6 +6048,19 @@ tk_status tk_prefill_moe_mmq_gu_q8(tk_ctx* ctx, const tk_moe_mmq_product* gate, 
     (void)ctx; (void)gate; (void)w_up; (void)swiglu_limit; (void)down_qtype; (void)xq_out; (void)xq_rows; (void)stream;
     return TK_ERR_UNSUPPORTED;
 }
+tk_status tk_prefill_moe_mmq_l(tk_ctx* ctx, const tk_moe_mmq_product* product, int32_t x_layout, tk_stream stream) {
+    (void)x_layout;
+    return tk_prefill_moe_mmq(ctx, product, stream);
+}
+tk_status tk_prefill_moe_mmq_gu_l(tk_ctx* ctx, const tk_moe_mmq_product* gate, const void* w_up, float swiglu_limit, int32_t x_layout, tk_stream stream) {
+    (void)x_layout;
+    return tk_prefill_moe_mmq_gu(ctx, gate, w_up, swiglu_limit, stream);
+}
+tk_status tk_prefill_moe_mmq_gu_q8_l(tk_ctx* ctx, const tk_moe_mmq_product* gate, const void* w_up, float swiglu_limit, int32_t down_qtype, void* xq_out, int64_t xq_rows, int32_t x_layout, tk_stream stream) {
+    (void)x_layout;
+    return tk_prefill_moe_mmq_gu_q8(ctx, gate, w_up, swiglu_limit, down_qtype, xq_out, xq_rows, stream);
+}
+int32_t tk_mmq_q8_buf_registered(const void* xq) { (void)xq; return 0; }
 tk_status tk_prefill_moe_mmq_iq(tk_ctx* ctx, tk_qtype gu_qtype, tk_qtype down_qtype, const void* const* expert_blobs, int32_t e0, int32_t e1, int32_t n_expert, int64_t n_routed_rows, int64_t n_embd, int64_t n_ff, const void* group_scratch, const void* x_act, const int32_t* src_rows_dev, void* h_act, float* down_out, tk_stream stream) {
     (void)ctx; (void)gu_qtype; (void)down_qtype; (void)expert_blobs; (void)e0; (void)e1; (void)n_expert; (void)n_routed_rows; (void)n_embd; (void)n_ff; (void)group_scratch; (void)x_act; (void)src_rows_dev; (void)h_act; (void)down_out; (void)stream;
     return TK_OK;
@@ -5468,6 +6464,14 @@ int talus_pf_fa_prefill(const float* q, const void* k, const void* vt, const flo
 int talus_pf_i8x_expand(const void* w, int32_t ggml_type, int32_t n, int32_t k, int8_t* qs, float* ws, void* stream) {
     (void)w; (void)ggml_type; (void)n; (void)k; (void)qs; (void)ws; (void)stream;
     return 0;
+}
+int talus_pf_i8gemm_v(const int8_t* qs, const float* ws, int32_t n, int32_t k, int32_t mode, const void* xq, int32_t T, float* dst, int64_t ld_dst, void* stream, int32_t variant) {
+    (void)qs; (void)ws; (void)n; (void)k; (void)mode; (void)xq; (void)T; (void)dst; (void)ld_dst; (void)stream; (void)variant;
+    return 0;
+}
+int talus_pf_i8gemm_swiglu_q8_v(const int8_t* qs, const float* ws, int32_t n, int32_t k, int32_t mode, const void* xq, int32_t T, const float* g, int64_t ldg, void* yq, int32_t layout, void* stream, int32_t variant) {
+    (void)qs; (void)ws; (void)n; (void)k; (void)mode; (void)xq; (void)T; (void)g; (void)ldg; (void)yq; (void)layout; (void)stream; (void)variant;
+    return -1;
 }
 int talus_pf_i8gemm(const int8_t* qs, const float* ws, int32_t n, int32_t k, int32_t mode, const void* xq, int32_t T, float* dst, int64_t ld_dst, void* stream) {
     (void)qs; (void)ws; (void)n; (void)k; (void)mode; (void)xq; (void)T; (void)dst; (void)ld_dst; (void)stream;

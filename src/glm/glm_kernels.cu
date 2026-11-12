@@ -5,6 +5,8 @@
 // (dsv4_hc_pre_mix, dsv4_hc_post, ssm_conv, swiglu_clamp, k-pool indexer). Block formats are ggml's (MIT).
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include "strata/kernels/variant_trace.hpp"   // S1
+#include "strata/kernels/gfx_arch.hpp"        // S6c (D4 arch gates)
 
 #include <cfloat>
 #include <cmath>
@@ -2875,20 +2877,14 @@ static int glm_mv_tile_cfg() {
 template <bool Q8, int RW, int TT, int SC>
 static bool tile_mv_go(const TileMV& m, int n_mats, int n_out_max, int n_in, int T, hipStream_t st) {
     if (n_in % (SC * (Q8 ? 256 : 128))) return false;
+    TALUS_VTRACE("glm_tile_mv", Q8 ? "q8" : "f32", RW * 100 + TT, SC, n_mats, n_in);
     const dim3 g((unsigned) ((n_out_max + 8 * RW - 1) / (8 * RW)), (unsigned) ((T + TT - 1) / TT), (unsigned) n_mats);
     hipLaunchKernelGGL((k_tile_mv<Q8, RW, TT, SC>), g, dim3(256), 0, st, m, n_in, T);
     return true;
 }
 // per-head Q8_0 mat-vecs (MLA wk_b 256 -> 512, wv_b 512 -> 256 per head) on k_tile_mv, opt-in GLM_MV_HEADS =
 // 1: 4 x 16 x 1, 2: 2 x 16 x 1, 3: 8 x 8 x 1 (bitwise the decode kernel k_heads_q8_0; measured slower than the wide
-// kernel at 512 rows (wk_b 2.2 -> 2.9-3.6 ms, wv_b ~equal), so off by default)
-static bool tile_heads_launch(const TileMV& m, int H, int n_out, int n_in, int T, hipStream_t st) {
-    static const int c = [] { const char* e = std::getenv("GLM_MV_HEADS"); return e ? std::atoi(e) : 0; }();
-    if (c <= 0 || !glm_mv_tile_on() || T <= 8 || n_in % 256) return false;
-    if (c == 2) return tile_mv_go<true, 2, 16, 1>(m, H, n_out, n_in, T, st);
-    if (c == 3) return tile_mv_go<true, 8, 8, 1>(m, H, n_out, n_in, T, st);
-    return tile_mv_go<true, 4, 16, 1>(m, H, n_out, n_in, T, st);
-}
+// kernel at 512 rows (wk_b 2.2 -> 2.9-3.6 ms, wv_b ~equal), so off by default): plans 101..103 of glm_heads_plan
 static bool tile_mv_launch(bool q8, const TileMV& m, int n_mats, int n_out_max, int n_in, int T, hipStream_t st) {
     if (!glm_mv_tile_on() || T <= 8 || n_mats < 1 || n_mats > 3 || n_out_max < 1) return false;
     const int c = glm_mv_tile_cfg();
@@ -3043,13 +3039,31 @@ __global__ __launch_bounds__(256) void k_wide_q8_wmma(WideQ8 m, int n_in, int T)
 #endif
 }
 
-// launch the Q8_0 wide kernel for n_in in {<=256, <=512, <=4096} (multiples of 32); false = not covered
-static bool wide_q8_launch(const WideQ8& m, int n_groups, int n_out_max, int n_in, int T, hipStream_t st) {
-    // For n_in > 512 (KDA f_a / g_a / beta, 4096 inputs), the register-resident form uses 128 weight VGPRs
-    // with low occupancy and the same x traffic, so keep 8-token tiles.
-    if (!glm_mv_wide_on() || n_in % 32 || n_in > 512) return false;
+// S6e: the wide Q8_0 kernel choice: 0 = not covered, 1 = N2 WMMA, 2 = two tokens per wave, 3 = KS 1 / RW 8,
+// 4 = KS 2 / RW 4 (the Rust host's copy: glm/plans.rs)
+static int wide_q8_variant(int n_out_max, int n_in) {
+    // n_in > 512 (KDA f_a / g_a / beta, 4096 inputs): the register-resident form measured slower than the 8-token
+    // kernel (1.6% -> 3.2% of an 8K prompt: 128 weight VGPRs, low occupancy, the same x traffic) -> 8-token tiles
+    if (!glm_mv_wide_on() || n_in % 32 || n_in > 512) return 0;
     static const bool n2 = [] { const char* e = std::getenv("GLM_N2"); return !e || e[0] != '0'; }();   // default ON (GLM_N2=0 = fp32 wide kernels)
-    if (n2 && n_out_max % 64 == 0) {   // fp16 WMMA (default on, output-changing)
+    // D4  S6c): k_wide_q8_wmma has a body only for gfx11; other targets take the fp32 wide kernels below
+    static const bool n2_arch = [] {
+        int dev = 0;
+        hipDeviceProp_t p{};
+        if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&p, dev) != hipSuccess) { (void) hipGetLastError(); return false; }
+        return strata::kernels::gfx_arch_is_gfx11_wmma(p.gcnArchName);
+    }();
+    if (n2 && n2_arch && n_out_max % 64 == 0) return 1;
+    if (n_in <= 128 && glm_mv_tile_on()) return 2;
+    return n_in <= 256 ? 3 : 4;
+}
+
+// launch the Q8_0 wide kernel for n_in in {<=256, <=512, <=4096} (multiples of 32); false = not covered
+static bool wide_q8_launch(const WideQ8& m, int n_groups, int n_out_max, int n_in, int T, hipStream_t st, int v = -1) {
+    if (v < 0) v = wide_q8_variant(n_out_max, n_in);
+    if (v == 0) return false;
+    if (v == 1) {   // fp16 WMMA (default on, output-changing)
+        TALUS_VTRACE("glm_wide_q8", "n2_wmma", n_in, n_out_max, n_groups);
         const dim3 g((unsigned) (n_out_max / 64), (unsigned) ((T + 63) / 64), (unsigned) n_groups);
         static const bool st_on = [] { const char* e = std::getenv("GLM_N2_ST"); return !e || e[0] != '0'; }();
         if (st_on) hipLaunchKernelGGL(k_wide_q8_wmma<true>, g, dim3(256), 0, st, m, n_in, T);
@@ -3065,13 +3079,15 @@ static bool wide_q8_launch(const WideQ8& m, int n_groups, int n_out_max, int n_i
         else hipLaunchKernelGGL((k_wide_q8_0<KS_, RW_>), g, dim3(256), 0, st, m, n_in, T);                            \
         return true;                                                                                                  \
     }
-    if (n_in <= 128 && glm_mv_tile_on()) {   // two tokens per wave (GLM_MV_TILE=0 = k_wide_q8_0<1, 8>)
+    if (v == 2) {   // two tokens per wave (GLM_MV_TILE=0 = k_wide_q8_0<1, 8>)
+        TALUS_VTRACE("glm_wide_q8", "h8", n_in, n_out_max, n_groups, pf ? 1 : 0);
         const dim3 g((unsigned) ((n_out_max + 63) / 64), ty, (unsigned) n_groups);
         if (pf) hipLaunchKernelGGL((k_wide_q8_0_h<8, true>), g, dim3(256), 0, st, m, n_in, T);
         else hipLaunchKernelGGL((k_wide_q8_0_h<8>), g, dim3(256), 0, st, m, n_in, T);
         return true;
     }
-    if (n_in <= 256) MVW_L(1, 8)
+    TALUS_VTRACE("glm_wide_q8", v == 3 ? "ks1_rw8" : "ks2_rw4", n_in, n_out_max, n_groups, pf ? 1 : 0);
+    if (v == 3) MVW_L(1, 8)
     MVW_L(2, 4)
 #undef MVW_L
     return false;
@@ -3263,27 +3279,42 @@ int tkg_argmax_rows(const float* x, int n, int rows, long ld, const int32_t* map
 
 
 
-int tkg_f32_matvec(const float* W, const float* x, float* y, int n_in, int n_out, int T, void* s) {
-    // The wide f32 form (k_wide_f32mv) is opt-in (GLM_MV_WIDE=2) because 8-token tiles have lower register pressure
-    // on the 4096-input router / indexer projections.
+// S7: kind * 1000 + config (the Rust host's copy: glm/plans.rs f32_matvec). 1 prompt tiles (GLM_MV_TILE's config),
+// 2 wide f32, 3 tiles of 8 tokens, 4 the decode kernel (config 1: batched loads).
+static int glm_f32_matvec_plan(int n_in, int n_out, int T) {
+    // The wide f32 form (k_wide_f32mv) measured slower than 8-token tiles for the 4096-input router / indexer
+    // projections (2.8% -> 7.6% of an 8K prompt), so it is opt-in only: GLM_MV_WIDE=2
     static const bool f32_wide = [] { const char* e = std::getenv("GLM_MV_WIDE"); return e && std::atoi(e) == 2; }();
-    if (T > 8) {   // rb-glm E1b: LDS-tiled prompt-chunk form (bitwise the 8-token tiles)
+    static const bool f32pf = [] { const char* e = std::getenv("GLM_F32MV_PF"); return !e || e[0] != '0'; }();
+    if (T > 8) {
+        const int c = glm_mv_tile_cfg();
+        if (glm_mv_tile_on() && n_out >= 1 && n_in % (c == 3 ? 128 : 256) == 0) return 1000 + c;   // rb-glm E1b (bitwise the 8-token tiles)
+        if (n_in % 4 == 0 && n_in <= 4096 && f32_wide) return 2000;
+        return 3000;
+    }
+    return f32pf && T <= 4 && n_in >= 1024 ? 4001 : 4000;   // batched loads (bitwise)
+}
+
+int tkg_f32_matvec_v(const float* W, const float* x, float* y, int n_in, int n_out, int T, void* s, int plan) {
+    const int lib = glm_f32_matvec_plan(n_in, n_out, T);
+    const int run = plan < 0 ? lib : strata::kernels::vtrace::plan_choose("tkg_f32_matvec", plan, lib);
+    TALUS_VTRACE("glm_f32_matvec", "plan", run, T > 8 ? 9 : T, n_in, n_out);
+    if (run / 1000 == 1) {
         TileMV m{};
         m.w[0] = W;
         m.x[0] = x;
         m.y[0] = y;
         m.n_out[0] = n_out;
         if (tile_mv_launch(false, m, 1, n_out, n_in, T, S(s))) return last();
-    }
-    if (T > 8 && n_in % 4 == 0 && n_in <= 4096 && f32_wide) {
+    } else if (run == 2000) {
         const dim3 g((unsigned) ((n_out + 7) / 8), (unsigned) ((T + MVW_TT - 1) / MVW_TT));
         hipLaunchKernelGGL((k_wide_f32mv<32>), g, dim3(256), 0, S(s), W, x, y, n_in, n_out, T);
         return last();
     }
     if (T > 8) {   // 8-token tiles (the decode kernel)
         for (int t0 = 0; t0 < T; t0 += 8) {
-            const int r = tkg_f32_matvec(W, x + (size_t) t0 * n_in, y + (size_t) t0 * n_out, n_in, n_out,
-                                         T - t0 < 8 ? T - t0 : 8, s);
+            const int r = tkg_f32_matvec_v(W, x + (size_t) t0 * n_in, y + (size_t) t0 * n_out, n_in, n_out,
+                                           T - t0 < 8 ? T - t0 : 8, s, -1);
             if (r) return r;
         }
         return 0;
@@ -3292,8 +3323,7 @@ int tkg_f32_matvec(const float* W, const float* x, float* y, int n_in, int n_out
     const dim3 g((n_out + 7) / 8);
     int64_t ld;
     const float* Wp = strata::kernels::rowpad_lookup(W, n_in, n_out, &ld);   // the padded router rows (same bits)
-    static const bool f32pf = [] { const char* e = std::getenv("GLM_F32MV_PF"); return !e || e[0] != '0'; }();
-    if (f32pf && T <= 4 && n_in >= 1024) {   // batched loads (bitwise)
+    if (run == 4001 && T <= 4) {
         switch (T) {
             case 1: hipLaunchKernelGGL((k_f32mv<1, true>), g, dim3(256), 0, S(s), Wp, x, y, n_in, n_out, ld); break;
             case 2: hipLaunchKernelGGL((k_f32mv<2, true>), g, dim3(256), 0, S(s), Wp, x, y, n_in, n_out, ld); break;
@@ -3310,6 +3340,9 @@ int tkg_f32_matvec(const float* W, const float* x, float* y, int n_in, int n_out
         default: hipLaunchKernelGGL((k_f32mv<8>), g, dim3(256), 0, S(s), Wp, x, y, n_in, n_out, ld); break;  // T 5..8
     }
     return last();
+}
+int tkg_f32_matvec(const float* W, const float* x, float* y, int n_in, int n_out, int T, void* s) {
+    return tkg_f32_matvec_v(W, x, y, n_in, n_out, T, s, -1);
 }
 
 // tkg_f32_matvec (n_out experts) + tkg_router in one launch, bitwise; cnt = 1 zeroed int (left zero).
@@ -3329,8 +3362,29 @@ int tkg_f32mv_router(const float* W, const float* x, float* logits, int n_in, in
     return last();
 }
 
-int tkg_heads_q8_0(const void* W, const float* x, float* y, int H, int n_in, int n_out, int T, void* s) {
-    if (T > 8 && n_in % 256 == 0) {   // prompt chunks in one launch
+// S6e: the T > 8 cascades as a plan: 0 = the <= 8 token kernels, 101..103 = tile (GLM_MV_HEADS / GLM_MV_TILE
+// configuration), 201..204 = wide_q8_variant, 300 = 8-token host loop.
+static int glm_heads_plan(int n_in, int n_out, int T) {
+    if (T <= 8 || n_in % 256) return 0;
+    static const int c = [] { const char* e = std::getenv("GLM_MV_HEADS"); return e ? std::atoi(e) : 0; }();
+    if (c > 0 && glm_mv_tile_on()) return 100 + (c == 2 || c == 3 ? c : 1);
+    const int w = wide_q8_variant(n_out, n_in);
+    return w ? 200 + w : 300;
+}
+static int glm_multi_plan(int n_mats, int mx, int n_in, int T) {
+    if (T <= 8 || n_mats < 1 || n_mats > 3 || n_in % 32) return 0;
+    const int w = wide_q8_variant(mx, n_in);
+    if (w) return 200 + w;
+    if (glm_mv_tile_on() && mx >= 1 && n_in > 512) {
+        const int c = glm_mv_tile_cfg();
+        const int cc = c == 2 || c == 3 ? c : 1;
+        if (n_in % ((cc == 1 ? 2 : 1) * 256) == 0) return 400 + cc;
+    }
+    return 300;
+}
+
+static int heads_q8_0_run(const void* W, const float* x, float* y, int H, int n_in, int n_out, int T, void* s, int plan) {
+    if (plan != 0) {   // prompt chunks in one launch
         WideQ8 m{};
         m.w[0] = static_cast<const block_q8_0*>(W);
         m.x[0] = x;
@@ -3345,9 +3399,12 @@ int tkg_heads_q8_0(const void* W, const float* x, float* y, int H, int n_in, int
             tm.y[0] = y;
             tm.n_out[0] = n_out;
             tm.H = H;
-            if (tile_heads_launch(tm, H, n_out, n_in, T, S(s))) return last();
+            if (plan == 102 && tile_mv_go<true, 2, 16, 1>(tm, H, n_out, n_in, T, S(s))) return last();
+            if (plan == 103 && tile_mv_go<true, 8, 8, 1>(tm, H, n_out, n_in, T, S(s))) return last();
+            if (plan == 101 && tile_mv_go<true, 4, 16, 1>(tm, H, n_out, n_in, T, S(s))) return last();
         }
-        if (wide_q8_launch(m, H, n_out, n_in, T, S(s))) return last();
+        if (plan > 200 && plan < 300 && wide_q8_launch(m, H, n_out, n_in, T, S(s), plan - 200)) return last();
+        TALUS_VTRACE("glm_heads_q8", "loop8", H, n_in, n_out);
         for (int t0 = 0; t0 < T; t0 += 8) {
             const int r = tkg_heads_q8_0(W, x + (size_t) t0 * H * n_in, y + (size_t) t0 * H * n_out, H, n_in, n_out,
                                          T - t0 < 8 ? T - t0 : 8, s);
@@ -3369,6 +3426,14 @@ int tkg_heads_q8_0(const void* W, const float* x, float* y, int H, int n_in, int
         default: hipLaunchKernelGGL((k_heads_q8_0<8>), g, dim3(256), 0, S(s), w, x, y, H, n_in, n_out); break;
     }
     return last();
+}
+int tkg_heads_q8_0(const void* W, const float* x, float* y, int H, int n_in, int n_out, int T, void* s) {
+    return heads_q8_0_run(W, x, y, H, n_in, n_out, T, s, glm_heads_plan(n_in, n_out, T));
+}
+int tkg_heads_q8_0_v(const void* W, const float* x, float* y, int H, int n_in, int n_out, int T, void* s, int plan) {
+    const int lib = glm_heads_plan(n_in, n_out, T);
+    return heads_q8_0_run(W, x, y, H, n_in, n_out, T, s,
+                          plan < 0 ? lib : strata::kernels::vtrace::plan_choose("tkg_heads_q8_0", plan, lib));
 }
 
 // lever 4: tkg_heads_q8_0 for a prompt chunk with the [T][H n_out] outputs written only as the MMQ q8_1 rows row0 ..
@@ -3475,6 +3540,7 @@ int tkg_hc_post_mix_moe(const float* y, const float* w, const float* shexp, floa
     if (n_embd % (HC_NS * 2)) return err(hipErrorInvalidValue);
     const dim3 g(HC_NS, T);
     if (std::exchange(talus::prefill::g_w16_ed16, 0)) {   // the expert rows are fp16
+        TALUS_VTRACE("glm_hc_post_mix_moe", "ed16");
         hipLaunchKernelGGL((k_hc_post_mix_moe<float, _Float16>), g, dim3(256), 0, S(s), reinterpret_cast<const _Float16*>(y), w, shexp,
                            xhc, pc, static_cast<const block_q8_0*>(w_next), parts, k, n_embd);
         return last();
@@ -3629,6 +3695,7 @@ int tkg_hc_post_mix_moe_pre(const float* ey, const float* ew, const float* shexp
     if (n_embd % (HC_NS * 2) || (n_embd / HC_NS) % 32 || !w_next) return -1;
     const dim3 g(HC_NS, T);
     if (std::exchange(talus::prefill::g_w16_ed16, 0)) {   // the expert rows are fp16
+        TALUS_VTRACE("glm_hc_post_mix_moe", "ed16");
         hipLaunchKernelGGL(k_hc_post_mix_moe_pre<_Float16>, g, dim3(256), 0, S(s), reinterpret_cast<const _Float16*>(ey), ew, shexp,
                            xhc, pc, static_cast<const block_q8_0*>(w_next), parts, k, n_embd, scale, base, norm_w, y, rms_eps,
                            norm_eps, hc_eps, iters, static_cast<q8_1_blk*>(yq), cnt, MmqY{});
@@ -3641,9 +3708,9 @@ int tkg_hc_post_mix_moe_pre(const float* ey, const float* ew, const float* shexp
 }
 
 
-int tkg_multi_q8_0(int n_mats, const void* const* w, const float* const* x, float* const* y, const int* n_out, int n_in,
-                   int T, void* s) {
-    if (T > 8 && n_mats >= 1 && n_mats <= 3 && n_in % 32 == 0) {   // prompt chunks in one launch
+static int multi_q8_0_run(int n_mats, const void* const* w, const float* const* x, float* const* y, const int* n_out,
+                          int n_in, int T, void* s, int plan) {
+    if (plan != 0) {   // prompt chunks in one launch
         WideQ8 m{};
         int mx = 0;
         for (int i = 0; i < n_mats; ++i) {
@@ -3654,7 +3721,7 @@ int tkg_multi_q8_0(int n_mats, const void* const* w, const float* const* x, floa
             mx = n_out[i] > mx ? n_out[i] : mx;
         }
         m.n_mats = n_mats;
-        if (wide_q8_launch(m, n_mats, mx, n_in, T, S(s))) return last();
+        if (plan > 200 && plan < 300 && wide_q8_launch(m, n_mats, mx, n_in, T, S(s), plan - 200)) return last();
         {   // rb-glm E1b: 4096-input matrices (KDA f_a / g_a / beta) on the LDS-tiled form (bitwise the 8-token tiles)
             TileMV tm{};
             for (int i = 0; i < n_mats; ++i) {
@@ -3663,8 +3730,11 @@ int tkg_multi_q8_0(int n_mats, const void* const* w, const float* const* x, floa
                 tm.y[i] = y[i];
                 tm.n_out[i] = n_out[i];
             }
-            if (tile_mv_launch(true, tm, n_mats, mx, n_in, T, S(s))) return last();
+            if (plan == 402 && tile_mv_go<true, 4, 16, 1>(tm, n_mats, mx, n_in, T, S(s))) return last();
+            if (plan == 403 && tile_mv_go<true, 8, 8, 1>(tm, n_mats, mx, n_in, T, S(s))) return last();
+            if (plan == 401 && tile_mv_go<true, 8, 8, 2>(tm, n_mats, mx, n_in, T, S(s))) return last();
         }
+        TALUS_VTRACE("glm_multi_q8", "loop8", n_mats, n_in, mx);
         for (int t0 = 0; t0 < T; t0 += 8) {
             const float* xt[3];
             float* yt[3];
@@ -3689,6 +3759,7 @@ int tkg_multi_q8_0(int n_mats, const void* const* w, const float* const* x, floa
     }
     const dim3 g((mx + 7) / 8, n_mats);
     static const bool pf = [] { const char* e = std::getenv("GLM_MQ8_PF"); return !e || e[0] != '0'; }();
+    TALUS_VTRACE("glm_multi_q8", (pf && T <= 4 && n_in >= 1024) ? "pf" : "plain", T, n_mats, n_in, mx);
     if (pf && T <= 4 && n_in >= 1024) {   // 4 K steps' loads in flight (bitwise)
         switch (T) {
             case 1: hipLaunchKernelGGL((k_multi_q8_0<1, true>), g, dim3(256), 0, S(s), m, n_in); break;
@@ -3709,6 +3780,21 @@ int tkg_multi_q8_0(int n_mats, const void* const* w, const float* const* x, floa
         default: hipLaunchKernelGGL((k_multi_q8_0<8>), g, dim3(256), 0, S(s), m, n_in); break;
     }
     return last();
+}
+static int glm_multi_mx(int n_mats, const int* n_out) {
+    int mx = 0;
+    for (int i = 0; i < n_mats && i < 3; ++i) mx = n_out[i] > mx ? n_out[i] : mx;
+    return mx;
+}
+int tkg_multi_q8_0(int n_mats, const void* const* w, const float* const* x, float* const* y, const int* n_out, int n_in,
+                   int T, void* s) {
+    return multi_q8_0_run(n_mats, w, x, y, n_out, n_in, T, s, glm_multi_plan(n_mats, glm_multi_mx(n_mats, n_out), n_in, T));
+}
+int tkg_multi_q8_0_v(int n_mats, const void* const* w, const float* const* x, float* const* y, const int* n_out, int n_in,
+                     int T, void* s, int plan) {
+    const int lib = glm_multi_plan(n_mats, glm_multi_mx(n_mats, n_out), n_in, T);
+    return multi_q8_0_run(n_mats, w, x, y, n_out, n_in, T, s,
+                          plan < 0 ? lib : strata::kernels::vtrace::plan_choose("tkg_multi_q8_0", plan, lib));
 }
 
 
@@ -3759,6 +3845,23 @@ int tkg_glm_mmvq_ids_pair(int qtype, const void* w, const void* w2, const void* 
     return err(e);
 }
 
+// S7: the expert mat-vec with the host's (rust glm/plans.rs) config, library's for one release (plan_choose)
+int tkg_glm_mmvq_ids_v(int qtype, const void* w, const void* xq, const int32_t* ids, float* y, int N, int K,
+                       int n_expert_used, int n_tokens, int x_group, int ids_s1, void* s, int plan) {
+    const int run = strata::kernels::vtrace::plan_choose("tkg_glm_mmvq_ids", plan, talus::glm_spike::glm_mmvq_plan(qtype, K, n_tokens));
+    const talus::glm_spike::GlmMmvqCfg c = talus::glm_spike::glm_mmvq_cfg_of_plan(run);
+    return err(talus::glm_spike::glm_mmvq_ids_cfg(qtype, w, xq, ids, y, N, K, n_expert_used, n_tokens, x_group, ids_s1, &c, S(s)));
+}
+int tkg_glm_mmvq_ids_pair_v(int qtype, const void* w, const void* w2, const void* xq, const int32_t* ids, float* y,
+                            float* y2, int N, int K, int n_expert_used, int n_tokens, int x_group, int ids_s1, void* s, int plan) {
+    const int run = strata::kernels::vtrace::plan_choose("tkg_glm_mmvq_ids_pair", plan, talus::glm_spike::glm_mmvq_plan(qtype, K, n_tokens));
+    const talus::glm_spike::GlmMmvqCfg c = talus::glm_spike::glm_mmvq_cfg_of_plan(run);
+    const hipError_t e = talus::glm_spike::glm_mmvq_ids_pair(qtype, w, w2, xq, ids, y, y2, N, K, n_expert_used, n_tokens,
+                                                            x_group, ids_s1, S(s), &c);
+    if (e == hipErrorNotSupported) return -1;
+    return err(e);
+}
+
 int tkg_glm_kda_step(const float* q, const float* k, const float* v, const float* g, const float* beta, float* state,
                      const int32_t* ids, const float* dtb, const float* a, float* dst, int H, int S_v, int T,
                      int K_snap, float scale, float pro_lb, float pro_l2_eps, void* s) {
@@ -3768,10 +3871,12 @@ int tkg_glm_kda_step(const float* q, const float* k, const float* v, const float
 
 // KDA conv + step + gate (q8_1 out) in one launch, bitwise the three launches (tkg_kda_conv, tkg_glm_kda_step,
 // tkg_kda_gate_q8); `cnt` = H ints of zeros (left zero). -1 = configuration without a fused kernel (use the three).
-int tkg_kda_fused(const float* qr, const float* kr, const float* vr, float* conv_state, const float* wq, const float* wk,
+// S7: host_cfg >= 0: the step layout from the host (rust glm/plans.rs kda_fused), library's for one release;
+// tkg_kda_fused passes -1.
+static int kda_fused_impl(const float* qr, const float* kr, const float* vr, float* conv_state, const float* wq, const float* wk,
                   const float* wv, const float* g, const float* beta, float* state, const int32_t* ids, const float* dtb,
                   const float* a, float* o, const float* g2, const float* onorm_w, void* oq, int* cnt, int H, int D,
-                  int T, int K_snap, float scale, float pro_lb, float pro_l2_eps, float gate_eps, void* s) {
+                  int T, int K_snap, float scale, float pro_lb, float pro_l2_eps, float gate_eps, void* s, int host_cfg) {
     if (D != 128 || T < 1 || T > 8 || K_snap < 1 || K_snap > T) return -1;
     // the step layout glm_kda_step picks on this arch (GLM HIP v2: gfx1151 auto, or GLM_KDA_CPW = 10000 + 100 NWV + CPW)
     static const int cfg_env = [] { const char* e = std::getenv("GLM_KDA_CPW"); return e ? std::atoi(e) : 0; }();
@@ -3781,7 +3886,9 @@ int tkg_kda_fused(const float* qr, const float* kr, const float* vr, float* conv
         if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&p, dev) != hipSuccess) { (void) hipGetLastError(); return false; }
         return std::strncmp(p.gcnArchName, "gfx1151", 7) == 0;
     }();
-    const int cfg = cfg_env > 0 ? cfg_env : (gfx1151 ? (T <= 1 ? 11601 : 10808) : 0);
+    const int lib_cfg = cfg_env > 0 ? cfg_env : (gfx1151 ? (T <= 1 ? 11601 : 10808) : 0);
+    const int cfg = host_cfg < 0 ? lib_cfg : strata::kernels::vtrace::plan_choose("tkg_kda_fused", host_cfg, lib_cfg);
+    TALUS_VTRACE("glm_kda_fused", "cfg", cfg, T <= 1 ? 1 : 2, gfx1151 ? 1 : 0);
 #define KF_L(CPW_, NWV_)                                                                                               \
     if (cfg == 10000 + 100 * NWV_ + CPW_) {                                                                          \
         hipLaunchKernelGGL((k_kda_fused<CPW_, NWV_>), dim3(H, 128 / (CPW_ * NWV_)), dim3(32 * NWV_), 0, S(s), qr, kr, \
@@ -3793,6 +3900,21 @@ int tkg_kda_fused(const float* qr, const float* kr, const float* vr, float* conv
     KF_L(1, 16) KF_L(8, 8) KF_L(2, 8) KF_L(4, 8) KF_L(1, 8) KF_L(2, 16) KF_L(4, 16)
 #undef KF_L
     return -1;
+}
+
+int tkg_kda_fused(const float* qr, const float* kr, const float* vr, float* conv_state, const float* wq, const float* wk,
+                  const float* wv, const float* g, const float* beta, float* state, const int32_t* ids, const float* dtb,
+                  const float* a, float* o, const float* g2, const float* onorm_w, void* oq, int* cnt, int H, int D,
+                  int T, int K_snap, float scale, float pro_lb, float pro_l2_eps, float gate_eps, void* s) {
+    return kda_fused_impl(qr, kr, vr, conv_state, wq, wk, wv, g, beta, state, ids, dtb, a, o, g2, onorm_w, oq, cnt, H, D, T,
+                          K_snap, scale, pro_lb, pro_l2_eps, gate_eps, s, -1);
+}
+int tkg_kda_fused_v(const float* qr, const float* kr, const float* vr, float* conv_state, const float* wq, const float* wk,
+                    const float* wv, const float* g, const float* beta, float* state, const int32_t* ids, const float* dtb,
+                    const float* a, float* o, const float* g2, const float* onorm_w, void* oq, int* cnt, int H, int D,
+                    int T, int K_snap, float scale, float pro_lb, float pro_l2_eps, float gate_eps, void* s, int cfg) {
+    return kda_fused_impl(qr, kr, vr, conv_state, wq, wk, wv, g, beta, state, ids, dtb, a, o, g2, onorm_w, oq, cnt, H, D, T,
+                          K_snap, scale, pro_lb, pro_l2_eps, gate_eps, s, cfg);
 }
 
 // prompt-window conv + step (k_kda_step_conv_pf), bitwise tkg_kda_conv then tkg_glm_kda_step; -1 = not covered
@@ -3815,6 +3937,26 @@ int tkg_glm_indexer(const float* q, const void* k, const float* w, float* dst, i
                     void* s) {
     return err(talus::glm_spike::glm_dsa_lightning_indexer(q, k, w, dst, D, H, n_kv, n_tokens, 1, true, S(s)));
 }
+// S6e: with the host's plan (glm/plans.rs; 1000000 = N3 WMMA, else variant * 10000 + nwv * 100 + tf). For one
+// release: compared with the library's own (plan_choose); a value that differs and is trusted runs through the cfg form.
+int tkg_glm_indexer_v(const float* q, const void* k, const float* w, float* dst, int D, int H, int n_kv, int n_tokens,
+                      void* s, int plan) {
+    const int lib = talus::glm_spike::glm_lightning_indexer_plan(H, n_kv, n_tokens, true);
+    const int run = plan < 0 ? lib : strata::kernels::vtrace::plan_choose("tkg_glm_indexer", plan, lib);
+    if (run == lib || run == 1000000)
+        return err(talus::glm_spike::glm_dsa_lightning_indexer(q, k, w, dst, D, H, n_kv, n_tokens, 1, true, S(s)));
+    const talus::glm_spike::GlmLiCfg c{run / 10000, (run / 100) % 100, run % 100};
+    return err(talus::glm_spike::glm_dsa_lightning_indexer_cfg(q, k, w, dst, D, H, n_kv, n_tokens, 1, true, &c, S(s)));
+}
+int tkg_glm_kda_step_v(const float* q, const float* k, const float* v, const float* g, const float* beta, float* state,
+                       const int32_t* ids, const float* dtb, const float* a, float* dst, int H, int S_v, int T, int K_snap,
+                       float scale, float pro_lb, float pro_l2_eps, void* s, int plan) {
+    // plan = cols_per_wave * 10 + the prompt v3 kernel on (GLM_KDA_CPW / per-arch table, GLM_KDA_V3)
+    const int lib = talus::glm_spike::glm_kda_step_plan(T, 1);
+    const int run = plan < 0 ? lib : strata::kernels::vtrace::plan_choose("tkg_glm_kda_step", plan, lib);
+    return err(talus::glm_spike::glm_kda_step(q, k, v, g, beta, state, ids, dtb, a, dst, H, S_v, T, K_snap, 1, scale,
+                                              true, pro_lb, pro_l2_eps, run / 10, S(s), run % 10));
+}
 
 int tkg_glm_sparse_fa_idx(const float* q, const void* kv, const void* zero_mask, const int32_t* idx, float* split,
                           float* dst, int D, int H, int N, int n_kv_max, uint32_t q_nb1, uint32_t q_nb2,
@@ -3822,6 +3964,21 @@ int tkg_glm_sparse_fa_idx(const float* q, const void* kv, const void* zero_mask,
     return err(talus::glm_spike::glm_dsa_sparse_fa_idx(q, static_cast<const __half*>(kv),
                                                        static_cast<const __half*>(zero_mask), idx, split, dst, D, H, N,
                                                        n_kv_max, q_nb1, q_nb2, k_stride, scale, S(s)));
+}
+
+// S6e: with the host's plan (kind * 100000 + k_num: kind 1 two-pass, 2 / 3 WMMA 1 / 2 tiles, 4 fdot2 + split-K)
+int tkg_glm_sparse_fa_idx_v(const float* q, const void* kv, const void* zero_mask, const int32_t* idx, float* split,
+                            float* dst, int D, int H, int N, int n_kv_max, uint32_t q_nb1, uint32_t q_nb2,
+                            uint32_t k_stride, float scale, void* s, int plan) {
+    const int lib = talus::glm_spike::glm_sparse_fa_idx_plan(q, kv, dst, D, H, N, n_kv_max, q_nb1, q_nb2, k_stride, S(s));
+    const int run = plan < 0 ? lib : strata::kernels::vtrace::plan_choose("tkg_glm_sparse_fa_idx", plan, lib);
+    return err(talus::glm_spike::glm_dsa_sparse_fa_idx(q, static_cast<const __half*>(kv),
+                                                       static_cast<const __half*>(zero_mask), idx, split, dst, D, H, N,
+                                                       n_kv_max, q_nb1, q_nb2, k_stride, scale, S(s), run));
+}
+
+void tkg_glm_sparse_2p_set_pool(float* pool, int* locks, int nslot) {
+    talus::glm_spike::glm_sparse_2p_set_pool(pool, locks, nslot);
 }
 
 size_t tkg_glm_sparse_fa_split_bytes(int D, int H, int N, int n_kv_max) {

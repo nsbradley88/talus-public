@@ -307,6 +307,37 @@ fn c_atoi(s: &str) -> i32 {
     c_atoll(s) as i32
 }
 /// `e && e[0] == c`
+/// S8c: the gather-free group rule computed here, the library's (`tk_qwen4exp_p2_mmq_inplace_ok`) cross-checks for one release.
+fn inplace_ok(f: &P2Ffi, ty: i32, n: i64, k: i64) -> bool {
+    // SAFETY: plain C query.
+    let lib = unsafe { (f.mmq_inplace_ok)(ty, n, k) } != 0;
+    let host = crate::pf_plans::moe_inplace_ok(ty, n, k);
+    crate::pf_plans::plan_choose(
+        "tk_qwen4exp_p2_mmq_inplace_ok",
+        i32::from(host),
+        i32::from(lib),
+    ) != 0
+}
+
+/// S8c: the host's tp_moe kernel version for the next products on this thread (optional symbol; < 0 = the library's).
+fn moe_host_version(v: i32) {
+    static F: OnceLock<Option<unsafe extern "C" fn(i32)>> = OnceLock::new();
+    // SAFETY: void(int32_t) in include/talus_qwen4exp_kernels.h; the library is loaded RTLD_GLOBAL.
+    if let Some(f) = *F.get_or_init(|| unsafe {
+        super::ffi::load_sym_from(std::ptr::null_mut(), "tk_qwen4exp_p2_moe_host_version").ok()
+    }) {
+        // SAFETY: as above.
+        unsafe { f(v) };
+    }
+}
+
+/// S8: the tp_moe rule for an MMQ product (prefill.cpp `run_mmq_product`): `TALUS_PF_MOE` not "0...", at least one
+/// expert, no per-row activation scales. `tk_qwen4exp_p2_mmq_product` adds the kernel's own shape check (`moe_supported`).
+fn tp_moe_allowed(n_experts: i32, no_y_scale: bool) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !env_first_is("TALUS_PF_MOE", b'0')) && n_experts >= 1 && no_y_scale
+}
+
 fn env_first_is(name: &str, c: u8) -> bool {
     env_str(name)
         .map(|v| v.as_bytes().first() == Some(&c))
@@ -825,7 +856,6 @@ impl<'a> Ctx<'a> {
 #[allow(clippy::too_many_arguments)]
 fn ple_gather(
     f: P2Ffi,
-    consts: SendPtr<c_void>,
     table: SendPtr<c_void>,
     direct: bool,
     threads: i64,
@@ -850,15 +880,11 @@ fn ple_gather(
     let mut pv = [at(c0), at(c0 + 1)];
     for t in 0..t_n {
         let tok = unsafe { *tokens.get().add((c0 + t) as usize) as i32 };
-        unsafe {
-            (f.ple_ngram_rows)(
-                consts.get(),
-                &tok,
-                pv.as_ptr(),
-                1,
-                rows.get().add((t * ple_n_heads) as usize),
-            );
-        }
+        // SAFETY: `rows` holds t_n * ple_n_heads (16) rows; this thread owns the window's slice.
+        let out = unsafe {
+            std::slice::from_raw_parts_mut(rows.get().add((t * ple_n_heads) as usize), 16)
+        };
+        super::weights::ngram_rows_one(tok, pv, out);
         pv[0] = pv[1];
         pv[1] = tok;
     }
@@ -904,6 +930,123 @@ fn ple_gather(
     gather(0, t_n)
 }
 
+/// D3b-1: the picture-row entries (optional symbols; a library without them keeps declining picture rows).
+#[derive(Clone, Copy)]
+struct PicFfi {
+    embd_rows: unsafe extern "C" fn(*mut c_void) -> *const *const f32,
+    acquire: unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void,
+    submit:
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, u64, *mut c_void) -> c_int,
+}
+
+fn pic_ffi() -> Option<&'static PicFfi> {
+    static F: OnceLock<Option<PicFfi>> = OnceLock::new();
+    F.get_or_init(|| unsafe {
+        use super::ffi::load_sym_from as l;
+        let n = std::ptr::null_mut();
+        Some(PicFfi {
+            embd_rows: l(n, "tk_qwen4exp_p2_embd_rows").ok()?,
+            acquire: l(n, "tk_qwen4exp_p2_upring_acquire").ok()?,
+            submit: l(n, "tk_qwen4exp_p2_upring_submit").ok()?,
+        })
+    })
+    .as_ref()
+}
+
+/// The chunk's picture rows into `emb` (prefill.cpp 2462-2487): text cells one by one through `embed_row`, each run of
+/// picture rows gathered into one pinned slot and sent up as one copy (row by row from the caller's memory, each copy
+/// waited for, when no slot can be had); device runs as one device-to-device copy each.
+#[allow(clippy::too_many_arguments)]
+unsafe fn embed_chunk_rows(
+    f: &P2Ffi,
+    pic: &crate::qwen4exp::picture::PictureRows,
+    pf: *mut c_void,
+    m: &TkP2Layout,
+    tokens: *const i64,
+    c0: i64,
+    p0: i64,
+    t_n: i64,
+    nn: i64,
+    cs: *mut c_void,
+) -> Result<(), String> {
+    use crate::qwen4exp::picture::RowSrc;
+    let pfn = pic_ffi().ok_or("prefill: picture rows without the D3b-1 entries")?;
+    let row_bytes = (nn * 4) as u64;
+    let runs = pic.chunk_runs(p0, t_n, nn);
+    let mut ri = 0usize;
+    let mut t = 0i64;
+    while t < t_n {
+        if ri < runs.len() && runs[ri].t0 == t {
+            let r = runs[ri];
+            ri += 1;
+            let dst = m.emb.add((t * nn) as usize);
+            match r.src {
+                RowSrc::Host(_) => {
+                    let bytes = r.n as u64 * row_bytes;
+                    let stage = (pfn.acquire)(pf, bytes);
+                    let ok = if !stage.is_null() {
+                        for j in 0..r.n {
+                            let Some(RowSrc::Host(src)) = pic.row(p0 + t + j) else {
+                                return Err("prefill: picture run changed under the gather".into());
+                            };
+                            std::ptr::copy_nonoverlapping(
+                                src.cast::<u8>(),
+                                stage.cast::<u8>().add((j as u64 * row_bytes) as usize),
+                                row_bytes as usize,
+                            );
+                        }
+                        (pfn.submit)(pf, dst.cast(), stage, bytes, cs) != 0
+                    } else {
+                        let mut ok = true;
+                        for j in 0..r.n {
+                            let Some(RowSrc::Host(src)) = pic.row(p0 + t + j) else {
+                                return Err("prefill: picture run changed under the gather".into());
+                            };
+                            ok = (f.memcpy)(
+                                dst.add((j * nn) as usize).cast(),
+                                src.cast(),
+                                row_bytes,
+                                H2D,
+                                cs,
+                            ) != 0
+                                && (f.stream_sync)(cs) != 0;
+                            if !ok {
+                                break;
+                            }
+                        }
+                        ok
+                    };
+                    if !ok {
+                        return Err("prefill: the image embedding upload failed".into());
+                    }
+                }
+                RowSrc::Device(src) => {
+                    if (f.memcpy)(dst.cast(), src.cast(), r.n as u64 * row_bytes, D2D, cs) == 0 {
+                        return Err("prefill: the image embedding copy failed".into());
+                    }
+                }
+            }
+            t += r.n;
+        } else {
+            let mut eb = [0 as c_char; 512];
+            if (f.embed_row)(
+                m.wt,
+                m.g,
+                *tokens.add((c0 + t) as usize),
+                m.emb.add((t * nn) as usize),
+                cs,
+                eb.as_mut_ptr(),
+                eb.len(),
+            ) == 0
+            {
+                return Err(CStr::from_ptr(eb.as_ptr()).to_string_lossy().into_owned());
+            }
+            t += 1;
+        }
+    }
+    Ok(())
+}
+
 /// Why a mode is declined (the C++ path runs it), or None.
 fn decline_reason(m: &TkP2Layout, e: &Env) -> Option<&'static str> {
     if m.metal != 0 {
@@ -918,8 +1061,8 @@ fn decline_reason(m: &TkP2Layout, e: &Env) -> Option<&'static str> {
     if m.has_cpu_pool != 0 && m.cpu_share_on != 0 {
         return Some("the CPU expert share");
     }
-    if m.has_embd_rows != 0 {
-        return Some("picture rows");
+    if m.has_embd_rows != 0 && pic_ffi().is_none() {
+        return Some("picture rows (library without the D3b-1 entries)");
     }
     if m.has_on_stage_chunk != 0 {
         return Some("on_stage_chunk");
@@ -1090,7 +1233,7 @@ unsafe fn run_chunks(
         ple_next: None,
     };
     let spawn_gather = |c0: i64, buf: usize| -> JoinHandle<Result<(), String>> {
-        let (consts, table) = (SendPtr(m.ple_consts), SendPtr(m.ple_table));
+        let table = SendPtr(m.ple_table);
         let (tok, rows, emb_h) = (
             SendPtr(tokens as *mut i64),
             SendPtr(m.ple_rows[buf]),
@@ -1106,13 +1249,44 @@ unsafe fn run_chunks(
         std::thread::spawn(move || {
             (f.pin_thread)();
             ple_gather(
-                f, consts, table, direct, threads, tok, n, mt, prev0, c0, rows, emb_h, pnh, nge,
+                f, table, direct, threads, tok, n, mt, prev0, c0, rows, emb_h, pnh, nge,
             )
         })
     };
     let mut ple_buf = 0usize;
     let dump_dir = env_str("TALUS_FN_DUMP").filter(|v| !v.is_empty());
 
+    // D3b-2: device pictures set by the Rust serve loop for this request (an in-process encoder's rows); they
+    // never reach the C++ structures (embd_rows stays null), so they are taken first
+    let dev_images: Option<(Vec<(i64, i64, *const f32)>, i64)> =
+        crate::qwen4exp::picture::with_device_pictures(|d| d.map(|d| (d.images.clone(), d.n_embd)));
+    // D3b-1: the prompt's picture rows (the table is indexed by absolute cell, as prefill.cpp's embd_rows[p0 + t])
+    let pic = if let Some((images, ne)) = dev_images.as_ref() {
+        if env_str("TALUS_FN_P2_SAY").is_some() {
+            eprintln!(
+                "talus-qwen4exp: qwen4exp-p2 takes device picture rows (cells {pos0}..{}, {} picture(s))",
+                pos0 + n,
+                images.len()
+            );
+        }
+        Some(crate::qwen4exp::picture::PictureRows::Device {
+            images,
+            n_embd: *ne,
+        })
+    } else if m.has_embd_rows != 0 {
+        let pfn = pic_ffi().ok_or("prefill: picture rows without the D3b-1 entries")?;
+        let rows = (pfn.embd_rows)(pf);
+        if !rows.is_null() && env_str("TALUS_FN_P2_SAY").is_some() {
+            eprintln!(
+                "talus-qwen4exp: qwen4exp-p2 takes picture rows (cells {pos0}..{})",
+                pos0 + n
+            );
+        }
+        (!rows.is_null())
+            .then_some(crate::qwen4exp::picture::PictureRows::HostTable { rows, n: pos0 + n })
+    } else {
+        None
+    };
     let mut c0 = 0i64;
     while c0 < n {
         if m.has_should_stop != 0 && (f.should_stop)(pf) != 0 {
@@ -1138,7 +1312,10 @@ unsafe fn run_chunks(
                 break;
             }
             let tok = *tokens.add((c0 + t) as usize);
-            if tok < 0 || (emb_kind == 2 && tok >= emb_rows) {
+            if pic.as_ref().is_some_and(|p| p.row(p0 + t).is_some())
+                || tok < 0
+                || (emb_kind == 2 && tok >= emb_rows)
+            {
                 batched = false;
             } else {
                 host.tok_host[t as usize] = tok as i32;
@@ -1149,6 +1326,8 @@ unsafe fn run_chunks(
                 return Err("prefill: the token id upload failed".into());
             }
             (f.embed_gather)(m.wt, m.tok_dev, t_n, m.emb, cs);
+        } else if let Some(p) = pic.as_ref() {
+            embed_chunk_rows(&f, p, pf, &m, tokens, c0, p0, t_n, nn, cs)?;
         } else {
             for t in 0..t_n {
                 let mut eb = [0 as c_char; 512];
@@ -2981,8 +3160,8 @@ unsafe fn moe_grouped<'b>(
         && (fm.up_off | fm.down_off | gub | db) % 16 == 0
         && (f.mmq_fp4_activations)(x.gt) == 0
         && (f.mmq_fp4_activations)(x.dt) == 0
-        && (f.mmq_inplace_ok)(x.gt, 2 * ff, nn) != 0
-        && (f.mmq_inplace_ok)(x.dt, nn, ff) != 0;
+        && inplace_ok(&f, x.gt, 2 * ff, nn)
+        && inplace_ok(&f, x.dt, nn, ff);
     let arena_end = if inplace_layer {
         (f.cache_device_end)(m.cache) as usize
     } else {
@@ -3156,6 +3335,11 @@ unsafe fn moe_grouped<'b>(
                             .unwrap_or(0);
                         c.pt.mark(PF_GEMM_GU, cs);
                         if in_place {
+                            moe_host_version(crate::pf_plans::moe_version(
+                                ngx,
+                                tk as i64,
+                                (nn) as i64,
+                            ));
                             if (f.mmq_product_each)(
                                 each_gu.as_ptr(),
                                 x.gt,
@@ -3174,7 +3358,18 @@ unsafe fn moe_grouped<'b>(
                             {
                                 return Err("prefill: the in-place gate/up product failed".into());
                             }
+                            moe_host_version(-1);
                         } else {
+                            let y_scale = if (f.mmq_fp4_activations)(x.gt) != 0 {
+                                m.xscale as *const f32
+                            } else {
+                                std::ptr::null()
+                            };
+                            moe_host_version(crate::pf_plans::moe_version(
+                                ngx,
+                                tk as i64,
+                                (nn) as i64,
+                            ));
                             (f.mmq_product)(
                                 m.mmq_ctx,
                                 m.grp_gu.cast(),
@@ -3190,14 +3385,11 @@ unsafe fn moe_grouped<'b>(
                                 maxr,
                                 m.gu,
                                 2 * ff,
-                                if (f.mmq_fp4_activations)(x.gt) != 0 {
-                                    m.xscale
-                                } else {
-                                    std::ptr::null()
-                                },
-                                1,
+                                y_scale,
+                                i32::from(tp_moe_allowed(ngx, y_scale.is_null())),
                                 cs,
                             );
+                            moe_host_version(-1);
                         }
                         if x.native && tail {
                             (f.mmq_swiglu_scaled)(
@@ -3235,6 +3427,7 @@ unsafe fn moe_grouped<'b>(
                         );
                         let dbounds = m.bounds_dev.add(n_ord + 1 + g * (MMQ_GROUP + 1));
                         if in_place {
+                            moe_host_version(crate::pf_plans::moe_version(ngx, nr, (ff) as i64));
                             if (f.mmq_product_each)(
                                 each_d.as_ptr(),
                                 x.dt,
@@ -3253,7 +3446,14 @@ unsafe fn moe_grouped<'b>(
                             {
                                 return Err("prefill: the in-place down product failed".into());
                             }
+                            moe_host_version(-1);
                         } else {
+                            let y_scale = if (f.mmq_fp4_activations)(x.dt) != 0 {
+                                m.hscale as *const f32
+                            } else {
+                                std::ptr::null()
+                            };
+                            moe_host_version(crate::pf_plans::moe_version(ngx, nr, (ff) as i64));
                             (f.mmq_product)(
                                 m.mmq_ctx,
                                 m.grp_d.cast(),
@@ -3269,14 +3469,11 @@ unsafe fn moe_grouped<'b>(
                                 maxr,
                                 m.dm.add((r0 * nn) as usize),
                                 nn,
-                                if (f.mmq_fp4_activations)(x.dt) != 0 {
-                                    m.hscale
-                                } else {
-                                    std::ptr::null()
-                                },
-                                1,
+                                y_scale,
+                                i32::from(tp_moe_allowed(ngx, y_scale.is_null())),
                                 cs,
                             );
+                            moe_host_version(-1);
                         }
                         if x.native && tail {
                             // s_down: applied by the combine

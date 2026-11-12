@@ -42,12 +42,14 @@ hipError_t glm_mmvq_ids(
 // hipErrorNotSupported (nothing launched) when the selected config is not a v1 kernel: call glm_mmvq_ids twice.
 hipError_t glm_mmvq_ids_pair(
     int qtype, const void* W, const void* W2, const void* x_q8_1, const int32_t* ids, float* y, float* y2,
-    int N, int K, int n_expert_used, int n_tokens, int x_group, int ids_s1, hipStream_t stream = nullptr);
+    int N, int K, int n_expert_used, int n_tokens, int x_group, int ids_s1, hipStream_t stream = nullptr,
+    const struct GlmMmvqCfg* cfg = nullptr);
 
 // GLM HIP: explicit kernel config for the expert mat-vec (sweeps / A-B). variant 0 = WP-1.7 spike kernels,
 // 1 = v1 (LDS grid, v_perm signs, R rows per wave, NW waves per WG, min WPE waves per SIMD). glm_mmvq_ids()
 // takes the per-arch table (gfx1151 tuned) or GLM_MMVQ_CFG="variant:R:NW:WPE[:pers]".
 struct GlmMmvqCfg { int variant, r, nw, wpe, pers; };   // pers > 0: persistent grid of pers WGs per CU
+GlmMmvqCfg glm_mmvq_cfg_of_plan(int plan);   // w3 rust-port S7
 hipError_t glm_mmvq_ids_cfg(
     int qtype,
     const void* W,
@@ -119,7 +121,14 @@ hipError_t glm_kda_step(
     float pro_lb,
     float pro_l2_eps,
     int cols_per_wave = 0,   // GLM HIP: <= 0 = per-arch auto; 1/2/4 = v0; 100*waves+cols = v1 (shared prologue)
-    hipStream_t stream = nullptr);
+    hipStream_t stream = nullptr,
+    int v3_plan = -1);       // w3 rust-port S6e: the prompt v3 kernel (0 / 1) from the host; < 0 = GLM_KDA_V3
+int glm_kda_step_plan(int T, int n_B);
+void glm_sparse_2p_set_pool(float* pool, int* locks, int nslot);   // w3 rust-port S5
+int glm_mmvq_plan(int qtype, int K, int T);   // w3 rust-port S7
+int glm_lightning_indexer_plan(int H, int n_kv, int n_tokens, bool k_is_f16);
+int glm_sparse_fa_idx_plan(const void* q, const void* kv, const void* dst, int D, int H, int N, int n_kv_max, uint32_t q_nb1,
+                           uint32_t q_nb2, uint32_t k_stride, hipStream_t stream);
 
 // GLM-5.3-Flash DSA decode lightning indexer.
 // Shapes:
@@ -198,7 +207,7 @@ void glm_set_fa_variant(int v);
 hipError_t glm_dsa_sparse_fa_idx(
     const float* q, const __half* kv, const __half* zero_mask, const int32_t* idx, float* split_buf, float* dst,
     int D, int H, int N, int n_kv_max, uint32_t q_nb1, uint32_t q_nb2, uint32_t k_stride, float scale,
-    hipStream_t stream = nullptr);
+    hipStream_t stream = nullptr, int plan = -1);
 size_t glm_dsa_sparse_fa_split_bytes(int D, int H, int N, int n_kv_max);
 
 // Talus GLM port: grouped expert mat-vec (prefill): q8_1 rows sorted by expert (bounds [n_experts + 1]), output row r

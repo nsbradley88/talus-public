@@ -684,6 +684,15 @@ extern "C" int tk_qwen4exp_p4_ple_rows(void* ss, const int32_t* tokens, int n, i
     return 0;
 }
 
+// w3 rust-port S8: the rows hashed by the host (qwen4exp/weights/ple.rs); only the prefetch stays with the C++ table.
+extern "C" int tk_qwen4exp_p4_ple_prefetch(void* ss, const uint32_t* rows, int n) {
+    if (ss == nullptr || rows == nullptr) return -1;
+    strata::core::SessionState& s = *(strata::core::SessionState*) ss;
+    if (s.ple.table == nullptr) return -1;
+    for (int t = 0; t < n; ++t) s.ple.table->prefetch_rows(rows + (size_t) t * strata::kernels::PLE_N_HEADS);
+    return 0;
+}
+
 extern "C" int tk_qwen4exp_p4_ple_gather(void* ss, const uint32_t* rows, size_t n_tokens, float* out, char* err,
                                          size_t err_cap) {
     if (ss == nullptr) return -1;

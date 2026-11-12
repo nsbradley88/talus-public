@@ -4,6 +4,7 @@
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "talus_iq_split.cuh"
+#include "strata/kernels/variant_trace.hpp"   // S1
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -3372,6 +3373,7 @@ void mimo_mmvq_ids(
     int                 x_group)
 {
     if (n_ids <= 0 || n_in <= 0 || n_out <= 0) return;
+    TALUS_VTRACE("mimo_mmvq_ids", weights2 ? "pair" : "one", ggml_type, n_ids * 2 + (x_per_id ? 1 : 0), x_group, n_out);
     switch (ggml_type) {
         case 16: launch_mimo_mmvq_ids<16>(weights, expert_bytes, ids, n_ids, x_q8_1, x_per_id, y, n_in, n_out, stream, weights2, y2, x_group); break;
         case 17: launch_mimo_mmvq_ids<17>(weights, expert_bytes, ids, n_ids, x_q8_1, x_per_id, y, n_in, n_out, stream, weights2, y2, x_group); break;
@@ -3382,6 +3384,39 @@ void mimo_mmvq_ids(
         case 10: launch_mimo_mmvq_ids<10>(weights, expert_bytes, ids, n_ids, x_q8_1, x_per_id, y, n_in, n_out, stream, weights2, y2, x_group); break;
         default: break;
     }
+}
+
+// S6: the launch plan of mimo_attn_swa_sinks, factored out of it (the same rules, the same order). The
+// Rust host computes it too (talus-model mimo::attn_plan::swa_plan) and passes it through tk_attn_swa_sinks_planned.
+MimoSwaPlan mimo_attn_swa_sinks_plan(bool q8_kv, bool causal, int head_dim_k, int n_tok, int n_head, int n_kv)
+{
+    MimoSwaPlan p{};
+    const int g_ratio = n_kv > 0 ? n_head / n_kv : 0;
+    // the v2 prefill kernel (bitwise; G = 8 heads per KV head) by default; TALUS_MIMO_SWA_VER=1: the v1 kernel
+    static const int swa_ver = [] {
+        const char* e = std::getenv("TALUS_MIMO_SWA_VER");
+        return e ? std::atoi(e) : 2;
+    }();
+    if (swa_ver == 2 && causal && head_dim_k == 192 && !q8_kv && n_tok >= 8 && g_ratio == 8) { p.kind = 1; return p; }
+    if (causal && head_dim_k == 192 && !q8_kv && n_tok >= 8 && (g_ratio % 8) == 0) { p.kind = 2; return p; }
+    auto att2_ok = [&](const Att2Shape& sh) {
+        bool inst = false;
+#define X(H, W, U) inst = inst || (sh.hq == H && sh.warps == W && sh.u == U);
+        ATT2_SHAPES(X)
+#undef X
+        return sh.hq > 0 && (g_ratio % sh.hq) == 0 && inst;
+    };
+    if (causal && head_dim_k == 192 && !q8_kv && att2_enabled()) {
+        const Att2Shape sh = att2_shape_swa(n_tok);
+        if (att2_ok(sh)) { p.kind = 3; p.a = sh.hq; p.b = sh.warps; p.c = sh.u; return p; }
+    }
+    if (head_dim_k == 128 && !q8_kv && att2_enabled() && att2_drafter_enabled()) {
+        const Att2Shape sh = att2_shape_swa(n_tok);
+        if (att2_ok(sh)) { p.kind = 4; p.a = sh.hq; p.b = sh.warps; p.c = sh.u; return p; }
+    }
+    p.kind = 5;
+    p.a = (g_ratio % 4) == 0 ? 4 : 1;
+    return p;
 }
 
 void mimo_attn_swa_sinks(
@@ -3408,7 +3443,8 @@ void mimo_attn_swa_sinks(
     void*                q8_out,
     void*                q8_mmq,
     int                  q8_mmq_layout,
-    bool*                q8_mmq_done)
+    bool*                q8_mmq_done,
+    const MimoSwaPlan*   plan)
 {
     (void)scratch;
     if (q8_mmq_done != nullptr) *q8_mmq_done = false;
@@ -3424,16 +3460,14 @@ void mimo_attn_swa_sinks(
     const int  g_ratio = n_head / n_kv;
     const auto hip_s   = static_cast<hipStream_t>(stream);
 
-    // the v2 prefill kernel (bitwise; G = 8 heads per KV head) by default; TALUS_MIMO_SWA_VER=1: the v1 kernel
-    static const int swa_ver = [] {
-        const char* e = std::getenv("TALUS_MIMO_SWA_VER");
-        return e ? std::atoi(e) : 2;
-    }();
-    if (swa_ver == 2 && causal && head_dim_k == 192 && !q8_kv && n_tok >= 8 && g_ratio == 8) {
+    // S6: the launch plan - the host's, or computed here (mimo_attn_swa_sinks_plan)
+    const MimoSwaPlan pl = plan ? *plan : mimo_attn_swa_sinks_plan(q8_kv, causal, head_dim_k, n_tok, n_head, n_kv);
+    if (pl.kind == 1) {
         const dim3 block(256);
         const dim3 grid(static_cast<unsigned int>((n_tok + 7) / 8), static_cast<unsigned int>(n_kv));
         const bool mmq = q8_mmq != nullptr && q8_out == nullptr && (q8_mmq_layout == 0 || q8_mmq_layout == 1) &&
                          n_head * head_dim_v % 512 == 0;
+        TALUS_VTRACE("mimo_swa", "prefill_v2", n_tok >= 8 ? 8 : n_tok, head_dim_k, mmq ? 1 + q8_mmq_layout : 0, g_ratio);
         mimo_attn_swa_sinks_prefill_v2_kernel<8><<<grid, block, 0, hip_s>>>(
             q, k_pool, v_pool, sinks, out, n_tok, n_head, n_kv, window, stride, scale, pos_dev, value_scale,
             mmq ? q8_mmq : nullptr, q8_mmq_layout);
@@ -3441,11 +3475,12 @@ void mimo_attn_swa_sinks(
         q8_after();
         return;
     }
-    if (causal && head_dim_k == 192 && !q8_kv && n_tok >= 8 && (g_ratio % 8) == 0) {
+    if (pl.kind == 2) {
         const dim3 block(8 * 32);
         const dim3 grid(
             static_cast<unsigned int>((n_head + 7) / 8),
             static_cast<unsigned int>((n_tok + 3) / 4));
+        TALUS_VTRACE("mimo_swa", "prefill_v1", 8, head_dim_k, 0, g_ratio);
         mimo_attn_swa_sinks_prefill_kernel<4, 8, 16><<<grid, block, 0, hip_s>>>(
             q, k_pool, v_pool, sinks, out,
             n_tok, n_head, n_kv, window, stride, scale, pos_dev, value_scale);
@@ -3453,19 +3488,22 @@ void mimo_attn_swa_sinks(
         return;
     }
 
-    if (causal && head_dim_k == 192 && !q8_kv && att2_enabled() &&
-        att2_launch_swa(att2_shape_swa(n_tok), g_ratio, q, k_pool, v_pool, sinks, out, n_tok, n_head, n_kv, window,
+    if (pl.kind == 3 &&
+        att2_launch_swa(Att2Shape{pl.a, pl.b, pl.c}, g_ratio, q, k_pool, v_pool, sinks, out, n_tok, n_head, n_kv, window,
                         stride, scale, pos_dev, value_scale, hip_s, 192, true, q8_out)) {
+        TALUS_VTRACE("mimo_swa", "att2", n_tok == 1 ? 1 : 2, 192, pl.a * 10000 + pl.b * 100 + pl.c, g_ratio);
         return;
     }
     // DFlash drafter (HDK 128, non-causal block over the window): v2 as well
-    if (head_dim_k == 128 && !q8_kv && att2_enabled() && att2_drafter_enabled() &&
-        att2_launch_swa(att2_shape_swa(n_tok), g_ratio, q, k_pool, v_pool, sinks, out, n_tok, n_head, n_kv, window,
+    if (pl.kind == 4 &&
+        att2_launch_swa(Att2Shape{pl.a, pl.b, pl.c}, g_ratio, q, k_pool, v_pool, sinks, out, n_tok, n_head, n_kv, window,
                         stride, scale, pos_dev, value_scale, hip_s, 128, causal, q8_out)) {
+        TALUS_VTRACE("mimo_swa", "att2_drafter", causal ? 1 : 0, 128, pl.a * 10000 + pl.b * 100 + pl.c, g_ratio);
         return;
     }
 
     auto launch_decode = [&]<int HDK>() {
+        TALUS_VTRACE("mimo_swa", "decode", (g_ratio % 4) == 0 ? 4 : 1, HDK, q8_kv ? 1 : 0, causal ? 1 : 0);
         if ((g_ratio % 4) == 0) {
             constexpr int HQ    = 4;
             constexpr int WARPS = 2;
@@ -3511,6 +3549,69 @@ void mimo_attn_swa_sinks(
     q8_after();
 }
 
+// S6: the launch plan of mimo_attn_k192_v128, factored out of it (the same rules, the same order). The
+// Rust host computes it too (talus-model mimo::attn_plan) and passes it through tk_attn_k192_v128_planned.
+MimoK192Plan mimo_attn_k192_v128_plan(bool q8_kv, bool has_scratch, int n_tok, int n_head, int n_kv, int stride,
+                                      int n_split)
+{
+    MimoK192Plan p{};
+    const int g_ratio = n_kv > 0 ? n_head / n_kv : 0;
+    if (!q8_kv && n_tok >= 8 && n_split <= 1 && (g_ratio % 8) == 0) {
+        static const bool use_wmma = [] {
+            const char* e = std::getenv("TALUS_MIMO_FA");
+            return e == nullptr || e[0] != '0';
+        }();
+        static const int fa_ver = [] {
+            const char* e = std::getenv("TALUS_MIMO_FA_VER");
+            return e ? std::atoi(e) : 7;
+        }();
+        p.kind = 1;
+        p.a = use_wmma ? 1 : 0;
+        p.b = fa_ver;
+        return p;
+    }
+    int splits = 1;
+    if (has_scratch) {
+        if (n_split > 1) {
+            splits = (n_split <= 32) ? n_split : 32;
+        } else if (n_split <= 0) {
+            if (stride >= 16384) {
+                splits = 16;
+            } else if (stride >= 2048) {
+                splits = 8;
+            } else if (stride >= 512) {
+                splits = 4;
+            }
+        }
+    }
+    p.splits = splits;
+    if (!q8_kv && att3_enabled()) {
+        const Att3Shape sh = att3_shape_full(n_tok);
+        bool inst = false;
+#define X(H, W) inst = inst || (sh.hg == H && sh.nw == W);
+        X(4, 4) X(2, 8) X(2, 4) X(1, 4) X(1, 8)
+#undef X
+        if (sh.hg > 0 && sh.nw > 0 && (g_ratio % (sh.hg * sh.nw)) == 0 && inst) {
+            p.kind = 2; p.a = sh.hg; p.b = sh.nw;
+            return p;
+        }
+    }
+    if (!q8_kv && att2_enabled()) {
+        const Att2Shape sh = att2_shape_full(n_tok);
+        bool inst = false;
+#define X(H, W, U) inst = inst || (sh.hq == H && sh.warps == W && sh.u == U);
+        ATT2_SHAPES(X)
+#undef X
+        if (sh.hq > 0 && (g_ratio % sh.hq) == 0 && inst) {
+            p.kind = 3; p.a = sh.hq; p.b = sh.warps; p.c = sh.u;
+            return p;
+        }
+    }
+    p.kind = 4;
+    p.a = (g_ratio % 4) == 0 ? 4 : 1;
+    return p;
+}
+
 void mimo_attn_k192_v128(
     const float*         q,
     const void*          k_pool,
@@ -3527,7 +3628,8 @@ void mimo_attn_k192_v128(
     const std::int32_t*  pos_dev,
     int                  n_split,
     void*                stream,
-    void*                q8_out)
+    void*                q8_out,
+    const MimoK192Plan*  plan)
 {
     if (n_tok <= 0 || n_head <= 0 || n_kv <= 0) return;
     auto q8_after = [&]() {
@@ -3537,19 +3639,16 @@ void mimo_attn_k192_v128(
     const bool q8_kv   = (k_scale != nullptr && v_scale != nullptr);
     const int  g_ratio = n_head / n_kv;
     const auto hip_s   = static_cast<hipStream_t>(stream);
+    // S6: the launch plan (kind, fa variant, split count, decode shape) - the host's, or computed here
+    const MimoK192Plan pl = plan ? *plan : mimo_attn_k192_v128_plan(q8_kv, scratch != nullptr, n_tok, n_head, n_kv, stride, n_split);
 
-    if (!q8_kv && n_tok >= 8 && n_split <= 1 && (g_ratio % 8) == 0) {
-        static const bool use_wmma = [] {
-            const char* e = std::getenv("TALUS_MIMO_FA");
-            return e == nullptr || e[0] != '0';
-        }();
+    if (pl.kind == 1) {
+        const bool use_wmma = pl.a != 0;
         // TALUS_MIMO_FA_VER 7 (default) = v2 with 8 waves + padded LDS rows + batched tile loads (bitwise; 30K: 150
         // -> 113 ms per chunk);
         // 1 = the v1 kernel; 2 / 3 = 4 waves (+ alpha skip), 4 / 5 = 8 waves (+ skip), 6 = 4 waves + padded rows
-        static const int fa_ver = [] {
-            const char* e = std::getenv("TALUS_MIMO_FA_VER");
-            return e ? std::atoi(e) : 7;
-        }();
+        const int fa_ver = pl.b;
+        TALUS_VTRACE("mimo_k192", "prefill", use_wmma ? fa_ver : 0, (n_head % n_kv) == 0 ? 1 : 0, g_ratio, 0);
         if (use_wmma && (n_head % n_kv) == 0 && fa_ver == 8) {   // v2 + padded LDS rows, 16 waves (256 query columns)
             const dim3 block(16 * 32);
             const dim3 grid(static_cast<unsigned int>((n_tok * g_ratio + 255) / 256), static_cast<unsigned int>(n_kv));
@@ -3616,32 +3715,24 @@ void mimo_attn_k192_v128(
         return;
     }
 
-    int splits = 1;
-    if (scratch != nullptr) {
-        if (n_split > 1) {
-            splits = (n_split <= 32) ? n_split : 32;
-        } else if (n_split <= 0) {
-            if (stride >= 16384) {
-                splits = 16;
-            } else if (stride >= 2048) {
-                splits = 8;
-            } else if (stride >= 512) {
-                splits = 4;
-            }
-        }
-    }
+    const int splits = pl.splits;
 
     float* target = (splits > 1) ? scratch : out;
+    TALUS_VTRACE("mimo_k192", "splits", splits, n_split, stride >= 16384 ? 16384 : stride >= 2048 ? 2048 : stride >= 512 ? 512 : 0,
+                 n_tok == 1 ? 1 : 2);
 
-    if (!q8_kv && att3_enabled() &&
-        att3_launch_full(att3_shape_full(n_tok), g_ratio, q, k_pool, v_pool, target, n_tok, n_head, n_kv, stride,
+    if (pl.kind == 2 &&
+        att3_launch_full(Att3Shape{pl.a, pl.b}, g_ratio, q, k_pool, v_pool, target, n_tok, n_head, n_kv, stride,
                          scale, pos_dev, splits, hip_s)) {
         // v3 written; combine below
-    } else if (!q8_kv && att2_enabled() &&
-        att2_launch_full(att2_shape_full(n_tok), g_ratio, q, k_pool, v_pool, target, n_tok, n_head, n_kv, stride,
+        TALUS_VTRACE("mimo_k192", "att3", n_tok == 1 ? 1 : 2, splits, pl.a * 100 + pl.b, g_ratio);
+    } else if (pl.kind == 3 &&
+        att2_launch_full(Att2Shape{pl.a, pl.b, pl.c}, g_ratio, q, k_pool, v_pool, target, n_tok, n_head, n_kv, stride,
                          scale, pos_dev, splits, hip_s)) {
         // v2 written; combine below
+        TALUS_VTRACE("mimo_k192", "att2", n_tok == 1 ? 1 : 2, splits, pl.a * 10000 + pl.b * 100 + pl.c, g_ratio);
     } else if ((g_ratio % 4) == 0) {
+        TALUS_VTRACE("mimo_k192", "v1", 4, splits, q8_kv ? 1 : 0, g_ratio);
         constexpr int HQ    = 4;
         constexpr int WARPS = 4;
         const int h_per_wg  = HQ * WARPS; // 16 query heads per workgroup
@@ -3660,6 +3751,7 @@ void mimo_attn_k192_v128(
                 n_tok, n_head, n_kv, stride, scale, pos_dev, splits);
         }
     } else {
+        TALUS_VTRACE("mimo_k192", "v1", 1, splits, q8_kv ? 1 : 0, g_ratio);
         constexpr int HQ    = 1;
         constexpr int WARPS = 4;
         const int h_per_wg  = HQ * WARPS;

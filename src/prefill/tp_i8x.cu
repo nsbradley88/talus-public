@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "strata/kernels/variant_trace.hpp"   // S1
 
 namespace talus::prefill {
 namespace {
@@ -155,5 +156,7 @@ extern "C" int talus_pf_i8x_expand(const void* w, int ggml_type, int n, int k, i
     talus::prefill::I8Mat m;
     m.qs = qs;
     m.ws = ws;
-    return talus::prefill::i8x_expand(w, ggml_type, n, k, m, stream) ? 0 : -1;
+    const bool ok = talus::prefill::i8x_expand(w, ggml_type, n, k, m, stream);
+    TALUS_VTRACE("pf_i8x_expand", ok ? "expanded" : "refused", ggml_type, talus::prefill::i8x_mode(ggml_type), n, k);
+    return ok ? 0 : -1;
 }

@@ -5,6 +5,7 @@
 pub mod cli;
 pub mod engine;
 pub mod ffi;
+pub mod plans;
 pub mod sample;
 pub mod spec;
 pub mod weights;

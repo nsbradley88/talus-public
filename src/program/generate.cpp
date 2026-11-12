@@ -1845,6 +1845,9 @@ struct tk_qwen4exp_serve_ctx {
     std::function<int(tk_qwen4exp_conv_state_sizes_t*)> state_sizes;
     std::function<int(int64_t)> snapshot_restore;
     std::function<int(int, const char*)> session_file_op;
+    // S12-v: the next request's pictures, built by the Rust host (vision_req.rs); see tk_qwen4exp_serve_set_images
+    std::function<int(const int32_t*, int64_t, const float*, const int64_t*, int64_t, const int64_t*, const uint64_t*, int64_t)> set_images;
+    std::function<void(int64_t*)> vision_info;
     // ---- qwen4exp-p5 begin ----
     // Piece 5: primitives for the Rust-owned conversation state (conv_state.rs); set by the Rust serve path only.
     std::function<int(tk_qwen4exp_p5_layout_t*)> p5_layout;
@@ -1890,6 +1893,11 @@ struct tk_qwen4exp_gen_ctx {
 
 static const tk_qwen4exp_rust_driver_t* g_qwen4exp_rust_driver = nullptr;
 static std::atomic<std::atomic<bool>*> g_qwen4exp_active_stop{nullptr};
+// S12-v: --vision requests go to the Rust serve loop only with TALUS_FN_RUST_VISION=1 (opt-in until its gates pass)
+static bool rust_vision_optin() {
+    const char* e = std::getenv("TALUS_FN_RUST_VISION");
+    return e != nullptr && e[0] == '1';
+}
 // ---- qwen4exp-p1 begin ----
 // Piece 1 runs in Rust when the Rust data plane is on (the driver owns the serve loop) and Rust registered its hooks.
 static bool qwen4exp_p1_on() {
@@ -10195,6 +10203,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
         // h = p + y, w = p + x, and the text after the image continues at p + max(nx, ny).
         const int64_t kImagePad = g.image_token_id;   // qwen4exp.ple.image_token_id: the PLE hash reads it for image cells
         bool mrope_identity = true;
+        bool rust_images_set = false;   // w3 rust-port S12-v: serve_ctx.set_images ran for the next begin_request
         std::vector<float> img_rows;
         std::vector<const float*> row_ptr;
         // ---- #533: VRAM <reserve_mib>, between requests, only with --vram-elastic.  It shrinks the expert cache
@@ -10832,7 +10841,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
         };
         if (g_qwen4exp_rust_driver != nullptr &&
             g_qwen4exp_rust_driver->run_serve_loop != nullptr &&
-            !multi_gpu && stages.empty() && o.batch <= 0 && !o.vision && !peer.valid() && !remote_opt && !pipe) {
+            !multi_gpu && stages.empty() && o.batch <= 0 && (!o.vision || rust_vision_optin()) && !peer.valid() && !remote_opt && !pipe) {
             struct RustServeReqState {
                 Clock::time_point r0{};
                 Clock::time_point tw0{};
@@ -11365,8 +11374,10 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                                           int64_t* out_resumed_checkpoint) -> int {
                 cur.assign(ids, ids + n_ids);
                 const int64_t n = (int64_t) cur.size();
-                req_imgs.clear();
-                if (!mrope_identity) {
+                const bool keep_imgs = rust_images_set;   // w3 rust-port S12-v: set_images ran for this request
+                rust_images_set = false;
+                if (!keep_imgs) req_imgs.clear();
+                if (!keep_imgs && !mrope_identity) {
                     const int64_t cells = (int64_t) mrope_host.size() / 3;
                     for (int64_t c = 0; c < cells; ++c) {
                         mrope_host[(size_t) c * 3] = (int32_t) c;
@@ -11382,7 +11393,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                     }
                     mrope_identity = true;
                 }
-                sp.embd_rows = nullptr;
+                if (!keep_imgs) sp.embd_rows = nullptr;
                 rreq.r0 = Clock::now();
                 auto starts_with = [&](const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) -> bool {
                     const int64_t L = (int64_t) pre.size();
@@ -12063,6 +12074,48 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                 out_stats->ms_ple = ps.ms_ple;
                 out_stats->cpu_share = ps.cpu_share;
                 return 0;
+            };
+            // S12-v: the Rust host built this request's positions, rows and keys (the GENI block's results); here
+            // they only land in the structures the C++ side reads (mrope_host + its device copy, sp.embd_rows, req_imgs).
+            // mrope == nullptr: a text request (back to the identity when it is not). The next begin_request keeps them.
+            serve_ctx.set_images = [&](const int32_t* mrope, int64_t cells, const float* rows, const int64_t* row_of, int64_t n,
+                                       const int64_t* key_start, const uint64_t* key_hash, int64_t n_keys) -> int {
+                req_imgs.clear();
+                rust_images_set = false;
+                if (mrope == nullptr) {
+                    if (!mrope_identity) {
+                        const int64_t c_all = (int64_t) mrope_host.size() / 3;
+                        for (int64_t c = 0; c < c_all; ++c)
+                            mrope_host[(size_t) c * 3] = mrope_host[(size_t) c * 3 + 1] = mrope_host[(size_t) c * 3 + 2] = (int32_t) c;
+                        cudaDeviceSynchronize();
+                        if (cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
+                            cudaSuccess)
+                            return 0;
+                        mrope_identity = true;
+                    }
+                    sp.embd_rows = nullptr;
+                    return 1;
+                }
+                if (cells != (int64_t) mrope_host.size() / 3) return 0;
+                std::memcpy(mrope_host.data(), mrope, mrope_host.size() * sizeof(int32_t));
+                row_ptr.assign((size_t) n, nullptr);
+                if (rows != nullptr)   // D3b-2: rows == nullptr = device rows the Rust prompt path takes itself (positions + keys only)
+                    for (int64_t i = 0; i < n; ++i) row_ptr[(size_t) i] = row_of[i] < 0 ? nullptr : rows + row_of[i];
+                for (int64_t k = 0; k < n_keys; ++k) req_imgs.push_back({key_start[k], key_hash[k]});
+                cudaDeviceSynchronize();
+                if (cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
+                    cudaSuccess)
+                    return 0;
+                mrope_identity = false;
+                sp.embd_rows = rows != nullptr ? row_ptr.data() : nullptr;
+                rust_images_set = true;
+                return 1;
+            };
+            serve_ctx.vision_info = [&](int64_t* out) {   // w3 rust-port S12-v: [vision, image pad id, n_embd, table cells]
+                out[0] = o.vision ? 1 : 0;
+                out[1] = kImagePad;
+                out[2] = g.n_embd;
+                out[3] = (int64_t) mrope_host.size() / 3;
             };
             serve_ctx.state_sizes = [&](tk_qwen4exp_conv_state_sizes_t* out_sizes) -> int {
                 if (out_sizes == nullptr) return -1;
@@ -17444,6 +17497,18 @@ extern "C" int tk_qwen4exp_serve_checkpoint_at(
     int64_t turn_at
 ) {
     return (ctx && ctx->checkpoint_at) ? ctx->checkpoint_at(pos, as_tail, is_pin, turn_at) : -1;
+}
+
+extern "C" int tk_qwen4exp_serve_set_images(tk_qwen4exp_serve_ctx_t* ctx, const int32_t* mrope, int64_t cells,
+                                            const float* rows, const int64_t* row_of, int64_t n, const int64_t* key_start,
+                                            const uint64_t* key_hash, int64_t n_keys) {
+    return (ctx && ctx->set_images) ? ctx->set_images(mrope, cells, rows, row_of, n, key_start, key_hash, n_keys) : -1;
+}
+
+extern "C" int tk_qwen4exp_serve_vision_info(tk_qwen4exp_serve_ctx_t* ctx, int64_t* out4) {
+    if (!ctx || !ctx->vision_info || out4 == nullptr) return -1;
+    ctx->vision_info(out4);
+    return 1;
 }
 
 extern "C" int tk_qwen4exp_serve_prefill_finish(

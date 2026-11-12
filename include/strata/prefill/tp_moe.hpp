@@ -43,6 +43,7 @@ constexpr int kMoeEachMax = 16;
 bool moe_inplace_ok(int ggml_type, int n, int k);
 
 bool moe_supported(int ggml_type, int n, int k);
+void moe_host_version(int v);   // w3 rust-port S10: < 0 = the library's rule
 /// dense (one-expert) Q6_K on tp_moe (bitwise MMQ); false = not covered, use MMQ
 bool moe_gemm_q6k_dense(const MoeProduct& p, void* stream);
 /// the dot family of the type (0: one scale per 32 values, 1: per 16, 2: scale + min; -1 unsupported).

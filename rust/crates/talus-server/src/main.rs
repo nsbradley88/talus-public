@@ -7,6 +7,8 @@ use talus_server::{ByteTokenizer, ScriptedMockEngine, ServerConfig, ServiceState
 fn main() {
     // TALUS_X works as STRATA_X (TALUS_API_KEY for STRATA_API_KEY, ...); the engine it starts inherits both
     talus_core_api::apply_env_aliases();
+    // talus#93: cap glibc arenas before the accept loop starts threads
+    let _ = talus_server::heap::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(

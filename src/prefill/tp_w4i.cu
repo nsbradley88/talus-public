@@ -20,6 +20,7 @@
 //
 // Copyright (c) 2026 nsbradley88
 // SPDX-License-Identifier: MIT
+#include "strata/kernels/variant_trace.hpp"   // S1
 #include <hip/hip_runtime.h>
 
 #include <cmath>
@@ -602,6 +603,7 @@ static bool w4i_gemm_dispatch(const uint8_t* wq, const float* ws, int wg, int N,
     static const int v = [] { const char* e = std::getenv("TALUS_PF_W4I_VARIANT"); return e ? std::atoi(e) : 1; }();
     static const int v128 = [] { const char* e = std::getenv("TALUS_PF_W4I_V128"); return e ? std::atoi(e) : 5; }();
     static const int v256 = [] { const char* e = std::getenv("TALUS_PF_W4I_V256"); return e ? std::atoi(e) : 5; }();
+    TALUS_VTRACE("pf_w4i", GU ? "gu" : "one", wg, wg == 128 ? v128 : wg == 256 ? (v256 == 4 ? 5 : v256) : v, N, K);
     if (wg == 128)
         return v128 == 1 ? launch<4, 2, 2, 4, 4, 128, GU>(wq, ws, N, K, xq, xk, xS, T, dst, ld, s)
              : v128 == 2 ? launch<4, 2, 2, 4, 2, 128, GU>(wq, ws, N, K, xq, xk, xS, T, dst, ld, s)

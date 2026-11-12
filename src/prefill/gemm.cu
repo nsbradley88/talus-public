@@ -936,6 +936,23 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     static const bool pad_on = [] { const char* v = std::getenv("STRATA_PF_PAD"); return v && v[0] == '1'; }();
     static const bool pf_on = [] { const char* v = std::getenv("STRATA_PF_GEMM"); return v && v[0] == '1'; }();
     static const int64_t pf_min_t = [] { const char* v = std::getenv("STRATA_PF_SWITCH_MIN_T"); return v ? (int64_t) std::atoll(v) : (int64_t) 0; }();
+    // talus#79 L2 (w3 J4): small chunks (T <= TALUS_PF_Q8G_MAX_T, default 384) of a Q8_0 weight run the GEMM with the
+    // Q8_0 blocks decoded in its loader (kernel_bk64q8) instead of dequant into the scratch + the same GEMM: bitwise
+    // the padded pair below (checked bit for bit on every shape), faster at T 64-512 where the dequant pass dominates.
+    // TALUS_PF_Q8G=0 = off (the dequant + GEMM pair, as before). The kernel declines (falls through) outside its
+    // shapes: N < 1024, K % 64, W not 4-byte aligned, ldx % 8.
+    static const bool q8g_on = [] { const char* v = std::getenv("TALUS_PF_Q8G"); return !v || v[0] != '0'; }();
+    static const int64_t q8g_max_t = [] { const char* v = std::getenv("TALUS_PF_Q8G_MAX_T"); return v ? (int64_t) std::atoll(v) : (int64_t) 384; }();
+    // Only where the pair below would run its BK64 kernel (N >= 1024, K % 64, STRATA_PF_BK64 not 0, scratch fits), so
+    // the result is the one that pair gives, bit for bit.
+    static const bool bk64_on = [] { const char* v = std::getenv("STRATA_PF_BK64"); return !v || v[0] != '0'; }();
+    if (q8g_on && bk64_on && pad_on && pf_on && ggml_type == 8 && T >= pf_min_t && T >= 64 && T <= q8g_max_t &&
+        N >= 1024 && K % 64 == 0 && N * (K + 64) <= scratch_elems_ &&
+        strata_pf_gemm_q8_ld(X, ldx > 0 ? ldx : K, W_blocks, Y, T, N, K, ldy, beta, stream_)) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) std::fprintf(stderr, "talus prefill: Q8_0 loader-decode GEMM on for chunks of <= %lld rows (TALUS_PF_Q8G=0 turns it off)\n", (long long) q8g_max_t);
+        return;
+    }
     if (pad_on && pf_on && T >= pf_min_t && T >= 64 && N >= 512 && K % 32 == 0 && N * (K + 64) <= scratch_elems_) {
         const int64_t ldw = K + 64;
         if (strata::kernels::dequant_f16_ld(ggml_type, W_blocks, 0, N, K, ldw, scratch_, stream_) &&

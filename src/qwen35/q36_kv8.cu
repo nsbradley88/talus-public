@@ -25,6 +25,7 @@
 //     tile: P' = fp16(P * scale), then the WMMA with the V codes.
 //   The own-tile scalar sum (the row's position tile) uses P * (code * scale) in f32.
 #include "strata/qwen35/q36_kernels.hpp"
+#include "strata/kernels/variant_trace.hpp"   // S7 kv8
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -777,12 +778,38 @@ extern "C" int talus_q36_kv8_quant(const void* kc, const void* vt, int ctx, int 
 ///   loaded before the softmax, LDS-only barriers, DPP reductions; bitwise variant 2);
 /// 1: the OFS variant of the rd-kv27 reader (offset kept, per-row corrections; TALUS_Q27_KV8_OFS=1);
 /// 2: the rd-kv27 reader k_attn_wmma_kv8 (TALUS_Q27_KV8_VAR=2, for A/B and the bitwise check).
+/// S7 kv8: the launch as one int (the host's copy: talus_kernels::plans::q36_kv8_plan): ng * 10 + variant, where
+/// ng = the 16-row groups per chunk (ceil(T * G / 16)) and variant picks the kernel instance below; -1 = refused.
+extern "C" int talus_q36_kv8_plan(int T, int H, int hkv, int variant) {
+    if (hkv <= 0 || H % hkv != 0 || T <= 0 || variant < 0 || variant > 2) return -1;
+    return ((T * (H / hkv) + 15) / 16) * 10 + variant;
+}
+
+extern "C" int talus_q36_attn_wmma_kv8_v(int n_chunk, int hkv, const float* q, const void* kq, const void* ks,
+                                         const void* vq, const void* vs, const int32_t* pos0, int T, int H, int ctx,
+                                         int vt_ctx, float sc, int chunk, float* pacc, float* pm, float* pl,
+                                         void* stream, int variant, int plan);
+
 extern "C" int talus_q36_attn_wmma_kv8(int n_chunk, int hkv, const float* q, const void* kq, const void* ks,
                                        const void* vq, const void* vs, const int32_t* pos0, int T, int H, int ctx,
                                        int vt_ctx, float sc, int chunk, float* pacc, float* pm, float* pl,
                                        void* stream, int variant) {
-    if (hkv <= 0 || H % hkv != 0 || T <= 0 || n_chunk <= 0 || variant < 0 || variant > 2) return -1;
-    const int ng = (T * (H / hkv) + 15) / 16;
+    return talus_q36_attn_wmma_kv8_v(n_chunk, hkv, q, kq, ks, vq, vs, pos0, T, H, ctx, vt_ctx, sc, chunk, pacc, pm, pl,
+                                     stream, variant, -1);
+}
+
+/// S7 kv8: `plan` from the host (< 0: the library's own); the library cross-checks it for one release.
+extern "C" int talus_q36_attn_wmma_kv8_v(int n_chunk, int hkv, const float* q, const void* kq, const void* ks,
+                                         const void* vq, const void* vs, const int32_t* pos0, int T, int H, int ctx,
+                                         int vt_ctx, float sc, int chunk, float* pacc, float* pm, float* pl,
+                                         void* stream, int variant, int plan) {
+    const int lib = talus_q36_kv8_plan(T, H, hkv, variant);
+    if (n_chunk <= 0 || lib < 0) return -1;
+    const int run = plan < 0 ? lib : strata::kernels::vtrace::plan_choose("talus_q36_attn_wmma_kv8", plan, lib);
+    if (run < 10) return -1;
+    TALUS_VTRACE("q36_attn_kv8", "plan", run, T, H, hkv);
+    variant = run % 10;
+    const int ng = run / 10;
     const dim3 grid((unsigned) (n_chunk * ng), (unsigned) hkv);
     const uint8_t *kq8 = (const uint8_t*) kq, *vq8 = (const uint8_t*) vq;
     const uint16_t *ks16 = (const uint16_t*) ks, *vs16 = (const uint16_t*) vs;

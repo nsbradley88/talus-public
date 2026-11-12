@@ -317,18 +317,17 @@ impl Engine {
         hip: Arc<HipRuntime>,
         tk: Arc<LibTalusKernels>,
     ) -> Result<Self> {
-        if std::env::var_os("STRATA_MMVQ_W32").is_none() {
-            // Match C++ laguna_model.hpp::mmvq_pre, which calls native_q{4,5,6}_k_mmvq /
-            // native_q8_0_mmvq directly rather than native_mmvq_w32.
-            unsafe {
-                std::env::set_var("STRATA_MMVQ_W32", "0");
-            }
-        }
+        // Match C++ laguna_model.hpp::mmvq_pre, which calls native_q{4,5,6}_k_mmvq /
+        // native_q8_0_mmvq directly rather than native_mmvq_w32 (unset only; the serve path sets 1 first).
+        talus_kernels::knobs::apply("laguna", talus_kernels::knobs::LAGUNA_ENGINE_DEFAULTS);
         // Enable STRATA_MMQ_KQ=1 for dense projections by default (`STRATA_MMQ_KQ=0` disables it).
         // Evaluated BEFORE tk_q36_mmq_built()/tk_q36_mmq_supported_fits() runs ensure_q36_env().
         let mmq_kq = std::env::var("STRATA_MMQ_KQ")
             .map(|v| !v.starts_with('0'))
             .unwrap_or(true);
+        // the C side's former ensure_q36_env defaults, now applied here, after the read above  S3)
+        talus_kernels::knobs::q36_env();
+        crate::pf_plans::w32_startup_check(tk.tk_mmvq_w32_table_plan);
         unsafe {
             let _ = (tk.tk_q36_mmq_built)();
         }
@@ -1503,7 +1502,7 @@ impl Engine {
             if nb >= 128 {
                 if let Some(&(qs, ws, mode)) = self.i8c.get(&(W.dev as usize)) {
                     let rc = unsafe {
-                        (self.tk.talus_pf_i8gemm)(
+                        self.tk.pf_i8gemm_v(
                             qs as *const i8,
                             ws as *const f32,
                             N as i32,
@@ -1514,6 +1513,7 @@ impl Engine {
                             out_ptr,
                             N as i64,
                             stream as *mut c_void,
+                            crate::pf_plans::i8gemm(mode),
                         )
                     };
                     if rc == 0 {
@@ -1552,7 +1552,7 @@ impl Engine {
             };
             check_tk(
                 ctx_ptr,
-                unsafe { (self.tk.tk_prefill_moe_mmq)(ctx_ptr, &P, stream) },
+                unsafe { crate::pf_plans::moe_mmq(&self.tk, ctx_ptr, &P, 1, stream) },
                 "tk_prefill_moe_mmq(dense)",
             )?;
             return Ok(());
@@ -1575,7 +1575,8 @@ impl Engine {
             check_tk(
                 ctx_ptr,
                 unsafe {
-                    (self.tk.tk_mmvq)(
+                    crate::pf_plans::mmvq(
+                        &self.tk,
                         ctx_ptr,
                         qtype,
                         W.dev as *const c_void,
@@ -1623,7 +1624,9 @@ impl Engine {
         };
         check_tk(
             self.tk_ctx.as_ptr(),
-            unsafe { (self.tk.tk_prefill_moe_mmq)(self.tk_ctx.as_ptr(), &P, self.s as tk_stream) },
+            unsafe {
+                crate::pf_plans::moe_mmq(&self.tk, self.tk_ctx.as_ptr(), &P, 1, self.s as tk_stream)
+            },
             "tk_prefill_moe_mmq(grouped)",
         )
     }
@@ -1938,7 +1941,7 @@ impl Engine {
                 check_tk(
                     ctx_ptr,
                     unsafe {
-                        (self.tk.tk_laguna_prompt_attn_wmma)(
+                        self.tk.laguna_prompt_attn_wmma_v(
                             ctx_ptr,
                             q_b,
                             self.kpool[il],
@@ -1965,6 +1968,13 @@ impl Engine {
                                 std::ptr::null()
                             },
                             stream,
+                            talus_kernels::plans::laguna_prompt_attn_wmma_variant(
+                                nbo as i32,
+                                (p0 + ob) as i32,
+                                1,
+                                self.kv_q8,
+                                false,
+                            ),
                         )
                     },
                     "tk_laguna_prompt_attn_wmma",
@@ -1973,7 +1983,7 @@ impl Engine {
                 check_tk(
                     ctx_ptr,
                     unsafe {
-                        (self.tk.tk_laguna_prompt_attn)(
+                        self.tk.laguna_prompt_attn_v(
                             ctx_ptr,
                             q_b,
                             self.kpool[il],
@@ -2001,6 +2011,7 @@ impl Engine {
                                 std::ptr::null()
                             },
                             stream,
+                            talus_kernels::plans::laguna_prompt_attn_variant(nbo as i32),
                         )
                     },
                     "tk_laguna_prompt_attn",
@@ -2103,7 +2114,8 @@ impl Engine {
                 check_tk(
                     ctx_ptr,
                     unsafe {
-                        (self.tk.tk_f32_matmul)(
+                        crate::pf_plans::f32_matmul(
+                            &self.tk,
                             ctx_ptr,
                             L.router_inp.as_f32(),
                             self.h,
@@ -2232,7 +2244,7 @@ impl Engine {
                 check_tk(
                     ctx_ptr,
                     unsafe {
-                        (self.tk.tk_moe_add_slots)(
+                        self.tk.moe_add_slots_v(
                             ctx_ptr,
                             x_b,
                             self.ysh,
@@ -2243,6 +2255,12 @@ impl Engine {
                             K_EMBD as i32,
                             K_TOP_K as i32,
                             stream,
+                            talus_kernels::plans::moe_add_slots_variant(
+                                x_b as usize,
+                                self.ysh as usize,
+                                self.yexp as usize,
+                                K_EMBD as i32,
+                            ),
                         )
                     },
                     "tk_moe_add_slots",
@@ -2477,7 +2495,8 @@ impl Engine {
             check_tk(
                 ctx_ptr,
                 unsafe {
-                    (self.tk.tk_mmvq)(
+                    crate::pf_plans::mmvq(
+                        &self.tk,
                         ctx_ptr,
                         to_tk_quant_type(t.qtype),
                         t.dev as *const c_void,
@@ -2529,7 +2548,8 @@ impl Engine {
                 check_tk(
                     ctx_ptr,
                     unsafe {
-                        (self.tk.tk_mmvq)(
+                        crate::pf_plans::mmvq(
+                            &self.tk,
                             ctx_ptr,
                             it.qtype,
                             it.w,
@@ -2819,7 +2839,7 @@ impl Engine {
             check_tk(
                 ctx_ptr,
                 unsafe {
-                    (self.tk.tk_laguna_decode_attn)(
+                    self.tk.laguna_decode_attn_v(
                         ctx_ptr,
                         self.dq,
                         self.kpool[il],
@@ -2848,6 +2868,13 @@ impl Engine {
                         self.sp_per_kv,
                         self.sp_bs,
                         stream,
+                        talus_kernels::plans::laguna_decode_attn_plan(
+                            H as i32,
+                            K_HEAD_KV as i32,
+                            if full { 0 } else { K_SWA as i32 },
+                            1,
+                            spl,
+                        ),
                     )
                 },
                 "tk_laguna_decode_attn(step)",
@@ -2866,7 +2893,8 @@ impl Engine {
             check_tk(
                 ctx_ptr,
                 unsafe {
-                    (self.tk.tk_mmvq)(
+                    crate::pf_plans::mmvq(
+                        &self.tk,
                         ctx_ptr,
                         to_tk_quant_type(L.wo.qtype),
                         L.wo.dev as *const c_void,
@@ -2943,7 +2971,8 @@ impl Engine {
                 check_tk(
                     ctx_ptr,
                     unsafe {
-                        (self.tk.tk_mmvq)(
+                        crate::pf_plans::mmvq(
+                            &self.tk,
                             ctx_ptr,
                             to_tk_quant_type(L.d_down.qtype),
                             L.d_down.dev as *const c_void,
@@ -3107,7 +3136,8 @@ impl Engine {
         check_tk(
             ctx_ptr,
             unsafe {
-                (self.tk.tk_mmvq)(
+                crate::pf_plans::mmvq(
+                    &self.tk,
                     ctx_ptr,
                     to_tk_quant_type(self.m.output.qtype),
                     self.m.output.dev as *const c_void,
@@ -3345,7 +3375,7 @@ impl Engine {
             check_tk(
                 ctx_ptr,
                 unsafe {
-                    (self.tk.tk_laguna_decode_attn)(
+                    self.tk.laguna_decode_attn_v(
                         ctx_ptr,
                         self.vq,
                         self.kpool[il],
@@ -3374,6 +3404,13 @@ impl Engine {
                         self.sp_per_kv,
                         self.sp_bs,
                         stream,
+                        talus_kernels::plans::laguna_decode_attn_plan(
+                            H as i32,
+                            K_HEAD_KV as i32,
+                            if full { 0 } else { K_SWA as i32 },
+                            n as i32,
+                            spl,
+                        ),
                     )
                 },
                 "tk_laguna_decode_attn(step_n)",

@@ -18,8 +18,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use crate::qwen4exp::cli::{
-    classify_serve_line, parse_fn_dump_compare_args, parse_serve_gen_line, use_cpp_engine,
-    ServeCommandKind,
+    classify_serve_line, parse_fn_dump_compare_args, use_cpp_engine, ServeCommandKind,
 };
 use crate::qwen4exp::ffi::P5Kernels; // qwen4exp-p5
 use crate::qwen4exp::ffi::{
@@ -34,7 +33,8 @@ use crate::qwen4exp::verify_mtp::{K_COPY_MID_ROWS, K_COPY_VERIFY_DEFAULT, K_VERI
 use talus_spec::{copy_cfg_from_env, copy_enabled, copy_env_f64, CopyMatch, CopyProposer}; // the widest verify window (16)
 
 struct StdinShared {
-    queue: Mutex<(VecDeque<String>, bool)>,
+    /// lines, each with the binary frame that followed it on stdin  D3b-2: GENI pixel form)
+    queue: Mutex<(VecDeque<(String, Option<Vec<u8>>)>, bool)>,
     cv: Condvar,
     stop: AtomicBool,
     request_stop_fn: FnRequestStop,
@@ -92,8 +92,20 @@ impl StdinReader {
                             }
                             let is_quit =
                                 matches!(classify_serve_line(&line), ServeCommandKind::Quit);
+                            // D3b-2: a GENI pixel-form line is followed at once by exactly frame_len bytes: read them here,
+                            // raw, so no byte of the frame is ever taken for a line (STOP / QUIT inside the pixels are data)
+                            let frame =
+                                match crate::qwen4exp::vision::read_frame(&line, &mut reader) {
+                                    Ok(f) => f,
+                                    Err(()) => {
+                                        let mut g = bg_shared.queue.lock().unwrap();
+                                        g.1 = true; // EOF inside a frame: the end of input
+                                        bg_shared.cv.notify_all();
+                                        break;
+                                    }
+                                };
                             let mut g = bg_shared.queue.lock().unwrap();
-                            g.0.push_back(std::mem::take(&mut line));
+                            g.0.push_back((std::mem::take(&mut line), frame));
                             bg_shared.cv.notify_one();
                             if is_quit {
                                 break;
@@ -125,7 +137,7 @@ impl StdinReader {
                 guard = shared.cv.wait(guard).unwrap();
             }
         }
-        if let Some(s) = guard.0.pop_front() {
+        if let Some((s, _frame)) = guard.0.pop_front() {
             drop(guard);
             let clean: Vec<u8> = s.into_bytes().into_iter().filter(|&b| b != 0).collect();
             let len = clean.len();
@@ -138,7 +150,12 @@ impl StdinReader {
         }
     }
 
-    fn next_line_string(&mut self, block: bool, request_stop_fn: FnRequestStop) -> Option<String> {
+    /// The next line and the binary frame that followed it (D3b-2: GENI pixel form), if any.
+    fn next_line_frame(
+        &mut self,
+        block: bool,
+        request_stop_fn: FnRequestStop,
+    ) -> Option<(String, Option<Vec<u8>>)> {
         let shared = self.ensure_started(request_stop_fn);
         let mut guard = shared.queue.lock().unwrap();
         if block {
@@ -995,6 +1012,37 @@ fn plan_window_rust(
     (t, t_mtp, from_sfx, sfx_match, chain_n, cm)
 }
 
+/// S12-v: the GENI entries (optional symbols).
+#[derive(Clone, Copy)]
+struct VisionFfi {
+    info: unsafe extern "C" fn(*mut TkQwen4ExpServeCtx, *mut i64) -> c_int,
+    #[allow(clippy::type_complexity)]
+    set_images: unsafe extern "C" fn(
+        *mut TkQwen4ExpServeCtx,
+        *const i32,
+        i64,
+        *const f32,
+        *const i64,
+        i64,
+        *const i64,
+        *const u64,
+        i64,
+    ) -> c_int,
+}
+
+impl VisionFfi {
+    fn load() -> Option<Self> {
+        unsafe {
+            use crate::qwen4exp::ffi::load_sym_from as l;
+            let n = std::ptr::null_mut();
+            Some(Self {
+                info: l(n, "tk_qwen4exp_serve_vision_info").ok()?,
+                set_images: l(n, "tk_qwen4exp_serve_set_images").ok()?,
+            })
+        }
+    }
+}
+
 unsafe extern "C" fn cb_run_serve_loop(
     user_data: *mut c_void,
     ctx: *mut TkQwen4ExpServeCtx,
@@ -1003,6 +1051,39 @@ unsafe extern "C" fn cb_run_serve_loop(
     let k = state.kernels;
     let mut info = TkQwen4ExpServeInfo::default();
     (k.serve_get_info)(ctx, &mut info);
+    // S12-v: GENI (--vision) in this loop: optional entries (a library without them keeps refusing GENI here,
+    // and generate.cpp only hands --vision engines over with TALUS_FN_RUST_VISION=1)
+    let vis = VisionFfi::load();
+    let mut vinfo = [0i64; 4];
+    let vision = match vis {
+        Some(v) => (v.info)(ctx, vinfo.as_mut_ptr()) == 1 && vinfo[0] != 0,
+        None => false,
+    };
+    let mut req_pictures: Option<crate::qwen4exp::vision_req::Pictures> = None;
+    // D3b-2: the in-process image encoder (TALUS_VISION_MOCK=<dir> = the test encoder; talus-vision plugs in here)
+    let mut encoder: Option<Box<dyn crate::qwen4exp::vision::ImageEncoder>> = None;
+    if vision {
+        if let Some(dir) = std::env::var_os("TALUS_VISION_MOCK") {
+            encoder = Some(Box::new(crate::qwen4exp::vision::MockEncoder::new(
+                std::path::PathBuf::from(dir),
+                vinfo[2],
+                std::env::var("TALUS_VISION_MOCK_MAX_ROWS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(16384),
+            )));
+        }
+        if let Some(e) = encoder.as_ref() {
+            if e.n_embd() != vinfo[2] {
+                eprintln!(
+                    "talus-qwen4exp: the image encoder's width {} is not the model's {}: pixel requests refused",
+                    e.n_embd(),
+                    vinfo[2]
+                );
+                encoder = None;
+            }
+        }
+    }
     let _ = state.rust_engine.piece1_weights.sync_from_ctx(&k, ctx);
     let _ = state
         .rust_engine
@@ -1055,7 +1136,7 @@ unsafe extern "C" fn cb_run_serve_loop(
 
     loop {
         let req_stop = state.request_stop_fn;
-        let Some(line) = state.stdin_reader.next_line_string(true, req_stop) else {
+        let Some((line, frame)) = state.stdin_reader.next_line_frame(true, req_stop) else {
             break;
         };
         let is_quit = line == "QUIT";
@@ -1080,7 +1161,12 @@ unsafe extern "C" fn cb_run_serve_loop(
 
         let _busy = BusyGuard::new(k.serve_set_busy, ctx);
 
-        let parsed = match parse_serve_gen_line(&line, info.pcie_frac, info.spec_min_p) {
+        let parsed = match crate::qwen4exp::cli::parse_serve_gen_line_v(
+            &line,
+            info.pcie_frac,
+            info.spec_min_p,
+            vision,
+        ) {
             Ok(p) => p,
             Err(err_line) => {
                 println!("{err_line}");
@@ -1097,6 +1183,315 @@ unsafe extern "C" fn cb_run_serve_loop(
                     println!("ERR logit_bias: {e}");
                     let _ = std::io::stdout().flush();
                     continue;
+                }
+            }
+        }
+
+        // D3b-2: whatever ends this request, the device pictures are cleared and the encoder releases its rows
+        struct PicGuard<'e>(Option<&'e mut Box<dyn crate::qwen4exp::vision::ImageEncoder>>);
+        impl Drop for PicGuard<'_> {
+            fn drop(&mut self) {
+                crate::qwen4exp::picture::set_device_pictures(None);
+                if let Some(e) = self.0.take() {
+                    e.release();
+                }
+            }
+        }
+        // held to the end of this request's loop iteration (dropped at its end or at any continue / return)
+        let _pic_guard: PicGuard;
+        // D3b-2: the pixel form needs an encoder, its img_px list, a matching frame and one key per picture
+        if vision && parsed.geni && parsed.pixels {
+            let v = vis.expect("vision implies the entries");
+            let fail = |e: &str| {
+                let _ = (v.set_images)(
+                    ctx,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                );
+                println!("ERR {e}");
+                let _ = std::io::stdout().flush();
+            };
+            let conv = state.rust_engine.piece5_conv_state.serve.as_deref_mut();
+            if let Some(cs) = conv {
+                cs.req_imgs.clear();
+            }
+            req_pictures = None;
+            let spec = parsed
+                .img_px
+                .as_deref()
+                .and_then(crate::qwen4exp::vision::parse_img_px);
+            let Some(spec) = spec else {
+                fail("img_px: expected <w>x<h>,... for the pixel form (@px)");
+                continue;
+            };
+            let Some(frame) = frame.as_ref() else {
+                fail("img_px: the pixel frame is missing");
+                continue;
+            };
+            if spec.bytes > crate::qwen4exp::vision::MAX_FRAME_BYTES || frame.len() != spec.bytes {
+                fail(&format!(
+                    "the pixel frame is {} bytes; at most {} are accepted",
+                    spec.bytes,
+                    crate::qwen4exp::vision::MAX_FRAME_BYTES
+                ));
+                continue;
+            }
+            if parsed.img_keys.len() != spec.sizes.len() {
+                fail("img_keys: one key per picture is required with the pixel form");
+                continue;
+            }
+            let Some(enc) = encoder.as_mut() else {
+                fail("this engine has no image encoder");
+                continue;
+            };
+            let mut at = 0usize;
+            let imgs: Vec<crate::qwen4exp::vision::PixelImage> = spec
+                .sizes
+                .iter()
+                .zip(&parsed.img_keys)
+                .map(|(&(w, h), &key)| {
+                    let len = w as usize * h as usize * 3;
+                    let im = crate::qwen4exp::vision::PixelImage {
+                        w,
+                        h,
+                        rgb: &frame[at..at + len],
+                        key,
+                    };
+                    at += len;
+                    im
+                })
+                .collect();
+            // the engine owns `done`; the encoder records it on the prefill's stream (the null stream here: the prompt
+            // path orders after it on its own stream through the event wait below)
+            let mut done: *mut c_void = std::ptr::null_mut();
+            // SAFETY: plain HIP runtime calls
+            if unsafe { hip_sys::hipEventCreateWithFlags(&mut done as *mut _ as *mut _, 0x2) }
+                != hip_sys::hipSuccess
+            {
+                fail("the image encoder event could not be created");
+                continue;
+            }
+            let res = enc.encode(&imgs, std::ptr::null_mut(), done);
+            // the prompt path's stream waits on `done` through a host wait here (one per request; the copy is the work)
+            let synced = unsafe { hip_sys::hipEventSynchronize(done as _) } == hip_sys::hipSuccess;
+            unsafe { hip_sys::hipEventDestroy(done as _) };
+            let max_rows = enc.max_rows();
+            _pic_guard = PicGuard(Some(enc));
+            let encoded = match res {
+                Ok(v) if synced => v,
+                Ok(_) => {
+                    fail("the image encoder did not finish");
+                    continue;
+                }
+                Err(e) => {
+                    fail(&e);
+                    continue;
+                }
+            };
+            let total: i64 = encoded.iter().map(|e| e.n).sum();
+            if total > max_rows {
+                fail(&format!(
+                    "the pictures need {total} rows; the image encoder takes at most {}",
+                    max_rows
+                ));
+                continue;
+            }
+            if let Some(bad) = encoded
+                .iter()
+                .position(|e| e.n < 1 || e.nx < 1 || e.ny < 1 || e.n != e.nx * e.ny)
+            {
+                fail(&format!(
+                    "the image encoder returned a bad grid for image {}",
+                    bad + 1
+                ));
+                continue;
+            }
+            // the same layout as the SVE path (vision_req::place): device rows are indexed per picture (off = picture index
+            // * a stride never used to read: the prompt path takes runs from `images`), content hash = the server key path
+            let recs: Vec<crate::qwen4exp::vision_req::PicRec> = encoded
+                .iter()
+                .map(|e| crate::qwen4exp::vision_req::PicRec {
+                    n: e.n,
+                    nx: e.nx,
+                    ny: e.ny,
+                    off: 0,
+                    content: &[],
+                })
+                .collect();
+            let placed = crate::qwen4exp::vision_req::place(
+                &recs,
+                &parsed.ids,
+                vinfo[1],
+                vinfo[2],
+                vinfo[3],
+                &parsed.img_keys,
+                "image encoder",
+            );
+            let (row_of, mrope, keys) = match placed {
+                Ok(x) => x,
+                Err(e) => {
+                    fail(&e);
+                    continue;
+                }
+            };
+            let (ks, kh): (Vec<i64>, Vec<u64>) = keys.iter().map(|k| (k.start, k.hash)).unzip();
+            let rc = (v.set_images)(
+                ctx,
+                mrope.as_ptr(),
+                vinfo[3],
+                std::ptr::null(),
+                row_of.as_ptr(),
+                row_of.len() as i64,
+                ks.as_ptr(),
+                kh.as_ptr(),
+                ks.len() as i64,
+            );
+            if rc != 1 {
+                fail("the image position upload failed");
+                continue;
+            }
+            if std::env::var_os("TALUS_FN_P2_SAY").is_some()
+                || std::env::var_os("TALUS_FN_VISION_SAY").is_some()
+            {
+                eprintln!("talus-qwen4exp: rust serve loop: GENI pixels, {} picture(s) encoded in process", keys.len());
+            }
+            if let Some(cs) = state.rust_engine.piece5_conv_state.serve.as_deref_mut() {
+                cs.req_imgs = keys
+                    .iter()
+                    .map(|k| crate::qwen4exp::conv_state::ImageKey {
+                        start: k.start,
+                        hash: k.hash,
+                    })
+                    .collect();
+            }
+            crate::qwen4exp::picture::set_device_pictures(Some(
+                crate::qwen4exp::picture::DevicePictures {
+                    images: keys
+                        .iter()
+                        .zip(&encoded)
+                        .map(|(k, e)| (k.start, e.n, e.rows))
+                        .collect(),
+                    n_embd: vinfo[2],
+                },
+            ));
+            // picture cells for the window rule below (row_of >= 0)
+            req_pictures = Some(crate::qwen4exp::vision_req::Pictures {
+                rows: Vec::new(),
+                row_of,
+                mrope: Vec::new(),
+                keys,
+            });
+        } else
+        // S12-v: the GENI block (generate.cpp 12880-12972): positions, rows, keys; ERR resets to the identity
+        if vision {
+            let v = vis.expect("vision implies the entries");
+            let conv = state.rust_engine.piece5_conv_state.serve.as_deref_mut();
+            req_pictures = None;
+            if parsed.geni {
+                match crate::qwen4exp::vision_req::build(
+                    &parsed.emb_path,
+                    &parsed.ids,
+                    vinfo[1],
+                    vinfo[2],
+                    vinfo[3],
+                    &parsed.img_keys,
+                ) {
+                    Ok(pc) => {
+                        if std::env::var_os("TALUS_FN_P2_SAY").is_some()
+                            || std::env::var_os("TALUS_FN_VISION_SAY").is_some()
+                        {
+                            eprintln!(
+                                "talus-qwen4exp: rust serve loop: GENI with {} picture(s)",
+                                pc.keys.len()
+                            );
+                        }
+                        let (ks, kh): (Vec<i64>, Vec<u64>) =
+                            pc.keys.iter().map(|k| (k.start, k.hash)).unzip();
+                        let rc = (v.set_images)(
+                            ctx,
+                            pc.mrope.as_ptr(),
+                            vinfo[3],
+                            pc.rows.as_ptr(),
+                            pc.row_of.as_ptr(),
+                            pc.row_of.len() as i64,
+                            ks.as_ptr(),
+                            kh.as_ptr(),
+                            ks.len() as i64,
+                        );
+                        if rc != 1 {
+                            let _ = (v.set_images)(
+                                ctx,
+                                std::ptr::null(),
+                                0,
+                                std::ptr::null(),
+                                std::ptr::null(),
+                                0,
+                                std::ptr::null(),
+                                std::ptr::null(),
+                                0,
+                            );
+                            println!("ERR the image position upload failed");
+                            let _ = std::io::stdout().flush();
+                            continue;
+                        }
+                        if let Some(cs) = conv {
+                            cs.req_imgs = pc
+                                .keys
+                                .iter()
+                                .map(|k| crate::qwen4exp::conv_state::ImageKey {
+                                    start: k.start,
+                                    hash: k.hash,
+                                })
+                                .collect();
+                        }
+                        req_pictures = Some(pc);
+                    }
+                    Err(e) => {
+                        let _ = (v.set_images)(
+                            ctx,
+                            std::ptr::null(),
+                            0,
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            0,
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            0,
+                        );
+                        if let Some(cs) = conv {
+                            cs.req_imgs.clear();
+                        }
+                        println!("ERR {e}");
+                        let _ = std::io::stdout().flush();
+                        continue;
+                    }
+                }
+            } else {
+                // a text request: the identity again (generate.cpp `!mrope_identity` branch)
+                if (v.set_images)(
+                    ctx,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                ) != 1
+                {
+                    println!("ERR the image position upload failed");
+                    let _ = std::io::stdout().flush();
+                    continue;
+                }
+                if let Some(cs) = conv {
+                    cs.req_imgs.clear();
                 }
             }
         }
@@ -1198,7 +1593,15 @@ unsafe extern "C" fn cb_run_serve_loop(
             if to <= at {
                 continue;
             }
-            let use_win = if to - at <= info.short_read { 1 } else { 0 };
+            // generate.cpp windows_ok: picture rows need the batched path
+            let has_pic = req_pictures.as_ref().is_some_and(|pc| {
+                (at..to).any(|i| pc.row_of.get(i as usize).is_some_and(|&r| r >= 0))
+            });
+            let use_win = if to - at <= info.short_read && !has_pic {
+                1
+            } else {
+                0
+            };
             let mut seg_nf = 0i32;
             let mut seg_cancel = 0i32;
             let seg_rc =

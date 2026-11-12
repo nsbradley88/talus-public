@@ -117,7 +117,8 @@ void launch_attn_merge(int rows, int HD, cudaStream_t st, const float* pacc, con
                        int chunk = kChunkCells, void* q8 = nullptr);
 void launch_attn_wmma(bool w8, dim3 grid, cudaStream_t st, const float* q, const __half* kc, const __half* vt,
                       const int32_t* pos0, int T, int H, int HKV, int ctx, int vt_ctx, float sc, int chunk, int n_chunk,
-                      float* pacc, float* pm, float* pl);
+                      float* pacc, float* pm, float* pl, int plan = -1);
+int attn_wmma_plan(int T, int H, int HKV);   // w3 rust-port S7
 /// test hook: one k_attn_wmma (w8 = 0) / k_attn_wmma8 (w8 = 1) instance, RT tiles, reduction RED.
 void launch_attn_wmma_inst(int w8, int rt, int red, dim3 grid, cudaStream_t st, const float* q, const __half* kc,
                            const __half* vt, const int32_t* pos0, int T, int H, int HKV, int ctx, int vt_ctx, float sc,

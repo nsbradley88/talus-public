@@ -412,6 +412,9 @@ tk_status tk_f32_matvec_rows_n(
  * Batched FP32 matrix-matrix product `y[t, o] = dot(w[o], x[t])` for `n_tok` rows.
  * [CAPTURABLE] `w`, `x`, `y` are device pointers; `n_in`, `n_out`, `n_tok` are baked at capture time.
  */
+/** w3 rust-port S7: with the host's plan (kind * 1000 + stream mode * 10 + config: 1 few-row family, 2 v2, 3 base), checked for one release. */
+tk_status tk_f32_matmul_v(tk_ctx* ctx, const float* w, const float* x, float* y, int32_t n_in, int32_t n_out, int32_t n_tok,
+                          tk_stream stream, int32_t plan) TK_NOEXCEPT;
 tk_status tk_f32_matmul(
     tk_ctx* ctx,
     const float* w,
@@ -527,6 +530,20 @@ tk_status tk_moe_add_slots(
     int32_t n_embd,
     int32_t k,
     tk_stream stream) TK_NOEXCEPT;
+/** w3 rust-port S6: as tk_moe_add_slots with the host's kernel choice `variant` (1 = float4, 0 = scalar; < 0 = the
+ * library decides). For one release the library compares it with its own choice (TALUS_PLAN_TRUST, plan_mismatch). */
+tk_status tk_moe_add_slots_v(
+    tk_ctx* ctx,
+    float* x,
+    const float* shared,
+    const float* y,
+    const int32_t* map_dev,
+    const float* weights_dev,
+    int32_t n_tok,
+    int32_t n_embd,
+    int32_t k,
+    tk_stream stream,
+    int32_t variant) TK_NOEXCEPT;
 
 /* ==========================================================================
  * 4. Norms, RoPE, Elementwise, Embedding & Sampling Helpers
@@ -872,6 +889,29 @@ tk_status tk_laguna_prompt_attn(
     const uint16_t* k_scale,
     const uint16_t* v_scale,
     tk_stream stream) TK_NOEXCEPT;
+/** w3 rust-port S6: as tk_laguna_prompt_attn with the host's tile shape (100 = one query token, else
+ * LAGUNA_PA_SHAPE's value; < 0 = the library decides); checked against the library's choice for one release. */
+tk_status tk_laguna_prompt_attn_v(
+    tk_ctx* ctx,
+    const float* q,
+    const uint16_t* k_pool,
+    const uint16_t* v_pool,
+    float* out,
+    int32_t nq,
+    int32_t q_pos0,
+    int32_t n_head,
+    int32_t n_kv,
+    int32_t window,
+    const int32_t* q_pos0_dev,
+    int32_t n_split,
+    float* part_acc,
+    float* part_ml,
+    bool merge,
+    int32_t vt_stride,
+    const uint16_t* k_scale,
+    const uint16_t* v_scale,
+    tk_stream stream,
+    int32_t variant) TK_NOEXCEPT;
 
 /**
  * Laguna RDNA3/3.5 WMMA prompt/decode causal attention (`strata::laguna::prompt_attn_wmma`).
@@ -897,6 +937,28 @@ tk_status tk_laguna_prompt_attn_wmma(
     const uint16_t* k_scale,
     const uint16_t* v_scale,
     tk_stream stream) TK_NOEXCEPT;
+/** w3 rust-port S6: as tk_laguna_prompt_attn_wmma with the host's kernel choice (1 split decode, 2 shared tiles
+ * transposed, 3 shared tiles, 4 per-wave tiles; < 0 = the library decides); checked for one release. */
+tk_status tk_laguna_prompt_attn_wmma_v(
+    tk_ctx* ctx,
+    const float* q,
+    const uint16_t* k_pool,
+    const uint16_t* v_pool,
+    float* out,
+    int32_t nq,
+    int32_t q_pos0,
+    int32_t n_head,
+    int32_t n_kv,
+    int32_t window,
+    int32_t vt_stride,
+    const int32_t* q_pos0_dev,
+    int32_t n_split,
+    float* part_acc,
+    float* part_ml,
+    const uint16_t* k_scale,
+    const uint16_t* v_scale,
+    tk_stream stream,
+    int32_t variant) TK_NOEXCEPT;
 
 /**
  * Laguna prefetching split-K decode/verify attention (`strata::laguna::decode_attn`).
@@ -925,6 +987,38 @@ tk_status tk_laguna_decode_attn(
     bool sel_per_kv,
     int32_t sel_bs,
     tk_stream stream) TK_NOEXCEPT;
+/** w3 rust-port S10: the W32 rule table's choice for (type, columns) without process overrides, as r * 1000000 + w * 10000 +
+ * (cg + 8) * 100 + sg: the host compares its own lookup over every shape at startup. */
+int32_t tk_mmvq_w32_table_plan(int32_t type, int32_t ncols) TK_NOEXCEPT;
+/** w3 rust-port S10: tk_mmvq with the host's route (kind * 1000 + XT2 config; 1 XT2, 2 XT KQ8, 3 LDS, 4 wave32 / tile chunks; < 0 =
+ * the library decides), checked against the library's for one release; and the wave32 switch it depends on. */
+tk_status tk_mmvq_v(tk_ctx* ctx, tk_qtype qtype, const void* w, const void* x_q8_1, float* y, int32_t n_in, int32_t n_out,
+                    int32_t ncols, tk_stream stream, int32_t route) TK_NOEXCEPT;
+int32_t tk_mmvq_w32_on(void) TK_NOEXCEPT;
+/** w3 rust-port S7: as tk_laguna_decode_attn with the host's launch shape: (nt * 10 + cap) * 1000 for the grouped kernel
+ * + 100 for 64-key tiles + 1 for the token-major grid; < 0 = the library decides; checked for one release. */
+tk_status tk_laguna_decode_attn_v(
+    tk_ctx* ctx,
+    const float* q,
+    const uint16_t* k_pool,
+    const uint16_t* v_pool,
+    const uint16_t* k_scale,
+    const uint16_t* v_scale,
+    int32_t n_head,
+    int32_t n_kv,
+    int32_t window,
+    int32_t stride,
+    const int32_t* pos_dev,
+    int32_t n_split,
+    float* part_acc,
+    float* part_ml,
+    int32_t n_tok,
+    const int32_t* sel_dev,
+    int32_t sel_k,
+    bool sel_per_kv,
+    int32_t sel_bs,
+    tk_stream stream,
+    int32_t plan) TK_NOEXCEPT;
 
 /**
  * Merge split-K attention partials (`part_acc`, `part_ml`), apply `softplus(g[h])` per head,
@@ -1167,6 +1261,110 @@ tk_status tk_attn_k192_v128_q8(
     int32_t n_split,
     tk_stream stream,
     void* q8_out) TK_NOEXCEPT;
+
+/**
+ * w3 rust-port S6: the launch plan of tk_attn_k192_v128 (`kind` 1 = prompt kernels: a = TALUS_MIMO_FA on, b = the raw
+ * TALUS_MIMO_FA_VER; 2 = v3 decode: a, b = heads per group, waves; 3 = v2 decode: a, b, c = hq, warps, u; 4 = v1
+ * decode: a = heads per wave; `splits` = the decode split-K count).
+ */
+typedef struct tk_mimo_k192_plan {
+    int32_t kind;
+    int32_t splits;
+    int32_t a;
+    int32_t b;
+    int32_t c;
+} tk_mimo_k192_plan;
+
+/** The plan the library would use for these arguments (`has_scratch` = a non-null split-K scratch). */
+tk_status tk_attn_k192_v128_plan(
+    int32_t q8_kv,
+    int32_t has_scratch,
+    int32_t n_tok,
+    int32_t n_head,
+    int32_t n_kv,
+    int32_t stride,
+    int32_t n_split,
+    tk_mimo_k192_plan* out) TK_NOEXCEPT;
+
+/**
+ * as `tk_attn_k192_v128_q8` (`q8_out` may be NULL) with the host's launch plan. For one release the library still
+ * computes its own plan: a disagreeing host plan is reported once per (kind, splits) (stderr, TALUS_VARIANT_TRACE
+ * "plan_mismatch") and the library's plan runs; TALUS_PLAN_TRUST=1 runs the host's plan. [CAPTURABLE]
+ */
+tk_status tk_attn_k192_v128_planned(
+    tk_ctx* ctx,
+    const float* q,
+    const void* k_pool,
+    const void* v_pool,
+    const uint16_t* k_scale,
+    const uint16_t* v_scale,
+    float* out,
+    float* scratch,
+    int32_t n_tok,
+    int32_t n_head,
+    int32_t n_kv,
+    int32_t stride,
+    float scale,
+    const int32_t* pos_dev,
+    int32_t n_split,
+    tk_stream stream,
+    void* q8_out,
+    const tk_mimo_k192_plan* plan) TK_NOEXCEPT;
+
+/**
+ * w3 rust-port S6: launch plan of the MiMo sliding-window attention (`tk_attn_swa_sinks*`): `kind` 1 = prefill v2,
+ * 2 = prefill v1, 3 = v2 decode (a, b, c = hq, warps, u), 4 = v2 drafter (head_dim 128), 5 = v1 decode (a = heads
+ * per wave).
+ */
+typedef struct tk_mimo_swa_plan {
+    int32_t kind;
+    int32_t a;
+    int32_t b;
+    int32_t c;
+} tk_mimo_swa_plan;
+
+/** The plan the library would use (`causal` = n_split != -2). */
+tk_status tk_attn_swa_sinks_plan(
+    int32_t q8_kv,
+    int32_t causal,
+    int32_t head_dim,
+    int32_t n_tok,
+    int32_t n_head,
+    int32_t n_kv,
+    tk_mimo_swa_plan* out) TK_NOEXCEPT;
+
+/**
+ * Every `tk_attn_swa_sinks*` form in one, with the host's launch plan: `q8_out` (the q8 form's Q8_1 outputs), `q8_mmq`
+ * / `q8_layout` / `q8_written` (the mmq form; `q8_written` may be NULL), value scale 1/sqrt(2) when n_split == -1.
+ * For one release the library compares the plan with its own, reports a mismatch once (stderr + TALUS_VARIANT_TRACE
+ * "plan_mismatch") and runs its own; TALUS_PLAN_TRUST=1 runs the host's. [CAPTURABLE]
+ */
+tk_status tk_attn_swa_sinks_planned(
+    tk_ctx* ctx,
+    const float* q,
+    const void* k_pool,
+    const void* v_pool,
+    const uint16_t* k_scale,
+    const uint16_t* v_scale,
+    const float* sinks,
+    float* out,
+    float* scratch,
+    int32_t n_tok,
+    int32_t n_head,
+    int32_t n_kv,
+    int32_t head_dim,
+    int32_t head_dim_v,
+    int32_t window,
+    int32_t stride,
+    float scale,
+    const int32_t* pos_dev,
+    int32_t n_split,
+    tk_stream stream,
+    void* q8_out,
+    void* q8_mmq,
+    int32_t q8_layout,
+    int32_t* q8_written,
+    const tk_mimo_swa_plan* plan) TK_NOEXCEPT;
 
 /**
  * MiMo decode: q + k partial NeoX rope in place (bitwise `tk_rope_neox` on the q rows and the k rows) and the
@@ -1418,6 +1616,57 @@ tk_status tk_prefill_moe_mmq_gu(
     const void* w_up,
     float swiglu_limit,
     tk_stream stream) TK_NOEXCEPT;
+
+/**
+ * w3 rust-port S4: the three products above with the activation layout passed by the host instead of read from the
+ * process-wide buffer registry (tk_q36_mmq_quantize / tk_register_mmq_q8_buf register a buffer as MMQ layout,
+ * tk_quantize_q8_1 / tk_swiglu_quantize_q8_1 / tk_gather_rows unregister it). `x_layout`: 0 = plain q8_1 rows,
+ * 1 = MMQ layout, -1 = the registry (what the exports without the suffix do). For one release the registry still
+ * decides: a disagreeing `x_layout` is reported once per site and type (stderr, TALUS_VARIANT_TRACE "layout_mismatch")
+ * and the registry value is used; TALUS_LAYOUT_TRUST=1 uses `x_layout`.  [STREAM-ORDERED]
+ */
+/** w3 rust-port S10: the same with the host's tp_moe kernel version and fused gate/up decision (0 / 1), both from
+ * talus_kernels::tune and checked against the library's rules for one release; < 0 = the library decides. */
+tk_status tk_prefill_moe_mmq_lv(tk_ctx* ctx, const tk_moe_mmq_product* product, int32_t x_layout, int32_t moe_ver,
+                                tk_stream stream) TK_NOEXCEPT;
+tk_status tk_prefill_moe_mmq_gu_q8_lv(tk_ctx* ctx, const tk_moe_mmq_product* gate, const void* w_up, float swiglu_limit,
+                                      int32_t down_qtype, void* xq_out, int64_t xq_rows, int32_t x_layout, int32_t moe_ver,
+                                      int32_t gu, tk_stream stream) TK_NOEXCEPT;
+tk_status tk_prefill_moe_mmq_gu_lv(tk_ctx* ctx, const tk_moe_mmq_product* gate, const void* w_up, float swiglu_limit,
+                                   int32_t x_layout, int32_t moe_ver, int32_t gu, tk_stream stream) TK_NOEXCEPT;
+tk_status tk_prefill_moe_mmq_l(
+    tk_ctx* ctx,
+    const tk_moe_mmq_product* product,
+    int32_t x_layout,
+    tk_stream stream) TK_NOEXCEPT;
+tk_status tk_prefill_moe_mmq_gu_q8_l(
+    tk_ctx* ctx,
+    const tk_moe_mmq_product* gate,
+    const void* w_up,
+    float swiglu_limit,
+    int32_t down_qtype,
+    void* xq_out,
+    int64_t xq_rows,
+    int32_t x_layout,
+    tk_stream stream) TK_NOEXCEPT;
+tk_status tk_prefill_moe_mmq_gu_l(
+    tk_ctx* ctx,
+    const tk_moe_mmq_product* gate,
+    const void* w_up,
+    float swiglu_limit,
+    int32_t x_layout,
+    tk_stream stream) TK_NOEXCEPT;
+/**
+ * w3 rust-port S5: tk_prefill_mmq's work buffer owned by the host (so it is budgeted and shed with the host's memory):
+ * bytes for `rows` (>= 1024) rows, and adoption (writes the identity ids on `stream`). tk_prefill_trim forgets an adopted
+ * buffer without freeing it: the host frees it after the trim and may adopt a new one. A product of more rows than the
+ * adopted capacity falls back to the library's own allocation.
+ */
+size_t tk_prefill_mmq_dense_bytes(int64_t rows) TK_NOEXCEPT;
+tk_status tk_prefill_adopt_mmq_dense(tk_ctx* ctx, void* buf, int64_t rows, tk_stream stream) TK_NOEXCEPT;
+
+/** 1 when `xq` is registered as an MMQ-layout activation buffer (the registry the products above consult). */
+int32_t tk_mmq_q8_buf_registered(const void* xq) TK_NOEXCEPT;
 
 /**
  * Grouped MoE expert MMQ / fused int8 product for IQ2/IQ3/IQ4 native expert blobs
@@ -1784,6 +2033,10 @@ tk_status tk_q36_attn_merge(
     void* q8,
     tk_stream stream) TK_NOEXCEPT;
 
+/** w3 rust-port S7: with the host's launch plan (red * 10000 + shape, the 4-wave reader; < 0 = the library decides), checked for one release. */
+tk_status tk_q36_attn_wmma_v(tk_ctx* ctx, bool w8, int32_t grid_x, int32_t grid_y, const float* q, const void* kc, const void* vt,
+                             const int32_t* pos0, int32_t n_tok, int32_t h, int32_t hkv, int32_t ctx_len, int32_t vt_ctx, float sc,
+                             int32_t chunk, int32_t n_chunk, float* pacc, float* pm, float* pl, tk_stream stream, int32_t plan) TK_NOEXCEPT;
 tk_status tk_q36_attn_wmma(
     tk_ctx* ctx,
     bool w8,
@@ -2511,6 +2764,12 @@ int talus_pf_i8x_expand(
     float* ws,
     void* stream) TK_NOEXCEPT;
 
+/** w3 rust-port S9: talus_pf_i8gemm / talus_pf_i8gemm_swiglu_q8 with the host's kernel variant (TP_I8_VARIANT, per-arch table;
+ * < 0 = the library decides), checked against the library's choice for one release. */
+int talus_pf_i8gemm_v(const int8_t* qs, const float* ws, int32_t n, int32_t k, int32_t mode, const void* xq, int32_t T,
+                      float* dst, int64_t ld_dst, void* stream, int32_t variant);
+int talus_pf_i8gemm_swiglu_q8_v(const int8_t* qs, const float* ws, int32_t n, int32_t k, int32_t mode, const void* xq,
+                                int32_t T, const float* g, int64_t ldg, void* yq, int32_t layout, void* stream, int32_t variant);
 int talus_pf_i8gemm(
     const int8_t* qs,
     const float* ws,

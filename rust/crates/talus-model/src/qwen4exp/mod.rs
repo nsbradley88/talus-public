@@ -6,11 +6,14 @@ pub mod decode;
 pub mod engine;
 pub mod ffi;
 pub mod kld_flags;
+pub mod picture;
 pub mod prefill;
 pub mod skeleton;
 pub mod spec;
 pub mod state;
 pub mod verify_mtp;
+pub mod vision;
+pub mod vision_req;
 pub mod weights;
 
 pub use cli::{

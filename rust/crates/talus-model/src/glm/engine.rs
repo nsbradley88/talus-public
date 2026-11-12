@@ -497,6 +497,8 @@ pub struct GlmEngine {
     /// size up front (l4_need), so this never happens by construction.
     l4_cp: std::cell::Cell<usize>,
     l4_pr: std::cell::Cell<usize>,
+    /// S5: `tk_prefill_mmq`'s adopted work buffer (null: none yet, or trimmed)
+    pub(super) mmq_dense: std::cell::Cell<*mut c_void>,
     rowsrc: Buf,
     rownat: Buf,
     bounds: Buf,
@@ -547,6 +549,7 @@ impl Dump {
 
 impl Drop for GlmEngine {
     fn drop(&mut self) {
+        ffi::dev_free(self.mmq_dense.get());
         for (_, g) in self.graphs.drain() {
             ffi::graph_destroy(g);
         }
@@ -594,6 +597,7 @@ pub fn state_bytes(hp: &super::weights::GlmHparams, ctx: usize, mtp: bool) -> (u
 
 impl GlmEngine {
     pub fn new(lib: GlmLib, w: GlmWeights, cfg: GlmConfig) -> Result<Self> {
+        crate::pf_plans::w32_startup_check(lib.w32_table_plan);
         let hp = w.hp.clone();
         let ctx = cfg.ctx.div_ceil(KV_BUCKET) * KV_BUCKET;
         let mut allocs = vec![];
@@ -1012,6 +1016,16 @@ impl GlmEngine {
             p: dev_alloc(mmq_bytes)?,
             bytes: mmq_bytes,
         };
+        // S5: the two-pass sparse attention's scratch pool, with the engine's buffers (before any capture)
+        if let (Some(set_pool), Some(nslot)) =
+            (lib.g.sparse_2p_set_pool, super::plans::sparse_2p_slots())
+        {
+            let pool = alloc(nslot as usize * 64 * 2080 * 4)?;
+            let locks = alloc(nslot as usize * 4)?;
+            ffi::memset(locks.p, 0, nslot as usize * 4)?;
+            // SAFETY: the slots and locks live as long as the engine (process-wide single engine).
+            unsafe { set_pool(pool.f(), locks.i(), nslot) };
+        }
         if let Some(reg) = lib.register_mmq {
             // SAFETY: registers the buffer as MMQ-layout activations (tk_prefill_moe_mmq dispatch).
             unsafe { reg(mmq_xq.p) };
@@ -1151,6 +1165,7 @@ impl GlmEngine {
             y_row0: 0,
             l4_cp: std::cell::Cell::new(0),
             l4_pr: std::cell::Cell::new(0),
+            mmq_dense: std::cell::Cell::new(ptr::null_mut()),
             rowsrc,
             rownat,
             bounds,
@@ -1241,7 +1256,8 @@ impl GlmEngine {
     fn mmvq(&self, w: &Tensor, xq: *const c_void, y: *mut f32, t: usize) -> Result<()> {
         // SAFETY: tk_* C ABI; pointers are device buffers sized for t columns.
         let stv = unsafe {
-            (self.lib.tk.tk_mmvq)(
+            crate::pf_plans::mmvq(
+                &self.lib.tk,
                 self.lib.ctx,
                 std::mem::transmute::<i32, ffi::tk_qtype>(w.ty as i32),
                 w.p(),
@@ -1739,7 +1755,10 @@ impl GlmEngine {
             y_scale_dev: ptr::null(),
         };
         // SAFETY: tk_* C ABI; the descriptor is read at launch.
-        let stv = unsafe { (self.lib.tk.tk_prefill_moe_mmq)(self.lib.ctx, &pr, self.stream as _) };
+        // mmq_xq: MMQ rows (tk_q36_mmq_quantize, registered at init) - S4
+        let stv = unsafe {
+            crate::pf_plans::moe_mmq(&self.lib.tk, self.lib.ctx, &pr, 1, self.stream as _)
+        };
         self.lib.cktk(stv, "tk_prefill_moe_mmq")
     }
 
@@ -1780,7 +1799,15 @@ impl GlmEngine {
         };
         // SAFETY: tk_* C ABI; the descriptor is read at launch.
         let stv = unsafe {
-            (self.lib.tk.tk_prefill_moe_mmq_gu)(self.lib.ctx, &pr, up.p(), limit, self.stream as _)
+            crate::pf_plans::moe_mmq_gu(
+                &self.lib.tk,
+                self.lib.ctx,
+                &pr,
+                up.p(),
+                limit,
+                1,
+                self.stream as _,
+            )
         };
         if stv == talus_kernels_sys::TK_ERR_UNSUPPORTED {
             return Ok(false);
@@ -1821,7 +1848,7 @@ impl GlmEngine {
             // SAFETY: tkg C ABI; tile offsets stay inside the [t][..] buffers.
             ck(
                 unsafe {
-                    (self.lib.g.f32_matvec)(
+                    self.lib.g.f32_matvec_p(
                         w.f(),
                         x.add(t0 * ni),
                         y.add(t0 * no),
@@ -1847,7 +1874,7 @@ impl GlmEngine {
         // SAFETY: tkg C ABI; the arrays are read at launch time.
         ck(
             unsafe {
-                (self.lib.g.multi_q8_0)(
+                self.lib.g.multi_q8_0_p(
                     mats.len() as i32,
                     w.as_ptr(),
                     x.as_ptr(),
@@ -1872,7 +1899,7 @@ impl GlmEngine {
             // SAFETY: tkg C ABI; tile offsets inside [t][H][..].
             ck(
                 unsafe {
-                    (self.lib.g.heads_q8_0)(
+                    self.lib.g.heads_q8_0_p(
                         w.p(),
                         x.add(t0 * h * ni),
                         y.add(t0 * h * no),
@@ -2337,7 +2364,7 @@ impl GlmEngine {
             self.join()?;
             // SAFETY: tkg C ABI, buffers sized for TMAX.
             let r = unsafe {
-                (self.lib.g.kda_fused)(
+                self.lib.g.kda_fused_p(
                     a.qr.f(),
                     a.kr.f(),
                     a.vr.f(),
@@ -2440,7 +2467,7 @@ impl GlmEngine {
             // SAFETY: tkg C ABI.
             unsafe {
                 ck(
-                    (self.lib.g.glm_kda_step)(
+                    self.lib.g.glm_kda_step_p(
                         a.qc.f(),
                         a.kc.f(),
                         a.vc.f(),
@@ -2723,7 +2750,7 @@ impl GlmEngine {
                         "tkg_kda_conv",
                     )?;
                     ck(
-                        (me.lib.g.glm_kda_step)(
+                        me.lib.g.glm_kda_step_p(
                             a.qc.f(),
                             a.kc.f(),
                             a.vc.f(),
@@ -2934,7 +2961,7 @@ impl GlmEngine {
                     "tkg_idx_pool",
                 )?;
                 ck(
-                    (me.lib.g.glm_indexer)(
+                    me.lib.g.glm_indexer_p(
                         a.iq.f(),
                         st_pool.v(),
                         a.iw.f(),
@@ -2998,7 +3025,7 @@ impl GlmEngine {
         // SAFETY: tkg C ABI.
         unsafe {
             ck(
-                (self.lib.g.glm_sparse_fa_idx)(
+                self.lib.g.glm_sparse_fa_idx_p(
                     a.qabs.f(),
                     st_kv.v(),
                     self.st.zero_mask.v(),
@@ -3375,7 +3402,7 @@ impl GlmEngine {
             let paired = gate_t == f.up_exps.ty && self.pair_ids && {
                 // SAFETY: tkg C ABI.
                 let r = unsafe {
-                    (self.lib.g.glm_mmvq_ids_pair)(
+                    self.lib.g.glm_mmvq_ids_pair_p(
                         gate_t as i32,
                         f.gate_exps.p(),
                         f.up_exps.p(),
@@ -3401,7 +3428,7 @@ impl GlmEngine {
             if !paired {
                 unsafe {
                     ck(
-                        (self.lib.g.glm_mmvq_ids)(
+                        self.lib.g.glm_mmvq_ids_p(
                             gate_t as i32,
                             f.gate_exps.p(),
                             a.yq.v(),
@@ -3418,7 +3445,7 @@ impl GlmEngine {
                         "glm_mmvq_ids gate",
                     )?;
                     ck(
-                        (self.lib.g.glm_mmvq_ids)(
+                        self.lib.g.glm_mmvq_ids_p(
                             f.up_exps.ty as i32,
                             f.up_exps.p(),
                             a.yq.v(),
@@ -3512,7 +3539,7 @@ impl GlmEngine {
             // SAFETY: tkg C ABI.
             unsafe {
                 ck(
-                    (self.lib.g.glm_mmvq_ids)(
+                    self.lib.g.glm_mmvq_ids_p(
                         down_t as i32,
                         f.down_exps.p(),
                         a.eactq.v(),

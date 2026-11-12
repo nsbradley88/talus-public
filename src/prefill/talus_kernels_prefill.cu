@@ -5,6 +5,7 @@
 // Copyright (c) 2026 nsbradley88
 // SPDX-License-Identifier: MIT
 
+#include "strata/kernels/variant_trace.hpp"   // S1
 #include "talus_kernels.h"
 #if __has_include("strata/kernels/tk_internal.hpp")
 #include "strata/kernels/tk_internal.hpp"
@@ -113,6 +114,29 @@ bool is_registered_mmq_q8_buf(const void* xq) noexcept {
     if (!xq) return false;
     std::lock_guard<std::mutex> lock(g_mmq_q8_buf_mu);
     return g_mmq_q8_bufs.find(xq) != g_mmq_q8_bufs.end();
+}
+
+// S4: the activation layout of a moe_mmq call. x_layout = -1: the registry (the legacy exports); 0 plain
+// q8_1 rows; 1 MMQ layout (the caller's own knowledge). For one release the registry stays the source of truth: a
+// caller value that disagrees with it is reported (once per site / type, stderr + TALUS_VARIANT_TRACE "layout_mismatch")
+// and the registry value is used, so output never changes. TALUS_LAYOUT_TRUST=1 uses the caller's value instead.
+bool resolve_x_mmq(const void* x, int32_t x_layout, const char* site, int ggml_t) noexcept {
+    const bool reg = is_registered_mmq_q8_buf(x);
+    if (x_layout < 0) return reg;
+    const bool arg = x_layout == 1;
+    if (arg == reg) return reg;
+    static const bool trust = [] { const char* e = std::getenv("TALUS_LAYOUT_TRUST"); return e != nullptr && e[0] == '1'; }();
+    TALUS_VTRACE("layout_mismatch", site, ggml_t, arg ? 1 : 0, reg ? 1 : 0, trust ? 1 : 0);
+    static std::mutex mu;
+    static std::set<std::pair<std::string, int>> warned;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (warned.emplace(site, ggml_t).second)
+            std::fprintf(stderr, "talus: %s: activation layout from the host (%s) differs from the registry (%s) for type %d; "
+                                 "using the %s\n", site, arg ? "mmq" : "plain", reg ? "mmq" : "plain", ggml_t,
+                         trust ? "host's" : "registry's");
+    }
+    return trust ? arg : reg;
 }
 
 bool dequant_f16_supported(int ggml_type) noexcept {
@@ -389,7 +413,7 @@ struct PrefillStateDeleter {
             state->mmq_ctx = nullptr;
         }
         if (state->mmq_dense_buf) {
-            (void) cudaFree(state->mmq_dense_buf);
+            if (!state->mmq_dense_adopted) (void) cudaFree(state->mmq_dense_buf);
             state->mmq_dense_buf = nullptr;
         }
         if (state->mmq_ids_buf) {
@@ -591,23 +615,28 @@ tk_status run_f16_gemm(
         return v ? static_cast<int64_t>(std::atoll(v)) : int64_t(0);
     }();
     if (pf_on && T >= pf_min_t && ldx == 0 && strata_pf_gemm_f16(X, W, Y, T, N, K, ldy, beta, stream)) {
+        TALUS_VTRACE("pf_f16_gemm", "pf_gemm", N, K, beta != 0.0f ? 1 : 0);
         return TK_OK;
     }
     if (wmma_on && ldx == 0 && T >= 16 && (beta == 0.0f || beta == 1.0f) &&
         strata_wmma_gemm_f16(X, W, Y, T, N, K, ldy, beta, stream)) {
+        TALUS_VTRACE("pf_f16_gemm", "wmma", N, K, beta != 0.0f ? 1 : 0);
         return TK_OK;
     }
 #endif
 #if defined(__HIPCC__)
     if (state.f16_io && beta == 0.0f && ldx == 0) {
+        TALUS_VTRACE("pf_f16_gemm", "f16_inplace", N, K, 0);
         return run_f16_inplace(state, X, W, Y, T, N, K, ldy, stream, ctx);
     }
 #endif
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     if (try_hipblaslt(state, strata::prefill::hipblaslt::InputType::f16, X, W, Y, T, N, K, ldy, beta, stream, ldx)) {
+        TALUS_VTRACE("pf_f16_gemm", "hipblaslt", N, K, beta != 0.0f ? 1 : 0);
         return TK_OK;
     }
 #endif
+    TALUS_VTRACE("pf_f16_gemm", "hipblas_default", N, K, beta != 0.0f ? 1 : 0, ldx != 0 ? 1 : 0);
     auto blas_h = reinterpret_cast<cublasHandle_t>(state.hipblas_handle);
     if (!blas_h) {
         record_error(ctx, "tk_prefill_gemm: hipBLAS handle is not initialized");
@@ -780,7 +809,8 @@ bool try_dense_native_mmq(
     };
     if (!state.mmq_dense_buf || state.mmq_dense_cap_rows < kRows) {
         if (state.mmq_dense_buf) {
-            (void) cudaFree(state.mmq_dense_buf);
+            if (!state.mmq_dense_adopted) (void) cudaFree(state.mmq_dense_buf);
+            state.mmq_dense_adopted = false;
             state.mmq_dense_buf = nullptr;
         }
         if (cudaMalloc(&state.mmq_dense_buf, bounds_off_for(kRows) + 256u) != cudaSuccess) {
@@ -905,8 +935,10 @@ tk_status run_native_gemm(
 
     if (beta == 0.0f && (ldx == 0 || ldx == K) &&
         try_dense_native_mmq(state, X, ggml_type, W_blocks, Y, T, N, K, ldy, stream)) {
+        TALUS_VTRACE("pf_native_gemm", "dense_mmq", ggml_type, N, K);
         return TK_OK;
     }
+    TALUS_VTRACE("pf_native_gemm", "dequant_f16", ggml_type, N, K, N * K > state.dequant_scratch_elems ? 1 : 0);
 
     if (N * K > state.dequant_scratch_elems) {
         const int64_t rows = state.dequant_scratch_elems / K;
@@ -1172,7 +1204,8 @@ extern "C" tk_status tk_prefill_trim(tk_ctx* ctx) TK_NOEXCEPT {
             state.mmq_ctx = nullptr;
         }
         if (state.mmq_dense_buf) {
-            (void) cudaFree(state.mmq_dense_buf);
+            if (!state.mmq_dense_adopted) (void) cudaFree(state.mmq_dense_buf);   // (adopted: the host frees it after this call)
+            state.mmq_dense_adopted = false;
             state.mmq_dense_buf = nullptr;
             state.mmq_dense_cap_rows = 0;
         }
@@ -1411,7 +1444,8 @@ extern "C" tk_status tk_prefill_mmq(
         };
         if (!own_ids && (!state->mmq_dense_buf || state->mmq_dense_cap_rows < need_rows)) {
             if (state->mmq_dense_buf) {
-                (void) cudaFree(state->mmq_dense_buf);
+                if (!state->mmq_dense_adopted) (void) cudaFree(state->mmq_dense_buf);
+                state->mmq_dense_adopted = false;
                 state->mmq_dense_buf = nullptr;
                 state->mmq_dense_cap_rows = 0;
             }
@@ -1493,6 +1527,7 @@ extern "C" tk_status tk_prefill_mmq(
             mp.ld_dst = ldy;
             if (talus::prefill::moe_gemm_q6k_dense(mp, stream)) return TK_OK;
         }
+        TALUS_VTRACE("tk_prefill_mmq", "ggml_mmq", ggml_t, n_out, n_in, use_dense_moe ? 1 : 0);
         auto* mmq_ctx = ensure_mmq_context(*state);
         mmq_ctx->run(p, stream);
         return TK_OK;
@@ -1501,9 +1536,28 @@ extern "C" tk_status tk_prefill_mmq(
     }
 }
 
-extern "C" tk_status tk_prefill_moe_mmq(
+namespace {
+thread_local int g_host_gu = -1;   // w3 rust-port S10: the host's fused gate/up decision for this export call (rust: tune::moe_gu)
+struct HostMoeVersion {   // w3 rust-port S10: the host's kernel version for this export call
+    explicit HostMoeVersion(int v) { talus::prefill::moe_host_version(v); }
+    ~HostMoeVersion() { talus::prefill::moe_host_version(-1); }
+};
+}  // namespace
+
+extern "C" tk_status tk_prefill_moe_mmq_lv(
     tk_ctx* ctx,
     const tk_moe_mmq_product* product,
+    int32_t x_layout,
+    int32_t moe_ver,
+    tk_stream stream) TK_NOEXCEPT {
+    const HostMoeVersion host_ver(moe_ver);
+    return tk_prefill_moe_mmq_l(ctx, product, x_layout, stream);
+}
+
+extern "C" tk_status tk_prefill_moe_mmq_l(
+    tk_ctx* ctx,
+    const tk_moe_mmq_product* product,
+    int32_t x_layout,
     tk_stream stream) TK_NOEXCEPT {
     if (ctx == nullptr || product == nullptr) {
         record_error(ctx, "tk_prefill_moe_mmq: NULL pointer argument");
@@ -1527,9 +1581,11 @@ extern "C" tk_status tk_prefill_moe_mmq(
     try {
         namespace mmq = strata::prefill::mmq;
         const int ggml_t = static_cast<int>(product->qtype);
-        const bool is_mmq_layout = (product->n_experts <= 1) || is_registered_mmq_q8_buf(product->x_q8_1);
+        const bool is_mmq_layout =
+            (product->n_experts <= 1) || resolve_x_mmq(product->x_q8_1, x_layout, "tk_prefill_moe_mmq", ggml_t);
         const bool mimo_iq =
             !is_mmq_layout && strata::kernels::mimo_is_iq_qtype(ggml_t) && ((product->w_cols % 256) == 0);
+        TALUS_VTRACE("tk_prefill_moe_mmq", "layout", ggml_t, is_mmq_layout ? 1 : 0, mimo_iq ? 1 : 0, product->n_experts > 1 ? 1 : 0);
         // IQ1_M has no MMQ path; with MMQ-layout activations (the IQ2_S / IQ2_XS D4 layout) and gfx11 it runs on
         // tp_moe (exact int8 representation of the IQ1_M weights, mode 1); otherwise unsupported as before
         if (ggml_t == (int) TK_QTYPE_IQ1_M && is_mmq_layout && product->n_experts > 1 && product->y_scale_dev == nullptr &&
@@ -1591,6 +1647,7 @@ extern "C" tk_status tk_prefill_moe_mmq(
             return v != nullptr && v[0] == '1';
         }();
         if (mimo_iq && (!force_legacy_mmq || !mmq::fits(ggml_t, product->w_rows))) {
+            TALUS_VTRACE("tk_prefill_moe_mmq", "mimo_grouped_mmq", ggml_t, product->w_rows, product->w_cols);
             strata::kernels::mimo_prefill_moe_mmq_q8(
                 ggml_t,
                 product->w,
@@ -1652,6 +1709,7 @@ extern "C" tk_status tk_prefill_moe_mmq(
             if (talus::prefill::moe_gemm(mp, stream)) return TK_OK;
         }
 
+        TALUS_VTRACE("tk_prefill_moe_mmq", "ggml_mmq", ggml_t, product->w_rows, product->w_cols, product->y_scale_dev != nullptr ? 1 : 0);
         auto* mmq_ctx = ensure_mmq_context(*state);
         mmq_ctx->run(p, stream);
         return TK_OK;
@@ -1660,12 +1718,19 @@ extern "C" tk_status tk_prefill_moe_mmq(
     }
 }
 
+extern "C" tk_status tk_prefill_moe_mmq(
+    tk_ctx* ctx,
+    const tk_moe_mmq_product* product,
+    tk_stream stream) TK_NOEXCEPT {
+    return tk_prefill_moe_mmq_l(ctx, product, -1, stream);
+}
+
 // fused gate/up + SwiGLU on tp_moe (see talus_kernels.h).  TALUS_PF_MOE_GU=0: always TK_ERR_UNSUPPORTED (the
 // caller keeps its separate gate / up / SwiGLU path).
 // tk_prefill_moe_mmq_gu with the SwiGLU rows written straight as the down projection's MMQ q8_1 activations
 // (bitwise the FP32 rows + tk_q36_mmq_quantize(rows, down_qtype)); TK_ERR_UNSUPPORTED = run the separate path.
 // TALUS_PF_MOE_GU_Q8=0: always unsupported.
-extern "C" tk_status tk_prefill_moe_mmq_gu_q8(
+extern "C" tk_status tk_prefill_moe_mmq_gu_q8_lv(
     tk_ctx* ctx,
     const tk_moe_mmq_product* gate,
     const void* w_up,
@@ -1673,6 +1738,26 @@ extern "C" tk_status tk_prefill_moe_mmq_gu_q8(
     int32_t down_qtype,
     void* xq_out,
     int64_t xq_rows,
+    int32_t x_layout,
+    int32_t moe_ver,
+    int32_t gu,
+    tk_stream stream) TK_NOEXCEPT {
+    const HostMoeVersion host_ver(moe_ver);
+    g_host_gu = gu;
+    const tk_status st = tk_prefill_moe_mmq_gu_q8_l(ctx, gate, w_up, swiglu_limit, down_qtype, xq_out, xq_rows, x_layout, stream);
+    g_host_gu = -1;
+    return st;
+}
+
+extern "C" tk_status tk_prefill_moe_mmq_gu_q8_l(
+    tk_ctx* ctx,
+    const tk_moe_mmq_product* gate,
+    const void* w_up,
+    float swiglu_limit,
+    int32_t down_qtype,
+    void* xq_out,
+    int64_t xq_rows,
+    int32_t x_layout,
     tk_stream stream) TK_NOEXCEPT {
     if (ctx == nullptr || gate == nullptr || w_up == nullptr || xq_out == nullptr) {
         record_error(ctx, "tk_prefill_moe_mmq_gu_q8: NULL pointer argument");
@@ -1685,15 +1770,19 @@ extern "C" tk_status tk_prefill_moe_mmq_gu_q8(
         return (v == nullptr || v[0] != '0') && (g == nullptr || g[0] != '0') && (m == nullptr || m[0] != '0');
     }();
     const int ggml_t = static_cast<int>(gate->qtype);
+    const bool x_mmq = resolve_x_mmq(gate->x_q8_1, x_layout, "tk_prefill_moe_mmq_gu_q8", ggml_t);
+    TALUS_VTRACE("tk_prefill_moe_mmq_gu_q8", "entry", ggml_t, x_mmq ? 1 : 0, (int) down_qtype, on ? 1 : 0);
     if (!on || gate->n_experts <= 1 || gate->y_scale_dev != nullptr || !talus::prefill::tp_gfx11_wmma() ||
-        !is_registered_mmq_q8_buf(gate->x_q8_1) || xq_rows < gate->total_rows ||
+        !x_mmq || xq_rows < gate->total_rows ||
         !talus::prefill::moe_gu_q8_supported(ggml_t, (int) down_qtype, (int) gate->w_rows, (int) gate->w_cols)) {
         return TK_ERR_UNSUPPORTED;
     }
     {   // the same per-arch rule as tk_prefill_moe_mmq_gu (mode-0 types: >= moe_gu_min_rows rows per expert)
         const talus::prefill::TpTune& tu = talus::prefill::tp_tune_current();
         const int64_t mean = gate->total_rows / gate->n_experts;
-        if (tu.moe_gu == 0 || mean < tu.moe_gu_min_rows) return TK_ERR_UNSUPPORTED;
+        int go = tu.moe_gu == 0 || mean < tu.moe_gu_min_rows ? 0 : 1;
+        if (g_host_gu >= 0) go = strata::kernels::vtrace::plan_choose("moe_gu_q8", g_host_gu, go);
+        if (!go) return TK_ERR_UNSUPPORTED;
     }
     if (gate->max_rows == 0 || gate->total_rows == 0) return TK_ERR_UNSUPPORTED;
     if (gate->w == nullptr || gate->bounds_dev == nullptr) {
@@ -1730,11 +1819,40 @@ extern "C" tk_status tk_prefill_moe_mmq_gu_q8(
     }
 }
 
-extern "C" tk_status tk_prefill_moe_mmq_gu(
+extern "C" tk_status tk_prefill_moe_mmq_gu_q8(
     tk_ctx* ctx,
     const tk_moe_mmq_product* gate,
     const void* w_up,
     float swiglu_limit,
+    int32_t down_qtype,
+    void* xq_out,
+    int64_t xq_rows,
+    tk_stream stream) TK_NOEXCEPT {
+    return tk_prefill_moe_mmq_gu_q8_l(ctx, gate, w_up, swiglu_limit, down_qtype, xq_out, xq_rows, -1, stream);
+}
+
+extern "C" tk_status tk_prefill_moe_mmq_gu_lv(
+    tk_ctx* ctx,
+    const tk_moe_mmq_product* gate,
+    const void* w_up,
+    float swiglu_limit,
+    int32_t x_layout,
+    int32_t moe_ver,
+    int32_t gu,
+    tk_stream stream) TK_NOEXCEPT {
+    const HostMoeVersion host_ver(moe_ver);
+    g_host_gu = gu;
+    const tk_status st = tk_prefill_moe_mmq_gu_l(ctx, gate, w_up, swiglu_limit, x_layout, stream);
+    g_host_gu = -1;
+    return st;
+}
+
+extern "C" tk_status tk_prefill_moe_mmq_gu_l(
+    tk_ctx* ctx,
+    const tk_moe_mmq_product* gate,
+    const void* w_up,
+    float swiglu_limit,
+    int32_t x_layout,
     tk_stream stream) TK_NOEXCEPT {
     if (ctx == nullptr || gate == nullptr || w_up == nullptr) {
         record_error(ctx, "tk_prefill_moe_mmq_gu: NULL pointer argument");
@@ -1746,9 +1864,11 @@ extern "C" tk_status tk_prefill_moe_mmq_gu(
         return (v == nullptr || v[0] != '0') && (m == nullptr || m[0] != '0');
     }();
     const int ggml_t = static_cast<int>(gate->qtype);
+    const bool x_mmq = resolve_x_mmq(gate->x_q8_1, x_layout, "tk_prefill_moe_mmq_gu", ggml_t);
+    TALUS_VTRACE("tk_prefill_moe_mmq_gu", "entry", ggml_t, x_mmq ? 1 : 0, gate->n_experts > 1 ? 1 : 0, on ? 1 : 0);
     // IQ1_M on plain q8_1 rows (MiMo): the exact fused k_moe1m (tp_moe.cu; TP_MOE_IQ1M_GU=0 / TP_MOE_IQ1M_X=0: unsupported)
     if (on && ggml_t == (int) TK_QTYPE_IQ1_M && gate->n_experts > 1 && gate->y_scale_dev == nullptr && swiglu_limit == 0.0f &&
-        !is_registered_mmq_q8_buf(gate->x_q8_1) && gate->ld_dst >= gate->w_rows && gate->w != nullptr &&
+        !x_mmq && gate->ld_dst >= gate->w_rows && gate->w != nullptr &&
         gate->bounds_dev != nullptr && gate->dst != nullptr && gate->x_q8_1 != nullptr &&
         talus::prefill::moe_iq1m_q8_1_supported(ggml_t, (int) gate->w_rows, (int) gate->w_cols)) {
         if (gate->max_rows == 0 || gate->total_rows == 0) return TK_OK;
@@ -1772,7 +1892,7 @@ extern "C" tk_status tk_prefill_moe_mmq_gu(
         return TK_ERR_UNSUPPORTED;
     }
     if (!on || gate->n_experts <= 1 || gate->y_scale_dev != nullptr || !talus::prefill::tp_gfx11_wmma() ||
-        !is_registered_mmq_q8_buf(gate->x_q8_1) ||
+        !x_mmq ||
         !talus::prefill::moe_gu_supported(ggml_t, (int) gate->w_rows, (int) gate->w_cols) ||
         gate->ld_dst < gate->w_rows) {
         return TK_ERR_UNSUPPORTED;
@@ -1786,9 +1906,10 @@ extern "C" tk_status tk_prefill_moe_mmq_gu(
         // up and SwiGLU and saves their round trips (TALUS_W16_GU=0: keep the cap)
         static const bool w16gu = [] { const char* v = std::getenv("TALUS_W16_GU"); return v == nullptr || v[0] != '0'; }();
         const bool w16_takes = w16gu && talus::prefill::moe_w16_enabled(ggml_t) && mean >= tu.pf_w16_moe_min_rows;
-        if (!force && (tu.moe_gu == 0 || mean < tu.moe_gu_min_rows ||
-                       (talus::prefill::moe_dot_mode(ggml_t) == 1 && mean > tu.moe_gu_mode1_max_rows && !w16_takes)))
-            return TK_ERR_UNSUPPORTED;
+        int go = !force && (tu.moe_gu == 0 || mean < tu.moe_gu_min_rows ||
+                            (talus::prefill::moe_dot_mode(ggml_t) == 1 && mean > tu.moe_gu_mode1_max_rows && !w16_takes)) ? 0 : 1;
+        if (g_host_gu >= 0) go = strata::kernels::vtrace::plan_choose("moe_gu", g_host_gu, go);
+        if (!go) return TK_ERR_UNSUPPORTED;
     }
     if (gate->max_rows == 0 || gate->total_rows == 0) return TK_OK;
     if (gate->w == nullptr || gate->bounds_dev == nullptr || gate->dst == nullptr) {
@@ -1818,6 +1939,15 @@ extern "C" tk_status tk_prefill_moe_mmq_gu(
     } catch (...) {
         return translate_current_exception(ctx, "tk_prefill_moe_mmq_gu");
     }
+}
+
+extern "C" tk_status tk_prefill_moe_mmq_gu(
+    tk_ctx* ctx,
+    const tk_moe_mmq_product* gate,
+    const void* w_up,
+    float swiglu_limit,
+    tk_stream stream) TK_NOEXCEPT {
+    return tk_prefill_moe_mmq_gu_l(ctx, gate, w_up, swiglu_limit, -1, stream);
 }
 
 extern "C" tk_status tk_prefill_moe_mmq_iq(
@@ -1980,6 +2110,34 @@ extern "C" void tk_prefill_ctx_skip_blas(tk_ctx* ctx) noexcept {
     }
 }
 
+// S5: the dense product's work buffer (activation scratch + identity ids + bounds) owned by the host, so its
+// allocator budgets and sheds it: bytes for `rows` rows (the same layout as tk_prefill_mmq's own), then adoption (writes
+// the identity ids on `stream`). tk_prefill_trim forgets it: the host frees it after the trim and adopts a new one.
+extern "C" size_t tk_prefill_mmq_dense_bytes(int64_t rows) noexcept {
+    namespace mmq = strata::prefill::mmq;
+    const auto up256 = [](size_t v) { return (v + 255u) & ~size_t(255u); };
+    return up256(mmq::q8_bytes(rows, 32768)) + up256(static_cast<size_t>(rows) * sizeof(int32_t)) + 256u;
+}
+extern "C" tk_status tk_prefill_adopt_mmq_dense(tk_ctx* ctx, void* buf, int64_t rows, tk_stream stream) TK_NOEXCEPT {
+    if (ctx == nullptr || buf == nullptr) return TK_ERR_NULL_PTR;
+    if (rows < 1024) return TK_ERR_INVALID_ARG;
+    try {
+        namespace mmq = strata::prefill::mmq;
+        tk_status st = TK_OK;
+        tk_prefill_state* state = ensure_state(ctx, &st);
+        if (!state) return st;
+        if (state->mmq_dense_buf && !state->mmq_dense_adopted) (void) cudaFree(state->mmq_dense_buf);
+        state->mmq_dense_buf = buf;
+        state->mmq_dense_cap_rows = rows;
+        state->mmq_dense_adopted = true;
+        const auto up256 = [](size_t v) { return (v + 255u) & ~size_t(255u); };
+        mmq::iota(reinterpret_cast<int32_t*>(static_cast<uint8_t*>(buf) + up256(mmq::q8_bytes(rows, 32768))), rows, stream);
+        return TK_OK;
+    } catch (...) {
+        return translate_current_exception(ctx, "tk_prefill_adopt_mmq_dense");
+    }
+}
+
 extern "C" void tk_register_mmq_q8_buf(const void* xq) noexcept {
     if (!xq) return;
     try {
@@ -1987,6 +2145,10 @@ extern "C" void tk_register_mmq_q8_buf(const void* xq) noexcept {
         g_mmq_q8_bufs.insert(xq);
     } catch (...) {
     }
+}
+
+extern "C" int32_t tk_mmq_q8_buf_registered(const void* xq) noexcept {
+    return xq != nullptr && is_registered_mmq_q8_buf(xq) ? 1 : 0;
 }
 
 extern "C" void tk_unregister_mmq_q8_buf(const void* xq) noexcept {

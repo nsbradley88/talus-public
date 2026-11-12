@@ -44,6 +44,7 @@ impl GlmEngine {
         y: *mut f32,
         t: usize,
     ) -> Result<()> {
+        self.ensure_mmq_dense();
         // SAFETY: tk_* C ABI.
         let stv = unsafe {
             (self.lib.tk.tk_prefill_mmq)(
@@ -232,6 +233,39 @@ impl GlmEngine {
     }
 }
 
+impl GlmEngine {
+    /// S5: the dense product's work buffer is the host's, allocated at the first prompt chunk (as the library
+    /// did) for the largest chunk. An allocation failure leaves the library's own path: the next product reports it.
+    fn ensure_mmq_dense(&self) {
+        let Some((bytes, adopt)) = self.lib.mmq_dense else {
+            return;
+        };
+        // glm-mem (#81, ): tk_prefill_mmq reads its ids / bounds from its own small buffer unless
+        // TALUS_PF_MMQ_IDS=0; the dense work buffer is then never read, so adopting one would only cost memory (144 MiB
+        // at 4096 rows), the waste glm-mem removed. Adopt only on the old shared-buffer path.
+        static OWN_IDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OWN_IDS
+            .get_or_init(|| std::env::var("TALUS_PF_MMQ_IDS").map_or(true, |v| !v.starts_with('0')))
+        {
+            return;
+        }
+        if !self.mmq_dense.get().is_null() {
+            return;
+        }
+        let rows = (super::pch() as i64).max(1024);
+        // SAFETY: plain C query.
+        let Ok(p) = ffi::dev_alloc(unsafe { bytes(rows) }) else {
+            return;
+        };
+        // SAFETY: ctx valid; p holds `bytes(rows)` bytes and lives until the trim or the engine's drop.
+        if unsafe { adopt(self.lib.ctx, p, rows, self.stream as _) } == 0 {
+            self.mmq_dense.set(p);
+        } else {
+            ffi::dev_free(p);
+        }
+    }
+}
+
 /// Memory pressure (#40): free the shared prefill engine's grown scratch and allocator caches (`tk_prefill_trim`;
 /// the next prompt chunk allocates them again, same sizes, same results). False when nothing was trimmed or the
 /// library has no trim entry.
@@ -244,5 +278,7 @@ pub(super) fn trim_arenas(eng: &mut GlmEngine) -> bool {
     }
     // SAFETY: ctx valid; the stream is idle (synchronized above).
     let st = unsafe { f(eng.lib.ctx) };
+    // the library forgot the adopted work buffer: free it; the next prompt chunk adopts a new one
+    ffi::dev_free(eng.mmq_dense.replace(std::ptr::null_mut()));
     st == 0
 }

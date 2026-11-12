@@ -937,6 +937,7 @@ impl Q36Engine {
 
     /// Initialize all scratch, state, KV, MoE, prefill, and speculative buffers (`Engine::init` in `q36_engine.cu:815-999`).
     pub fn init(&mut self, model: &Q36Model, ctx_len: i32) -> Result<()> {
+        w32_startup_check();
         self.m = model as *const Q36Model;
         self.opts = model.opts.clone();
         self.ctx_len = ctx_len;
@@ -964,7 +965,12 @@ impl Q36Engine {
         if let Ok(w) = std::env::var("STRATA_MMVQ_W32") {
             let _ = unsafe { tk_mmvq_set_w32(self.tk.as_ptr(), w != "0") };
         } else {
-            let _ = unsafe { tk_mmvq_set_w32(self.tk.as_ptr(), self.opts.use_w32) };
+            // D4  S6c): the wave32 kernels by default only where the library itself turns them on (gfx11);
+            // elsewhere the library's own default (an exported STRATA_MMVQ_W32 still wins, above)
+            let gfx11 = talus_hip::Device::new(talus_core_api::DeviceId(0))
+                .map(|d| d.arch().has_gfx11_wmma())
+                .unwrap_or(true);
+            let _ = unsafe { tk_mmvq_set_w32(self.tk.as_ptr(), self.opts.use_w32 && gfx11) };
         }
         if let Ok(wv) = std::env::var("STRATA_MMVQ_WAVES") {
             if let Ok(n) = wv.parse::<i32>() {
@@ -3054,7 +3060,7 @@ impl Q36Engine {
             ld_dst: w.n_out as i64,
             y_scale_dev: ptr::null(),
         };
-        unsafe { tk_prefill_moe_mmq(self.tk.as_ptr(), &p, stream) == TK_OK }
+        unsafe { tk_prefill_moe_mmq_l(self.tk.as_ptr(), &p, 1, stream) == TK_OK }
     }
 
     /// Fused SwiGLU + Q8_1 MMQ quantize + down projection (`Engine::tp_down` in `q36_engine.cu:1005-1025`).
@@ -4010,7 +4016,7 @@ impl Q36Engine {
                     ld_dst: (2 * F) as i64,
                     y_scale_dev: ptr::null(),
                 };
-                let _ = unsafe { tk_prefill_moe_mmq(self.tk.as_ptr(), &p_gu, stream) };
+                let _ = unsafe { tk_prefill_moe_mmq_l(self.tk.as_ptr(), &p_gu, 1, stream) };
                 let _ = tk_q36_mmq_swiglu(
                     self.tk.as_ptr(),
                     self.mmq_gu,
@@ -4047,7 +4053,7 @@ impl Q36Engine {
                     ld_dst: E as i64,
                     y_scale_dev: ptr::null(),
                 };
-                let _ = unsafe { tk_prefill_moe_mmq(self.tk.as_ptr(), &p_d, stream) };
+                let _ = unsafe { tk_prefill_moe_mmq_l(self.tk.as_ptr(), &p_d, 1, stream) };
             } else {
                 let cap_grp = NE.min(n_ent);
                 let _ = tk_q36_group(

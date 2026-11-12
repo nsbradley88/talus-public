@@ -121,7 +121,8 @@ the speculative-decoding service, the prompt cache and the protocol. What each e
 - **`qwen35` (Qwen3.8-27B, dense).** Gated delta net and attention layers. Decode and verify run on wave32 matvecs
   over 1 to 8 columns, where every column is bitwise the single-column result, so verifying drafts gives the same
   numbers as decoding them one at a time. WMMA attention for decode and verify. Prompts run on an exact int8 GEMM over
-  weights expanded at load time. Drafting: the model's MTP head, the DFlash2 block-diffusion drafter, or both with a
+  weights expanded at load time, except the feed-forward of layers 48-63, which runs on 4-bit prompt weights by default
+  when the v3 `.w4i` file is installed (`TALUS_Q27_W4I=0` keeps the exact int8 path). Drafting: the model's MTP head, the DFlash2 block-diffusion drafter, or both with a
   switch by context depth, plus n-gram drafts and a 64K draft vocabulary. The prompt cache keeps snapshots of the
   recurrent state on a fixed grid. From v0.1.6, after a reply the engine reads the reply up to its last grid point and
   takes a snapshot there, so the next turn restores past the reply instead of re-reading it (`TALUS_Q27_CATCHUP=0`

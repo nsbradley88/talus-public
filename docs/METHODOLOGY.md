@@ -22,7 +22,7 @@ Which figures come from which machine:
 
 | Figures | Machine | Build |
 |---|---|---|
-| Speed of the current release (RESULTS "Speed" tables, the README's first table) | desktop | the v0.1.7 release candidate tarball (rc1; the same engine source as the published tarball, see RESULTS) |
+| Speed of the current release (RESULTS "Speed" tables, the README's first table) | desktop | the v0.1.8 release candidate tarball (rc1; the same engine source as the published tarball, see RESULTS) |
 | The previous release on the same machine (RESULTS "v0.1.2" rows and the change table) | desktop | the published v0.1.2 tarball, interleaved with the current release in the same session |
 | Qwen3.8-27B 4-bit weights against BF16 (RESULTS) | desktop | v0.1.2 (release candidate 2); not re-measured for v0.1.3 |
 | Quality gates of the current release | laptop (some soaks on the desktop; RESULTS names the machine) | the same release (RESULTS says which build each gate ran on) |
@@ -153,7 +153,7 @@ Prompt-only changes on 27B (such as the 4-bit prompt GEMM in [MODELS.md](MODELS.
 checked on four 4,096-token prompts cut from the corpus at offsets 0, 100K, 200K and 300K, processed in 2,048-token
 chunks as in serving and scored over the last 256 positions of each prompt (1,024 positions total) against
 llama.cpp's CPU backend on the same GGUF. In the same run we measure both the exact int8 prompt path
-(`TALUS_Q27_W4I=0`, the default) and the opt-in `.w4i` prompt path (`TALUS_Q27_W4I=auto`) with the same flash attention and dense MMQ settings; the ratio of the `.w4i` path's mean KL to the exact path's is recorded (it was gated at 1.35 until v0.1.5; history 1.236, 1.160, 1.145). We also score the two paths against each other to record their direct divergence (reported in [RESULTS.md](RESULTS.md)).
+(`TALUS_Q27_W4I=0`) and the `.w4i` prompt path (the default when the v3 `.w4i` file is installed) with the same flash attention and dense MMQ settings; the ratio of the `.w4i` path's mean KL to the exact path's is recorded (it was gated at 1.35 until v0.1.5; history 1.236, 1.160, 1.145). We also score the two paths against each other to record their direct divergence (reported in [RESULTS.md](RESULTS.md)).
 
 **Qwen3.8-Flash-Next reference.** The reference is llama.cpp's CPU backend (b11972, cf24317, the Zen 4 build) running
 the original BF16 weights on the 43 fixed prompts, with one scored row per prompt: the next token after the prompt. The

@@ -6,7 +6,8 @@
 #   stale build directory handling (tests/install/build-error.sh).
 #   Kernel stage (opt-in): TALUS_CI_KERNELS=1 builds libtalus_kernels with ../build.sh (needs a ROCm SDK:
 #   ROCM_SDK=<sdk root>, BUILD=<dir> default ../build-ci, TARGETS default talus_kernels, CMAKE_EXTRA passed through).
-#   build.sh itself fails if any built target is older than its sources (the stale-build guard).
+#   build.sh itself fails if any built target is older than its sources (the stale-build guard), and rebuilds sources
+#   whose content changed since the last build even when an object looks newer (tests/install/src-manifest.sh).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -55,6 +56,7 @@ command -v "$CXX_BIN" >/dev/null || { echo "ci.sh: no C++ compiler ($CXX_BIN) fo
 tail -1 "$TMPDIR/spec_prob_test.out"
 "$SCRIPT_DIR/../tests/install/no-color.sh"
 "$SCRIPT_DIR/../tests/install/build-error.sh"
+"$SCRIPT_DIR/../tests/install/src-manifest.sh"
 
 if [ "${TALUS_CI_KERNELS:-0}" = 1 ]; then
   echo "ci.sh: kernel build check (build.sh, stale-build guard)"

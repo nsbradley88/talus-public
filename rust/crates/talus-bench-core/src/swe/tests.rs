@@ -422,11 +422,19 @@ fn rows(fx: &Fixture) -> Vec<Value> {
 
 #[test]
 fn cheater_suite_every_layer_blocks_or_flags() {
-    if Command::new("strace").arg("-V").output().is_err()
-        || Command::new("git").arg("--version").output().is_err()
-    {
-        eprintln!("needs strace and git: skipped");
-        return;
+    // strace and git are required, not optional: a missing tool used to return early and report ok, so the CI image
+    // without strace never ran this suite (talus#87). TALUS_SKIP_STRACE_TESTS=1 skips it on purpose, loudly.
+    let missing: Vec<&str> = [("strace", "-V"), ("git", "--version")]
+        .into_iter()
+        .filter(|(t, a)| Command::new(t).arg(a).output().is_err())
+        .map(|(t, _)| t)
+        .collect();
+    if !missing.is_empty() {
+        if std::env::var("TALUS_SKIP_STRACE_TESTS").is_ok_and(|v| v == "1") {
+            eprintln!("SKIPPED (TALUS_SKIP_STRACE_TESTS=1): needs {missing:?}");
+            return;
+        }
+        panic!("the SWE cheater suite needs {missing:?} on PATH (install it, or set TALUS_SKIP_STRACE_TESTS=1 to skip on purpose)");
     }
     let root = std::env::temp_dir().join(format!("tb-swe-suite-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);

@@ -4822,6 +4822,14 @@ extern "C" int tk_qwen4exp_p2_tok_upload(void* prefill, int32_t* dst, const int3
 extern "C" int tk_qwen4exp_p2_upring_h2d(void* prefill, void* dst, const void* src, uint64_t bytes, void* stream) {
     return Qwen4expP2Access::m(prefill).up_ring.h2d(dst, src, (size_t) bytes, (cudaStream_t) stream) == cudaSuccess ? 1 : 0;
 }
+// D3b-1: thin accessors for the Rust prompt path's picture rows (no policy here: the run gather is Rust's)
+extern "C" const float* const* tk_qwen4exp_p2_embd_rows(void* prefill) { return Qwen4expP2Access::pf(prefill).embd_rows; }
+extern "C" void* tk_qwen4exp_p2_upring_acquire(void* prefill, uint64_t bytes) {
+    return Qwen4expP2Access::m(prefill).up_ring.acquire((size_t) bytes);
+}
+extern "C" int tk_qwen4exp_p2_upring_submit(void* prefill, void* dst, const void* stage, uint64_t bytes, void* stream) {
+    return Qwen4expP2Access::m(prefill).up_ring.submit(dst, stage, (size_t) bytes, (cudaStream_t) stream) == cudaSuccess ? 1 : 0;
+}
 extern "C" int tk_qwen4exp_p2_upring_d2h_sync(void* prefill, void* dst, const void* src, uint64_t bytes, void* stream) {
     return Qwen4expP2Access::m(prefill).up_ring.d2h_sync(dst, src, (size_t) bytes, (cudaStream_t) stream) == cudaSuccess ? 1 : 0;
 }

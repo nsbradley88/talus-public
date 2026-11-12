@@ -193,6 +193,9 @@ pub struct ConvServe {
     /// What the session holds right now: the tokens it has consumed.
     pub live: Vec<i32>,
     pub live_imgs: Vec<ImageKey>,
+    /// S12-v: this request's picture keys (generate.cpp `req_imgs`), set by the GENI path before `begin`, cleared
+    /// for a text request
+    pub req_imgs: Vec<ImageKey>,
     pub live_ok: bool,
     /// The saved points; every one is a prefix of `live` (a chain).
     pub checks: Vec<Checkpoint>,
@@ -250,6 +253,7 @@ impl ConvServe {
             opts,
             live: Vec::new(),
             live_imgs: Vec::new(),
+            req_imgs: Vec::new(),
             live_ok: false,
             checks: Vec::new(),
             check_clock: 0,
@@ -294,6 +298,7 @@ impl ConvServe {
         }
         let mut c = Checkpoint {
             ids: cur[..l.min(cur.len())].iter().map(|&t| t as i32).collect(),
+            imgs: self.req_imgs_below(len),
             ..Default::default()
         };
         if let Err(e) = self.dev.sync() {
@@ -504,6 +509,15 @@ impl ConvServe {
     /// conversation), parks the outgoing conversation, restores what the request continues from.
     /// Returns (resume, read_from, reread_to, resumed_checkpoint; the last is 0 for no checkpoint or the live state);
     /// Err = an `ERR` line was printed and the engine stops.
+    /// generate.cpp `imgs_below(req_imgs, L)`: the request's pictures that start before cell `l`
+    fn req_imgs_below(&self, l: i64) -> Vec<ImageKey> {
+        self.req_imgs
+            .iter()
+            .copied()
+            .filter(|k| k.start < l)
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments, clippy::result_unit_err)]
     pub fn begin(
         &mut self,
@@ -514,12 +528,19 @@ impl ConvServe {
         want_cvec: bool,
     ) -> Result<(i64, i64, i64, i64), ()> {
         let n = cur.len() as i64;
+        // generate.cpp: tokens match and imgs_below(req_imgs, L) == pre_imgs (a text request: req_imgs empty -> pre_imgs empty)
+        let req_imgs = self.req_imgs.clone();
         let starts_with = |pre: &[i32], pre_imgs: &[ImageKey]| -> bool {
             let len = pre.len() as i64;
             if len < 1 || len > n - 1 {
                 return false;
             }
-            pre.iter().zip(cur).all(|(&a, &b)| a as i64 == b) && pre_imgs.is_empty()
+            pre.iter().zip(cur).all(|(&a, &b)| a as i64 == b)
+                && req_imgs
+                    .iter()
+                    .filter(|k| k.start < len)
+                    .copied()
+                    .eq(pre_imgs.iter().copied())
         };
         if unsafe { (self.api.take_nan_flush)(self.ctx) } != 0 {
             let n_checks = self.checks.len();
@@ -563,7 +584,42 @@ impl ConvServe {
                 }
             }
         }
-        let parked = self.conversations.best(cur, &[], want_cvec);
+        // #2228 (generate.cpp 13049-13077): a state whose TOKENS this prompt starts with, deeper than what is reused, but whose
+        // pictures differ cannot be reused: said once per request
+        if self.opts.prompt_cache > 0 && !self.req_imgs.is_empty() {
+            let tokens_match = |pre: &[i32]| -> bool {
+                let l = pre.len() as i64;
+                l >= 1 && l < n && pre.iter().zip(cur).all(|(&a, &b)| a as i64 == b)
+            };
+            let mut deep = 0i64;
+            let mut deep_imgs: Option<Vec<ImageKey>> = None;
+            let mut consider = |pre: &[i32], pre_imgs: &[ImageKey]| {
+                let l = pre.len() as i64;
+                if l > deep.max(resume) && tokens_match(pre) && self.req_imgs_below(l) != pre_imgs {
+                    deep = l;
+                    deep_imgs = Some(pre_imgs.to_vec());
+                }
+            };
+            if self.live_ok {
+                consider(&self.live, &self.live_imgs);
+            }
+            for c in &self.checks {
+                consider(&c.ids, &c.imgs);
+            }
+            if let Some(d) = deep_imgs {
+                let now = self.req_imgs_below(deep);
+                let mut k = 0usize;
+                while k < now.len() && k < d.len() && now[k] == d[k] {
+                    k += 1;
+                }
+                eprintln!(
+                    "talus serve: conversation cache: the state at {deep} tokens has this prompt's tokens but picture {} (at token {}) is not the same as when it was saved (its embeddings changed): it cannot be reused (#2228)",
+                    k + 1,
+                    if k < now.len() { now[k].start } else { -1 }
+                );
+            }
+        }
+        let parked = self.conversations.best(cur, &self.req_imgs, want_cvec);
         let mut incoming = None;
         if req_cache && parked.tokens > resume {
             incoming = Some(self.conversations.take(parked.index));
@@ -742,7 +798,7 @@ impl ConvServe {
     ) {
         if !cancelled {
             self.live = consumed.to_vec();
-            self.live_imgs.clear();
+            self.live_imgs = self.req_imgs_below(self.live.len() as i64);
             self.live_ok = self.opts.prompt_cache > 0 && req_ckpt;
             if nf_hit {
                 self.live_ok = false;
@@ -758,7 +814,7 @@ impl ConvServe {
                 .iter()
                 .map(|&t| t as i32)
                 .collect();
-            self.live_imgs.clear();
+            self.live_imgs = self.req_imgs_below(pp_reached);
             self.live_ok = true;
             eprintln!(
                 "talus serve: cancelled request keeps its conversation: {pp_reached} tokens live"

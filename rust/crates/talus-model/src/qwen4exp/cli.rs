@@ -72,7 +72,7 @@ pub fn parse_i64_list(s: &str) -> Result<Vec<i64>, String> {
         let val = part
             .trim_start()
             .parse::<i64>()
-            .map_err(|_| format!("bad integer in list: '{part}'"))?;
+            .map_err(|_| "invalid token id: expected an integer in [0, 2147483647]".to_string())?; // generate.cpp's text (talus#92)
         out.push(val);
     }
     Ok(out)
@@ -134,6 +134,14 @@ pub struct ParsedServeGenRequest {
     pub req_cache: bool,
     pub bias_text: Option<String>,
     pub ids: Vec<i64>,
+    /// S12-v: a `GENI` line (pictures); `emb_path` = its SVE1 embeddings file (the first token without `=`).
+    pub geni: bool,
+    pub emb_path: String,
+    /// `img_keys=<hex>,...` (#2228), cleared when malformed, as generate.cpp
+    pub img_keys: Vec<u64>,
+    /// D3b-2: the pixel form (`@px` where the SVE path stands) and its raw `img_px=` value
+    pub pixels: bool,
+    pub img_px: Option<String>,
 }
 
 /// Parses a `GEN <max_new> [key=val ...] <id,id,...>` protocol line.
@@ -142,11 +150,23 @@ pub fn parse_serve_gen_line(
     default_pcie_frac: f64,
     default_spec_min_p: f64,
 ) -> Result<ParsedServeGenRequest, String> {
+    parse_serve_gen_line_v(line, default_pcie_frac, default_spec_min_p, false)
+}
+
+/// `GEN` / `GENI`  S12-v: `vision` = the engine runs `--vision` and this loop takes pictures). Same grammar and
+/// ERR texts as generate.cpp: keys, then for GENI the embeddings file (first token without `=`), then the ids.
+pub fn parse_serve_gen_line_v(
+    line: &str,
+    default_pcie_frac: f64,
+    default_spec_min_p: f64,
+    vision: bool,
+) -> Result<ParsedServeGenRequest, String> {
     let trimmed = line.trim_end_matches(['\r', '\n']);
-    if trimmed.starts_with("GENI ") {
+    let geni = trimmed.starts_with("GENI ");
+    if geni && !vision {
         return Err("ERR this engine was started without --vision".to_string());
     }
-    let Some(rest) = trimmed.strip_prefix("GEN ") else {
+    let Some(rest) = trimmed.strip_prefix(if geni { "GENI " } else { "GEN " }) else {
         return Err(
             "ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>"
                 .to_string(),
@@ -185,6 +205,11 @@ pub fn parse_serve_gen_line(
         req_cache: true,
         bias_text: None,
         ids: Vec::new(),
+        geni,
+        emb_path: String::new(),
+        img_keys: Vec::new(),
+        pixels: false,
+        img_px: None,
     };
 
     let mut cursor = &rest[sp_idx..];
@@ -221,9 +246,23 @@ pub fn parse_serve_gen_line(
             "pcie_frac" => req.pcie_frac = (fv as f64).clamp(0.0, 1.0),
             "spec_min_p" => req.spec_min_p = (fv as f64).clamp(0.0, 1.0),
             "aux_cpus" => req.aux_cpus = if iv != 0 { 1 } else { 0 },
+            "img_keys" => req.img_keys = parse_img_keys(val),
+            "img_px" => req.img_px = Some(val.to_string()),
             _ => {}
         }
         cursor = &cursor[tok_end..];
+    }
+    if geni {
+        // generate.cpp: the path is the next token; with no space after it the request is malformed (no ids)
+        let c = cursor.trim_start_matches(' ');
+        match c.find(' ') {
+            Some(gap) => {
+                req.emb_path = c[..gap].to_string();
+                req.pixels = req.emb_path == "@px";
+                cursor = &c[gap..];
+            }
+            None => return Err("ERR bad request: max_new".to_string()),
+        }
     }
 
     let ids_str = cursor.trim();
@@ -236,6 +275,43 @@ pub fn parse_serve_gen_line(
     }
     req.ids = ids;
     Ok(req)
+}
+
+/// `img_keys=<hex>,<hex>,...` as generate.cpp: strtoull base 16 per entry; an empty entry or a stray character clears the
+/// whole list (the request then falls back to the embeddings' hash).
+pub fn parse_img_keys(v: &str) -> Vec<u64> {
+    // generate.cpp's loop: `v = strtoull(q, &qe, 16)`; no digits -> clear; then q = qe + 1 after ',' (so a trailing ',' ends
+    // the list cleanly) or stop at the end; any other character -> clear.
+    let b = v.as_bytes();
+    let mut out = Vec::new();
+    let mut q = 0usize;
+    while q < b.len() {
+        let mut k = q;
+        if k + 1 < b.len()
+            && b[k] == b'0'
+            && (b[k + 1] | 0x20) == b'x'
+            && k + 2 < b.len()
+            && b[k + 2].is_ascii_hexdigit()
+        {
+            k += 2; // strtoull's optional 0x prefix (only taken when a hex digit follows)
+        }
+        let d0 = k;
+        while k < b.len() && b[k].is_ascii_hexdigit() {
+            k += 1;
+        }
+        if k == d0 {
+            return Vec::new();
+        }
+        out.push(u64::from_str_radix(&v[d0..k], 16).unwrap_or(u64::MAX)); // strtoull saturates
+        if k < b.len() && b[k] == b',' {
+            q = k + 1;
+        } else if k == b.len() {
+            q = k;
+        } else {
+            return Vec::new();
+        }
+    }
+    out
 }
 
 /// High-level command kind on the `--serve` line protocol.
@@ -292,7 +368,7 @@ pub fn classify_serve_line(line: &str) -> ServeCommandKind {
     if trimmed == "BATCH" || trimmed.starts_with("BATCH ") {
         return ServeCommandKind::Batch;
     }
-    if trimmed.starts_with("GEN ") {
+    if trimmed.starts_with("GEN ") || trimmed.starts_with("GENI ") {
         return ServeCommandKind::Gen;
     }
     let first = trimmed.split_whitespace().next().unwrap_or("");
@@ -301,6 +377,52 @@ pub fn classify_serve_line(line: &str) -> ServeCommandKind {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn geni_lines_parse_as_generate_cpp() {
+        use super::{parse_img_keys, parse_serve_gen_line, parse_serve_gen_line_v};
+        // without --vision: the same ERR as the C++ loop
+        assert_eq!(
+            parse_serve_gen_line("GENI 8 /tmp/a.sve 1,2,3", 0.0, 0.0).unwrap_err(),
+            "ERR this engine was started without --vision"
+        );
+        let r = parse_serve_gen_line_v(
+            "GENI 16 cache=0 img_keys=00ff,1A2b /tmp/x.sve 5,6,7\n",
+            0.0,
+            0.0,
+            true,
+        )
+        .unwrap();
+        assert!(r.geni && r.max_new == 16 && !r.req_cache);
+        assert_eq!(r.emb_path, "/tmp/x.sve");
+        assert_eq!(r.img_keys, vec![0xff, 0x1a2b]);
+        assert_eq!(r.ids, vec![5, 6, 7]);
+        // a GEN line on a --vision engine is unchanged
+        let g = parse_serve_gen_line_v("GEN 4 1,2", 0.0, 0.0, true).unwrap();
+        assert!(!g.geni && g.emb_path.is_empty() && g.ids == vec![1, 2]);
+        // GENI with a path but no ids: generate.cpp's "ERR bad request: max_new" (emb_path stays empty)
+        assert_eq!(
+            parse_serve_gen_line_v("GENI 4 /tmp/x.sve", 0.0, 0.0, true).unwrap_err(),
+            "ERR bad request: max_new"
+        );
+        // img_keys: trailing comma ends cleanly, empty entry / stray char clears, 0x prefix taken
+        assert_eq!(parse_img_keys("a,"), vec![0xa]);
+        assert_eq!(parse_img_keys("a,,b"), Vec::<u64>::new());
+        assert_eq!(parse_img_keys("a;b"), Vec::<u64>::new());
+        assert_eq!(parse_img_keys(""), Vec::<u64>::new());
+        assert_eq!(parse_img_keys("0x10,ff"), vec![0x10, 0xff]);
+        assert_eq!(parse_img_keys("ffffffffffffffffff"), vec![u64::MAX]);
+        assert_eq!(
+            super::classify_serve_line("GENI 1 x 1"),
+            super::ServeCommandKind::Gen
+        );
+        // D3b-2: the pixel form
+        let p = parse_serve_gen_line_v("GENI 8 img_keys=ab img_px=4x2,1x1 @px 1,2", 0.0, 0.0, true)
+            .unwrap();
+        assert!(p.pixels && p.img_px.as_deref() == Some("4x2,1x1"));
+        assert!(p.img_keys == vec![0xab] && p.ids == vec![1, 2]);
+        assert!(!r.pixels && r.img_px.is_none());
+    }
+
     use super::*;
 
     #[test]
@@ -319,6 +441,11 @@ mod tests {
         );
         assert_eq!(parse_i64_list("10,20,30").unwrap(), vec![10, 20, 30]);
         assert!(parse_i64_list("10,bad,30").is_err());
+        // talus#92: the C++ serve loop's ERR text, byte for byte
+        assert_eq!(
+            parse_serve_gen_line("GEN 8 /tmp/x.sve 1,2", 0.0, 0.0).unwrap_err(),
+            "ERR bad request: invalid token id: expected an integer in [0, 2147483647]"
+        );
 
         let parsed = parse_serve_gen_line(
             "GEN 64 temperature=0.7 top_k=40 ckpt=0 pin=128 logit_bias=10:1.5 100,200,300\n",

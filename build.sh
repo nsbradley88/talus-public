@@ -7,6 +7,11 @@ set -eo pipefail
 cd "$(dirname "$0")"
 SDK=${ROCM_SDK:-$HOME/rocm/install}
 BUILD=${BUILD:-build}
+# Result file (rust-port, 2026-11-09): "build.sh: OK" or "build.sh: FAILED rc=N" in $BUILD/build-repo.result, written on
+# EVERY exit of this script, so a caller that hides the exit status (`./build.sh; true`, `./build.sh | tail` without
+# pipefail, a wrapper) can still be checked: ops/remote-build.sh fails the call on a FAILED line written during it.
+mkdir -p "$BUILD"; RESULT="$(cd "$BUILD" && pwd -P)/build-repo.result"; rm -f "$RESULT"
+trap 'rc=$?; if [ $rc = 0 ]; then echo "build.sh: OK" > "$RESULT"; else echo "build.sh: FAILED rc=$rc" > "$RESULT"; fi' EXIT
 # the device libraries: $SDK/amdgcn/bitcode in the wheels' layout, $SDK/lib/llvm/amdgcn/bitcode in an install tree
 BC=$SDK/amdgcn/bitcode
 [ -d "$BC" ] || BC=$SDK/lib/llvm/amdgcn/bitcode
@@ -42,12 +47,21 @@ cmake -S . -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_HIP_COMPILER=$CXX_HIP -DCMAKE_HIP_COMPILER_ROCM_ROOT=$SDK \
   "-DCMAKE_PREFIX_PATH=$SDK;$SDK/lib/rocm_sysdeps;$SDK/lib/llvm" \
   "-DCMAKE_HIP_FLAGS=$HIPFLAGS" ${CMAKE_EXTRA:-}
+# Content check (tools/src-manifest.sh): a source edited since the last build is rebuilt even when an object looks newer
+# than it by mtime (an object compiled on a build VM from content edited meanwhile on the dev host came back with the later mtime).
+if [ "${STALE_CHECK:-1}" != 0 ]; then
+  tools/src-manifest.sh refresh "$BUILD"
+  tools/src-manifest.sh snap "$BUILD"
+else
+  rm -f "$BUILD/src-manifest" "$BUILD/src-manifest.new"   # not checked: the next checked build starts from "unknown"
+fi
 cmake --build "$BUILD" --target ${TARGETS:-talus_kernels talus-pf-bench talus-attn-bench hip_laguna_mmvq_check} \
   -j ${JOBS:-12} 2>&1 | { grep -v "^\[" || [ $? -eq 1 ]; }
 
 # Stale-build guard: every requested target's output must be newer than each source file it depends on (the direct
 # inputs ninja knows plus the headers in its objects' depfiles). Catches a build that "succeeded" while leaving an old
-# libtalus_kernels.so behind (e.g. the target was not built, or a failure got swallowed). STALE_CHECK=0 skips it.
+# libtalus_kernels.so behind (e.g. the target was not built, or a failure got swallowed), and a source whose content
+# changed while the build ran (tools/src-manifest.sh verify). STALE_CHECK=0 skips it.
 if [ "${STALE_CHECK:-1}" != 0 ]; then
   SRC=$(pwd -P)
   for t in ${TARGETS:-talus_kernels talus-pf-bench talus-attn-bench hip_laguna_mmvq_check}; do
@@ -60,5 +74,7 @@ if [ "${STALE_CHECK:-1}" != 0 ]; then
              | while read -r f; do if [ "$f" -nt "$BUILD/$out" ]; then echo "$f"; fi; done | head -5 || true)
     [ -z "$newer" ] || { echo "build.sh: STALE CHECK FAILED: $BUILD/$out is older than:" >&2; echo "$newer" >&2; exit 1; }
   done
+  tools/src-manifest.sh verify "$BUILD" >&2 || { echo "build.sh: STALE CHECK FAILED: a source changed during the build (run it again)" >&2; exit 1; }
+  tools/src-manifest.sh record "$BUILD"   # only a verified build vouches for its sources
   echo "build.sh: stale check OK (${TARGETS:-default targets})"
 fi

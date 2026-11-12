@@ -5,7 +5,9 @@
 //! q = exp(x/tau - lse)), and the n-gram rows use the point-mass rule (`qs = false`). Chi-square on the joint law of
 //! the first three generated tokens.
 
-use super::graphs::{draw_dist, make_dist, spec_decide_row, RowDecision, Sampling, SplitMix64};
+use super::graphs::{
+    draw_dist, make_dist, spec_decide_row, DFlash, RowDecision, Sampling, SplitMix64,
+};
 use talus_spec::ssamp::{chi2_critical, chi2_tv};
 
 const V: usize = 12;
@@ -242,6 +244,198 @@ fn q27_spec_rows_are_exact() {
             assert!(chi2 < crit, "{label}: chi2 {chi2:.1} >= {crit:.1}");
             assert!(tv < 0.02);
         }
+    }
+}
+
+/// Candidates the model drafter keeps per draft (the device keeps 16; fewer here so some tokens have q = 0).
+const DF_C: usize = 8;
+
+/// CPU model of the DFlash2 chain selector's score for draft `d` of a block: a unary term that does not see the
+/// earlier drafts, plus a transition term from the previous pick.
+fn dflash_scores(h: &[i32], d: usize, prev: i32) -> Vec<f32> {
+    let a = *h.last().unwrap_or(&0) as u64;
+    let t = target(h);
+    (0..V)
+        .map(|v| {
+            0.6 * t[v]
+                + 2.0 * unit(hash(a * 31 + d as u64 * 7 + v as u64 * 5 + 3))
+                + 1.5 * unit(hash(prev as u64 * 131 + v as u64 + 97))
+        })
+        .collect()
+}
+
+/// One block of `k` drafts written in the device's layout: `cand` row `d + 1` holds draft `d`'s candidates (row 0 is
+/// the anchor), `q` row `d` their probabilities (`k_select_chain` writes `qout[(i - 1) * 16 + j]` for block row `i`).
+fn dflash_block(
+    h: &[i32],
+    k: usize,
+    tau: f32,
+    cand: &mut [i32],
+    q: &mut [f32],
+    rng: &mut SplitMix64,
+) -> Vec<i32> {
+    cand.fill(-1);
+    q.fill(0.0);
+    let mut prev = *h.last().unwrap();
+    let mut drafts = Vec::with_capacity(k);
+    for d in 0..k {
+        let sc = dflash_scores(h, d, prev);
+        let mut order: Vec<usize> = (0..V).collect();
+        order.sort_by(|&a, &b| sc[b].total_cmp(&sc[a]).then(a.cmp(&b)));
+        let top = &order[..DF_C];
+        let w: Vec<f32> = top
+            .iter()
+            .map(|&v| ((sc[v] - sc[top[0]]) / tau).exp())
+            .collect();
+        let z: f32 = w.iter().sum();
+        let mut qd = Vec::with_capacity(DF_C);
+        for (c, &v) in top.iter().enumerate() {
+            cand[(d + 1) * 16 + c] = v as i32;
+            q[d * 16 + c] = w[c] / z;
+            qd.push((v as i32, (w[c] / z) as f64));
+        }
+        prev = draw_q(&qd, rng);
+        drafts.push(prev);
+    }
+    drafts
+}
+
+fn generate_dflash(prompt: &[i32], s: &Sampling, k: usize, rng: &mut SplitMix64) -> Vec<i32> {
+    let mut cand = vec![-1i32; (k + 1) * 16];
+    let mut q = vec![0f32; (k + 1) * 16];
+    let mut h = prompt.to_vec();
+    let mut out = vec![];
+    let first = draw_dist(&make_dist(&target(&h), s, &h), rng);
+    out.push(first);
+    h.push(first);
+    while out.len() < M {
+        let drafts = dflash_block(&h, k, s.temp, &mut cand, &mut q, rng);
+        let mut df = DFlash::default();
+        df.hcand = cand.as_mut_ptr();
+        df.q_prop_h = q.as_mut_ptr();
+        for i in 0..=k {
+            let mut p = make_dist(&target(&h), s, &h);
+            if i == k {
+                let x = draw_dist(&p, rng);
+                out.push(x);
+                h.push(x);
+                break;
+            }
+            let d = drafts[i];
+            let hh = h.clone();
+            let qof = |t: i32| df.q_host(i, t);
+            match spec_decide_row(&mut p, d, true, qof, rng, || {
+                make_dist(&target(&hh), s, &hh)
+            }) {
+                RowDecision::Accept => {
+                    out.push(d);
+                    h.push(d);
+                }
+                RowDecision::End(x) => {
+                    out.push(x);
+                    h.push(x);
+                    break;
+                }
+            }
+        }
+    }
+    out.truncate(M);
+    out
+}
+
+#[test]
+fn q27_dflash_rows_are_exact() {
+    // DFlash2 rows: each draft is drawn from the chain selector's q, and the host reads that q back through
+    // `DFlash::q_host` from the buffers as the device lays them out
+    let prompt = [3, 1, 4, 1, 5];
+    let cfgs = [
+        Sampling {
+            temp: 0.8,
+            top_p: 0.95,
+            top_k: 40,
+            min_p: 0.05,
+            ..Sampling::default()
+        },
+        Sampling {
+            temp: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            ..Sampling::default()
+        },
+    ];
+    for s in cfgs {
+        let law = exact_law(&prompt, &s);
+        for k in [2usize, 3] {
+            let mut rng = SplitMix64::new(4242);
+            let mut counts = vec![0u64; law.len()];
+            for _ in 0..300_000 {
+                let o = generate_dflash(&prompt, &s, k, &mut rng);
+                counts[o.iter().fold(0usize, |c, &t| c * V + t as usize)] += 1;
+            }
+            let (chi2, df, tv) = chi2_tv(&counts, &law);
+            let crit = chi2_critical(df.max(1), 1e-6);
+            eprintln!(
+                "27b dflash2 [t{} k{} p{} minp{}] {k} drafts: chi2 {chi2:.1} df {df} crit(1e-6) {crit:.1} tv {tv:.4}",
+                s.temp, s.top_k, s.top_p, s.min_p
+            );
+            assert!(
+                chi2 < crit,
+                "dflash2 {k} drafts: chi2 {chi2:.1} >= {crit:.1}"
+            );
+            assert!(tv < 0.02);
+        }
+    }
+}
+
+#[test]
+fn q27_dflash_q_host_reads_every_row() {
+    // The law test above only reaches the first two drafts of a block. This one is the layout for every draft, at
+    // the file's block (8) and at the longest block that can run (16): draft i's candidates are row i + 1 of
+    // `hcand`, their q row i of `q_prop` (the kernel writes q rows 0 .. block - 2; the last row stays 0). A token
+    // that is no candidate of the draft has q = 0. A token held by two columns has the sum.
+    let id = |i: usize, c: usize| (1000 * (i + 1) + c) as i32;
+    let qv = |i: usize, c: usize| ((i * 16 + c + 1) as f32) / 4096.0;
+    for block in [8usize, 16] {
+        let mut cand = vec![-1i32; block * 16];
+        let mut q = vec![0f32; block * 16];
+        for i in 0..block - 1 {
+            for c in 0..16 {
+                cand[(i + 1) * 16 + c] = id(i, c);
+                q[i * 16 + c] = qv(i, c);
+            }
+        }
+        let mut df = DFlash::default();
+        df.hcand = cand.as_mut_ptr();
+        df.q_prop_h = q.as_mut_ptr();
+        for i in 0..block - 1 {
+            for c in 0..16 {
+                assert_eq!(
+                    df.q_host(i, id(i, c)),
+                    qv(i, c) as f64,
+                    "block {block} draft {i} column {c}"
+                );
+            }
+            assert_eq!(
+                df.q_host(i, 7),
+                0.0,
+                "block {block} draft {i}: not a candidate"
+            );
+            if i + 2 < block {
+                assert_eq!(
+                    df.q_host(i, id(i + 1, 0)),
+                    0.0,
+                    "block {block} draft {i}: the next draft's candidate"
+                );
+            }
+        }
+        // draft 2: columns 3 and 9 hold the same id
+        cand[3 * 16 + 9] = id(2, 3);
+        assert_eq!(
+            df.q_host(2, id(2, 3)),
+            (qv(2, 3) as f64) + (qv(2, 9) as f64)
+        );
+        assert_eq!(df.q_host(2, id(2, 9)), 0.0);
     }
 }
 

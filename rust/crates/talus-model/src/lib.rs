@@ -25,6 +25,7 @@
 pub mod glm;
 pub mod laguna;
 pub mod mimo;
+pub mod pf_plans;
 pub mod qwen35;
 pub mod qwen4exp;
 pub mod rowpad;

@@ -51,6 +51,11 @@ void mimo_mmvq_ids(
     float*              y2 = nullptr,
     int                 x_group = 1);
 
+/// S6: launch plan of mimo_attn_swa_sinks. kind 1 = prefill v2 (TALUS_MIMO_SWA_VER 2, GQA 8), 2 = prefill
+/// v1, 3 = v2 decode (a, b, c = hq, warps, u), 4 = v2 drafter (HDK 128), 5 = v1 decode (a = heads per wave 4 / 1).
+struct MimoSwaPlan { int kind = 0, a = 0, b = 0, c = 0; };
+MimoSwaPlan mimo_attn_swa_sinks_plan(bool q8_kv, bool causal, int head_dim_k, int n_tok, int n_head, int n_kv);
+
 /// MiMo sliding-window attention (e.g. `window = 128`, `head_dim_k = 192`, `head_dim_v = 128`,
 /// `n_head = 64`, `n_kv = 8`) with learned per-head attention sinks (`f32[n_head]`) incorporated
 /// into the online softmax denominator (`exp(sink[h] - max_score)`) and optional `value_scale`
@@ -79,7 +84,15 @@ void mimo_attn_swa_sinks(
     void*                q8_out = nullptr,    // also write Q8_1 of the outputs (tk_quantize_q8_1's bytes)
     void*                q8_mmq = nullptr,    // also the MMQ q8_1 rows of the outputs (layout 0 D4 / 1 DS4) ...
     int                  q8_mmq_layout = 0,   // ... where the prefill v2 kernel runs; *q8_mmq_done says whether it did
-    bool*                q8_mmq_done = nullptr);
+    bool*                q8_mmq_done = nullptr,
+    const struct MimoSwaPlan* plan = nullptr); // w3 rust-port S6: the host's plan (nullptr: mimo_attn_swa_sinks_plan)
+
+/// S6: launch plan of mimo_attn_k192_v128. kind 1 = prompt kernels (a = TALUS_MIMO_FA on, b = the raw
+/// TALUS_MIMO_FA_VER), 2 = v3 decode (a, b = heads per group, waves), 3 = v2 decode (a, b, c = hq, warps, u),
+/// 4 = v1 decode (a = heads per wave 4 / 1); splits = split-K count of the decode kinds (1 = none).
+struct MimoK192Plan { int kind = 0, splits = 1, a = 0, b = 0, c = 0; };
+MimoK192Plan mimo_attn_k192_v128_plan(bool q8_kv, bool has_scratch, int n_tok, int n_head, int n_kv, int stride,
+                                      int n_split);
 
 /// MiMo full causal GQA attention with asymmetric head dimensions (`head_dim_k = 192`, `head_dim_v = 128`,
 /// `n_head = 64`, `n_kv = 4`, GQA 16:1). Supports multi-token verify (`n_tok = 1..8`), F16 and Q8 KV caches,
@@ -100,7 +113,8 @@ void mimo_attn_k192_v128(
     const std::int32_t*  pos_dev,
     int                  n_split,
     void*                stream,
-    void*                q8_out = nullptr);   // also write Q8_1 of the outputs (tk_quantize_q8_1's bytes)
+    void*                q8_out = nullptr,    // also write Q8_1 of the outputs (tk_quantize_q8_1's bytes)
+    const MimoK192Plan*  plan = nullptr);     // the host's plan (nullptr: mimo_attn_k192_v128_plan)
 
 /// q + k partial NeoX rope (bitwise rope_neox_apply) and the f16 K / V cache store (bitwise
 /// q36 kv_store_f16, cell = (store_pos[0] + t) % ring) in one launch.

@@ -9,6 +9,7 @@ pub mod energy;
 pub mod engine;
 pub mod fingerprint;
 pub mod frontend;
+pub mod heap;
 pub mod json;
 pub mod logprobs;
 pub mod prometheus;

@@ -603,6 +603,21 @@ pub fn judge(
         let st = eval_stage(e["resolved"] == true, e["patch_applied"] == true);
         details["eval"] = e.clone();
         details["eval_reused"] = json!(true);
+        // the reused evaluation's network use still counts: its flags and notes come from the eval, not the
+        // agent audit, so carry them over (otherwise a patch that fetched upstream at test time is cleared)
+        if p["eval_network"].is_object() {
+            details["eval_network"] = p["eval_network"].clone();
+            for (key, kind) in [("flags", "eval_network"), ("notes", "eval_network_blocked")] {
+                let mut list = details[key].as_array().cloned().unwrap_or_default();
+                for f in p[key].as_array().into_iter().flatten() {
+                    if f["kind"] == kind && !list.contains(f) {
+                        list.push(f.clone());
+                        invalid |= key == "flags";
+                    }
+                }
+                details[key] = json!(list);
+            }
+        }
         return finish(details, st, e["resolved"] == true, invalid);
     }
     // 4. a fresh, offline evaluation container with the hidden tests

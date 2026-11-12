@@ -8,42 +8,42 @@ serves each model through an OpenAI-compatible HTTP API.
 
 ## How fast is it?
 
-The current release is **v0.1.7**: faster code editing on Qwen3.8-27B (verify windows of up to 32 rows), the default
-4-bit prompt weights on 64 GB machines, an exact resend on GLM-5.3-Flash, less memory and faster prompts on GLM-5.3-Flash,
-16-bit prompt-path streams and a 4-bit draft head on Qwen3.8-Flash-Next, and `talus start` / `stop` / `status`
-([release notes](https://github.com/nsbradley88/talus-public/releases)). Qwen3.8-Flash-Next replies differ from v0.1.6's;
-the release notes explain why.
+The current release is **v0.1.8**: Claude Code works against the Anthropic endpoint on Qwen models, the server keeps
+less memory after large requests, and Qwen3.8-27B's sampled DFlash2 drafting is exactly rejection-sampled again
+([release notes](https://github.com/nsbradley88/talus-public/releases)). Greedy output is unchanged on all five models.
 
-Tokens per second for Talus v0.1.7 (its release candidate 1) on a Ryzen AI Max+ 395 desktop (GMKtec
+Tokens per second for Talus v0.1.8 (its release candidate 1; see RESULTS for the later candidates) on a Ryzen AI Max+ 395 desktop (GMKtec
 EVO-X2, 128 GB, about 120 W sustained, 15 of its 16 CPU cores online), end to end through the HTTP server, each model in its shipped configuration.
 `chat` is the sampled chat mix, `code` the coding-prompt mix, `edit` the code-editing mix, `pp2k` / `pp32k` prompt
 processing and `tg32k` generation at about 2K / 32K tokens of context. In brackets: the change from the published
-v0.1.6 tarball, measured in the same session on the same desktop. Before each timed run, every weight file was read in
+v0.1.7 tarball, measured in the same session on the same desktop. Before each timed run, every weight file was read in
 full and checked against its pinned SHA-256.
 
 | Model | chat | code | edit | pp2k | pp32k | tg32k |
 |---|---|---|---|---|---|---|
-| Qwen3.8-27B | 50.0 (0.0 %) | 66.7 (−0.3 %) | 133.9 (+8.7 %) | 602 | 549 (0.0 %) | 38.8 (−0.8 %) |
-| Qwen3.8-Flash-Next | 61.8 (−1.9 %) | 73.9 (+1.0 %) | 163.1 (+0.7 %) | 1,329 | 1,744 (+4.9 %) | 65.7 (+0.3 %) |
-| GLM-5.3-Flash | 33.6 (+0.3 %) | 35.0 (−0.3 %) | 35.8 (0.0 %) | 574 | 579 (+1.6 %) | 35.2 (−0.3 %) |
-| MiMo-V2.6-Flash | 40.9 (0.0 %) | 50.0 (0.0 %) | 65.5 (+0.2 %) | 732 | 660 (+0.2 %) | 43.0 (0.0 %) |
-| Laguna-S-2.1 | 43.3 (−1.4 %) | 55.0 (0.0 %) | 124.1 (−0.1 %) | 1,150 | 1,001 (0.0 %) | 37.2 (+0.3 %) |
+| Qwen3.8-27B | 49.5 (+0.6 %) | 66.2 (0.0 %) | 133.2 (+0.1 %) | 597 | 547 (0.0 %) | 38.6 (0.0 %) |
+| Qwen3.8-Flash-Next | 62.1 (−0.6 %) | 73.3 (+0.3 %) | 162.1 (+0.2 %) | 1,320 | 1,736 (−0.1 %) | 65.1 (0.0 %) |
+| GLM-5.3-Flash | 33.4 (−0.3 %) | 34.8 (−0.3 %) | 35.5 (−0.3 %) | 577 | 581 (−0.2 %) | 35.0 (0.0 %) |
+| MiMo-V2.6-Flash | 40.9 (+0.5 %) | 49.8 (0.0 %) | 65.2 (0.0 %) | 737 | 663 (0.0 %) | 42.9 (0.0 %) |
+| Laguna-S-2.1 | 43.1 (−1.6 %) | 54.7 (+0.2 %) | 124.0 (0.0 %) | 1,159 | 1,006 (−0.1 %) | 36.9 (0.0 %) |
 
 The quality gates (long-context recall, an agentic smoke test on five coding tasks, logit rows against a frozen set,
 greedy output with drafts on and off, a 45-minute soak test) ran on both machines: the soaks on the desktop, the others
 mostly on our 70 W laptop (HP ZBook Ultra G1a); [docs/RESULTS.md](docs/RESULTS.md) says where each ran. The two
 machines have the same chip but different power limits, so their figures are not comparable with each other.
 
-How much the 27B's shipped 4-bit weights give up against the full BF16 weights, measured with v0.1.2 on the same
-desktop (not re-measured since):
+How much the 27B's shipped 4-bit weights give up against the full BF16 weights. Speeds: v0.1.2 on the same desktop
+(not re-measured since). KL and top-1 against Talus's BF16; the `UD-IQ4_XS` row is the shipped default, with the 4-bit
+prompt weights on (measured on the laptop with a v0.1.6 build, same text and BF16 reference):
 
 | Weights | Size | KL code | top-1 code | code | pp32k | tg32k, no speculation |
 |---|---|---|---|---|---|---|
 | BF16 (reference, opt-in) | 54.7 GB | reference | reference | 19.4 | 506 | 4.0 |
 | `UD-Q4_K_XL` (option) | 17.6 GB | 0.0357 | 95.8 % | 57.4 | 487 | 11.3 |
-| `UD-IQ4_XS` (shipped default) | 14.3 GB (+2.2 GB W4A4 prompt sidecar) | 0.0815 | 93.5 % | 67.8 | 546 | 13.2 |
+| `UD-IQ4_XS` (shipped default) | 14.3 GB (+2.2 GB W4A4 prompt sidecar) | 0.1187 | 92.2 % | 67.8 | 546 | 13.2 |
 
-Lower KL and higher top-1 = closer to BF16. `code` is served with speculative decoding as above; `tg32k` here is plain
+Lower KL and higher top-1 = closer to BF16. With the exact int8 prompt path (`TALUS_Q27_W4I=0`, slower prompts)
+`UD-IQ4_XS` measures KL 0.0815 on code. `code` is served with speculative decoding as above; `tg32k` here is plain
 decode without it. Details, wiki text and all speed cells:
 [docs/RESULTS.md](docs/RESULTS.md#qwen38-27b-our-4-bit-weights-against-bf16).
 
@@ -70,8 +70,8 @@ the same HTTP client and prompts; package power about 117-120 W for every engine
 
 Prompt processing is where Talus v0.1.3 trailed: gufo and tubo prefill the 27B's `UD-Q4_K_XL` file faster, and gufo
 prefilled Flash-Next 16 % faster at 32K (47 % at 2K). Those gaps are
-v0.1.3's: Talus's Flash-Next prompt processing was faster in each of v0.1.4 to v0.1.6, and in v0.1.7 its change is
-within noise (v0.1.7 against v0.1.6 is in the first table above), which narrows them. The other engines have not been re-measured, so this table still shows v0.1.3.
+v0.1.3's: Talus's Flash-Next prompt processing was faster in each of v0.1.4 to v0.1.6, and in v0.1.7 and v0.1.8 its change is
+within noise (v0.1.8 against v0.1.7 is in the first table above), which narrows them. The other engines have not been re-measured, so this table still shows v0.1.3.
 
 Full tables (edit, 2K cells, time to first token, memory, the v0.1.2 figures from the same session, quality gates):
 [docs/RESULTS.md](docs/RESULTS.md). Every figure there names its machine and build. A model whose release run has not

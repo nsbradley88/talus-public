@@ -1322,13 +1322,17 @@ mod tests {
     /// The mock cheater, run for real under strace: every vector must be flagged.
     #[test]
     fn cheater_under_strace_is_flagged() {
+        // strace is required (talus#87): fail, not pass, when it is missing, unless skipped on purpose
         if std::process::Command::new("strace")
             .arg("-V")
             .output()
             .is_err()
         {
-            eprintln!("strace not installed: skipped");
-            return;
+            if std::env::var("TALUS_SKIP_STRACE_TESTS").is_ok_and(|v| v == "1") {
+                eprintln!("SKIPPED (TALUS_SKIP_STRACE_TESTS=1): needs strace");
+                return;
+            }
+            panic!("needs strace on PATH (install it, or set TALUS_SKIP_STRACE_TESTS=1 to skip on purpose)");
         }
         let root = std::env::temp_dir().join(format!("tb-audit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);

@@ -34,6 +34,7 @@
 //
 // Copyright (c) 2026 nsbradley88
 // SPDX-License-Identifier: MIT
+#include "strata/kernels/variant_trace.hpp"   // S1
 #include <hip/hip_runtime.h>
 
 #include <atomic>
@@ -466,6 +467,7 @@ static int gemv_cols(int wt, const uint16_t* W, int64_t ldw, int N, int K, const
         const int c = T - t0 < kMaxCols ? T - t0 : kMaxCols;
         const float* xc = X + (size_t) t0 * (size_t) ldx;
         float* yc = Y + (size_t) t0 * (size_t) ldy;
+        TALUS_VTRACE("w16_gemv", wt == kBF16 ? "bf16" : "f16", c, tb.cfg[c].r * 100 + tb.cfg[c].u * 10 + tb.cfg[c].w, N, K);
         if (wt == kBF16) {
             launch_gemv<kBF16>(c, tb.cfg[c], W, ldw, N, K8, xc, ldx, yc, ldy, s);
         } else {
@@ -518,6 +520,7 @@ extern "C" int talus_w16_gemm(int wtype, const void* w, int64_t ldw, int n_out, 
     hipStream_t s = static_cast<hipStream_t>(stream);
     const bool wmma = device_has_wmma() && tables().gemm_on && n_in % 64 == 0 && ldw % 8 == 0 && aligned16(w) &&
                       x16 != nullptr && aligned16(x16) && scratch_elems >= (int64_t) n_tok * n_in;
+    TALUS_VTRACE("w16_gemm", wmma ? "wmma" : "gemv_slices", wtype, n_out, n_in);
     if (!wmma) {   // the mat-vec in 16-column slices: correct on any GPU, slow
         return talus_w16_gemv(wtype, w, ldw, n_out, n_in, x, ldx, y, ldy, n_tok, stream);
     }

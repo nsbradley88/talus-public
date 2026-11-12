@@ -40,7 +40,10 @@ bool i8x_expand(const void* w, int ggml_type, int n, int k, I8Mat& out, void* st
 
 /// dst [T][ld_dst] (FP32, the first w.n columns) = W x for the T activation rows `xq`: MMQ's q8_1 activations of the
 /// matching layout (strata::prefill::mmq::quantize for the weights' type: blocks of 128 values, [k_pad / 128][T]).
-void i8gemm(const I8Mat& w, const void* xq, int T, float* dst, int64_t ld_dst, void* stream);
+void i8gemm(const I8Mat& w, const void* xq, int T, float* dst, int64_t ld_dst, void* stream, int variant = -1);
+/// S9: the kernel variant for an expansion mode (the host's copy: talus_kernels::tune); `variant` above < 0: this
+int i8gemm_plan(int mode);
+int swq8_plan(int mode);
 
 /// The engine's expanded matrices, keyed by the GGUF weights' device pointer (owns the device memory).
 class I8Cache {
@@ -66,6 +69,8 @@ extern "C" {
 /// C ABI (Rust port): expansion and GEMM as above.  Return 0 on success, -1 when unsupported.
 int talus_pf_i8x_expand(const void* w, int ggml_type, int n, int k, int8_t* qs, float* ws, void* stream);
 /// (mode: talus::prefill::i8x_mode of the weights' type)
+int talus_pf_i8gemm_v(const int8_t* qs, const float* ws, int n, int k, int mode, const void* xq, int T, float* dst,
+                      int64_t ld_dst, void* stream, int variant);
 int talus_pf_i8gemm(const int8_t* qs, const float* ws, int n, int k, int mode, const void* xq, int T, float* dst,
                     int64_t ld_dst, void* stream);
 }

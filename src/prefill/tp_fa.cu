@@ -2,6 +2,7 @@
 //
 // Copyright (c) 2026 nsbradley88
 // SPDX-License-Identifier: MIT
+#include "strata/kernels/variant_trace.hpp"   // S1
 #include "strata/prefill/tp_fa.hpp"
 #include "strata/prefill/tp_tune.hpp"
 
@@ -480,6 +481,7 @@ void fa_prefill(const float* q, const void* k, const void* vt, const float* gate
     static const int env = [] { const char* e = std::getenv("TALUS_PF_FA_VARIANT"); return e ? std::atoi(e) : 0; }();
     if (variant == 0) variant = env ? env : tp_tune_current().fa_variant;
     const int G = H / HKV;
+    TALUS_VTRACE("pf_fa", variant == 3 ? "pair" : variant == 2 ? "plain" : "gate", variant, H, HKV, D);
     const dim3 grid((unsigned) ((T * G + kBQ - 1) / kBQ), (unsigned) HKV);
     const hipStream_t s = (hipStream_t) stream;
     if (variant == 3)

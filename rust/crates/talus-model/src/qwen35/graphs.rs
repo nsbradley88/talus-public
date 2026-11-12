@@ -2122,15 +2122,19 @@ impl DFlash {
     }
 
     /// Lookup proposal probability `q(t)` at draft position `i` (`0..B-1`) (`DFlash::q_host` in `q36_dflash_model.cpp:298-305`).
+    /// The two buffers are one row apart: draft `i` is block row `i + 1` in `hcand` (row 0 is the anchor), and
+    /// `k_select_chain` writes that draft's q to row `i` of `q_prop`.
+    /// A token held by more than one candidate column (a draft-vocabulary map that repeats a target id) was proposed
+    /// with the sum of their probabilities, as the C++ host counted it.
     pub fn q_host(&self, i: usize, t: i32) -> f64 {
-        let r = i + 1;
+        let mut q = 0.0f64;
         for c in 0..16 {
-            let id = unsafe { *self.hcand.add(r * 16 + c) };
+            let id = unsafe { *self.hcand.add((i + 1) * 16 + c) };
             if id == t {
-                return (unsafe { *self.q_prop_h.add(r * 16 + c) }) as f64;
+                q += (unsafe { *self.q_prop_h.add(i * 16 + c) }) as f64;
             }
         }
-        0.0
+        q
     }
 
     pub fn sync_sampling(&mut self, tau: f32, seed: u32) {

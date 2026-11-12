@@ -22,6 +22,7 @@ use crate::responses::{
 };
 use crate::tokenizer::{ByteTokenizer, Detokenizer, StopMatcher};
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -666,7 +667,10 @@ fn run_accept_loop(listener: TcpListener, state: Arc<ServiceState>, shutdown: Ar
                     .name("talus-http".to_string())
                     .spawn(move || {
                         let _slot = slot;
-                        let _ = handle_connection(stream, st);
+                        let big = Cell::new(0usize);
+                        let _ = handle_connection(stream, st, &big);
+                        // talus#93: everything the request held is dropped by now; give large bodies back to the OS
+                        crate::heap::after_request(big.get());
                     });
             }
             Err(_) => {
@@ -1365,7 +1369,12 @@ fn is_allowed_host(host_header: Option<&str>, configured_host: &str) -> bool {
     false
 }
 
-fn handle_connection(mut stream: TcpStream, state: Arc<ServiceState>) -> std::io::Result<()> {
+/// `big` records the largest body this connection announced or read (talus#93: the heap is trimmed after it).
+fn handle_connection(
+    mut stream: TcpStream,
+    state: Arc<ServiceState>,
+    big: &Cell<usize>,
+) -> std::io::Result<()> {
     let lim = state.http_limits.clone();
     let accepted = Instant::now();
     let _ = stream.set_nodelay(true);
@@ -1416,7 +1425,14 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServiceState>) -> std::io
             Instant::now() + lim.write_stall,
         )?;
     }
-    match read_http_body(&mut reader, &req, &lim, &mut budget, &mut charge) {
+    if let Some(Some(n)) = req.body_framing() {
+        big.set(big.get().max(n.min(lim.max_body)));
+    }
+    let body = read_http_body(&mut reader, &req, &lim, &mut budget, &mut charge);
+    if let Ok(b) = &body {
+        big.set(big.get().max(b.len()));
+    }
+    match body {
         Ok(body) => req.body = body,
         Err(e) => {
             let res = reply_read_error(&mut stream, e);

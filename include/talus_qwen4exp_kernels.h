@@ -206,6 +206,19 @@ int tk_qwen4exp_run_with_rust_driver(
     const tk_qwen4exp_rust_driver_t* driver
 );
 
+/* w3 rust-port S12-v: the next request's pictures, built by the Rust host from a GENI line (vision_req.rs): mrope = (t, h, w) per
+   cell for `cells` cells (must equal the engine's table; nullptr = a text request: back to the identity), rows + row_of = the
+   embedding rows and each prompt cell's offset into them (-1 text), keys = (start, hash) per picture (the conversation
+   cache's). Only copies into the engine's existing structures; the next serve_begin_request keeps them. rows must stay valid
+   until that request's prompt is read; rows == nullptr with mrope set (D3b-2) = positions and keys only, the picture rows are
+   device rows the Rust prompt path copies itself (sp.embd_rows stays null). 1 ok, 0 failed (table size / upload), -1 no engine. */
+int tk_qwen4exp_serve_set_images(tk_qwen4exp_serve_ctx_t* ctx, const int32_t* mrope, int64_t cells, const float* rows,
+                                 const int64_t* row_of, int64_t n, const int64_t* key_start, const uint64_t* key_hash,
+                                 int64_t n_keys);
+
+/* w3 rust-port S12-v: out4 = {--vision on, the <|image_pad|> id, n_embd, the M-RoPE table's cells}. 1 ok, -1 no engine. */
+int tk_qwen4exp_serve_vision_info(tk_qwen4exp_serve_ctx_t* ctx, int64_t* out4);
+
 // Trigger an immediate asynchronous stop of the active request (callable from any thread).
 void tk_qwen4exp_request_stop(void);
 
@@ -1587,6 +1600,11 @@ void tk_qwen4exp_p2_stager_finish(void* prefill);
 int tk_qwen4exp_p2_steps_upload(void* prefill, int32_t* dst, const int32_t* src, uint64_t count, void* stream);
 int tk_qwen4exp_p2_tok_upload(void* prefill, int32_t* dst, const int32_t* src, uint64_t count, void* stream);
 int tk_qwen4exp_p2_upring_h2d(void* prefill, void* dst, const void* src, uint64_t bytes, void* stream);
+/* w3 rust-port D3b-1: the prompt's picture-row table (Prefill::embd_rows; nullptr = none), and the upload ring's
+   acquire (nullptr: no pinned slot, copy from the caller's memory and wait) / submit (queue the slot's copy, guard it) pair. */
+const float* const* tk_qwen4exp_p2_embd_rows(void* prefill);
+void* tk_qwen4exp_p2_upring_acquire(void* prefill, uint64_t bytes);
+int tk_qwen4exp_p2_upring_submit(void* prefill, void* dst, const void* stage, uint64_t bytes, void* stream);
 int tk_qwen4exp_p2_upring_d2h_sync(void* prefill, void* dst, const void* src, uint64_t bytes, void* stream);
 int tk_qwen4exp_p2_should_stop(void* prefill);
 int tk_qwen4exp_p2_on_chunk(void* prefill, const float* r_rows, int64_t t, int64_t p0, char* err, size_t err_cap);
@@ -1766,6 +1784,8 @@ int tk_qwen4exp_p2_mmq_gather_native_group(const uint8_t* const* blobs, int32_t 
                                            uint64_t tail_off, void* tail_dst, uint64_t zero_bytes);
 void tk_qwen4exp_p2_mmq_gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream);
 /// gather-free products: whether a type / shape can read its experts in place, and the product (nonzero: launched)
+/* w3 rust-port S8c: the host's tp_moe kernel version for this thread's next products (< 0: the library's rule); optional symbol. */
+void tk_qwen4exp_p2_moe_host_version(int32_t v);
 int tk_qwen4exp_p2_mmq_inplace_ok(int32_t type, int64_t w_rows, int64_t w_cols);
 int tk_qwen4exp_p2_mmq_product_each(const void* const* w_each, int32_t type, int64_t w_rows, int64_t w_cols, int32_t n,
                                     const void* xq, const int32_t* bounds, const int32_t* ids, int64_t total_rows,

@@ -79,6 +79,7 @@ impl Piece3Decode {
         }
         let st = global_recorder()?;
         unsafe { (st.fns.set_window_recorder)(Some(recorder_cb), std::ptr::null_mut()) };
+        RECORDER_INSTALLED.store(true, std::sync::atomic::Ordering::Relaxed);
         self.recorder_installed = true;
         Ok(())
     }
@@ -327,6 +328,27 @@ fn global_recorder() -> Result<&'static GlobalRecorder, String> {
         })
         .as_ref()
         .map_err(|e| e.clone())
+}
+
+static RECORDER_INSTALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// S8: the installed recorder called directly by Piece 4 (no round trip through the C shim): 1 recorded, 0
+/// declined or not installed (the C++ recorder), < 0 failed (`err`).
+///
+/// # Safety
+/// As the recorder hook: `ver` a live Verifier, `stream` capturing, `err` holds `cap` bytes.
+pub unsafe fn record_direct(
+    ver: *mut c_void,
+    t: c_int,
+    stream: *mut c_void,
+    err: *mut c_char,
+    cap: usize,
+) -> c_int {
+    if !RECORDER_INSTALLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    recorder_cb(std::ptr::null_mut(), ver, t, stream, err, cap)
 }
 
 unsafe extern "C" fn recorder_cb(

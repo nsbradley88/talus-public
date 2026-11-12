@@ -1,3 +1,4 @@
+#include "strata/kernels/variant_trace.hpp"   // S1
 #include "strata/kernels/glm_spike_kernels.hpp"
 #include "strata/hip_compat/intrinsics.hpp"
 #include "strata/kernels/dp4a.hpp"
@@ -3290,6 +3291,15 @@ hipError_t mmvq_v1_fq_dispatch(const GlmMmvqCfg& c, const void* W, const float* 
 }
 } // namespace
 
+// S7: the pick as one int (the Rust host's copy: glm/plans.rs mmvq), and back.
+int glm_mmvq_plan(int qtype, int K, int T) {
+    const GlmMmvqCfg c = mmvq_pick(qtype, K, T);
+    return c.variant * 100000000 + c.r * 1000000 + c.nw * 10000 + c.wpe * 100 + c.pers;
+}
+GlmMmvqCfg glm_mmvq_cfg_of_plan(int p) {
+    return GlmMmvqCfg{p / 100000000, p / 1000000 % 100, p / 10000 % 100, p / 100 % 100, p % 100};
+}
+
 hipError_t glm_mmvq_ids_cfg(
     int qtype,
     const void* W,
@@ -3308,6 +3318,8 @@ hipError_t glm_mmvq_ids_cfg(
     if (qtype != GLM_QTYPE_IQ2_S && qtype != GLM_QTYPE_IQ3_S) return hipErrorInvalidValue;
     if (n_expert_used * n_tokens > 64 || (K % 256) != 0) return hipErrorInvalidValue;
     const GlmMmvqCfg c = cfg ? *cfg : mmvq_pick(qtype, K, n_tokens);
+    TALUS_VTRACE("glm_mmvq_ids", cfg ? "cfg_arg" : "pick", qtype * 100000 + K, n_tokens * 100 + n_expert_used,
+                 c.variant * 1000 + c.r * 100 + c.nw * 10 + c.wpe, c.pers);
     const size_t blk = (qtype == GLM_QTYPE_IQ2_S) ? sizeof(block_iq2_s) : sizeof(block_iq3_s);
     const size_t expert_bytes = static_cast<size_t>(N) * static_cast<size_t>(K / 256) * blk;
     if (c.variant == 1) {
@@ -3386,11 +3398,11 @@ hipError_t glm_mmvq_ids(
 // by its own glm_mmvq_ids call.  hipErrorNotSupported (nothing launched) when the config is not a v1 one.
 hipError_t glm_mmvq_ids_pair(
     int qtype, const void* W, const void* W2, const void* x_q8_1, const int32_t* ids, float* y, float* y2,
-    int N, int K, int n_expert_used, int n_tokens, int x_group, int ids_s1, hipStream_t stream)
+    int N, int K, int n_expert_used, int n_tokens, int x_group, int ids_s1, hipStream_t stream, const GlmMmvqCfg* cfg)
 {
     if (qtype != GLM_QTYPE_IQ2_S && qtype != GLM_QTYPE_IQ3_S) return hipErrorInvalidValue;
     if (n_expert_used * n_tokens > 64 || (K % 256) != 0) return hipErrorInvalidValue;
-    const GlmMmvqCfg c = mmvq_pick(qtype, K, n_tokens);
+    const GlmMmvqCfg c = cfg ? *cfg : mmvq_pick(qtype, K, n_tokens);
     if (c.variant != 1) return hipErrorNotSupported;
     const size_t blk = (qtype == GLM_QTYPE_IQ2_S) ? sizeof(block_iq2_s) : sizeof(block_iq3_s);
     const size_t eb = static_cast<size_t>(N) * static_cast<size_t>(K / 256) * blk;
@@ -3452,6 +3464,17 @@ hipError_t glm_kda_step_v3(const float* q, const float* k, const float* v, const
     return hipGetLastError();
 }
 
+static bool glm_kda_v3_on() {
+    static const bool v3 = [] { const char* e = std::getenv("GLM_KDA_V3"); return e == nullptr || e[0] != '0'; }();
+    return v3;
+}
+// S6e: cols_per_wave * 10 + v3 (the Rust host's copy: glm/plans.rs)
+int glm_kda_step_plan(int T, int n_B) {
+    static const int env = [] { const char* e = std::getenv("GLM_KDA_CPW"); return e ? std::atoi(e) : 0; }();
+    const int cpw = env > 0 ? env : (glm_arch_id() == 1 ? (T / n_B <= 1 ? 11601 : 10808) : 2);
+    return cpw * 10 + (glm_kda_v3_on() ? 1 : 0);
+}
+
 hipError_t glm_kda_step(
     const float* q,
     const float* k,
@@ -3473,7 +3496,8 @@ hipError_t glm_kda_step(
     float pro_lb,
     float pro_l2_eps,
     int cols_per_wave,
-    hipStream_t stream)
+    hipStream_t stream,
+    int v3_plan)
 {
     if (S_v != 128) return hipErrorInvalidValue;
 
@@ -3485,10 +3509,11 @@ hipError_t glm_kda_step(
         // MTP verify windows
         cols_per_wave = env > 0 ? env : (glm_arch_id() == 1 ? (T / n_B <= 1 ? 11601 : 10808) : 2);
     }
+    TALUS_VTRACE("glm_kda_step", T / n_B > 8 ? "prompt" : "window", cols_per_wave, T / n_B > 8 ? 9 : T / n_B, n_B, prologue ? 1 : 0);
     if (cols_per_wave >= 10000) {   // GLM HIP v2: 10000 + 100 * waves per WG + columns per wave
         const int nwv = (cols_per_wave - 10000) / 100, cpw = cols_per_wave % 100;
         // v3 (bitwise v2, pipelined loads) for prompt windows (T > 8 per sequence); GLM_KDA_V3=0: v2
-        static const bool v3 = [] { const char* e = std::getenv("GLM_KDA_V3"); return e == nullptr || e[0] != '0'; }();
+        const bool v3 = v3_plan >= 0 ? v3_plan != 0 : glm_kda_v3_on();   // w3 rust-port S6e: the host's plan, else the env
         // glm-kda4: v4 (one column per lane, bitwise v3) for the same windows. Default OFF (bench 1.17x at T512, below the
         // 1.6x ship rule, 2026-11-08); GLM_KDA_V4=1 opts in.
         static const bool v4 = [] { const char* e = std::getenv("GLM_KDA_V4"); return e != nullptr && e[0] == '1'; }();
@@ -3678,6 +3703,17 @@ __global__ __launch_bounds__(256) void glm_dsa_li_wmma_kernel(const float* __res
 #endif
 }
 
+namespace { bool glm_is_gfx11(); }   // (defined with the sparse kernels below)
+
+// S6e: the indexer choice, the rules of glm_dsa_lightning_indexer_cfg: 1000000 = N3 WMMA, else
+// variant * 10000 + nwv * 100 + tf (li_pick). The Rust host's copy: glm/plans.rs.
+int glm_lightning_indexer_plan(int H, int n_kv, int n_tokens, bool k_is_f16) {
+    static const bool n3 = [] { const char* e = std::getenv("GLM_N3"); return !e || e[0] != '0'; }();
+    if (n3 && k_is_f16 && H == 32 && n_tokens > 8 && glm_is_gfx11()) return 1000000;
+    const GlmLiCfg c = li_pick(n_kv, n_tokens);
+    return c.variant * 10000 + c.nwv * 100 + c.tf;
+}
+
 hipError_t glm_dsa_lightning_indexer_cfg(
     const float* q,
     const void* k,
@@ -3694,13 +3730,17 @@ hipError_t glm_dsa_lightning_indexer_cfg(
 {
     if (D != 128) return hipErrorInvalidValue;
     static const bool n3 = [] { const char* e = std::getenv("GLM_N3"); return !e || e[0] != '0'; }();   // default ON (GLM_N3=0 = fp32 indexer)
-    if (n3 && !cfg && k_is_f16 && H == 32 && n_tokens > 8) {   // N3 (default on, output-changing)
+    // D4  S6c): the N3 WMMA kernel exists only for gfx11 (empty body elsewhere): other targets keep v4..v0
+    if (n3 && !cfg && k_is_f16 && H == 32 && n_tokens > 8 && glm_is_gfx11()) {   // N3 (default on, output-changing)
+        TALUS_VTRACE("glm_indexer", "n3_wmma", H, 9, k_is_f16 ? 1 : 0);
         const dim3 grid(static_cast<uint32_t>((n_kv + 63) / 64), static_cast<uint32_t>((n_tokens + 3) / 4), static_cast<uint32_t>(n_streams));
         hipLaunchKernelGGL(glm_dsa_li_wmma_kernel, grid, dim3(256), 0, stream, q, static_cast<const __half*>(k), w, dst,
                            static_cast<uint32_t>(n_kv), static_cast<uint32_t>(n_tokens));
         return hipGetLastError();
     }
     const GlmLiCfg c = cfg ? *cfg : li_pick(n_kv, n_tokens);
+    TALUS_VTRACE("glm_indexer", cfg ? "cfg_arg" : "li_pick", c.variant * 100 + c.nwv * 10 + c.tf,
+                 n_kv <= 4096 ? 4096 : n_kv <= 12288 ? 12288 : 1 << 30, n_tokens == 1 ? 1 : n_tokens <= 8 ? 8 : 9, k_is_f16 ? 1 : 0);
     if (c.variant == 4 && k_is_f16 && (H % c.nwv) == 0) {
         const dim3 grid(static_cast<uint32_t>((n_kv + 63) / 64), static_cast<uint32_t>(n_tokens), static_cast<uint32_t>(n_streams));
 #define GLM_LI4(NWV_) if (c.nwv == NWV_) { hipLaunchKernelGGL((glm_dsa_li_v4_kernel<NWV_>), grid, dim3(32 * NWV_), 0, stream, \
@@ -4330,8 +4370,9 @@ int glm_sparse_2p_min() {   // smallest window (tokens per call) that takes the 
 struct G2pPool { float* pool = nullptr; int* locks = nullptr; int nslot = 0; bool tried = false; };
 // The scratch pool: one [64][2080] fp32 slot per possibly resident workgroup (64 KiB LDS -> at most 2 per WGP;
 // multiProcessorCount reports WGPs on gfx11), x2 margin. Allocated once, outside stream capture.
+G2pPool g_g2p;
 G2pPool* g2p_pool(hipStream_t stream) {
-    static G2pPool p;
+    G2pPool& p = g_g2p;
     if (p.tried) return p.pool ? &p : nullptr;
     hipStreamCaptureStatus cs = hipStreamCaptureStatusNone;
     if (hipStreamIsCapturing(stream, &cs) != hipSuccess) { (void) hipGetLastError(); return nullptr; }
@@ -4358,19 +4399,47 @@ G2pPool* g2p_pool(hipStream_t stream) {
 // Talus GLM port: sparse decode attention from a caller-built row-index list (idx [N][n_kv_max], ascending rows,
 // -1 padded), e.g. the indexer top-k expansion. The mask is not scanned: data_m is a zero row read at the selected
 // rows (m_stride 0). Same tile kernel and split-K reduce as the 3-launch path.
+// S5: the two-pass scratch pool owned by the host (budgeted with its buffers, allocated before any capture):
+// nslot slots of [64][2080] fp32, `locks` nslot zeroed ints. Without it g2p_pool allocates its own, as before.
+void glm_sparse_2p_set_pool(float* pool, int* locks, int nslot) {
+    g_g2p.pool = pool;
+    g_g2p.locks = locks;
+    g_g2p.nslot = nslot;
+    g_g2p.tried = true;
+    std::fprintf(stderr, "glm: GLM_SPARSE_2P two-pass WMMA sparse prompt attention active (windows >= %d tokens, %d scratch slots, %zu MiB)\n",
+                 glm_sparse_2p_min(), nslot, ((size_t) nslot * kG2HB * kG2SMAX * sizeof(float)) >> 20);
+}
+
+// S6e: kind * 100000 + k_num: kind 1 two-pass WMMA (the pool may still be absent: during capture, or a failed
+// allocation), 2 / 3 single-pass WMMA (prefetch 1 / 2 tiles), 4 fdot2 + split-K reduce. The Rust host's copy: glm/plans.rs.
+int glm_sparse_fa_idx_plan(const void* q, const void* kv, const void* dst, int D, int H, int N, int n_kv_max, uint32_t q_nb1,
+                           uint32_t q_nb2, uint32_t k_stride, hipStream_t stream) {
+    uint32_t k_num = 1, per_blocks = 1;
+    if (glm_sparse_2p_on() && N >= glm_sparse_2p_min() && D == kG2D && H % kG2HB == 0 && n_kv_max <= kG2SMAX &&
+        glm_is_gfx11() && (k_stride % 8u) == 0 && (q_nb1 % 4u) == 0 && (q_nb2 % 4u) == 0 &&
+        (reinterpret_cast<uintptr_t>(kv) & 15u) == 0 && (reinterpret_cast<uintptr_t>(q) & 15u) == 0 &&
+        (reinterpret_cast<uintptr_t>(dst) & 15u) == 0 && g2p_pool(stream) != nullptr)
+        return 100001;
+    glm_sparse_fa_split_plan(H, N, n_kv_max, k_num, per_blocks);
+    if (glm_sparse_wmma_on() && k_num == 1u && D == kGwD && H % 64 == 0 && glm_is_gfx11() &&
+        (k_stride % 8u) == 0 && (q_nb1 % 4u) == 0 && (q_nb2 % 4u) == 0)
+        return (glm_sparse_wmma_on() == 2 ? 300000 : 200000) + 1;
+    return 400000 + static_cast<int>(k_num);
+}
+
 hipError_t glm_dsa_sparse_fa_idx(
     const float* q, const __half* kv, const __half* zero_mask, const int32_t* idx, float* split_buf, float* dst,
     int D, int H, int N, int n_kv_max, uint32_t q_nb1, uint32_t q_nb2, uint32_t k_stride, float scale,
-    hipStream_t stream)
+    hipStream_t stream, int plan)
 {
     constexpr uint32_t HG = 32u, BC = 32u, MAX_SLOTS = 2304u;
     if (D != 512 || (H % HG) != 0 || n_kv_max <= 0 || static_cast<uint32_t>(n_kv_max) > MAX_SLOTS * 64u) return hipErrorInvalidValue;
     uint32_t k_num, per_blocks;
-    if (glm_sparse_2p_on() && N >= glm_sparse_2p_min() && D == kG2D && H % kG2HB == 0 && n_kv_max <= kG2SMAX &&
-        glm_is_gfx11() && (k_stride % 8u) == 0 && (q_nb1 % 4u) == 0 && (q_nb2 % 4u) == 0 &&
-        (reinterpret_cast<uintptr_t>(kv) & 15u) == 0 && (reinterpret_cast<uintptr_t>(q) & 15u) == 0 &&
-        (reinterpret_cast<uintptr_t>(dst) & 15u) == 0) {
+    if (plan < 0) plan = glm_sparse_fa_idx_plan(q, kv, dst, D, H, N, n_kv_max, q_nb1, q_nb2, k_stride, stream);
+    const int kind = plan / 100000;
+    if (kind == 1) {
         if (G2pPool* p = g2p_pool(stream)) {
+            TALUS_VTRACE("glm_sparse_fa_idx", "2p", N > 8 ? 9 : N, H, p->nslot, n_kv_max);
             hipLaunchKernelGGL(glm_sparse_fa_2p_kernel, dim3(static_cast<uint32_t>(N), static_cast<uint32_t>(H) / kG2HB),
                 dim3(512), 0, stream, q, reinterpret_cast<const _Float16*>(kv), idx, dst, H, n_kv_max, q_nb1, q_nb2,
                 k_stride, scale, p->pool, p->locks, p->nslot);
@@ -4378,9 +4447,9 @@ hipError_t glm_dsa_sparse_fa_idx(
         }
     }
     glm_sparse_fa_split_plan(H, N, n_kv_max, k_num, per_blocks);
-    if (glm_sparse_wmma_on() && k_num == 1u && D == kGwD && H % 64 == 0 && glm_is_gfx11() &&
-        (k_stride % 8u) == 0 && (q_nb1 % 4u) == 0 && (q_nb2 % 4u) == 0) {
-        hipLaunchKernelGGL(glm_sparse_wmma_on() == 2 ? glm_sparse_fa_wmma_kernel<2> : glm_sparse_fa_wmma_kernel<1>, dim3(static_cast<uint32_t>(N), static_cast<uint32_t>(H) / 64u),
+    TALUS_VTRACE("glm_sparse_fa_idx", (kind == 2 || kind == 3) ? "wmma" : "fdot2", N, n_kv_max, k_num, per_blocks);
+    if (kind == 2 || kind == 3) {
+        hipLaunchKernelGGL(kind == 3 ? glm_sparse_fa_wmma_kernel<2> : glm_sparse_fa_wmma_kernel<1>, dim3(static_cast<uint32_t>(N), static_cast<uint32_t>(H) / 64u),
             dim3(512), 0, stream, q, reinterpret_cast<const _Float16*>(kv), idx, dst, H, n_kv_max, q_nb1, q_nb2, k_stride,
             scale);
         return hipGetLastError();

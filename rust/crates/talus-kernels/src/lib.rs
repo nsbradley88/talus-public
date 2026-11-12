@@ -5,8 +5,12 @@ pub mod backend;
 pub mod cpu_mock;
 pub mod ffi;
 pub mod kernel_set;
+pub mod knobs;
+pub mod plans;
 pub mod quant;
+pub mod tune;
 pub mod tuning;
+pub mod w32;
 
 pub use backend::{
     AttnDecodeArgs, AttnPrefillArgs, GdnSeqArgs, GdnStepArgs, KernelBackend, MmvqIdsArgs,

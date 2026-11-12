@@ -16,6 +16,7 @@
 #include "strata/kernels/native_gdn_preprocess.hpp"
 #include "strata/kernels/native_gr_norm.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/variant_trace.hpp"   // S1
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/quantize_act.hpp"
@@ -26,6 +27,8 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cctype>
 #include <cerrno>
 #include <cmath>
@@ -185,13 +188,18 @@ inline void tk_dispatch_mmvq_cols(
     int32_t n_in,
     int32_t n_out,
     int32_t ncols,
-    void* stream) {
-    // wide calls (Laguna verify windows) take the matrix-core or LDS-staged kernel in one launch when it covers the type
-    if (strata::kernels::native_mmvq_xt(ggml_type, w, x_q8_1, y, n_in, n_out, ncols, stream)) return;
-    if (strata::kernels::native_mmvq_lds(ggml_type, w, x_q8_1, y, n_in, n_out, ncols, stream)) return;
-    // talus#78: 17..32 columns (27B copy windows) in one launch: the 32-column tiles, or the LDS-staged kernel for the
-    // types without a tile (opt-in); else the 16-column chunks below (bitwise the same columns either way)
-    if (ncols > 16 && ncols <= 32 &&
+    void* stream,
+    int32_t route = -1) {
+    // S10: route = the host's plan (talus_kernels::w32::route; kind * 1000 + config), checked by tk_mmvq_v
+    const int kind = route < 0 ? 0 : route / 1000;
+    // wide calls (Laguna verify windows) take the LDS-staged kernel in one launch when it covers the type
+    // Q4_K / Q5_K wide calls on the matrix cores (exact) when STRATA_MMVQ_XT covers the width
+    if ((kind == 0 || kind == 1 || kind == 2) && strata::kernels::native_mmvq_xt(ggml_type, w, x_q8_1, y, n_in, n_out, ncols, stream)) return;
+    if ((kind == 0 || kind == 3) && strata::kernels::native_mmvq_lds(ggml_type, w, x_q8_1, y, n_in, n_out, ncols, stream)) return;
+    // talus#78  ): 17..32 columns (27B copy windows) in one launch: the 32-column tiles, or the LDS-staged kernel for
+    // the types without a tile (opt-in); else the 16-column chunks below (bitwise the same columns either way). Part of the
+    // chunked family (route kind 4 or no host route): the host's route plan does not model these one-launch tiles.
+    if ((kind == 0 || kind == 4) && ncols > 16 && ncols <= 32 &&
         (strata::kernels::native_mmvq_tw32(ggml_type, w, x_q8_1, y, n_in, n_out, ncols, stream) ||
          strata::kernels::native_mmvq_lds_wide(ggml_type, w, x_q8_1, y, n_in, n_out, ncols, stream)))
         return;
@@ -200,6 +208,7 @@ inline void tk_dispatch_mmvq_cols(
                           strata::kernels::native_mmvq_w32_active())
                              ? 16
                              : 8;
+    TALUS_VTRACE("tk_mmvq_cols", "chunked", ggml_type, ncols, cmax);
     int32_t col_off = 0;
     while (col_off < ncols) {
         const int32_t chunk = std::min<int32_t>(ncols - col_off, cmax);
@@ -273,6 +282,10 @@ void tk_set_last_error(tk_ctx* ctx, const char* msg) TK_NOEXCEPT {
 
 uint32_t tk_abi_version(void) TK_NOEXCEPT {
     return TALUS_KERNELS_ABI_VERSION;
+}
+
+int32_t tk_mmvq_w32_table_plan(int32_t type, int32_t ncols) TK_NOEXCEPT {
+    return strata::kernels::native_mmvq_w32_table_plan(type, ncols);
 }
 
 int32_t tk_mmvq_rows_for_arch(tk_arch arch, tk_qtype qtype, int32_t ncols) TK_NOEXCEPT {
@@ -712,7 +725,7 @@ void tk_packed_free(tk_ctx* ctx, tk_packed_weights* packed) TK_NOEXCEPT {
  * 3. MMVQ & MoE Decode / Verify Entry Points
  * ========================================================================== */
 
-tk_status tk_mmvq(
+tk_status tk_mmvq_v(
     tk_ctx*       ctx,
     tk_qtype      qtype,
     const void*   w,
@@ -721,7 +734,8 @@ tk_status tk_mmvq(
     int32_t       n_in,
     int32_t       n_out,
     int32_t       ncols,
-    tk_stream     stream) TK_NOEXCEPT {
+    tk_stream     stream,
+    int32_t       route) TK_NOEXCEPT {
     if (ctx == nullptr || w == nullptr || x_q8_1 == nullptr || y == nullptr) {
         return tk_null_err(ctx, "tk_mmvq: null pointer argument");
     }
@@ -742,9 +756,28 @@ tk_status tk_mmvq(
         return tk_hip_err(ctx, "tk_mmvq: no HIP device available");
     }
     TK_TRY_BEGIN
-    tk_dispatch_mmvq_cols(static_cast<int>(qtype), w, x_q8_1, y, n_in, n_out, ncols, tk_effective_stream(stream));
+    const int32_t run = route < 0 ? -1
+        : strata::kernels::vtrace::plan_choose("tk_mmvq", route, strata::kernels::native_mmvq_route_plan(static_cast<int>(qtype), n_out, ncols));
+    tk_dispatch_mmvq_cols(static_cast<int>(qtype), w, x_q8_1, y, n_in, n_out, ncols, tk_effective_stream(stream), run);
     return TK_OK;
     TK_TRY_END(ctx)
+}
+
+int32_t tk_mmvq_w32_on(void) TK_NOEXCEPT {
+    return strata::kernels::native_mmvq_w32_active() ? 1 : 0;
+}
+
+tk_status tk_mmvq(
+    tk_ctx*       ctx,
+    tk_qtype      qtype,
+    const void*   w,
+    const void*   x_q8_1,
+    float*        y,
+    int32_t       n_in,
+    int32_t       n_out,
+    int32_t       ncols,
+    tk_stream     stream) TK_NOEXCEPT {
+    return tk_mmvq_v(ctx, qtype, w, x_q8_1, y, n_in, n_out, ncols, stream, -1);
 }
 
 tk_status tk_mmvq_packed(
@@ -817,6 +850,7 @@ tk_status tk_mmvq_ids(
     if (strata::kernels::mimo_is_iq_qtype(static_cast<int>(qtype))) {
         const int x_group =
             (w2 != nullptr && expert_bytes > 0 && x_per_id && n_ids > 8 && (n_ids % 8) == 0) ? 8 : 1;
+        TALUS_VTRACE("tk_mmvq_ids", "mimo_iq", static_cast<int>(qtype), n_ids, x_group, n_out);
         strata::kernels::mimo_mmvq_ids(
             static_cast<int>(qtype),
             w,
@@ -1059,6 +1093,104 @@ tk_status tk_attn_decode(
 
 // tk_attn_swa_sinks that, where the prefill v2 kernel runs, also writes the outputs as the wo projection's
 // MMQ q8_1 rows (q8_layout 0 = D4, 1 = DS4; bitwise tk_q36_mmq_quantize of `out`); *q8_written = 1 when it did.
+tk_status tk_attn_swa_sinks_plan(
+    int32_t q8_kv,
+    int32_t causal,
+    int32_t head_dim,
+    int32_t n_tok,
+    int32_t n_head,
+    int32_t n_kv,
+    tk_mimo_swa_plan* out) TK_NOEXCEPT {
+    if (out == nullptr) return TK_ERR_NULL_PTR;
+    try {
+        const strata::kernels::MimoSwaPlan p =
+            strata::kernels::mimo_attn_swa_sinks_plan(q8_kv != 0, causal != 0, head_dim, n_tok, n_head, n_kv);
+        out->kind = p.kind;
+        out->a = p.a;
+        out->b = p.b;
+        out->c = p.c;
+        return TK_OK;
+    } catch (...) {
+        return TK_ERR_INTERNAL;
+    }
+}
+
+tk_status tk_attn_swa_sinks_planned(
+    tk_ctx*          ctx,
+    const float*     q,
+    const void*      k_pool,
+    const void*      v_pool,
+    const uint16_t*  k_scale,
+    const uint16_t*  v_scale,
+    const float*     sinks,
+    float*           out,
+    float*           scratch,
+    int32_t          n_tok,
+    int32_t          n_head,
+    int32_t          n_kv,
+    int32_t          head_dim,
+    int32_t          head_dim_v,
+    int32_t          window,
+    int32_t          stride,
+    float            scale,
+    const int32_t*   pos_dev,
+    int32_t          n_split,
+    tk_stream        stream,
+    void*            q8_out,
+    void*            q8_mmq,
+    int32_t          q8_layout,
+    int32_t*         q8_written,
+    const tk_mimo_swa_plan* plan) TK_NOEXCEPT {
+    if (ctx == nullptr || q == nullptr || k_pool == nullptr || v_pool == nullptr ||
+        out == nullptr || pos_dev == nullptr || plan == nullptr) {
+        return tk_null_err(ctx, "tk_attn_swa_sinks_planned: null pointer argument");
+    }
+    if (q8_written != nullptr) *q8_written = 0;
+    if ((k_scale != nullptr) != (v_scale != nullptr)) {
+        return tk_null_err(ctx, "tk_attn_swa_sinks_planned: k_scale and v_scale must both be non-null or both be null");
+    }
+    if (n_tok <= 0 || n_head <= 0 || n_kv <= 0 || window <= 0 || stride < 0) {
+        return tk_arg_err(ctx, "tk_attn_swa_sinks_planned: invalid dimensions");
+    }
+    if ((head_dim != 192 && head_dim != 128) || head_dim_v != 128 || (n_head % n_kv) != 0 ||
+        q == out || k_pool == v_pool) {
+        return tk_unsupported_err(ctx, "tk_attn_swa_sinks_planned: unsupported head dimensions or aliased buffers");
+    }
+    if (!ctx->has_gpu) {
+        return tk_hip_err(ctx, "tk_attn_swa_sinks_planned: no HIP device available");
+    }
+    TK_TRY_BEGIN
+    const bool q8_kv = k_scale != nullptr && v_scale != nullptr;
+    const strata::kernels::MimoSwaPlan lib_plan =
+        strata::kernels::mimo_attn_swa_sinks_plan(q8_kv, n_split != -2, head_dim, n_tok, n_head, n_kv);
+    strata::kernels::MimoSwaPlan host_plan;
+    host_plan.kind = plan->kind;
+    host_plan.a = plan->a;
+    host_plan.b = plan->b;
+    host_plan.c = plan->c;
+    const bool same = lib_plan.kind == host_plan.kind && lib_plan.a == host_plan.a && lib_plan.b == host_plan.b &&
+                      lib_plan.c == host_plan.c;
+    static const bool trust = [] { const char* e = std::getenv("TALUS_PLAN_TRUST"); return e != nullptr && e[0] == '1'; }();
+    if (!same) {
+        TALUS_VTRACE("plan_mismatch", "tk_attn_swa_sinks", host_plan.kind, lib_plan.kind,
+                     host_plan.a * 10000 + host_plan.b * 100 + host_plan.c, lib_plan.a * 10000 + lib_plan.b * 100 + lib_plan.c);
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 8)
+            std::fprintf(stderr, "talus: tk_attn_swa_sinks: host plan (%d,%d,%d,%d) differs from the library's (%d,%d,%d,%d); "
+                                 "running the %s\n", host_plan.kind, host_plan.a, host_plan.b, host_plan.c, lib_plan.kind,
+                         lib_plan.a, lib_plan.b, lib_plan.c, trust ? "host's" : "library's");
+    }
+    const strata::kernels::MimoSwaPlan& run = (same || trust) ? host_plan : lib_plan;
+    const float value_scale = (n_split == -1) ? 0.7071067811865475244f : 1.0f;
+    bool done = false;
+    strata::kernels::mimo_attn_swa_sinks(q, k_pool, v_pool, k_scale, v_scale, sinks, out, scratch, n_tok, n_head, n_kv,
+                                         head_dim, head_dim_v, window, stride, scale, pos_dev, n_split,
+                                         tk_effective_stream(stream), value_scale, q8_out, q8_mmq, q8_layout, &done, &run);
+    if (q8_written != nullptr) *q8_written = done ? 1 : 0;
+    return TK_OK;
+    TK_TRY_END(ctx)
+}
+
 tk_status tk_attn_swa_sinks_mmq(
     tk_ctx*          ctx,
     const float*     q,
@@ -1287,6 +1419,95 @@ tk_status tk_attn_k192_v128(
         pos_dev,
         n_split,
         tk_effective_stream(stream));
+    return TK_OK;
+    TK_TRY_END(ctx)
+}
+
+tk_status tk_attn_k192_v128_plan(
+    int32_t q8_kv,
+    int32_t has_scratch,
+    int32_t n_tok,
+    int32_t n_head,
+    int32_t n_kv,
+    int32_t stride,
+    int32_t n_split,
+    tk_mimo_k192_plan* out) TK_NOEXCEPT {
+    if (out == nullptr) return TK_ERR_NULL_PTR;
+    try {
+        const strata::kernels::MimoK192Plan p =
+            strata::kernels::mimo_attn_k192_v128_plan(q8_kv != 0, has_scratch != 0, n_tok, n_head, n_kv, stride, n_split);
+        out->kind = p.kind;
+        out->splits = p.splits;
+        out->a = p.a;
+        out->b = p.b;
+        out->c = p.c;
+        return TK_OK;
+    } catch (...) {
+        return TK_ERR_INTERNAL;
+    }
+}
+
+tk_status tk_attn_k192_v128_planned(
+    tk_ctx*          ctx,
+    const float*     q,
+    const void*      k_pool,
+    const void*      v_pool,
+    const uint16_t*  k_scale,
+    const uint16_t*  v_scale,
+    float*           out,
+    float*           scratch,
+    int32_t          n_tok,
+    int32_t          n_head,
+    int32_t          n_kv,
+    int32_t          stride,
+    float            scale,
+    const int32_t*   pos_dev,
+    int32_t          n_split,
+    tk_stream        stream,
+    void*            q8_out,
+    const tk_mimo_k192_plan* plan) TK_NOEXCEPT {
+    if (ctx == nullptr || q == nullptr || k_pool == nullptr || v_pool == nullptr ||
+        out == nullptr || pos_dev == nullptr || plan == nullptr) {
+        return tk_null_err(ctx, "tk_attn_k192_v128_planned: null pointer argument");
+    }
+    if ((k_scale != nullptr) != (v_scale != nullptr)) {
+        return tk_null_err(ctx, "tk_attn_k192_v128_planned: k_scale and v_scale must both be non-null or both be null");
+    }
+    if (n_tok <= 0 || n_head <= 0 || n_kv <= 0 || stride < 0) {
+        return tk_arg_err(ctx, "tk_attn_k192_v128_planned: invalid dimensions");
+    }
+    if ((n_head % n_kv) != 0 || q == out || k_pool == v_pool) {
+        return tk_unsupported_err(ctx, "tk_attn_k192_v128_planned: unsupported GQA ratio or aliased buffers");
+    }
+    if (!ctx->has_gpu) {
+        return tk_hip_err(ctx, "tk_attn_k192_v128_planned: no HIP device available");
+    }
+    TK_TRY_BEGIN
+    const bool q8_kv = k_scale != nullptr && v_scale != nullptr;
+    const strata::kernels::MimoK192Plan lib_plan =
+        strata::kernels::mimo_attn_k192_v128_plan(q8_kv, scratch != nullptr, n_tok, n_head, n_kv, stride, n_split);
+    strata::kernels::MimoK192Plan host_plan;
+    host_plan.kind = plan->kind;
+    host_plan.splits = plan->splits;
+    host_plan.a = plan->a;
+    host_plan.b = plan->b;
+    host_plan.c = plan->c;
+    const bool same = lib_plan.kind == host_plan.kind && lib_plan.splits == host_plan.splits && lib_plan.a == host_plan.a &&
+                      lib_plan.b == host_plan.b && lib_plan.c == host_plan.c;
+    static const bool trust = [] { const char* e = std::getenv("TALUS_PLAN_TRUST"); return e != nullptr && e[0] == '1'; }();
+    if (!same) {
+        TALUS_VTRACE("plan_mismatch", "tk_attn_k192_v128", host_plan.kind * 100 + host_plan.splits,
+                     lib_plan.kind * 100 + lib_plan.splits, host_plan.a * 10000 + host_plan.b * 100 + host_plan.c,
+                     lib_plan.a * 10000 + lib_plan.b * 100 + lib_plan.c);
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 8)
+            std::fprintf(stderr, "talus: tk_attn_k192_v128: host plan (%d,%d,%d,%d,%d) differs from the library's (%d,%d,%d,%d,%d); "
+                                 "running the %s\n", host_plan.kind, host_plan.splits, host_plan.a, host_plan.b, host_plan.c,
+                         lib_plan.kind, lib_plan.splits, lib_plan.a, lib_plan.b, lib_plan.c, trust ? "host's" : "library's");
+    }
+    const strata::kernels::MimoK192Plan& run = (same || trust) ? host_plan : lib_plan;
+    strata::kernels::mimo_attn_k192_v128(q, k_pool, v_pool, k_scale, v_scale, out, scratch, n_tok, n_head, n_kv, stride,
+                                         scale, pos_dev, n_split, tk_effective_stream(stream), q8_out, &run);
     return TK_OK;
     TK_TRY_END(ctx)
 }

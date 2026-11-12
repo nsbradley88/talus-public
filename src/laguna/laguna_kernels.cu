@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "strata/kernels/variant_trace.hpp"   // S1
+
 namespace strata::laguna {
 
 namespace {
@@ -602,28 +604,38 @@ __global__ void attn_merge_kernel(const float* __restrict__ part_acc, const floa
 }
 }  // namespace
 
+int prompt_attn_variant(int nq) {
+    if (nq == 1) return 100;   // decode: QT 1, KT 32
+    static const int shape = [] {
+        // tuning: 0 = QT4/KT64, 1 = QT4/KT32 (default on gfx1151: ~30 KB LDS, 2 blocks per WGP),
+        // 2 = QT2/KT32, 3 = QT8/KT32
+        const char* e = std::getenv("LAGUNA_PA_SHAPE");
+        return e ? std::atoi(e) : 1;
+    }();
+    return shape;
+}
+
 void prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool, float* out, int nq, int q_pos0,
                  int n_head, int n_kv, int window, void* stream, const int* q_pos0_dev, int n_split,
                  float* part_acc, float* part_ml, bool merge, int vt_stride, const uint16_t* ksc,
-                 const uint16_t* vsc) {
+                 const uint16_t* vsc, int variant) {
     const int G = n_head / n_kv;
     if (G > kMaxG || n_head % n_kv != 0) { std::fprintf(stderr, "laguna: prompt_attn: GQA %d unsupported\n", G); std::exit(1); }
     if (n_split < 1) n_split = 1;
     // decode (one query token): QT 1, KT 32 keeps the block's LDS ~21 KB so several fit per WGP; prompts: QT 4, KT 64
-    if (nq == 1) {
+    // S6: the host's variant (prompt_attn_variant rules), or computed here
+    const int pv = variant < 0 ? prompt_attn_variant(nq) : variant;
+    if (pv == 100) {
+        TALUS_VTRACE("laguna_prompt_attn", "decode_qt1", G, n_split > 1 ? 2 : 1, window > 0 ? 1 : 0, ksc != nullptr ? 1 : 0);
         const dim3 grid(1, n_kv, n_split);
         prompt_attn_kernel<1, 32><<<grid, 256, 0, (cudaStream_t) stream>>>(q, k_pool, v_pool, out, nq, q_pos0,
                                                                           q_pos0_dev, n_head, G, n_kv, window,
                                                                           n_split > 1 ? part_acc : nullptr, part_ml, vt_stride, ksc, vsc);
     } else {
-        static const int shape = [] {
-            // tuning: 0 = QT4/KT64, 1 = QT4/KT32 (default on gfx1151: ~30 KB LDS, 2 blocks per WGP),
-            // 2 = QT2/KT32, 3 = QT8/KT32
-            const char* e = std::getenv("LAGUNA_PA_SHAPE");
-            return e ? std::atoi(e) : 1;
-        }();
+        const int shape = pv;
         float* pa = n_split > 1 ? part_acc : nullptr;
         const cudaStream_t st = (cudaStream_t) stream;
+        TALUS_VTRACE("laguna_prompt_attn", "shape", shape, G, n_split > 1 ? 2 : 1, window > 0 ? 1 : 0);
         switch (shape) {
         case 1: prompt_attn_kernel<4, 32><<<dim3((nq + 3) / 4, n_kv, n_split), 256, 0, st>>>(q, k_pool, v_pool, out, nq, q_pos0, q_pos0_dev, n_head, G, n_kv, window, pa, part_ml, vt_stride, ksc, vsc); break;
         case 2: prompt_attn_kernel<2, 32><<<dim3((nq + 1) / 2, n_kv, n_split), 256, 0, st>>>(q, k_pool, v_pool, out, nq, q_pos0, q_pos0_dev, n_head, G, n_kv, window, pa, part_ml, vt_stride, ksc, vsc); break;
@@ -638,10 +650,23 @@ void prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
     }
 }
 
-void f32_matmul(const float* w, const float* x, float* y, int n_in, int n_out, int n_tok, void* stream) {
-    if (n_in % 16 != 0) { std::fprintf(stderr, "laguna: f32_matmul: n_in %d not a multiple of 16\n", n_in); std::exit(1); }
+// S7: kind * 1000 + stream mode * 10 + config (the Rust host's copy: talus_kernels::plans::f32_matmul_plan): kind 1 the few-row
+// family (stream kernel on padded rows, or staged: whether a padded copy exists stays with the rowpad registry), 2 v2, 3 base.
+int f32_matmul_plan(int n_in, int n_tok) {
     static const bool old_only = [] { const char* e = std::getenv("TALUS_F32MM_OLD"); return e && e[0] == '1'; }();
-    if (!old_only && n_tok <= 16 && n_in % 64 == 0 && n_in <= 8192) {   // decode / verify windows: bitwise, 2 rows per block
+    static const int stream_mode = [] { const char* e = std::getenv("TALUS_F32FEW_STREAM"); return e ? std::atoi(e) : 1; }();
+    static const int cfg = [] { const char* e = std::getenv("TALUS_F32FEW_CFG"); return e ? std::atoi(e) : 5; }();
+    static const bool v2 = [] { const char* e = std::getenv("TALUS_F32MM_V2"); return e != nullptr && e[0] == '1'; }();
+    if (!old_only && n_tok <= 16 && n_in % 64 == 0 && n_in <= 8192)
+        return 1000 + (stream_mode >= 2 ? 2 : stream_mode == 1 ? 1 : 0) * 10 + (cfg >= 1 && cfg <= 6 && cfg != 5 ? cfg : 5);
+    return v2 && !old_only && n_in % 16 == 0 ? 2000 : 3000;
+}
+
+void f32_matmul(const float* w, const float* x, float* y, int n_in, int n_out, int n_tok, void* stream, int plan) {
+    if (n_in % 16 != 0) { std::fprintf(stderr, "laguna: f32_matmul: n_in %d not a multiple of 16\n", n_in); std::exit(1); }
+    const int run = plan < 0 ? f32_matmul_plan(n_in, n_tok) : plan;
+    TALUS_VTRACE("laguna_f32_matmul", "plan", run, n_tok > 16 ? 17 : n_tok, n_in, n_out);
+    if (run / 1000 == 1) {   // decode / verify windows: bitwise, 2 rows per block
         int64_t ld;
         const float* wp = strata::kernels::rowpad_lookup(w, n_in, n_out, &ld);   // rd-pad (same bits)
         // the streaming kernel on padded rows (rd-pad copy registered: ld != n_in). On the plain rows every
@@ -649,8 +674,7 @@ void f32_matmul(const float* w, const float* x, float* y, int n_in, int n_out, i
         // the staged one (kab2, the desktop: MiMo T1 46 us staged, 55-58 us stream plain, 24.8 us stream padded 16x256).
         // TALUS_F32FEW_STREAM=0: never; =2: also on plain rows (bench). TALUS_F32FEW_CFG picks OB x KC (bench):
         // 1 = 4x512, 2 = 8x512, 3 = 4x256, 4 = 8x256, 5 = 16x256 (default), 6 = 2x1024
-        static const int stream_mode = [] { const char* e = std::getenv("TALUS_F32FEW_STREAM"); return e ? std::atoi(e) : 1; }();
-        static const int cfg = [] { const char* e = std::getenv("TALUS_F32FEW_CFG"); return e ? std::atoi(e) : 5; }();
+        const int stream_mode = run / 10 % 10, cfg = run % 10;
         const bool stream_on = stream_mode >= 2 || (stream_mode == 1 && ld != n_in);
         const cudaStream_t st = (cudaStream_t) stream;
 #define TALUS_F32_STREAM(OB, KC) \
@@ -675,8 +699,7 @@ void f32_matmul(const float* w, const float* x, float* y, int n_in, int n_out, i
         check_launch("f32_matmul_few");
         return;
     }
-    static const bool v2 = [] { const char* e = std::getenv("TALUS_F32MM_V2"); return e != nullptr && e[0] == '1'; }();
-    if (v2 && !old_only && n_in % 16 == 0) {   // bitwise, 8 x 8 outputs per thread
+    if (run == 2000) {   // bitwise, 8 x 8 outputs per thread
         f32_matmul_v2_kernel<<<dim3((n_out + 63) / 64, (n_tok + 63) / 64), 64, 0, (cudaStream_t) stream>>>(w, x, y, n_in,
                                                                                                           n_out, n_tok);
         check_launch("f32_matmul_v2");
@@ -705,10 +728,18 @@ void gather_rows(const void* src, void* dst, const int* idx, int n_rows, size_t 
     check_launch("gather_rows");
 }
 
-void moe_add_slots(float* x, const float* shared, const float* y, const int* map, const float* w, int n_tok,
-                   int n_embd, int k, void* stream) {
+int moe_add_slots_variant(const float* x, const float* shared, const float* y, int n_embd) {
     static const bool v4 = [] { const char* e = std::getenv("TALUS_MOE_ADD4"); return !(e && e[0] == '0'); }();
     const bool al = ((uintptr_t) x | (uintptr_t) shared | (uintptr_t) y) % 16 == 0;
+    return v4 && n_embd % 4 == 0 && al ? 1 : 0;
+}
+
+void moe_add_slots(float* x, const float* shared, const float* y, const int* map, const float* w, int n_tok,
+                   int n_embd, int k, void* stream, int variant) {
+    // S6: the host's variant (1 = float4, 0 = scalar), or computed here
+    const int mv = variant < 0 ? moe_add_slots_variant(x, shared, y, n_embd) : variant;
+    const bool v4 = mv == 1, al = true;
+    TALUS_VTRACE("laguna_moe_add_slots", (v4 && n_embd % 4 == 0 && al) ? "v4" : "scalar", n_embd, k);
     if (v4 && n_embd % 4 == 0 && al) {   // float4 per thread (bitwise; TALUS_MOE_ADD4=0: off)
         const dim3 grid((n_embd / 4 + 255) / 256, n_tok);
         moe_add_slots4_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(x, shared, y, map, w, n_embd, k);
@@ -1909,23 +1940,32 @@ int prompt_attn_version() {
 
 void prompt_attn_set_version(int v) { g_prompt_attn_version = v; }
 
+int prompt_attn_wmma_variant(int nq, int q_pos0, int n_split, bool has_ksc, bool has_pos_dev) {
+    const int pv = prompt_attn_version();
+    if (n_split > 1) return 1;
+    if (pv >= 2 && (has_ksc || has_pos_dev || q_pos0 + nq > 4096 || pv == 3 || pv >= 5)) return pv >= 4 ? 2 : 3;
+    return 4;
+}
+
 void prompt_attn_wmma(const float* q, const uint16_t* k_pool, const uint16_t* v_pool, float* out, int nq, int q_pos0,
                       int n_head, int n_kv, int window, void* stream, int vt_stride, const int* q_pos0_dev, int n_split,
-                      float* part_acc, float* part_ml, const uint16_t* ksc, const uint16_t* vsc) {
+                      float* part_acc, float* part_ml, const uint16_t* ksc, const uint16_t* vsc, int variant) {
     if (vt_stride <= 0 || vt_stride % 16 != 0) { std::fprintf(stderr, "laguna: prompt_attn_wmma: V must be transposed, stride %% 16\n"); std::exit(1); }
     const int G = n_head / n_kv;
     const int rows = nq * G;
-    if (n_split > 1) {   // decode: one wave per (KV head, key chunk)
+    // S6: the host's variant (prompt_attn_wmma_variant rules: 1 split, 2 shared_t, 3 shared, 4 nw4), or here
+    const int wv = variant < 0 ? prompt_attn_wmma_variant(nq, q_pos0, n_split, ksc != nullptr, q_pos0_dev != nullptr) : variant;
+    TALUS_VTRACE("laguna_prompt_attn_wmma", wv == 1 ? "split" : wv == 2 ? "shared_t" : wv == 3 ? "shared" : "nw4",
+                 prompt_attn_version(), G, ksc != nullptr ? 1 : 0, q_pos0_dev != nullptr ? 1 : 0);
+    if (wv == 1) {   // decode: one wave per (KV head, key chunk)
         prompt_attn_wmma_kernel<1><<<dim3((rows + 15) / 16, n_kv, n_split), 32, 0, (cudaStream_t) stream>>>(
             q, k_pool, v_pool, out, nq, q_pos0, n_head, G, n_kv, window, vt_stride, q_pos0_dev, part_acc, part_ml, ksc, vsc);
-    } else if (prompt_attn_version() >= 2 &&
-               (ksc != nullptr || q_pos0_dev != nullptr || q_pos0 + nq > 4096 || prompt_attn_version() == 3 ||
-                prompt_attn_version() >= 5)) {
+    } else if (wv == 2 || wv == 3) {
         // (shared tiles: q8 KV x1.18-1.42 at every depth; f16 KV only pays past a few K keys: x0.92-1.0 at depth 0,
         // x1.15-1.93 at 6-30K - talus-laguna-attn-test)
         constexpr int NW = 8, NT = 4;
         const dim3 grid((rows + 16 * NW - 1) / (16 * NW), n_kv);
-        if (prompt_attn_version() >= 4)
+        if (wv == 2)
             prompt_attn_wmma_shared_t_kernel<NW, NT><<<grid, NW * 32, 0, (cudaStream_t) stream>>>(
                 q, k_pool, v_pool, out, nq, q_pos0, n_head, G, n_kv, window, vt_stride, q_pos0_dev, ksc, vsc);
         else
@@ -2654,22 +2694,16 @@ __global__ void __launch_bounds__(256) decode_attn_grp_kernel(const float* __res
 // test hook overrides of LAGUNA_DEC_GRP / LAGUNA_DEC_GRP_NT (-1 = the environment); talus_laguna_decode_attn_grp
 int g_dec_grp_min = -1, g_dec_grp_nt = -1, g_dec_tokmajor = -1, g_dec_grp_sparse = 0;
 
-void decode_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool, const uint16_t* k_scale,
-                 const uint16_t* v_scale, int n_head, int n_kv, int window, int stride, const int* pos_dev, int n_split,
-                 float* part_acc, float* part_ml, void* stream, int n_tok, const int* sel, int sel_k, bool sel_per_kv,
-                 int sel_bs) {
-    const int sel_sh = sel_bs == 16 ? 4 : sel_bs == 32 ? 5 : 6;
+int decode_attn_plan(int n_head, int n_kv, int window, int n_tok, bool has_sel) {
     const int G = n_head / n_kv;
     // rb-vattn kill switch: LAGUNA_DEC_TOKMAJOR=0 restores the (split, KV head, token) grid
     static const int tokmajor_env = [] { const char* e = std::getenv("LAGUNA_DEC_TOKMAJOR"); return e ? std::atoi(e) : 1; }();
     // (default: full layers at any width; sliding-window layers up to 16 tokens, where it measured faster)
     const int tm = n_tok > 1 && (g_dec_tokmajor >= 0 ? g_dec_tokmajor : (tokmajor_env && (window == 0 || n_tok <= 16))) ? 1 : 0;
-    const dim3 grid = tm ? dim3(n_split * n_kv * n_tok) : dim3(n_split, n_kv, n_tok);
     static const int kt = [] {   // tuning: LAGUNA_DEC_KT = 32 or 64 keys per tile
         const char* e = std::getenv("LAGUNA_DEC_KT");
         return e && std::atoi(e) == 64 ? 64 : 32;
     }();
-    const cudaStream_t st = (cudaStream_t) stream;
     // grouped verify attention (decode_attn_grp_kernel, bitwise the per-token kernel) from LAGUNA_DEC_GRP
     // window tokens (default 2; 0 = off, the kill switch). Dense ranges only (full-attention layers below the sparse
     // threshold, and the sliding-window layers): with block-sparse selections a window's tokens walk different blocks at
@@ -2680,9 +2714,31 @@ void decode_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
     static const int grp_nt_env = [] { const char* e = std::getenv("LAGUNA_DEC_GRP_NT"); return e ? std::atoi(e) : 0; }();
     const int grp_min = g_dec_grp_min >= 0 ? g_dec_grp_min : grp_min_env;
     const int grp_nt = g_dec_grp_nt >= 0 ? g_dec_grp_nt : grp_nt_env;
-    if (grp_min > 0 && n_tok >= grp_min && kt == 32 && G <= 9 && (sel == nullptr || g_dec_grp_sparse)) {
+    int grp = 0;
+    if (grp_min > 0 && n_tok >= grp_min && kt == 32 && G <= 9 && (!has_sel || g_dec_grp_sparse)) {
         const int nt = grp_nt > 0 ? ((grp_nt % 10 == 8 && G <= 6) ? 8 : 4) : ((G <= 6 && n_tok >= 8) ? 8 : 4);
-        const int cap = grp_nt >= 10 ? grp_nt / 10 : 2;
+        const int cap = (grp_nt >= 10 ? grp_nt / 10 : 2) == 2 ? 2 : 4;   // the two kernel instances
+        grp = nt * 10 + cap;
+    }
+    return grp * 1000 + (kt == 64 ? 100 : 0) + tm;
+}
+bool decode_attn_hooked() { return g_dec_grp_min >= 0 || g_dec_grp_nt >= 0 || g_dec_tokmajor >= 0 || g_dec_grp_sparse; }
+
+void decode_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool, const uint16_t* k_scale,
+                 const uint16_t* v_scale, int n_head, int n_kv, int window, int stride, const int* pos_dev, int n_split,
+                 float* part_acc, float* part_ml, void* stream, int n_tok, const int* sel, int sel_k, bool sel_per_kv,
+                 int sel_bs, int plan) {
+    const int sel_sh = sel_bs == 16 ? 4 : sel_bs == 32 ? 5 : 6;
+    const int G = n_head / n_kv;
+    const int p = plan < 0 ? decode_attn_plan(n_head, n_kv, window, n_tok, sel != nullptr) : plan;
+    const int tm = p % 10;
+    const int kt = p % 1000 >= 100 ? 64 : 32;
+    const dim3 grid = tm ? dim3(n_split * n_kv * n_tok) : dim3(n_split, n_kv, n_tok);
+    const cudaStream_t st = (cudaStream_t) stream;
+    if (p >= 1000) {
+        const int nt = p / 10000;
+        const int cap = p / 1000 % 10;
+        TALUS_VTRACE("laguna_decode_attn", "grp", nt * 10 + cap, G, k_scale ? 1 : 0, sel != nullptr ? 1 : 0);
         const dim3 gg(n_split * n_kv * ((n_tok + nt - 1) / nt));
 #define GRP_L(Q, NT_, GM_) if (cap == 2) decode_attn_grp_kernel<Q, 32, NT_, GM_, 2><<<gg, 256, 0, st>>>(q, k_pool, v_pool, k_scale, v_scale, \
             n_head, G, n_kv, window, stride, pos_dev, part_acc, part_ml, sel, sel_k, sel_per_kv ? 1 : 0, sel_sh, n_split, n_tok); \
@@ -2697,6 +2753,7 @@ void decode_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
         check_launch("decode_attn_grp");
         return;
     }
+    TALUS_VTRACE("laguna_decode_attn", tm ? "tokmajor" : "split_major", kt, G, k_scale ? 1 : 0, (sel != nullptr ? 2 : 0) + (window > 0 ? 1 : 0));
     if (k_scale && kt == 64)
         decode_attn_kernel<true, 64><<<grid, 256, 0, st>>>(q, k_pool, v_pool, k_scale, v_scale, n_head, G, n_kv, window,
                                                            stride, pos_dev, part_acc, part_ml, sel, sel_k, sel_per_kv ? 1 : 0, sel_sh, n_split, n_kv, tm);
@@ -3084,6 +3141,7 @@ void sparse_select(const float* ub, int nb_max, int n_head, const int* pos_dev, 
     if (n_head > 64 || n_head % groups != 0 || (!scr && nb_max > kSpMaxNb)) {
         std::fprintf(stderr, "laguna: sparse_select: shape\n"); std::exit(1);
     }
+    TALUS_VTRACE("laguna_sparse_select", scr ? "radix" : "lds", groups, bs, k, sink * 100000 + recent);
     if (scr)
         sparse_select_radix_kernel<<<dim3(n_tok, groups), 1024, 0, (cudaStream_t) stream>>>(
             ub, nb_max, n_head, pos_dev, k, sink, recent, sel, bs, scr);

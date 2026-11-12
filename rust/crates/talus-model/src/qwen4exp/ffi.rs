@@ -1693,7 +1693,6 @@ p2_ffi_table! {
     pf_hcdown_bf16: fn(Eh, i64, Eh, Eh, i64, i64, Mf, Mf, i64, i64, Vp) -> c_int;
     cvec_info: fn(i64, *mut TkP2Cvec);
     cvec_apply: fn(Mf, i64, i64, i64, Vp);
-    ple_ngram_rows: fn(Vp, Ei, Ei, i32, *mut u32);
     ple_gather_batch: fn(Vp, *const u32, u64, Mf, *mut c_char, usize) -> c_int;
     ple_postops_batch: fn(Vp, Mf, Mf, Ef, Mf, Mf, Mf, Mf, i32, Vp, *mut c_char, usize) -> c_int;
     ple_block: fn(Vp, Ef, Ef, Ef, Mf, Mf, Vp, Vp, *mut c_char, usize) -> c_int;

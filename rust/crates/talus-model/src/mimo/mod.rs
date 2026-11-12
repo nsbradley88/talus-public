@@ -6,6 +6,7 @@
 //! and the WP-3.2 DFlash speculation engine (`talus-spec`, 152,064 `Q8_0` head +
 //! 64K `mimo-dv-65536.bin` draft vocabulary + `n4`).
 
+pub mod attn_plan;
 pub mod engine;
 pub mod ffi;
 pub mod serve;

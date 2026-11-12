@@ -22,6 +22,7 @@
 // Copyright (c) 2026 nsbradley88
 // SPDX-License-Identifier: MIT
 #include <hip/hip_runtime.h>
+#include "strata/kernels/variant_trace.hpp"   // S1
 #include <hip/hip_fp16.h>
 
 #include "ggml.h"
@@ -1176,7 +1177,10 @@ bool moe_gemm_w16(const MoeProduct& p, void* stream, bool force) {
     if (p.n % (gu ? 128 : 256) != 0 || p.k % (t == GGML_TYPE_IQ4_NL ? 128 : 256) != 0 || p.k <= 0) return false;
     if (p.max_rows <= 0 || p.n_experts <= 0 || p.total_rows <= 0) return false;
     static const int env_min = [] { const char* v = std::getenv("STRATA_PF_W16_MOE_MIN"); return v ? std::atoi(v) : -1; }();
-    if (!force && p.total_rows < (int64_t) p.n_experts * (env_min >= 0 ? env_min : tp_tune_current().pf_w16_moe_min_rows)) return false;
+    if (!force && p.total_rows < (int64_t) p.n_experts * (env_min >= 0 ? env_min : tp_tune_current().pf_w16_moe_min_rows)) {
+        TALUS_VTRACE("pf_moe_w16", "below_min", t, gu ? 1 : 0, p.n_experts > 1 ? 1 : 0, env_min >= 0 ? env_min : tp_tune_current().pf_w16_moe_min_rows);
+        return false;
+    }
     const int bb = t == GGML_TYPE_IQ2_S ? 82 : t == GGML_TYPE_IQ3_S ? 110 : t == GGML_TYPE_IQ2_XXS ? 66 : t == GGML_TYPE_IQ3_XXS ? 98 : 18;
     const int bv = t == GGML_TYPE_IQ4_NL ? 32 : 256;
     F::MqArgs a;
@@ -1210,6 +1214,7 @@ bool moe_gemm_w16(const MoeProduct& p, void* stream, bool force) {
     // <= total_rows / bm + n_experts
     static const bool cmp = [] { const char* v = std::getenv("TALUS_W16_CMP"); return v == nullptr || v[0] != '0'; }();
     const bool use_cmp = cmp && p.n_experts <= 512;
+    TALUS_VTRACE("pf_moe_w16", "mq", t, gu ? 1 : 0, bm * 100 + (use_cmp ? 10 : 0) + (bf ? 1 : 0) + (u2 ? 2 : 0), w16_ft());
     const dim3 gridc((unsigned) (p.n / (gu ? 128 : 256)), (unsigned) ((p.total_rows + bm - 1) / bm + p.n_experts), 1u);
     const F::Batch nb{};
     const F::NativeGeom ng{};
@@ -1255,6 +1260,7 @@ bool w16_glm_launch(int t, bool gu, bool u2, int64_t total_rows, int n, int n_ex
     // 128 routed rows per item from a mean of 32 (per-row results do not depend on the item size)
     const int bm = env_bm == 64 ? 64 : env_bm == 128 ? 128 : (mean >= 32 ? 128 : 64);
     const dim3 g((unsigned) (n / (gu ? 128 : 256)), (unsigned) ((total_rows + bm - 1) / bm + n_experts), 1u);
+    TALUS_VTRACE("pf_w16_glm", gu ? "gu_q8" : (a.dst16 ? "down_f16" : "down"), t, bm, u2 ? 1 : 0, a.ft);
     const F::Batch nb{};
     const F::NativeGeom ng{};
     const F::Tables nt{};

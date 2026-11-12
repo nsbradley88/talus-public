@@ -189,6 +189,36 @@ int tkg_glm_sparse_fa_idx(const float* q, const void* kv_f16, const void* zero_m
                           float* split_buf, float* dst, int D, int H, int N, int n_kv_max, uint32_t q_nb1,
                           uint32_t q_nb2, uint32_t k_stride, float scale, void* stream);
 size_t tkg_glm_sparse_fa_split_bytes(int D, int H, int N, int n_kv_max);
+/* w3 rust-port S7: tkg_f32_matvec with the host's plan: kind * 1000 + config: 1 prompt tiles, 2 wide, 3 tiles of 8 tokens, 4 the
+ * decode kernel (config 1: batched loads). Optional symbol; checked for one release; < 0 = the library decides. */
+int tkg_f32_matvec_v(const float* W, const float* x, float* y, int n_in, int n_out, int T, void* s, int plan);
+/* w3 rust-port S7: the expert mat-vecs and the fused KDA step with the host's config (optional symbols; plan_choose):
+ * plan = variant*1e8 + R*1e6 + NW*1e4 + WPE*100 + persistent WGs/CU; cfg = 10000 + 100 NWV + CPW (0: none). */
+int tkg_glm_mmvq_ids_v(int qtype, const void* w, const void* xq, const int32_t* ids, float* y, int N, int K,
+                       int n_expert_used, int n_tokens, int x_group, int ids_s1, void* s, int plan);
+int tkg_glm_mmvq_ids_pair_v(int qtype, const void* w, const void* w2, const void* xq, const int32_t* ids, float* y,
+                            float* y2, int N, int K, int n_expert_used, int n_tokens, int x_group, int ids_s1, void* s, int plan);
+int tkg_kda_fused_v(const float* qr, const float* kr, const float* vr, float* conv_state, const float* wq, const float* wk,
+                    const float* wv, const float* g, const float* beta, float* state, const int32_t* ids, const float* dtb,
+                    const float* a, float* o, const float* g2, const float* onorm_w, void* oq, int* cnt, int H, int D,
+                    int T, int K_snap, float scale, float pro_lb, float pro_l2_eps, float gate_eps, void* s, int cfg);
+/* w3 rust-port S5: the two-pass sparse attention's scratch pool from the host: nslot slots of [64][2080] fp32, locks = nslot
+ * zeroed ints (optional symbol; without a call the library allocates its own at the first eligible launch). */
+void tkg_glm_sparse_2p_set_pool(float* pool, int* locks, int nslot);
+/* w3 rust-port S6e: the same with the host's launch plan (optional symbols; plan < 0 = the library decides; for one
+ * release the library compares with its own choice, reports a difference once per process up to 8 times and runs its
+ * own unless TALUS_PLAN_TRUST=1). Plan values: glm/plans.rs in talus-model. */
+int tkg_heads_q8_0_v(const void* W, const float* x, float* y, int H, int n_in, int n_out, int T, void* stream, int plan);
+int tkg_multi_q8_0_v(int n_mats, const void* const* w, const float* const* x, float* const* y, const int* n_out, int n_in,
+                     int T, void* stream, int plan);
+int tkg_glm_kda_step_v(const float* q, const float* k, const float* v, const float* g, const float* beta, float* state,
+                       const int32_t* ids, const float* dtb, const float* a, float* dst, int H, int S_v, int T,
+                       int K_snap, float scale, float pro_lb, float pro_l2_eps, void* stream, int plan);
+int tkg_glm_indexer_v(const float* q, const void* k_f16, const float* w, float* dst, int D, int H, int n_kv,
+                      int n_tokens, void* stream, int plan);
+int tkg_glm_sparse_fa_idx_v(const float* q, const void* kv_f16, const void* zero_mask_f16, const int32_t* idx,
+                            float* split_buf, float* dst, int D, int H, int N, int n_kv_max, uint32_t q_nb1,
+                            uint32_t q_nb2, uint32_t k_stride, float scale, void* stream, int plan);
 
 /* ---- lever 4: producers that write the next GEMM's MMQ q8_1 activations (llama.cpp block_q8_1_mmq,
  * layout 0 = D4, 1 = DS4 as tk_q36_mmq_q8_layout) - bitwise the fp32 producer + tk_q36_mmq_quantize. -1 = not covered

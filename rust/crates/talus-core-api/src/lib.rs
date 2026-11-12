@@ -340,6 +340,15 @@ impl GpuArch {
         }
     }
 
+    /// True for the gfx11 targets the library's gfx11 WMMA kernels are compiled for (gfx1100-gfx1103, gfx1150,
+    /// gfx1151), as `strata::kernels::gfx_arch_is_gfx11_wmma`. Selections of gfx11-only kernels check this (D4).
+    pub fn has_gfx11_wmma(&self) -> bool {
+        matches!(
+            self.as_str(),
+            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151"
+        )
+    }
+
     /// Canonical short architecture name (`"gfx1151"`, `"gfx1201"`, or the raw string).
     pub fn as_str(&self) -> &str {
         match self {
@@ -1500,5 +1509,28 @@ mod tests {
             .status()
             .expect("invoke g++ for C++17 check");
         assert!(cpp_status.success(), "g++ -std=c++17 syntax check failed");
+    }
+}
+
+#[cfg(test)]
+mod gfx11_wmma_tests {
+    use super::GpuArch;
+
+    #[test]
+    fn gfx11_wmma_targets_match_the_library() {
+        for g in [
+            "gfx1100",
+            "gfx1101",
+            "gfx1102",
+            "gfx1103",
+            "gfx1150",
+            "gfx1151",
+            "gfx1151:sramecc-:xnack-",
+        ] {
+            assert!(GpuArch::from_gcn_arch_name(g).has_gfx11_wmma(), "{g}");
+        }
+        for g in ["gfx1201", "gfx1200", "gfx1030", "gfx906", "gfx942", ""] {
+            assert!(!GpuArch::from_gcn_arch_name(g).has_gfx11_wmma(), "{g}");
+        }
     }
 }

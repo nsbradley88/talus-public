@@ -950,11 +950,37 @@ pub type Kv8AttnFn = unsafe extern "C" fn(
     c_int,
 ) -> c_int;
 
+/// S7 kv8: `talus_q36_attn_wmma_kv8_v(..., variant, plan)`: the same launch with the host's plan
+/// (`talus_kernels::plans::q36_kv8_plan`), cross-checked by the library for one release. Optional symbol.
+pub type Kv8AttnVFn = unsafe extern "C" fn(
+    c_int,
+    c_int,
+    *const f32,
+    *const c_void,
+    *const c_void,
+    *const c_void,
+    *const c_void,
+    *const i32,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    f32,
+    c_int,
+    *mut f32,
+    *mut f32,
+    *mut f32,
+    *mut c_void,
+    c_int,
+    c_int,
+) -> c_int;
+
 #[derive(Clone, Copy)]
 struct Kv8Fns {
     version: unsafe extern "C" fn() -> c_int,
     quant: Kv8QuantFn,
     attn: Kv8AttnFn,
+    attn_v: Option<Kv8AttnVFn>,
 }
 
 fn kv8_fns() -> Option<Kv8Fns> {
@@ -976,10 +1002,12 @@ fn kv8_fns() -> Option<Kv8Fns> {
             if v.is_null() || q.is_null() || a.is_null() {
                 return None;
             }
+            let av = dlsym(handle, c"talus_q36_attn_wmma_kv8_v".as_ptr());
             Some(Kv8Fns {
                 version: std::mem::transmute::<*mut c_void, unsafe extern "C" fn() -> c_int>(v),
                 quant: std::mem::transmute::<*mut c_void, Kv8QuantFn>(q),
                 attn: std::mem::transmute::<*mut c_void, Kv8AttnFn>(a),
+                attn_v: (!av.is_null()).then(|| std::mem::transmute::<*mut c_void, Kv8AttnVFn>(av)),
             })
         }
         #[cfg(not(unix))]
@@ -1047,6 +1075,17 @@ pub fn talus_q36_attn_wmma_kv8(
     variant: i32,
 ) -> bool {
     match kv8_fns() {
+        // S7 kv8: the host plans the launch (row groups + kernel instance); a library without the plan-taking
+        // entry plans it itself, as before
+        Some(Kv8Fns {
+            attn_v: Some(av), ..
+        }) => unsafe {
+            let plan = talus_kernels::plans::q36_kv8_plan(t_rows, h_q, hkv, variant);
+            av(
+                n_chunk, hkv, q, kq, ks, vq, vs, pos0, t_rows, h_q, ctx, vt_ctx, sc, chunk, pacc,
+                pm, pl, stream, variant, plan,
+            ) == 0
+        },
         Some(f) => unsafe {
             (f.attn)(
                 n_chunk, hkv, q, kq, ks, vq, vs, pos0, t_rows, h_q, ctx, vt_ctx, sc, chunk, pacc,
@@ -1292,7 +1331,7 @@ pub fn tk_mmvq(
     ncols: i32,
     stream: tk_stream,
 ) -> tk_status {
-    unsafe { (lib().tk_mmvq)(ctx, qtype, w, x_q8_1, y, n_in, n_out, ncols, stream) }
+    unsafe { crate::pf_plans::mmvq(lib(), ctx, qtype, w, x_q8_1, y, n_in, n_out, ncols, stream) }
 }
 
 #[inline]
@@ -1384,6 +1423,17 @@ pub fn tk_prefill_moe_mmq(
     stream: tk_stream,
 ) -> tk_status {
     unsafe { (lib().tk_prefill_moe_mmq)(ctx, product, stream) }
+}
+
+/// `tk_prefill_moe_mmq` with the activation layout from the host (0 plain q8_1, 1 MMQ) - S4.
+#[inline]
+pub fn tk_prefill_moe_mmq_l(
+    ctx: *mut tk_ctx,
+    product: *const tk_moe_mmq_product,
+    x_layout: i32,
+    stream: tk_stream,
+) -> tk_status {
+    unsafe { crate::pf_plans::moe_mmq(lib(), ctx, product, x_layout, stream) }
 }
 
 #[inline]
@@ -1836,6 +1886,20 @@ pub fn tk_q36_attn_wmma(
     pl: *mut f32,
     stream: tk_stream,
 ) -> tk_status {
+    if let Some(f) = crate::pf_plans::q36_attn_v(lib()) {
+        let plan = if w8 {
+            -1
+        } else {
+            talus_kernels::plans::q36_attn_plan(t_rows, h_q, h_kv)
+        };
+        // SAFETY: the C ABI in include/talus_kernels.h.
+        return unsafe {
+            f(
+                ctx, w8, grid_x, grid_y, q, kc_f16, vt_f16, pos0, t_rows, h_q, h_kv, ctx_cap,
+                vt_ctx, scale, chunk, n_chunk, pacc, pm, pl, stream, plan,
+            )
+        };
+    }
     unsafe {
         (lib().tk_q36_attn_wmma)(
             ctx, w8, grid_x, grid_y, q, kc_f16, vt_f16, pos0, t_rows, h_q, h_kv, ctx_cap, vt_ctx,
@@ -2872,6 +2936,7 @@ pub fn tk_dequantize_q8_0_to_f16(
 #[inline]
 pub fn tk_q36_q8_0_pack_should(ggml_type: i32, n_in: i32, n_out: i32) -> bool {
     if let Ok(k) = load_kernels_once() {
+        talus_kernels::knobs::q36_env();
         unsafe { (k.lib.tk_q36_q8_0_pack_should)(ggml_type, n_in, n_out) }
     } else {
         ggml_type == 8 && n_in > 0 && n_in % 128 == 0 && n_out > 0 && (n_out & 1) == 0
@@ -2926,6 +2991,7 @@ pub fn tk_q36_embed_rows(
 #[inline]
 pub fn tk_q36_mmq_built() -> bool {
     if let Ok(k) = load_kernels_once() {
+        talus_kernels::knobs::q36_env();
         unsafe { (k.lib.tk_q36_mmq_built)() }
     } else {
         false
@@ -2935,6 +3001,7 @@ pub fn tk_q36_mmq_built() -> bool {
 #[inline]
 pub fn tk_q36_mmq_supported_fits(ggml_type: i32, w_rows: i64) -> bool {
     if let Ok(k) = load_kernels_once() {
+        talus_kernels::knobs::q36_env();
         unsafe { (k.lib.tk_q36_mmq_supported_fits)(ggml_type, w_rows) }
     } else {
         false
@@ -3262,6 +3329,13 @@ pub fn talus_pf_i8x_expand(
     }
 }
 
+/// S10: see [`crate::pf_plans::w32_startup_check`].
+pub fn w32_startup_check() {
+    if let Ok(kern) = load_kernels_once() {
+        crate::pf_plans::w32_startup_check(kern.lib.tk_mmvq_w32_table_plan);
+    }
+}
+
 #[inline]
 pub fn talus_pf_i8gemm(
     qs: *const i8,
@@ -3276,7 +3350,21 @@ pub fn talus_pf_i8gemm(
     stream: *mut c_void,
 ) -> bool {
     if let Ok(kern) = load_kernels_once() {
-        unsafe { (kern.lib.talus_pf_i8gemm)(qs, ws, n, k, mode, xq, t, dst, ld_dst, stream) == 0 }
+        unsafe {
+            kern.lib.pf_i8gemm_v(
+                qs,
+                ws,
+                n,
+                k,
+                mode,
+                xq,
+                t,
+                dst,
+                ld_dst,
+                stream,
+                crate::pf_plans::i8gemm(mode),
+            ) == 0
+        }
     } else {
         false
     }
@@ -3301,8 +3389,20 @@ pub fn talus_pf_i8gemm_swiglu_q8(
 ) -> bool {
     if let Ok(kern) = load_kernels_once() {
         unsafe {
-            (kern.lib.talus_pf_i8gemm_swiglu_q8)(
-                qs, ws, n, k, mode, xq, t, g, ldg, yq, layout, stream,
+            kern.lib.pf_i8gemm_swiglu_q8_v(
+                qs,
+                ws,
+                n,
+                k,
+                mode,
+                xq,
+                t,
+                g,
+                ldg,
+                yq,
+                layout,
+                stream,
+                crate::pf_plans::swq8(mode),
             ) == 0
         }
     } else {

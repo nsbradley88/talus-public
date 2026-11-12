@@ -3,6 +3,7 @@
 
 #include "talus_kernels.h"
 #include "laguna/laguna_kernels.hpp"
+#include "strata/kernels/variant_trace.hpp"   // S6: plan_choose
 
 #include <climits>
 #include <cstddef>
@@ -118,7 +119,7 @@ tk_status tk_f32_matvec_rows_n(
     });
 }
 
-tk_status tk_f32_matmul(
+tk_status tk_f32_matmul_v(
     tk_ctx* ctx,
     const float* w,
     const float* x,
@@ -126,7 +127,8 @@ tk_status tk_f32_matmul(
     int32_t n_in,
     int32_t n_out,
     int32_t n_tok,
-    tk_stream stream) TK_NOEXCEPT {
+    tk_stream stream,
+    int32_t plan) TK_NOEXCEPT {
     (void) ctx;
     if (!w || !x || !y) {
         return TK_ERR_NULL_PTR;
@@ -135,8 +137,14 @@ tk_status tk_f32_matmul(
         return TK_ERR_INVALID_ARG;
     }
     return invoke_noexcept([&] {
-        strata::laguna::f32_matmul(w, x, y, n_in, n_out, n_tok, stream);
+        strata::laguna::f32_matmul(w, x, y, n_in, n_out, n_tok, stream,
+                                   plan < 0 ? -1 : strata::kernels::vtrace::plan_choose("tk_f32_matmul", plan, strata::laguna::f32_matmul_plan(n_in, n_tok)));
     });
+}
+
+tk_status tk_f32_matmul(tk_ctx* ctx, const float* w, const float* x, float* y, int32_t n_in, int32_t n_out, int32_t n_tok,
+                        tk_stream stream) TK_NOEXCEPT {
+    return tk_f32_matmul_v(ctx, w, x, y, n_in, n_out, n_tok, stream, -1);
 }
 
 /* ==========================================================================
@@ -212,6 +220,32 @@ tk_status tk_gather_rows(
     });
 }
 
+tk_status tk_moe_add_slots_v(
+    tk_ctx* ctx,
+    float* x,
+    const float* shared,
+    const float* y,
+    const int32_t* map_dev,
+    const float* weights_dev,
+    int32_t n_tok,
+    int32_t n_embd,
+    int32_t k,
+    tk_stream stream,
+    int32_t variant) TK_NOEXCEPT {
+    (void) ctx;
+    if (!x || !shared || !y || !map_dev || !weights_dev) {
+        return TK_ERR_NULL_PTR;
+    }
+    if (n_tok <= 0 || n_embd <= 0 || k < 0) {
+        return TK_ERR_INVALID_ARG;
+    }
+    return invoke_noexcept([&] {
+        const int lib = strata::laguna::moe_add_slots_variant(x, shared, y, n_embd);
+        const int run = variant < 0 ? lib : strata::kernels::vtrace::plan_choose("tk_moe_add_slots", variant, lib);
+        strata::laguna::moe_add_slots(x, shared, y, map_dev, weights_dev, n_tok, n_embd, k, stream, run);
+    });
+}
+
 tk_status tk_moe_add_slots(
     tk_ctx* ctx,
     float* x,
@@ -223,16 +257,7 @@ tk_status tk_moe_add_slots(
     int32_t n_embd,
     int32_t k,
     tk_stream stream) TK_NOEXCEPT {
-    (void) ctx;
-    if (!x || !shared || !y || !map_dev || !weights_dev) {
-        return TK_ERR_NULL_PTR;
-    }
-    if (n_tok <= 0 || n_embd <= 0 || k < 0) {
-        return TK_ERR_INVALID_ARG;
-    }
-    return invoke_noexcept([&] {
-        strata::laguna::moe_add_slots(x, shared, y, map_dev, weights_dev, n_tok, n_embd, k, stream);
-    });
+    return tk_moe_add_slots_v(ctx, x, shared, y, map_dev, weights_dev, n_tok, n_embd, k, stream, -1);
 }
 
 tk_status tk_silu_mul(
@@ -638,7 +663,7 @@ tk_status tk_qkv_norm_rope_store(
  * 5. Laguna Attention & Merge Kernels
  * ========================================================================== */
 
-tk_status tk_laguna_prompt_attn(
+tk_status tk_laguna_prompt_attn_v(
     tk_ctx* ctx,
     const float* q,
     const uint16_t* k_pool,
@@ -657,7 +682,8 @@ tk_status tk_laguna_prompt_attn(
     int32_t vt_stride,
     const uint16_t* k_scale,
     const uint16_t* v_scale,
-    tk_stream stream) TK_NOEXCEPT {
+    tk_stream stream,
+    int32_t variant) TK_NOEXCEPT {
     (void) ctx;
     if (!q || !k_pool || !v_pool) {
         return TK_ERR_NULL_PTR;
@@ -693,11 +719,38 @@ tk_status tk_laguna_prompt_attn(
             merge,
             vt_stride,
             k_scale,
-            v_scale);
+            v_scale,
+            variant < 0 ? -1
+                        : strata::kernels::vtrace::plan_choose("tk_laguna_prompt_attn", variant,
+                                                                strata::laguna::prompt_attn_variant(nq)));
     });
 }
 
-tk_status tk_laguna_prompt_attn_wmma(
+tk_status tk_laguna_prompt_attn(
+    tk_ctx* ctx,
+    const float* q,
+    const uint16_t* k_pool,
+    const uint16_t* v_pool,
+    float* out,
+    int32_t nq,
+    int32_t q_pos0,
+    int32_t n_head,
+    int32_t n_kv,
+    int32_t window,
+    const int32_t* q_pos0_dev,
+    int32_t n_split,
+    float* part_acc,
+    float* part_ml,
+    bool merge,
+    int32_t vt_stride,
+    const uint16_t* k_scale,
+    const uint16_t* v_scale,
+    tk_stream stream) TK_NOEXCEPT {
+    return tk_laguna_prompt_attn_v(ctx, q, k_pool, v_pool, out, nq, q_pos0, n_head, n_kv, window, q_pos0_dev, n_split,
+                                   part_acc, part_ml, merge, vt_stride, k_scale, v_scale, stream, -1);
+}
+
+tk_status tk_laguna_prompt_attn_wmma_v(
     tk_ctx* ctx,
     const float* q,
     const uint16_t* k_pool,
@@ -715,7 +768,8 @@ tk_status tk_laguna_prompt_attn_wmma(
     float* part_ml,
     const uint16_t* k_scale,
     const uint16_t* v_scale,
-    tk_stream stream) TK_NOEXCEPT {
+    tk_stream stream,
+    int32_t variant) TK_NOEXCEPT {
     (void) ctx;
     if (!q || !k_pool || !v_pool) {
         return TK_ERR_NULL_PTR;
@@ -750,11 +804,39 @@ tk_status tk_laguna_prompt_attn_wmma(
             part_acc,
             part_ml,
             k_scale,
-            v_scale);
+            v_scale,
+            variant < 0 ? -1
+                        : strata::kernels::vtrace::plan_choose(
+                              "tk_laguna_prompt_attn_wmma", variant,
+                              strata::laguna::prompt_attn_wmma_variant(nq, q_pos0, n_split, k_scale != nullptr,
+                                                                       q_pos0_dev != nullptr)));
     });
 }
 
-tk_status tk_laguna_decode_attn(
+tk_status tk_laguna_prompt_attn_wmma(
+    tk_ctx* ctx,
+    const float* q,
+    const uint16_t* k_pool,
+    const uint16_t* v_pool,
+    float* out,
+    int32_t nq,
+    int32_t q_pos0,
+    int32_t n_head,
+    int32_t n_kv,
+    int32_t window,
+    int32_t vt_stride,
+    const int32_t* q_pos0_dev,
+    int32_t n_split,
+    float* part_acc,
+    float* part_ml,
+    const uint16_t* k_scale,
+    const uint16_t* v_scale,
+    tk_stream stream) TK_NOEXCEPT {
+    return tk_laguna_prompt_attn_wmma_v(ctx, q, k_pool, v_pool, out, nq, q_pos0, n_head, n_kv, window, vt_stride,
+                                        q_pos0_dev, n_split, part_acc, part_ml, k_scale, v_scale, stream, -1);
+}
+
+tk_status tk_laguna_decode_attn_v(
     tk_ctx* ctx,
     const float* q,
     const uint16_t* k_pool,
@@ -774,7 +856,8 @@ tk_status tk_laguna_decode_attn(
     int32_t sel_k,
     bool sel_per_kv,
     int32_t sel_bs,
-    tk_stream stream) TK_NOEXCEPT {
+    tk_stream stream,
+    int32_t plan) TK_NOEXCEPT {
     (void) ctx;
     if (!q || !k_pool || !v_pool || !pos_dev || !part_acc || !part_ml) {
         return TK_ERR_NULL_PTR;
@@ -808,8 +891,22 @@ tk_status tk_laguna_decode_attn(
             sel_dev,
             sel_k,
             sel_per_kv,
-            sel_bs);
+            sel_bs,
+            plan < 0 || strata::laguna::decode_attn_hooked()
+                ? -1
+                : strata::kernels::vtrace::plan_choose(
+                      "tk_laguna_decode_attn", plan,
+                      strata::laguna::decode_attn_plan(n_head, n_kv, window, n_tok, sel_dev != nullptr)));
     });
+}
+
+tk_status tk_laguna_decode_attn(
+    tk_ctx* ctx, const float* q, const uint16_t* k_pool, const uint16_t* v_pool, const uint16_t* k_scale,
+    const uint16_t* v_scale, int32_t n_head, int32_t n_kv, int32_t window, int32_t stride, const int32_t* pos_dev,
+    int32_t n_split, float* part_acc, float* part_ml, int32_t n_tok, const int32_t* sel_dev, int32_t sel_k,
+    bool sel_per_kv, int32_t sel_bs, tk_stream stream) TK_NOEXCEPT {
+    return tk_laguna_decode_attn_v(ctx, q, k_pool, v_pool, k_scale, v_scale, n_head, n_kv, window, stride, pos_dev, n_split,
+                                   part_acc, part_ml, n_tok, sel_dev, sel_k, sel_per_kv, sel_bs, stream, -1);
 }
 
 tk_status tk_attn_merge_gate_quant(

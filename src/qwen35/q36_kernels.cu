@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include "strata/kernels/variant_trace.hpp"   // S1
 
 namespace {
 
@@ -1901,11 +1902,35 @@ void launch_attn_wmma_pf(int var, dim3 grid, cudaStream_t st, const float* q, co
 #undef TQ_PF
 }
 
+// S7: the f16 reader's launch as one int, (4-wave reader; the host's copy: talus_kernels::plans::q36_attn_plan):
+// red * 10000 + shape: 1..10 k_attn_wmma_pf variant, 100 groups of 1 tile, 200 RT 1, 300 RT 2, 400 RT 3, 500 groups of 2 tiles in one
+// launch, 600 a launch per group.
+int attn_wmma_plan(int T, int H, int HKV) {
+    const int rt = (T * (H / HKV) + 15) / 16;
+    static const bool rt3 = std::getenv("STRATA_ATTN_RT3") != nullptr;   // the 3-tile instance (spills; A/B)
+    // windows above 16 rows as groups of 16 rows (the 1-tile instance at 181 VGPRs / 8 waves per SIMD,
+    // adjacent blocks per chunk so the second group reads K / V from cache) instead of 2-tile groups (256 VGPRs,
+    // 5 waves); a row's arithmetic does not depend on its tile mates, so the result is bitwise the same.
+    // TALUS_ATTN_RT1G=0: revert to 2-tile groups.
+    static const int rt1g = [] { const char* e = std::getenv("TALUS_ATTN_RT1G"); return e ? std::atoi(e) : 1; }();
+    // rows in groups of 32 (2 tiles): one launch, a chunk's groups adjacent (STRATA_ATTN_SPLIT=0: a launch per group)
+    static const bool split = [] { const char* e = std::getenv("STRATA_ATTN_SPLIT"); return !(e && e[0] == '0'); }();
+    int shape;
+    if (g_attn_red == 3 && g_attn_pf > 0 && (rt == 1 || rt1g))   // w2: the prefetching reader (bitwise k_attn_wmma<1, 3>)
+        shape = g_attn_pf == 11 ? ((T >= 3 && T <= 6) ? 5 : 1) : g_attn_pf;
+    else if (rt > 1 && rt1g) shape = 100;
+    else if (rt == 1) shape = 200;
+    else if (rt == 2) shape = 300;
+    else if (rt3 && rt == 3) shape = 400;
+    else shape = split ? 500 : 600;
+    return g_attn_red * 10000 + shape;
+}
+
 /// k_attn_wmma (4 waves) or k_attn_wmma8 (8 waves, w8) for T rows, RT = ceil(T G / 16) tiles of 16 query rows.
 template <int RED>
 static void launch_attn_wmma_red(bool w8, dim3 grid, cudaStream_t st, const float* q, const __half* kc, const __half* vt,
                       const int32_t* pos0, int T, int H, int HKV, int ctx, int vt_ctx, float sc, int chunk, int n_chunk,
-                      float* pacc, float* pm, float* pl) {
+                      float* pacc, float* pm, float* pl, int shape) {
     const int rt = (T * (H / HKV) + 15) / 16;
 #define TQ_ATT(K, R, NT) K<R, RED><<<grid, NT, 0, st>>>(q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl)
     if (w8) {
@@ -1913,35 +1938,26 @@ static void launch_attn_wmma_red(bool w8, dim3 grid, cudaStream_t st, const floa
         else if (rt == 2) TQ_ATT(k_attn_wmma8, 2, 256);
         else TQ_ATT(k_attn_wmma8, 3, 256);
     } else {
-        static const bool rt3 = std::getenv("STRATA_ATTN_RT3") != nullptr;   // the 3-tile instance (spills; A/B)
-        // windows above 16 rows as groups of 16 rows (the 1-tile instance at 181 VGPRs / 8 waves per SIMD,
-        // adjacent blocks per chunk so the second group reads K / V from cache) instead of 2-tile groups (256 VGPRs,
-        // 5 waves); a row's arithmetic does not depend on its tile mates, so the result is bitwise the same.
-        // TALUS_ATTN_RT1G=0: revert to 2-tile groups.
-        static const int rt1g = [] { const char* e = std::getenv("TALUS_ATTN_RT1G"); return e ? std::atoi(e) : 1; }();
-        // w2: the prefetching reader (k_attn_wmma_pf, bitwise k_attn_wmma<1, 3>) for the 1-tile instances
-        if (RED == 3 && g_attn_pf > 0 && (rt == 1 || rt1g)) {
-            const int ng = (T * (H / HKV) + 15) / 16;
-            launch_attn_wmma_pf(g_attn_pf, dim3(grid.x * ng, grid.y), st, q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk,
+        const int ng = rt;
+        if (shape < 100) {
+            launch_attn_wmma_pf(shape, dim3(grid.x * ng, grid.y), st, q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk,
                                 n_chunk, pacc, pm, pl, 0, ng);
             return;
         }
-        if (rt > 1 && rt1g) {
-            const int ng = (T * (H / HKV) + 15) / 16;
+        if (shape == 100) {
             k_attn_wmma<1, RED><<<dim3(grid.x * ng, grid.y), 128, 0, st>>>(q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk,
                                                                       n_chunk, pacc, pm, pl, 0, ng);
             return;
         }
-        if (rt == 1) TQ_ATT(k_attn_wmma, 1, 128);
-        else if (rt == 2) TQ_ATT(k_attn_wmma, 2, 128);
-        else if (rt3 && rt == 3) TQ_ATT(k_attn_wmma, 3, 128);
-        else {   // rows in groups of 32 (2 tiles): one launch, a chunk's groups adjacent (STRATA_ATTN_SPLIT=0: a launch per group)
-            static const bool split = [] { const char* e = std::getenv("STRATA_ATTN_SPLIT"); return !(e && e[0] == '0'); }();
+        if (shape == 200) TQ_ATT(k_attn_wmma, 1, 128);
+        else if (shape == 300) TQ_ATT(k_attn_wmma, 2, 128);
+        else if (shape == 400) TQ_ATT(k_attn_wmma, 3, 128);
+        else {
             const int R = T * (H / HKV);
-            if (split) {
-                const int ng = (R + 31) / 32;
-                k_attn_wmma<2, RED><<<dim3(grid.x * ng, grid.y), 128, 0, st>>>(q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk,
-                                                                          n_chunk, pacc, pm, pl, 0, ng);
+            if (shape == 500) {
+                const int ng32 = (R + 31) / 32;
+                k_attn_wmma<2, RED><<<dim3(grid.x * ng32, grid.y), 128, 0, st>>>(q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk,
+                                                                          n_chunk, pacc, pm, pl, 0, ng32);
             } else
                 for (int r0 = 0; r0 < R; r0 += 32) {
                     if (R - r0 > 16)
@@ -1959,12 +1975,15 @@ static void launch_attn_wmma_red(bool w8, dim3 grid, cudaStream_t st, const floa
 int g_attn_red = [] { const char* e = std::getenv("TALUS_ATTN_RED"); const int v = e ? std::atoi(e) : 3; return v >= 0 && v <= 3 ? v : 3; }();
 void launch_attn_wmma(bool w8, dim3 grid, cudaStream_t st, const float* q, const __half* kc, const __half* vt,
                       const int32_t* pos0, int T, int H, int HKV, int ctx, int vt_ctx, float sc, int chunk, int n_chunk,
-                      float* pacc, float* pm, float* pl) {
-    switch (g_attn_red) {
-    case 1: launch_attn_wmma_red<1>(w8, grid, st, q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl); break;
-    case 2: launch_attn_wmma_red<2>(w8, grid, st, q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl); break;
-    case 3: launch_attn_wmma_red<3>(w8, grid, st, q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl); break;
-    default: launch_attn_wmma_red<0>(w8, grid, st, q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl);
+                      float* pacc, float* pm, float* pl, int plan) {
+    const int p = plan < 0 ? attn_wmma_plan(T, H, HKV) : plan;
+    const int red = w8 ? g_attn_red : p / 10000, shape = p % 10000;
+    if (!w8) TALUS_VTRACE("q36_attn_wmma", "plan", p, T, H, HKV);
+    switch (red) {
+    case 1: launch_attn_wmma_red<1>(w8, grid, st, q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl, shape); break;
+    case 2: launch_attn_wmma_red<2>(w8, grid, st, q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl, shape); break;
+    case 3: launch_attn_wmma_red<3>(w8, grid, st, q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl, shape); break;
+    default: launch_attn_wmma_red<0>(w8, grid, st, q, kc, vt, pos0, T, H, HKV, ctx, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl, shape);
     }
 }
 // test hook (talus-q27-attn-red): one instance - w8 0/1, RT 1..3, RED 0..3, rows r0 / ngrp row groups
@@ -2262,11 +2281,14 @@ inline tk_status check_last_cuda_error(tk_ctx* ctx, const char* op) noexcept {
     return TK_OK;
 }
 
+// S3: the defaults this used to set (CUDA_MODULE_LOADING=EAGER, STRATA_Q8_PACKED=1, STRATA_MMQ_KQ=1, each
+// only when unset) are applied by the Rust host (talus_kernels::knobs::q36_env) immediately before every call of the
+// three entry points below. What is left records, under TALUS_VARIANT_TRACE, which of them were set when the first of
+// those calls arrived (7 = all three: the host applied them; a caller that bypasses the host shows up here).
 inline void ensure_q36_env() noexcept {
     static const bool init = [] {
-        setenv("CUDA_MODULE_LOADING", "EAGER", 0);
-        setenv("STRATA_Q8_PACKED", "1", 0);
-        setenv("STRATA_MMQ_KQ", "1", 0);
+        TALUS_VTRACE("env", "ensure_q36_env", (std::getenv("CUDA_MODULE_LOADING") ? 1 : 0) + (std::getenv("STRATA_Q8_PACKED") ? 2 : 0) +
+                                                   (std::getenv("STRATA_MMQ_KQ") ? 4 : 0));
         return true;
     }();
     (void) init;
@@ -2449,16 +2471,25 @@ tk_status tk_q36_attn_merge(tk_ctx* ctx, int32_t rows, int32_t hd, const float* 
     TK_TRY_END(ctx);
 }
 
+tk_status tk_q36_attn_wmma_v(tk_ctx* ctx, bool w8, int32_t grid_x, int32_t grid_y, const float* q, const void* kc,
+                             const void* vt, const int32_t* pos0, int32_t n_tok, int32_t h, int32_t hkv, int32_t ctx_len,
+                             int32_t vt_ctx, float sc, int32_t chunk, int32_t n_chunk, float* pacc, float* pm, float* pl,
+                             tk_stream stream, int32_t plan) TK_NOEXCEPT {
+    TK_TRY_BEGIN
+    const int run = plan < 0 || w8 ? -1 : strata::kernels::vtrace::plan_choose("tk_q36_attn_wmma", plan, talus::q36::attn_wmma_plan(n_tok, h, hkv));
+    talus::q36::launch_attn_wmma(w8, dim3((unsigned) grid_x, (unsigned) grid_y), as_cuda_stream(stream), q,
+                                 static_cast<const __half*>(kc), static_cast<const __half*>(vt), pos0, n_tok, h, hkv,
+                                 ctx_len, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl, run);
+    return check_last_cuda_error(ctx, "tk_q36_attn_wmma");
+    TK_TRY_END(ctx);
+}
+
 tk_status tk_q36_attn_wmma(tk_ctx* ctx, bool w8, int32_t grid_x, int32_t grid_y, const float* q, const void* kc,
                            const void* vt, const int32_t* pos0, int32_t n_tok, int32_t h, int32_t hkv, int32_t ctx_len,
                            int32_t vt_ctx, float sc, int32_t chunk, int32_t n_chunk, float* pacc, float* pm, float* pl,
                            tk_stream stream) TK_NOEXCEPT {
-    TK_TRY_BEGIN
-    talus::q36::launch_attn_wmma(w8, dim3((unsigned) grid_x, (unsigned) grid_y), as_cuda_stream(stream), q,
-                                 static_cast<const __half*>(kc), static_cast<const __half*>(vt), pos0, n_tok, h, hkv,
-                                 ctx_len, vt_ctx, sc, chunk, n_chunk, pacc, pm, pl);
-    return check_last_cuda_error(ctx, "tk_q36_attn_wmma");
-    TK_TRY_END(ctx);
+    return tk_q36_attn_wmma_v(ctx, w8, grid_x, grid_y, q, kc, vt, pos0, n_tok, h, hkv, ctx_len, vt_ctx, sc, chunk, n_chunk,
+                              pacc, pm, pl, stream, -1);
 }
 
 tk_status tk_q36_group(tk_ctx* ctx, const int32_t* ids, int32_t n_ent, int32_t k, int32_t n_expert,

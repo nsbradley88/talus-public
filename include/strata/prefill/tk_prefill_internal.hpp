@@ -189,6 +189,7 @@ struct tk_prefill_state {
     void* mmq_ctx = nullptr;
     void* mmq_dense_buf = nullptr;
     int64_t mmq_dense_cap_rows = 0;
+    bool mmq_dense_adopted = false;   // w3 rust-port S5: the host owns mmq_dense_buf (never freed here)
     bool mmq_dense_failed = false;
     // tk_prefill_mmq's identity row ids + bounds (glm-mem #81): it reads only these, never an activation buffer,
     // so they get their own small buffer instead of mmq_dense_buf's rows x 32768 Q8_1 activations.

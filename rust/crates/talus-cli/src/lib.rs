@@ -2683,7 +2683,10 @@ pub fn run_laguna_cli(cfg: &CliConfig, model_path: &Path) -> i32 {
 
     let mut opt = talus_model::laguna::Options::default();
     opt.ubatch = ubatch;
-    opt.use_wmma = true;
+    // D4  S6c): the WMMA prompt attention exists only for gfx11 (it traps elsewhere)
+    opt.use_wmma = talus_hip::Device::new(talus_core_api::DeviceId(0))
+        .map(|d| d.arch().has_gfx11_wmma())
+        .unwrap_or(true);
     opt.kv_q8 = cfg.kv_q8;
     opt.graph = cfg.use_graph && !cfg.no_graph;
     opt.sparse = cfg.sparse;
@@ -2715,18 +2718,10 @@ pub fn run_laguna_cli(cfg: &CliConfig, model_path: &Path) -> i32 {
     };
     opt.taps = df_path.is_some();
     if fast_serve_mode {
-        if std::env::var_os("STRATA_MMVQ_W32").is_none() {
-            unsafe {
-                std::env::set_var("STRATA_MMVQ_W32", "1");
-            }
-        }
-        // wide dense mat-vecs (verify windows) through the exact tile kernels from 9 columns, every column
-        // bitwise the single-column wave32 result (STRATA_MMVQ_XT=0: off, the 16-column wave32 chunks)
-        if std::env::var_os("STRATA_MMVQ_XT").is_none() {
-            unsafe {
-                std::env::set_var("STRATA_MMVQ_XT", "9");
-            }
-        }
+        // the wave32 kernels, and wide dense mat-vecs (verify windows) through the exact tile kernels from 9
+        // columns, every column bitwise the single-column wave32 result (STRATA_MMVQ_XT=0: off, the 16-column wave32
+        // chunks); unset only (talus_kernels::knobs)
+        talus_kernels::knobs::apply("laguna-serve", talus_kernels::knobs::LAGUNA_SERVE_DEFAULTS);
         opt.dense_mmvq = true;
     }
 

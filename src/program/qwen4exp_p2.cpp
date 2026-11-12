@@ -619,13 +619,9 @@ void tk_qwen4exp_p2_mmq_product(void* mmq_ctx, const void* w, int32_t type, int6
     p.xq = xq; p.bounds = bounds; p.ids = ids; p.total_rows = total_rows; p.max_rows = max_rows; p.dst = dst;
     p.ld_dst = ld_dst; p.y_scale = y_scale;
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
-    // prefill.cpp's run_mmq_product: tp_moe where it covers the product (TALUS_PF_MOE=0 turns it off)
-    static const bool use_tp_moe = [] {
-        const char* v = std::getenv("TALUS_PF_MOE");
-        return v == nullptr || v[0] != '0';
-    }();
-    if (allow_tp_moe && use_tp_moe && p.n >= 1 && p.y_scale == nullptr &&
-        talus::prefill::moe_supported(p.type, (int) p.w_rows, (int) p.w_cols)) {
+    // prefill.cpp's run_mmq_product: tp_moe where it covers the product. w3 rust-port S8: the rule (TALUS_PF_MOE, y_scale, n)
+    // is the host's (qwen4exp/prefill.rs tp_moe_allowed): allow_tp_moe; the shape check stays with the kernels.
+    if (allow_tp_moe && talus::prefill::moe_supported(p.type, (int) p.w_rows, (int) p.w_cols)) {
         talus::prefill::MoeProduct mp;
         mp.w = p.w;
         mp.type = p.type;
@@ -646,6 +642,15 @@ void tk_qwen4exp_p2_mmq_product(void* mmq_ctx, const void* w, int32_t type, int6
     (void) allow_tp_moe;
 #endif
     ((pf::mmq::Context*) mmq_ctx)->run(p, stream);
+}
+// w3 rust-port S8c: the host's tp_moe kernel version for this thread's next products (talus_kernels::tune::moe_version;
+// < 0 = the library's rule), checked against the library's rule for one release (moe_version_for)
+void tk_qwen4exp_p2_moe_host_version(int32_t v) {
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+    talus::prefill::moe_host_version(v);
+#else
+    (void) v;
+#endif
 }
 // W2 k_moe5: a group's products can read its experts in place (no gather); the bits are the gathered product's
 int tk_qwen4exp_p2_mmq_inplace_ok(int32_t type, int64_t w_rows, int64_t w_cols) {

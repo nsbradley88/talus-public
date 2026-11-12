@@ -191,6 +191,8 @@ void native_mmvq_set_w32_waves(int w);
 /// -1 = TALUS_MMVQ_W32_TS (unset = on where a model loader opted in to the wide tiles - the 27B; 0 = the kill switch,
 /// 1 = on for every caller), 0 off, 1 on.  For benches; before capture.
 void native_mmvq_set_w32_ts(int mode);
+int native_mmvq_w32_table_plan(int type, int ncols);   // w3 rust-port S10
+int native_mmvq_route_plan(int type, int n_out, int ncols);   // w3 rust-port S10
 void native_mmvq_w32_config(int type, int ncols, int* r, int* w);
 /// Talus: n (1..3) matrices of type ggml_type with the same input in one launch (each as native_mmvq_w32 computes it);
 /// false when not available (STRATA_MMVQ_MULTI=0, a type without wave32 kernels): the caller launches them one by one.

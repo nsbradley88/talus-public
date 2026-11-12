@@ -957,7 +957,7 @@ impl LagunaDFlash {
             check_tk(
                 ctx,
                 unsafe {
-                    (eng.tk.tk_laguna_decode_attn)(
+                    eng.tk.laguna_decode_attn_v(
                         ctx,
                         self.bq,
                         L.kpool,
@@ -978,6 +978,13 @@ impl LagunaDFlash {
                         false,
                         16,
                         st,
+                        talus_kernels::plans::laguna_decode_attn_plan(
+                            DF_HEADS as i32,
+                            K_HEAD_KV as i32,
+                            DF_WINDOW as i32,
+                            n as i32,
+                            false,
+                        ),
                     )
                 },
                 "tk_laguna_decode_attn(dflash)",

@@ -35,6 +35,7 @@
 #include "talus_iq_split.cuh"   // Talus: i-quant / Q2_K batch traits (MiMo)
 #include "strata/kernels/talus_wide_fmt.hpp"   // the wide tiles' formats (after ggml-common.h: grids)
 #include "strata/kernels/pdl.hpp"
+#include "strata/kernels/variant_trace.hpp"   // S1
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -2063,6 +2064,7 @@ bool q6_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in,
 bool native_q8_0_packed_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("STRATA_Q8_PACKED");
+        TALUS_VTRACE("env", "STRATA_Q8_PACKED@native_q8_0_packed_enabled", (v && v[0] == '1' && v[1] == '\0') ? 1 : 0, v != nullptr ? 1 : 0);
         return v && v[0] == '1' && v[1] == '\0';
     }();
     return enabled;
@@ -2548,6 +2550,7 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
         const void* const w[2] = {w1, w2};
         float* const y[2] = {y1, y2};
         const int no[2] = {n_out, n_out};
+        TALUS_VTRACE("mmvq_pair", "w32_multi", ggml_type, ncols, n_in, n_out);
         return native_mmvq_w32_multi(ggml_type, 2, w, y, no, x_q8_1, n_in, ncols, stream);
     }
     // only where both calls would run native_mmvq_multi_kernel<F, ncols, WARPS, 1> (exact layout, not packed)
@@ -2560,6 +2563,7 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
     const auto* b = static_cast<const Q80Block*>(w2);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     const auto s = static_cast<cudaStream_t>(stream);
+    TALUS_VTRACE("mmvq_pair", "q8_0_pair", ggml_type, ncols, n_in, n_out);
     switch (ncols) {
         case 2: q8_0_pair_launch<2>(a, b, x, y1, y2, n_in, n_out, s); break;
         case 3: q8_0_pair_launch<3>(a, b, x, y1, y2, n_in, n_out, s); break;
@@ -2640,6 +2644,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         return;
     }
     if (native_mmvq_w32(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // gfx11 (Talus)
+    TALUS_VTRACE("mmvq", "generic", ggml_type, ncols, n_in, n_out);
     switch (ggml_type) {
     case 2: native_q4_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 6: native_q5_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
@@ -3102,6 +3107,7 @@ void native_mmvq_ids_cols(int ggml_type, const void* weights, int ncols, const v
     validate_stream(stream);
     if (weights2) validate_pointer(y2);
     const auto s = static_cast<cudaStream_t>(stream);
+    TALUS_VTRACE("mmvq_ids_cols", weights2 ? "pair" : "one", ggml_type, ncols, n_in, n_out);
     switch (ggml_type) {
     case 12: validate_shape(n_in, 1, 256); launch_ids_cols<Q4KTraits>(weights, ncols, x_q8_1, y, n_in, n_out, s, weights2, y2); break;
     case 13: validate_shape(n_in, 1, 256); launch_ids_cols<Q5KTraits>(weights, ncols, x_q8_1, y, n_in, n_out, s, weights2, y2); break;
@@ -3123,6 +3129,7 @@ void native_mmvq_ids(int ggml_type, const void* weights, std::size_t expert_byte
     validate_stream(stream);
     if (weights2) validate_pointer(y2);
     const auto s = static_cast<cudaStream_t>(stream);
+    TALUS_VTRACE("mmvq_ids", weights2 ? "pair" : "one", ggml_type, n_ids * 2 + (x_per_id ? 1 : 0), n_in, n_out);
     switch (ggml_type) {
     case 12: validate_shape(n_in, 1, 256); launch_ids<Q4KTraits>(weights, expert_bytes, ids, n_ids, x_q8_1, x_per_id, y, n_in, n_out, s, weights2, y2); break;
     case 13: validate_shape(n_in, 1, 256); launch_ids<Q5KTraits>(weights, expert_bytes, ids, n_ids, x_q8_1, x_per_id, y, n_in, n_out, s, weights2, y2); break;
@@ -3807,6 +3814,7 @@ void native_mmvq_batch(const MmvqItem* items, int n_items, void* stream) {
                 ++w.n;
             }
             w.start[w.n] = blocks;
+            for (int i = 0; i < w.n; ++i) TALUS_VTRACE("mmvq_batch", "wide", w.it[i].type, w.it[i].n_ids, w.tpr[i] * 100 + w.rows[i], w.it[i].n_out);
             native_mmvq_wide_kernel<<<unsigned(blocks), dim3(WARP, WARPS), 0, static_cast<cudaStream_t>(stream)>>>(w);
             launch_check();
             if (n_rest > 0) native_mmvq_batch(rest, n_rest, stream);
@@ -3891,6 +3899,7 @@ void native_mmvq_batch(const MmvqItem* items, int n_items, void* stream) {
                 }
                 if (ki > 0) {
                     const int nc2 = v2_nc == 2 || v2_nc == 4 || v2_nc == 8 ? v2_nc : (ki == 1 ? v2_nc1_default : 4);
+                    for (int j = 0; j < g.n; ++j) TALUS_VTRACE("mmvq_batch", "group_v2", type, g.it[j].n_ids, ki * 100 + nc2, g.rpb[j]);
 #define STRATA_GROUP_V2(F, K) \
                     if (nc2 == 8) native_mmvq_group_kernel<F, 8, K><<<unsigned(blocks), dim3(WARP, WARPS), 0, st>>>(g); \
                     else if (nc2 == 2) native_mmvq_group_kernel<F, 2, K><<<unsigned(blocks), dim3(WARP, WARPS), 0, st>>>(g); \
@@ -3906,6 +3915,7 @@ void native_mmvq_batch(const MmvqItem* items, int n_items, void* stream) {
                     launch_check();
                     continue;
                 }
+                for (int j = 0; j < g.n; ++j) TALUS_VTRACE("mmvq_batch", "group", type, g.it[j].n_ids, nc_env, g.rpb[j]);
 #define STRATA_GROUP_LAUNCH(F) \
                 if (nc_env == 2) native_mmvq_group_kernel<F, 2><<<unsigned(blocks), dim3(WARP, WARPS), 0, st>>>(g); \
                 else if (nc_env == 8) native_mmvq_group_kernel<F, 8><<<unsigned(blocks), dim3(WARP, WARPS), 0, st>>>(g); \
@@ -3970,6 +3980,7 @@ void native_mmvq_batch(const MmvqItem* items, int n_items, void* stream) {
         blocks += a.rblocks[i] * (cols ? 1 : it.n_ids);
     }
     a.start[n_items] = blocks;
+    for (int i = 0; i < n_items; ++i) TALUS_VTRACE("mmvq_batch", "batch", items[i].type, items[i].n_ids, items[i].expert_major, items[i].n_out);
     native_mmvq_batch_kernel<<<unsigned(blocks), dim3(WARP, WARPS), 0, static_cast<cudaStream_t>(stream)>>>(a);
     launch_check();
 }
@@ -4261,6 +4272,7 @@ bool w32_on() {
         const char* e = std::getenv("STRATA_MMVQ_W32");
         if (e && e[0] == '0') on = 0;
         if (const char* r = std::getenv("STRATA_MMVQ_W32_R")) g_w32_r = std::atoi(r);
+        TALUS_VTRACE("env", "STRATA_MMVQ_W32@w32_on", on, e ? (e[0] == '0' ? 0 : 1) : -1, g_w32_r);
         g_w32_mode = on;
     }
     return g_w32_mode == 1;
@@ -4281,40 +4293,12 @@ bool w32_on() {
 // STRATA_MMVQ_W32_TAB="type:cols:R:W[:CG[:SG]],..." (type or cols '*', cols also "lo-hi") goes first, for in-engine sweeps;
 // STRATA_MMVQ_W32_R=1|2|4 forces R; STRATA_MMVQ_W32_RTAB=0 drops the gfx1151 rules.
 struct W32Rule { int type, n0, n1, r, w, cg = 0, sg = 0; };
+// S10: the rules live in one source, shared with the Rust host (talus_kernels::w32).
 constexpr W32Rule kW32Generic[] = {
-    {10, 1, 1, 2, 0}, {17, 1, 1, 2, 0}, {22, 1, 1, 2, 0}, {11, 1, 1, 4, 0}, {-1, 1, 1, 1, 0},
-    {12, 2, 5, 2, 0}, {13, 2, 5, 2, 0}, {14, 2, 5, 2, 0}, {21, 2, 5, 4, 0}, {11, 2, 5, 4, 0}, {10, 2, 5, 4, 0},
-    {-1, 2, 5, 1, 0},
-    {12, 6, 7, 2, 12}, {13, 6, 7, 2, 12}, {14, 6, 7, 2, 12}, {21, 6, 7, 4, 12}, {11, 6, 7, 4, 12}, {10, 6, 7, 4, 12},
-    {-1, 6, 7, 1, 12},
-    {12, 8, 8, 2, 8}, {13, 8, 8, 2, 8}, {14, 8, 8, 2, 8}, {21, 8, 8, 4, 8}, {11, 8, 8, 4, 8}, {10, 8, 8, 4, 8},
-    {-1, 8, 8, 1, 8}, {-1, 9, 16, 1, 8},
+#include "strata/kernels/w32_rules_generic.inc"
 };
-// gfx1151 (Strix Halo): in-engine, UD-IQ4_XS verify windows at 2K (gfx1151 verify-window table)
-// (STRATA_MMVQ_W32_TAB tuning table, ms per verify pass by type): 2..3 columns R 1 (R 2 for the IQ3 / IQ2
-// grids), 4 columns R 2 at <= 8 waves (IQ4_XS R 1); 5..9 columns R 2 at <= 8 waves for every type (IQ4_XS 8 columns
-// 35.9 ms against 42.4 at R 1, 33.0 at 1 column), Q4_K R 4.
 constexpr W32Rule kW32Gfx1151[] = {
-    // Q4_K (KQ8) at 4..5 columns (MiMo DFlash verify) R 1 W 0, as at 2..3: MiMo 8192x4096 4 / 5 cols 132 / 132
-    // -> 111 / 113 us, 4096x12288 156 / 163 -> 145 / 150, 4096x14848 186 / 192 -> 173 / 187 (mvb graph sweep with a
-    // dependent kernel; every column bitwise the 1-column result, mvbx);
-    // STRATA_MMVQ_W32_TAB="12:4-5:2:8" restores
-    {12, 4, 5, 1, 0},
-    // Graph sweep with a dependent kernel, 27B shapes 5120x17408 / 17408x5120):
-    // IQ2_S / IQ2_XS at 3..5 columns R 4 W 8 (IQ2_S 5 cols 206 / 187 -> 187 / 179 us, IQ2_XS 4 cols 175 / 173 -> 167 /
-    // 153), Q3_K at 3..6 R 4 W 8 (6 cols 375 / 354 -> 345 / 345) and at 8 R 4 W 0 (458 / 434 -> 431 / 409). Bitwise
-    // (every instance's columns are the 1-column result, mb/mvbx.cpp); STRATA_MMVQ_W32_TAB overrides.
-    {22, 3, 5, 4, 8}, {17, 3, 5, 4, 8}, {11, 3, 6, 4, 8}, {11, 8, 8, 4, 0},
-    {21, 2, 3, 2, 0}, {18, 2, 3, 2, 0}, {22, 2, 3, 2, 0}, {17, 2, 3, 2, 0}, {11, 2, 3, 2, 0}, {-1, 2, 3, 1, 0},
-    // IQ3_XXS at 4 columns R 2 at <= 8 waves (W 8), not the default occupancy: 27B 5120x17408 / 17408x5120
-    // 240-250 -> 176-188 us (mvb graph sweep); STRATA_MMVQ_W32_TAB="18:4:2:0" restores
-    {23, 4, 4, 1, 8}, {18, 4, 4, 2, 8}, {-1, 4, 4, 2, 8},
-    {-1, 5, 10, 2, 8},   // (Q4_K / Q5_K: KQ8Traits R 2 selected on gfx1151)
-    // 11..13 columns: R 2 in one pass at <= 6 waves (<= 256 VGPRs; 12-row window 117 ms against 128 in groups); 16:
-    // that for IQ4_XS / Q4_K / IQ2_XS / Q2_K / IQ4_NL (IQ4_XS 53.7 ms against 60.7), else and at 14..15 R 2 in column
-    // groups of 8 (16-row window 155 ms against 198 at R 1)
-    {-1, 11, 13, 2, 6}, {23, 16, 16, 2, 6}, {12, 16, 16, 2, 6}, {13, 16, 16, 2, 6}, {17, 16, 16, 2, 6}, {10, 16, 16, 2, 6}, {20, 16, 16, 2, 6},
-    {-1, 14, 16, 2, 8, 8},
+#include "strata/kernels/w32_rules_gfx1151.inc"
 };
 std::vector<W32Rule> w32_env_rules() {
     std::vector<W32Rule> r;
@@ -4358,7 +4342,8 @@ int w32_arch() {   // 1: gfx1151, 0: other
 }
 int g_w32_rtab = [] { const char* e = std::getenv("STRATA_MMVQ_W32_RTAB"); return e ? std::atoi(e) : 1; }();
 int g_w32_wf = -1;   // native_mmvq_set_w32_waves (the bench): forces W when >= 0
-W32Cfg w32_cfg(int type, int ncols) {
+// (host_overrides = false: without the process overrides native_mmvq_set_w32 / _waves, for the startup equality check)
+W32Cfg w32_cfg_ex(int type, int ncols, bool host_overrides) {
     static const std::vector<W32Rule> env = w32_env_rules();
     auto find = [&](const W32Rule* b, const W32Rule* e, W32Cfg& c) {
         for (const W32Rule* q = b; q != e; ++q)
@@ -4369,10 +4354,11 @@ W32Cfg w32_cfg(int type, int ncols) {
     bool hit = !env.empty() && find(env.data(), env.data() + env.size(), c);
     if (!hit && g_w32_rtab && w32_arch() == 1) hit = find(std::begin(kW32Gfx1151), std::end(kW32Gfx1151), c);
     if (!hit) find(std::begin(kW32Generic), std::end(kW32Generic), c);
-    if (g_w32_r > 0) c.r = g_w32_r;
-    if (g_w32_wf >= 0) { c.w = g_w32_wf % 100; c.sg = g_w32_wf >= 100; }   // (100 + W: with the load-first schedule)
+    if (host_overrides && g_w32_r > 0) c.r = g_w32_r;
+    if (host_overrides && g_w32_wf >= 0) { c.w = g_w32_wf % 100; c.sg = g_w32_wf >= 100; }   // (100 + W: with the load-first schedule)
     return w32_sanitize(ncols, c);
 }
+W32Cfg w32_cfg(int type, int ncols) { return w32_cfg_ex(type, ncols, true); }
 // ---- the tsum-epilogue (EP 1) twins for 2..8 columns (default on; TALUS_MMVQ_W32_TS=0 off) ----
 // (not 1 column: the decode pass measured slower with it, while
 // 4..8 columns gain: at P = R <= 2 values the dependent DPP chain is slower than the pipelined ds_bpermutes)
@@ -4490,10 +4476,17 @@ bool native_mmvq_w32_supported(int t) noexcept {
 bool native_mmvq_w32_active() { return w32_on(); }
 void native_mmvq_set_w32(int mode, int rows) {
     (void) w32_on();
+    TALUS_VTRACE("env", "native_mmvq_set_w32", mode, rows, g_w32_r);
     g_w32_mode = mode;
     g_w32_r = rows;
 }
 void native_mmvq_set_w32_waves(int w) { g_w32_wf = w; }   // Talus: -1 = the table's W
+// S10: the table's choice as r * 1000000 + w * 10000 + (cg + 8) * 100 + sg, for the host's startup equality check
+int native_mmvq_w32_table_plan(int type, int ncols) {
+    (void) w32_on();
+    const W32Cfg c = w32_cfg_ex(type, ncols, false);
+    return c.r * 1000000 + c.w * 10000 + (c.cg + 8) * 100 + c.sg;
+}
 void native_mmvq_w32_config(int type, int ncols, int* r, int* w) { const W32Cfg c = w32_cfg(type, ncols); *r = c.r; *w = c.w; }
 bool native_mmvq_w32_multi(int t, int n, const void* const* w, float* const* y, const int* n_out, const void* x,
                            int n_in, int ncols, void* stream) {
@@ -4502,9 +4495,11 @@ bool native_mmvq_w32_multi(int t, int n, const void* const* w, float* const* y, 
     auto s = static_cast<cudaStream_t>(stream);
     const W32Cfg r = w32_cfg(t, ncols);
     if (w32_ts_multi_try(t, r, n, w, y, n_out, x, n_in, ncols, s)) {   // opt-in: same bits, tsum epilogue
+        TALUS_VTRACE("mmvq_w32_multi", "ts", t, ncols, r.r * 100 + r.w, n);
         launch_check();
         return true;
     }
+    TALUS_VTRACE("mmvq_w32_multi", (g_kq8 && (t == 12 || t == 13)) ? "w32_kq8" : "w32", t, ncols, r.r * 100 + r.w, n);
     switch (t) {
     case 2: w32_multi_launch<SmallTraits<Q40Block, 4>>(r, n, w, y, n_out, x, n_in, ncols, s); break;
     case 6: w32_multi_launch<SmallTraits<Q50Block, 4>>(r, n, w, y, n_out, x, n_in, ncols, s); break;
@@ -4693,6 +4688,9 @@ bool native_mmvq_lds(int t, const void* w, const void* x, float* y, int n_in, in
     // only where the single-column call takes the wave32 kernels with these traits (the rows must be its rows)
     const int lmin = lds_min();
     if (lmin <= 0 || ncols < lmin || !w32_on() || !native_mmvq_w32_supported(t)) return false;
+    if ((t == 12 || t == 13) && !g_kq8) return false;
+    if (t != 12 && t != 13 && t != 14 && t != 8) return false;
+    TALUS_VTRACE("mmvq_lds", "lds", t, ncols, n_in, n_out);
     const auto s = static_cast<cudaStream_t>(stream);
     switch (t) {
     case 12: if (!g_kq8) return false; validate_shape(n_in, 1, 256); lds_dispatch<KQ8Traits<false>>(w, x, y, n_in, n_out, ncols, s); break;
@@ -4992,27 +4990,59 @@ int xt_min() {
     static const int m = [] { const char* e = std::getenv("STRATA_MMVQ_XT"); return e ? std::atoi(e) : 0; }();
     return m;
 }
+// per-type floor (talus-laguna-wide-bench, gfx1151, Laguna shapes): the dp4a tiles win over the 16-column wave32 calls from
+// 16 columns for Q8_0 (head 100352 rows: n 16 1956 vs 2191 us, n 9 1901 vs 1513) and from 32 for Q6_K (1024 rows:
+// n 16 51 vs 33 us, n 32 58 vs 65); STRATA_MMVQ_XT_Q8 / STRATA_MMVQ_XT_Q6 override
+int xt_q8_min() {
+    static const int m = [] { const char* e = std::getenv("STRATA_MMVQ_XT_Q8"); return e ? std::atoi(e) : 16; }();
+    return m;
+}
+int xt_q6_min() {
+    static const int m = [] { const char* e = std::getenv("STRATA_MMVQ_XT_Q6"); return e ? std::atoi(e) : 32; }();
+    return m;
+}
+// STRATA_MMVQ_XT2_CFG="R:C" (rows per wave : columns per pass) for sweeps; default 4:8
+int xt2_cfg0() {
+    static const int m = [] {
+        const char* e = std::getenv("STRATA_MMVQ_XT2_CFG");
+        if (!e) return 0;
+        const int r = std::atoi(e);
+        const char* c = std::strchr(e, ':');
+        return 10 * r + (c ? std::atoi(c + 1) : 8);
+    }();
+    return m;
+}
 }  // namespace
+// S10: the wide-call route of tk_mmvq as one int, the same order as tk_dispatch_mmvq_cols (the Rust host's copy:
+// talus_kernels::w32::route): kind * 1000 + the XT2 config; kind 1 XT2 tiles, 2 XT KQ8 tiles, 3 LDS, 4 wave32 / tile chunks.
+int native_mmvq_route_plan(int t, int n_out, int ncols) {
+    const int xmin = xt_min();
+    if (xmin > 0 && ncols >= xmin && ncols <= 64 && w32_on()) {
+        if (t == 14 || t == 8) {
+            const int tmin = t == 14 ? xt_q6_min() : xt_q8_min();
+            if (tmin > 0 && ncols >= tmin) {
+                const int c0 = xt2_cfg0();
+                return 1000 + (c0 ? c0 : (t == 8 && n_out >= 8192) ? 88 : 48);
+            }
+        } else if (g_kq8 && (t == 12 || t == 13)) {
+            return 2000;
+        }
+    }
+    const int lmin = lds_min();
+    if (lmin > 0 && ncols >= lmin && w32_on() && native_mmvq_w32_supported(t)) {
+        if (((t == 12 || t == 13) && g_kq8) || t == 14 || t == 8) return 3000;
+    }
+    return 4000;
+}
+
 bool native_mmvq_xt(int t, const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* stream) {
     const int lmin = xt_min();
     if (lmin <= 0 || ncols < lmin || ncols > 64 || !w32_on()) return false;
     const auto s = static_cast<cudaStream_t>(stream);
     if (t == 14 || t == 8) {
-        // per-type floor (talus-laguna-wide-bench, gfx1151, Laguna shapes): the dp4a tiles win over the 16-column wave32 calls from
-        // 16 columns for Q8_0 (head 100352 rows: n 16 1956 vs 2191 us, n 9 1901 vs 1513) and from 32 for Q6_K (1024 rows:
-        // n 16 51 vs 33 us, n 32 58 vs 65); STRATA_MMVQ_XT_Q8 / STRATA_MMVQ_XT_Q6 override
-        static const int q8_min = [] { const char* e = std::getenv("STRATA_MMVQ_XT_Q8"); return e ? std::atoi(e) : 16; }();
-        static const int q6_min = [] { const char* e = std::getenv("STRATA_MMVQ_XT_Q6"); return e ? std::atoi(e) : 32; }();
-        const int tmin = t == 14 ? q6_min : q8_min;
+        const int tmin = t == 14 ? xt_q6_min() : xt_q8_min();
         if (tmin <= 0 || ncols < tmin) return false;
-        // STRATA_MMVQ_XT2_CFG="R:C" (rows per wave : columns per pass) for sweeps; default 4:8
-        static const int cfg0 = [] {
-            const char* e = std::getenv("STRATA_MMVQ_XT2_CFG");
-            if (!e) return 0;
-            const int r = std::atoi(e);
-            const char* c = std::strchr(e, ':');
-            return 10 * r + (c ? std::atoi(c + 1) : 8);
-        }();
+        const int cfg0 = xt2_cfg0();
         validate_shape(n_in, 1, t == 14 ? 256 : 32);
 #define STRATA_XT2_CASES(F) \
         switch (cfg) { \
@@ -5023,9 +5053,10 @@ bool native_mmvq_xt(int t, const void* w, const void* x, float* y, int n_in, int
         case 88: xt2_launch<F, 8, 8>(w, x, y, n_in, n_out, ncols, s); break; \
         default: xt2_launch<F, 4, 8>(w, x, y, n_in, n_out, ncols, s); break; \
         }
-        if (t == 14) { const int cfg = cfg0 ? cfg0 : 48; STRATA_XT2_CASES(XtQ6K) }
+        if (t == 14) { const int cfg = cfg0 ? cfg0 : 48; TALUS_VTRACE("mmvq_xt", "xt2", t, ncols, cfg, n_out); STRATA_XT2_CASES(XtQ6K) }
         else {   // Q8_0: R 8 for the head (6896 vs 7268 us at n 64), R 4 for short matrices (attn_gate 72 rows: 10 vs 27 us)
             const int cfg = cfg0 ? cfg0 : n_out >= 8192 ? 88 : 48;
+            TALUS_VTRACE("mmvq_xt", "xt2", t, ncols, cfg, n_out);
             STRATA_XT2_CASES(XtQ80)
         }
 #undef STRATA_XT2_CASES
@@ -5034,6 +5065,7 @@ bool native_mmvq_xt(int t, const void* w, const void* x, float* y, int n_in, int
     }
     if (!g_kq8 || (t != 12 && t != 13)) return false;
     validate_shape(n_in, 1, 256);
+    TALUS_VTRACE("mmvq_xt", "xt_kq8", t, ncols, n_in, n_out);
     const int nct = (ncols + 15) / 16, nrt = (n_out + 15) / 16;
     if (t == 13) native_mmvq_xt_kq8_kernel<true><<<unsigned(nct * nrt), 128, 0, s>>>(w, static_cast<const Q81Block*>(x), y, n_in, n_out, ncols, nct);
     else native_mmvq_xt_kq8_kernel<false><<<unsigned(nct * nrt), 128, 0, s>>>(w, static_cast<const Q81Block*>(x), y, n_in, n_out, ncols, nct);
@@ -5325,6 +5357,8 @@ bool native_mmvq_tw(int t, const void* w, const void* x, float* y, int n_in, int
     if (mode <= 0) return false;
     if (mode != 2 && mode != 3 && mode != 4) pk = nullptr;
     const auto s = static_cast<cudaStream_t>(stream);
+    if (mode == 3 && !pk) return false;
+    TALUS_VTRACE("mmvq_tw", mode == 3 ? "tr" : mode == 4 ? "tws" : "tw", t, ncols, mode, pk != nullptr);
     if (mode == 3) {   // one row per lane, on the packed copy only
         if (!pk) return false;
         TALUS_TW_CASES(tr_launch, pk->p, x, y, n_in, n_out, ncols, s)
@@ -5358,6 +5392,7 @@ bool native_mmvq_tw_multi(int t, int n, const void* const* w, float* const* y, c
     bool packed = mode == 2 || mode == 3 || mode == 4;
     for (int i = 0; i < n; ++i) packed = packed && pk[i] != nullptr;   // (a forced mode 2 without a copy: GGUF rows)
     if (mode == 3 && !packed) return false;   // tr reads the copies only (else the wave32 multi)
+    TALUS_VTRACE("mmvq_tw_multi", mode == 3 ? "tr" : mode == 4 ? "tws" : "tw", t, ncols, mode * 10 + (packed ? 1 : 0), n);
     for (int i = 0; i < n; ++i) m.w[i] = static_cast<const uint8_t*>(packed ? pk[i]->p : w[i]);
     const auto s = static_cast<cudaStream_t>(stream);
     if (mode == 3) {
@@ -5464,9 +5499,11 @@ bool native_mmvq_w32(int t, const void* w, const void* x, float* y, int n_in, in
     const auto s = static_cast<cudaStream_t>(stream);
     const W32Cfg r = w32_cfg(t, ncols);
     if (w32_ts_try(t, r, w, x, y, n_in, n_out, ncols, s)) {   // opt-in: same bits, tsum epilogue
+        TALUS_VTRACE("mmvq_w32", "ts", t, ncols, r.r, r.w);
         launch_check();
         return true;
     }
+    TALUS_VTRACE("mmvq_w32", (g_kq8 && (t == 12 || t == 13)) ? "w32_kq8" : "w32", t, ncols, r.r, r.w);
     switch (t) {
     case 2: w32_launch<SmallTraits<Q40Block, 4>>(r, w, x, y, n_in, n_out, ncols, s); break;
     case 6: w32_launch<SmallTraits<Q50Block, 4>>(r, w, x, y, n_in, n_out, ncols, s); break;
