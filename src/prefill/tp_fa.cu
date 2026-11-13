@@ -247,12 +247,18 @@ __global__ void __launch_bounds__(128) k_fa_prefill(const float* __restrict__ q,
 /// fragment read from LDS feeds one WMMA of useful work (variant 1: Q re-read every tile).  The scores' two halves are
 /// summed through LDS (float addition commutes: both waves hold the same bits), the softmax runs in both waves.  The
 /// next tile's K / V are fetched into registers while this tile computes.
+/// PAD (v0.1.9, TALUS_ATTN_PAD, default on): V^T rows of 24 halves instead of 16 in LDS, so the b128 fragment reads of
+/// lanes l16 and l16 + 4 no longer share banks (2-way before: 128 conflict cycles per 32-key tile and wave, the
+/// measured SQC_LDS_BANK_CONFLICT count). Same loads, values and order: bitwise the unpadded kernel.
+typedef _Float16 h16u __attribute__((ext_vector_type(16), aligned(16)));
+template <bool PAD>
 __global__ void __launch_bounds__(256) k_fa_prefill_pair(const float* __restrict__ q, const _Float16* __restrict__ kc,
                                                          const _Float16* __restrict__ vt, const float* __restrict__ gate,
                                                          float* __restrict__ out, int T, int H, int64_t kv_stride,
                                                          int vt_cells, int p0, float scale, int HKV) {
     __shared__ __attribute__((aligned(16))) _Float16 Ks[kBK * kD];
-    __shared__ __attribute__((aligned(16))) _Float16 Vs[kBK * kD];
+    constexpr int VS = PAD ? 24 : 16;   // V^T row stride (halves) of a 16-key block
+    __shared__ __attribute__((aligned(16))) _Float16 Vs[kBK / 16 * kD * VS];
     __shared__ float Sx[8][2][8][32];
     const int G = H / HKV, kvh = blockIdx.y, c0 = blockIdx.x * kBQ, ncol = T * G;
     const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31, l16 = lane & 15, hi = lane >> 4;
@@ -342,7 +348,10 @@ __global__ void __launch_bounds__(256) k_fa_prefill_pair(const float* __restrict
     };
     auto sv = [&]() {
 #pragma unroll
-        for (int j = 0; j < 4; ++j) *(h8*) &Vs[(tid + 256 * j) * 8] = vr[j];
+        for (int j = 0; j < 4; ++j) {
+            const int idx = tid + 256 * j;
+            *(h8*) &Vs[(idx >> 1) * VS + (idx & 1) * 8] = vr[j];
+        }
     };
     auto tile = [&](int base, auto maskc) {
         constexpr bool kMask = decltype(maskc)::value;
@@ -419,7 +428,7 @@ __global__ void __launch_bounds__(256) k_fa_prefill_pair(const float* __restrict
                 if (kt == 0 && rescale)
 #pragma unroll
                     for (int i = 0; i < 8; ++i) o[dt][i] *= alpha;
-                const h16 a = *(const h16*) &Vs[(kt * kD + hf * 128 + dt * 16 + l16) * 16];
+                const h16 a = *(const h16u*) &Vs[(kt * kD + hf * 128 + dt * 16 + l16) * VS];
                 o[dt] = wmma(a, pb.v, o[dt]);
             }
         }
@@ -484,9 +493,13 @@ void fa_prefill(const float* q, const void* k, const void* vt, const float* gate
     TALUS_VTRACE("pf_fa", variant == 3 ? "pair" : variant == 2 ? "plain" : "gate", variant, H, HKV, D);
     const dim3 grid((unsigned) ((T * G + kBQ - 1) / kBQ), (unsigned) HKV);
     const hipStream_t s = (hipStream_t) stream;
-    if (variant == 3)
-        k_fa_prefill_pair<<<grid, 256, 0, s>>>(q, (const _Float16*) k, (const _Float16*) vt, gate, out, T, H, kv_stride,
-                                               (int) vt_cells, (int) p0, scale, HKV);
+    static const bool pad = [] { const char* e = std::getenv("TALUS_ATTN_PAD"); return !(e && std::atoi(e) == 0); }();
+    if (variant == 3 && pad)
+        k_fa_prefill_pair<true><<<grid, 256, 0, s>>>(q, (const _Float16*) k, (const _Float16*) vt, gate, out, T, H,
+                                                     kv_stride, (int) vt_cells, (int) p0, scale, HKV);
+    else if (variant == 3)
+        k_fa_prefill_pair<false><<<grid, 256, 0, s>>>(q, (const _Float16*) k, (const _Float16*) vt, gate, out, T, H,
+                                                      kv_stride, (int) vt_cells, (int) p0, scale, HKV);
     else if (variant == 2)
         k_fa_prefill<false><<<grid, 128, 0, s>>>(q, (const _Float16*) k, (const _Float16*) vt, gate, out, T, H, HKV,
                                                   kv_stride, (int) vt_cells, (int) p0, scale);

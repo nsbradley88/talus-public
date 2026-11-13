@@ -1269,9 +1269,52 @@ pub struct DFlash {
     pub n_vocab: i32,
     pub shared_head: Mat,
     pub draft_map: *const i32,
+    /// The block size in the drafter file (`mdl.block_size` is the block that runs).
+    pub block_file: i32,
+    /// talus-27b-dflash-block: the block attention runs on `tk_q36_dflash_block_attn_rows` (opt-in, see `init`).
+    pub rows_attn: bool,
+    /// The widest window the engine runs as a verify pass (its `gemm_t`), set by the engine before `init`. A
+    /// longer block than the file's is taken only up to this (0 = not told: the file's block only).
+    pub verify_rows: i32,
     tk_ptr: *mut talus_kernels_sys::tk_ctx,
     allocs: Vec<*mut c_void>,
     hallocs: Vec<*mut c_void>,
+}
+
+/// The longest DFlash2 draft block `TALUS_Q27_DFL_BLOCK` may ask for (the rows-aware attention's limit; 15 drafts).
+pub const K_DFLASH_BLOCK_RUN_MAX: i32 = 16;
+
+/// What `TALUS_Q27_DFL_BLOCK` asks for (talus-27b-dflash-block).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DflBlockAsk {
+    /// Not set: the file's block on the 8-row attention.
+    Unset,
+    /// This block (`file_block ..= 16`) on the rows-aware attention.
+    Run(i32),
+    /// Set to something that is not a block length in `file_block ..= 16` (ignored with a notice).
+    Bad(String),
+    /// A longer block than the engine verifies in one verify pass (ignored with a notice): its windows would
+    /// run as prompt chunks, which do not keep the verify rules for the recurrent state.
+    TooWide(i32),
+}
+
+/// The block length asked for with `TALUS_Q27_DFL_BLOCK`, from the variable's text, the drafter file's block and
+/// the engine's verify width.
+pub fn dfl_block_request(text: Option<&str>, file_block: i32, verify_rows: i32) -> DflBlockAsk {
+    let Some(t) = text.map(str::trim).filter(|t| !t.is_empty()) else {
+        return DflBlockAsk::Unset;
+    };
+    match t.parse::<i32>() {
+        Ok(n) if n == file_block => DflBlockAsk::Run(n),
+        Ok(n) if n > file_block && n <= K_DFLASH_BLOCK_RUN_MAX => {
+            if n <= verify_rows {
+                DflBlockAsk::Run(n)
+            } else {
+                DflBlockAsk::TooWide(n)
+            }
+        }
+        _ => DflBlockAsk::Bad(t.to_string()),
+    }
 }
 
 unsafe impl Send for DFlash {}
@@ -1286,6 +1329,17 @@ impl DFlash {
     #[inline]
     pub fn n_draft(&self) -> i32 {
         self.mdl.block_size - 1
+    }
+
+    /// The drafts of the drafter file's own block. The MTP windows that stand in for DFlash2 rounds (forced-DFlash2
+    /// mode, drafter window not resident) keep this length whatever block `TALUS_Q27_DFL_BLOCK` runs.
+    #[inline]
+    pub fn n_draft_file(&self) -> i32 {
+        if self.block_file > 0 {
+            self.block_file - 1
+        } else {
+            self.mdl.block_size - 1
+        }
     }
 
     #[inline]
@@ -1382,6 +1436,51 @@ impl DFlash {
         if !self.mdl.load(path, target_n_layer, target_d_model)? {
             return Ok(false);
         }
+        // talus-27b-dflash-block (opt-in, default off): TALUS_Q27_DFL_BLOCK=n drafts n - 1 tokens per round instead
+        // of the file's 7 (n = 9 ..= 16), with the stop rule choosing how many of them are verified as before.
+        // Draft side only: every emitted token is still decided by its verify row. n = 8 keeps the block and only
+        // moves the block attention to the rows-aware kernel (a self-check: the bytes must not change). Needs a
+        // GGUF drafter, a kernel library with tk_q36_dflash_block_attn_rows, and an engine whose verify pass takes
+        // n rows (`verify_rows`: 16 on the dense 16-row engine, 8 with --no-v16); otherwise the block stays the
+        // file's.
+        self.block_file = self.mdl.block_size;
+        self.rows_attn = false;
+        let asked = std::env::var("TALUS_Q27_DFL_BLOCK").ok();
+        match dfl_block_request(asked.as_deref(), self.block_file, self.verify_rows) {
+            DflBlockAsk::Unset => {}
+            DflBlockAsk::Run(nb) => {
+                if self.mdl.is_gguf
+                    && tk_q36_dflash_attn_rows_ok(
+                        self.mdl.n_heads,
+                        self.mdl.n_kv,
+                        self.mdl.head_dim,
+                        nb,
+                    )
+                {
+                    self.rows_attn = true;
+                    self.mdl.block_size = nb;
+                    eprintln!(
+                        "talus-cli: DFlash2 block {nb} (TALUS_Q27_DFL_BLOCK; the drafter file's block is {}): {} drafts per round",
+                        self.block_file,
+                        nb - 1
+                    );
+                } else {
+                    eprintln!(
+                        "talus-cli: TALUS_Q27_DFL_BLOCK={nb} ignored (needs a GGUF drafter and a kernel library with tk_q36_dflash_block_attn_rows): DFlash2 block stays {}",
+                        self.block_file
+                    );
+                }
+            }
+            DflBlockAsk::Bad(t) => eprintln!(
+                "talus-cli: TALUS_Q27_DFL_BLOCK={t} ignored (want {} ..= {K_DFLASH_BLOCK_RUN_MAX}): DFlash2 block stays {}",
+                self.block_file, self.block_file
+            ),
+            DflBlockAsk::TooWide(nb) => eprintln!(
+                "talus-cli: TALUS_Q27_DFL_BLOCK={nb} ignored (this engine verifies at most {} rows in one verify pass): DFlash2 block stays {}",
+                self.verify_rows, self.block_file
+            ),
+        }
+
         let E = self.mdl.d_model as usize;
         let KV = (self.mdl.n_kv * self.mdl.head_dim) as usize;
         let F = self.mdl.d_ff as usize;
@@ -1431,8 +1530,17 @@ impl DFlash {
             B * (self.mdl.n_heads as usize) * (self.mdl.head_dim as usize),
             &mut self.allocs,
         )?;
-        let scr_floats =
-            tk_q36_dflash_attn_scratch_floats(self.mdl.n_heads, self.mdl.head_dim, self.mdl.window);
+        let scr_floats = if self.rows_attn {
+            tk_q36_dflash_attn_scratch_floats_rows(
+                self.mdl.n_heads,
+                self.mdl.head_dim,
+                self.mdl.window,
+                self.mdl.block_size,
+            )
+            .ok_or_else(|| anyhow!("talus-dflash: the rows-aware block attention went away"))?
+        } else {
+            tk_q36_dflash_attn_scratch_floats(self.mdl.n_heads, self.mdl.head_dim, self.mdl.window)
+        };
         self.att_part = hip_alloc_zeroed::<f32>(scr_floats.max(16), &mut self.allocs)?;
         let ng = (E / (self.mdl.conv_group.max(1) as usize)).max(E / 64);
         self.dyn_w = hip_alloc_zeroed::<f32>(B * ng * 5, &mut self.allocs)?;
@@ -1939,22 +2047,42 @@ impl DFlash {
                 self.ring_len,
                 s,
             );
-            let _ = tk_q36_dflash_block_attn(
-                self.tk_ptr,
-                self.q,
-                self.k_ring[l],
-                self.v_ring[l],
-                pos_d,
-                H,
-                HKV,
-                HD,
-                self.ring_len,
-                self.mdl.window,
-                sc,
-                self.att_part,
-                self.att,
-                s,
-            );
+            if self.rows_attn {
+                let _ = tk_q36_dflash_block_attn_rows(
+                    self.tk_ptr,
+                    self.q,
+                    self.k_ring[l],
+                    self.v_ring[l],
+                    pos_d,
+                    H,
+                    HKV,
+                    HD,
+                    self.ring_len,
+                    self.mdl.window,
+                    sc,
+                    B,
+                    self.att_part,
+                    self.att,
+                    s,
+                );
+            } else {
+                let _ = tk_q36_dflash_block_attn(
+                    self.tk_ptr,
+                    self.q,
+                    self.k_ring[l],
+                    self.v_ring[l],
+                    pos_d,
+                    H,
+                    HKV,
+                    HD,
+                    self.ring_len,
+                    self.mdl.window,
+                    sc,
+                    self.att_part,
+                    self.att,
+                    s,
+                );
+            }
             self.apply_mm(&L.wo, self.att, self.ffn_out, B, stream);
             let _ = tk_q36_dflash_dyn_conv(
                 self.tk_ptr,
@@ -5082,7 +5210,9 @@ impl Q36Engine {
         }
         let is_eos = |t: i32| eos.contains(&t);
         let D_init = if self.use_dflash && self.df.ready && !self.dp.uses_mtp() {
-            self.df.n_draft().clamp(1, 15)
+            // the MTP windows that stand in for DFlash2 rounds: the file's draft count (DFlash2 windows take
+            // their width from `df.block()`)
+            self.df.n_draft_file().clamp(1, 15)
         } else {
             n_spec.clamp(1, 15)
         };

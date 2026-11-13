@@ -230,9 +230,10 @@ pub fn laguna_prompt_attn_variant(nq: i32) -> i32 {
     *SHAPE.get_or_init(|| env_int("LAGUNA_PA_SHAPE", 1))
 }
 
-/// `prompt_attn_wmma_variant` (laguna_kernels.cu): 1 split decode (n_split > 1); with TALUS_LAGUNA_ATTN (default 4) at
-/// least 2 and (q8 KV, a device position, more than 4096 positions, or version 3 or 5+): 2 (version 4+, shared tiles
-/// transposed) or 3 (shared tiles); else 4 (per-wave tiles).
+/// `prompt_attn_wmma_variant` (laguna_kernels.cu): 1 split decode (n_split > 1); with TALUS_LAGUNA_ATTN (default 6 =
+/// 4 with conflict-free LDS rows, routed as 4; 4 is the kill switch) at least 2 and (q8 KV, a device position, more
+/// than 4096 positions, or version 3 or 5): 2 (version 4+, shared tiles transposed) or 3 (shared tiles); else 4
+/// (per-wave tiles).
 pub fn laguna_prompt_attn_wmma_variant(
     nq: i32,
     q_pos0: i32,
@@ -241,7 +242,7 @@ pub fn laguna_prompt_attn_wmma_variant(
     has_pos_dev: bool,
 ) -> i32 {
     static VER: OnceLock<i32> = OnceLock::new();
-    let pv = *VER.get_or_init(|| env_int("TALUS_LAGUNA_ATTN", 4));
+    let pv = *VER.get_or_init(|| env_int("TALUS_LAGUNA_ATTN", 6));
     wmma_variant_with(pv, nq, q_pos0, n_split, has_ksc, has_pos_dev)
 }
 
@@ -256,7 +257,7 @@ fn wmma_variant_with(
     if n_split > 1 {
         return 1;
     }
-    if pv >= 2 && (has_ksc || has_pos_dev || q_pos0 + nq > 4096 || pv == 3 || pv >= 5) {
+    if pv >= 2 && (has_ksc || has_pos_dev || q_pos0 + nq > 4096 || pv == 3 || pv == 5) {
         return if pv >= 4 { 2 } else { 3 };
     }
     4
@@ -340,6 +341,18 @@ mod tests {
         assert_eq!(wmma_variant_with(4, 8, 0, 1, true, false), 2);
         assert_eq!(wmma_variant_with(2, 8, 0, 1, false, true), 3);
         assert_eq!(wmma_variant_with(3, 8, 0, 1, false, false), 3);
+        for (nq, p0, ns, ksc, pd) in [
+            (64, 0, 4, false, false),
+            (2048, 0, 1, false, false),
+            (2048, 4000, 1, false, false),
+            (8, 0, 1, true, false),
+            (8, 0, 1, false, true),
+        ] {
+            assert_eq!(
+                wmma_variant_with(6, nq, p0, ns, ksc, pd),
+                wmma_variant_with(4, nq, p0, ns, ksc, pd)
+            );
+        }
         assert_eq!(wmma_variant_with(5, 8, 0, 1, false, false), 2);
         assert_eq!(wmma_variant_with(1, 8, 9000, 1, true, true), 4);
     }

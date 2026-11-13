@@ -35,6 +35,15 @@ int attn_chunks(int window);
 size_t attn_scratch_floats(int heads, int hd, int window);
 void block_attn(const float* q, const float* kring, const float* vring, const int32_t* pos, int heads, int heads_kv,
                 int hd, int ring, int window, float scale, float* part, float* out, void* stream);
+/// block_attn for a block of `rows` rows (1 .. 16): queries q [rows][heads][hd] at positions *pos .. *pos + rows - 1
+/// over the ring cells of positions max(0, *pos - window + 1) .. *pos + rows - 1, the same visibility rule.  rows = 8
+/// gives block_attn's result.  attn_rows_ok: whether the shape is one the kernel handles (heads = 4 * heads_kv,
+/// hd = 128).  part: attn_scratch_floats_rows floats.  out [rows][heads][hd].
+int attn_rows_ok(int heads, int heads_kv, int hd, int rows);
+size_t attn_scratch_floats_rows(int heads, int hd, int window, int rows);
+void block_attn_rows(const float* q, const float* kring, const float* vring, const int32_t* pos, int heads,
+                     int heads_kv, int hd, int ring, int window, float scale, int rows, float* part, float* out,
+                     void* stream);
 /// out = silu(g) * u
 void swiglu(const float* g, const float* u, float* out, int64_t n, void* stream, void* q8 = nullptr);
 /// x += y

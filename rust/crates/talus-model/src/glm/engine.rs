@@ -102,43 +102,27 @@ pub struct Q8p {
     pub yr: bool,
     pub sw: bool,
 }
-/// Lever-4 pieces that are disabled in this release: the mHC y copies (GPU memory fault in k_hc_post_mix_moe_pre's
-/// y-copy variant on 2026-11-09, t2-glmbundle-rows2) and the SwiGLU piece (slower than the separate quantize). Setting
-/// their switches logs one warning and leaves them off.
-const Q8P_DISABLED: [&str; 2] = ["GLM_Q8P_Y", "GLM_Q8P_SW"];
-
+/// Lever-4 opt-in pieces (=1): the mHC y copies (GLM_Q8P_Y, + routed rows unless GLM_Q8P_YR=0) and the SwiGLU piece
+/// (GLM_Q8P_SW). Exact, default off (slower than the separate quantize at T512 in pg-glmq8p-bench1). The 11-09 GPU
+/// memory fault in the y path (shared-expert rows read from the TMAX-row sh_out) is fixed  ).
 impl Q8p {
     fn from_env() -> Self {
-        let (q, set) = Self::from_lookup(|k| std::env::var(k).ok());
-        if !set.is_empty() {
-            eprintln!(
-                "glm: {} set but disabled in this release (lever 4 mHC y / SwiGLU pieces); they stay off",
-                set.join(", ")
-            );
-        }
-        q
+        Self::from_lookup(|k| std::env::var(k).ok())
     }
 
-    /// The switches from `get` (env lookup): GLM_Q8P_GATE / GLM_Q8P_VB default ON (=0 off), GLM_Q8P=0 all off; the
-    /// Q8P_DISABLED pieces are always off. Also returns the disabled switches that were set (for the warning).
-    fn from_lookup(get: impl Fn(&str) -> Option<String>) -> (Self, Vec<&'static str>) {
+    /// The switches from `get` (env lookup): GLM_Q8P_GATE / GLM_Q8P_VB default ON (=0 off), GLM_Q8P_Y / GLM_Q8P_SW
+    /// opt-in (=1), GLM_Q8P_YR (routed rows of the y copies) default on under GLM_Q8P_Y; GLM_Q8P=0 = all off.
+    fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
         let on = |k: &str| get(k).map(|v| v != "0").unwrap_or(true);
+        let opt_in = |k: &str| get(k).map(|v| v == "1").unwrap_or(false);
         let all = on("GLM_Q8P");
-        let set = Q8P_DISABLED
-            .iter()
-            .copied()
-            .filter(|k| get(k).is_some())
-            .collect();
-        (
-            Q8p {
-                gate: all && on("GLM_Q8P_GATE"),
-                vb: all && on("GLM_Q8P_VB"),
-                y: false,
-                yr: false,
-                sw: false,
-            },
-            set,
-        )
+        Q8p {
+            gate: all && on("GLM_Q8P_GATE"),
+            vb: all && on("GLM_Q8P_VB"),
+            y: all && opt_in("GLM_Q8P_Y"),
+            yr: all && opt_in("GLM_Q8P_Y") && on("GLM_Q8P_YR"),
+            sw: all && opt_in("GLM_Q8P_SW"),
+        }
     }
 }
 
@@ -147,7 +131,7 @@ mod q8p_tests {
     use super::Q8p;
     use std::collections::HashMap;
 
-    fn parse(kv: &[(&str, &str)]) -> (Q8p, Vec<&'static str>) {
+    fn parse(kv: &[(&str, &str)]) -> Q8p {
         let m: HashMap<String, String> = kv
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -157,26 +141,27 @@ mod q8p_tests {
 
     #[test]
     fn defaults_gate_and_vb_on_rest_off() {
-        let (q, set) = parse(&[]);
+        let q = parse(&[]);
         assert!(q.gate && q.vb && !q.y && !q.yr && !q.sw);
-        assert!(set.is_empty());
     }
 
     #[test]
-    fn disabled_pieces_stay_off_and_are_reported() {
-        let (q, set) = parse(&[("GLM_Q8P_Y", "1"), ("GLM_Q8P_SW", "1"), ("GLM_Q8P_YR", "1")]);
-        assert!(!q.y && !q.yr && !q.sw);
-        assert!(q.gate && q.vb, "no other behaviour change");
-        assert_eq!(set, vec!["GLM_Q8P_Y", "GLM_Q8P_SW"]);
+    fn opt_in_pieces() {
+        let q = parse(&[("GLM_Q8P_Y", "1"), ("GLM_Q8P_SW", "1")]);
+        assert!(q.y && q.yr && q.sw && q.gate && q.vb);
+        let q = parse(&[("GLM_Q8P_Y", "1"), ("GLM_Q8P_YR", "0")]);
+        assert!(q.y && !q.yr && !q.sw);
+        let q = parse(&[("GLM_Q8P_Y", "true")]);
+        assert!(!q.y, "only =1 opts in");
     }
 
     #[test]
     fn kill_switches_still_work() {
-        let (q, _) = parse(&[("GLM_Q8P", "0")]);
-        assert!(!q.gate && !q.vb);
-        let (q, _) = parse(&[("GLM_Q8P_GATE", "0")]);
+        let q = parse(&[("GLM_Q8P", "0"), ("GLM_Q8P_Y", "1"), ("GLM_Q8P_SW", "1")]);
+        assert!(!q.gate && !q.vb && !q.y && !q.yr && !q.sw);
+        let q = parse(&[("GLM_Q8P_GATE", "0")]);
         assert!(!q.gate && q.vb);
-        let (q, _) = parse(&[("GLM_Q8P_VB", "0")]);
+        let q = parse(&[("GLM_Q8P_VB", "0")]);
         assert!(q.gate && !q.vb);
     }
 }
@@ -480,8 +465,8 @@ pub struct GlmEngine {
     /// phase go (0, except the shared expert of an FFN whose routed-expert y rows were made by the mHC kernel)
     xq_off: usize,
     /// lever 4 switches: GLM_Q8P_GATE (KDA gate -> wo) and GLM_Q8P_VB (MLA v_b -> wo) default ON (=0 = the separate
-    /// quantize path); GLM_Q8P=0 = all off. The mHC y (GLM_Q8P_Y / _YR) and SwiGLU (GLM_Q8P_SW) pieces are disabled in
-    /// this release (Q8P_DISABLED): setting them logs a warning and they stay off
+    /// quantize path); GLM_Q8P=0 = all off. The mHC y (GLM_Q8P_Y / _YR) and SwiGLU (GLM_Q8P_SW) pieces are opt-in
+    /// (=1, default off)
     pub q8p: Q8p,
     /// MMQ copies of the current a.y that the last mHC kernel wrote (valid until y is rewritten)
     ycp: [Option<YCopy>; 2],
@@ -2199,7 +2184,9 @@ impl GlmEngine {
                         fm(
                             self.a.ed.f(),
                             self.a.ew.f(),
-                            self.a.sh_out.f(),
+                            // the shared expert's rows of this window (sh_buf; sh_out holds TMAX rows only since
+                            // glm-mem #81: passing it here read past its end = the 11-09 GPU memory fault)
+                            self.sh_cur.f(),
                             self.a.xhc.f(),
                             self.a.pc.f(),
                             w,

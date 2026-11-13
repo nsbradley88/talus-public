@@ -195,8 +195,8 @@ the tiles read the GGUF rows, somewhat slower. One log line says which and why (
 copies of 387 matrices, 12.0 GiB (auto: they fit with the reserve; ...)`). From v0.1.3 the int8 KV copy for decode and
 verify attention adds 35 KiB per token beside the f16 cache: 2.19 GiB at 64K and
 8.77 GiB at 256K (`TALUS_Q27_KV8=0` frees it); the automatic context counts it. Lowest `MemAvailable`
-in the v0.1.8 release run on our desktop: 31 GiB at the shipped 256K context
-(31 GiB for v0.1.7 in the same session).
+in the v0.1.9 release run on our desktop: 31 GiB at the shipped 256K context
+(31 GiB for v0.1.8 in the same session).
 
 **Context by machine.** Without `--max-context` the engine takes the largest of 256K, 128K and 64K whose KV cache fits
 beside the weights, the int8 prompt weights and a 3 GiB reserve, keeping 8 GiB of `MemAvailable` free, and logs one
@@ -317,7 +317,7 @@ HC-down default above). The table is in `src/core/arch_defaults.cpp`; each entry
 `TALUS_COPY=0` turns off long prompt copies (in every engine). The turn-checkpoint GDN buffer pool omits unused `conv_state` staging to save host/device memory.
 From v0.1.3 each MTP window picks its draft depth from a measured cost per verify width, keeping the depth with the most
 expected tokens per millisecond, instead of fixed confidence thresholds (`TALUS_FN_COSTDEPTH=0` restores the
-thresholds). Verification is unchanged, so output stays exact; chat −0.6 % on the desktop
+thresholds). Verification is unchanged, so output stays exact; chat −1.0 % on the desktop
 (v0.1.3 release candidate vs v0.1.2, same session).
 
 **Memory.** Weights about 88 GB (`UD-IQ4_XS`), read through the expert cache (`--expert-cache` in MiB) and a resident budget
@@ -427,7 +427,7 @@ drafter is found, the engine runs without drafting.
 |---|---|---|
 | Wave32 matvec for routed experts | `STRATA_IDS_W32=0` | The engine sets `STRATA_IDS_W32=1` unless `STRATA_IDS_W32` or `TALUS_MIMO_W32_DENSE` is already set (setting the latter at all, even to 0, keeps the default off). Logit differences are at floating-point rounding level. |
 | WMMA f16 flash attention in prompts | `TALUS_MIMO_FA=0` | `TALUS_MIMO_FA_VER=1` selects the earlier v1 tile. |
-| Confident-prefix verify | `TALUS_MIMO_DF_CONF=0` (greedy), `TALUS_MIMO_DF_CONF_S=0` (sampled) | After the DFlash drafter runs, the round verifies only the longest prefix of its drafts whose running product of the drafter's own confidence in each draft stays at or above 0.6; the rest would mostly be rejected. Greedy output is unchanged (every token is still the model's own argmax); code about 6 % faster. From v0.1.3 sampled requests use it too (threshold 0.6): sampled output keeps the model's distribution, draft acceptance on the sampled chat mix went from 0.60 -> 0.77, and chat is +0.5 % (desktop, v0.1.3 release candidate vs v0.1.2, same session) |
+| Confident-prefix verify | `TALUS_MIMO_DF_CONF=0` (greedy), `TALUS_MIMO_DF_CONF_S=0` (sampled) | After the DFlash drafter runs, the round verifies only the longest prefix of its drafts whose running product of the drafter's own confidence in each draft stays at or above 0.6; the rest would mostly be rejected. Greedy output is unchanged (every token is still the model's own argmax); code about 6 % faster. From v0.1.3 sampled requests use it too (threshold 0.6): sampled output keeps the model's distribution, draft acceptance on the sampled chat mix went from 0.60 -> 0.77, and chat is +0.2 % (desktop, v0.1.3 release candidate vs v0.1.2, same session) |
 | Last-layer tail-row pruning in prompts | `TALUS_MIMO_TAIL_PRUNE=0` | The last layer computes only the rows the output head and the drafter read (about 3 % faster prompts at 32K). Prompt results are bitwise equal; a short request that resumes inside another prompt's pruned rows re-reads up to 1152 rows (1-2 s), so its text can differ from a run without pruning |
 | Padded router rows + streaming router kernel | `TALUS_ROUTER_PAD=0` (`TALUS_F32FEW_STREAM=0`: staged kernel) | A copy of the f32 router weights with rows 512 B apart, skipped when less than 10 GiB would stay free. Output is identical. |
 
@@ -439,7 +439,7 @@ copies), `TALUS_MIMO_GRAPH` (HIP graphs), and the shared prompt switches `TALUS_
 `TALUS_PF_DENSE_MOE`.
 
 **Memory.** Weights and drafter about 92 GB. The engine starts only with 8.5 GiB left free after its allocations (the 8 GiB run floor plus its measured transient). Lowest
-`MemAvailable` in the v0.1.3 release run on our desktop: 14 GiB.
+`MemAvailable` in the v0.1.3 release run on our desktop: 15 GiB.
 
 ## Laguna-S-2.1
 
@@ -498,7 +498,7 @@ is lower. It needs q8 KV.
 per window; the new pass keeps the activations in registers per pass and unrolls the weight loads. Expert mat-vec
 bandwidth 155 -> 208 GB/s (gate+up), 159 -> 198 GB/s (down) (desktop, development build). Bitwise equal to the old pass and to one-row
 decoding (greedy 9/9, teacher-forced KL 0 at 2K against v0.1.2). With the sampled confident-prefix verify above:
-chat −1.6 %, code +0.2 %, edit 0.0 % (desktop, v0.1.3
+chat −0.9 %, code 0.0 %, edit −0.1 % (desktop, v0.1.3
 release candidate vs v0.1.2, same session). `STRATA_EGROUP_V2=0` restores the old pass.
 
 **Exact defaults (kill switches):** `LAGUNA_EXPERT_MAJOR=0` (expert-major routed matvec), `STRATA_MMVQ_XT=0` (wide

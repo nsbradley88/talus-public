@@ -22,7 +22,7 @@ Which figures come from which machine:
 
 | Figures | Machine | Build |
 |---|---|---|
-| Speed of the current release (RESULTS "Speed" tables, the README's first table) | desktop | the v0.1.8 release candidate tarball (rc1; the same engine source as the published tarball, see RESULTS) |
+| Speed of the current release (RESULTS "Speed" tables, the README's first table) | desktop | the v0.1.9 release candidate tarball (rc1; the same engine source as the published tarball, see RESULTS) |
 | The previous release on the same machine (RESULTS "v0.1.2" rows and the change table) | desktop | the published v0.1.2 tarball, interleaved with the current release in the same session |
 | Qwen3.8-27B 4-bit weights against BF16 (RESULTS) | desktop | v0.1.2 (release candidate 2); not re-measured for v0.1.3 |
 | Quality gates of the current release | laptop (some soaks on the desktop; RESULTS names the machine) | the same release (RESULTS says which build each gate ran on) |

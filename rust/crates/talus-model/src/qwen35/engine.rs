@@ -95,6 +95,14 @@ pub const K_ARG_BLOCKS: i32 = 128;
 /// debug-row stride.
 pub const Q27_VMAX: usize = 32;
 
+/// The first row of a prompt chunk that goes to the DFlash2 drafter, if any. A `process` call injects its last
+/// `keep` tokens: the chunk `off .. off + t` of a call of `total` tokens has drafter rows `r0 .. t` exactly when
+/// `off + t + keep > total`, with `r0` = where those last `keep` tokens start inside the chunk (0 from the second
+/// such chunk on).
+pub fn pf_inject_from(off: i32, t: i32, total: i32, keep: i32) -> Option<i32> {
+    (off + t + keep > total).then(|| (total - keep - off).max(0))
+}
+
 #[inline]
 pub const fn att_chunk_size(ck: i32) -> i32 {
     ck & 0xffff
@@ -650,6 +658,15 @@ impl Drop for Q36Engine {
 impl Q36Engine {
     /// Construct and initialize a `Q36Engine` for `model` with maximum context `ctx_len`.
     pub fn new(model: &Q36Model, ctx_len: i32) -> Result<Self> {
+        Self::new_with_batch(model, ctx_len, 512)
+    }
+
+    /// As `new`, for a prompt chunk of `chunk` rows (`--chunk`). `init` sizes every row buffer (activations, token
+    /// ids, the q8 and f16 copies, the W4 sidecar's activations) for `max_batch` rows, so a chunk above 512 has to be
+    /// known here: set after `new`, it ran 896 rows through buffers of 512 and faulted in the first kernel of the
+    /// start-up pass. Chunks of 512 and below keep the 512-row buffers they always had; the caller still sets
+    /// `max_batch` to the chunk it wants.
+    pub fn new_with_batch(model: &Q36Model, ctx_len: i32, chunk: i32) -> Result<Self> {
         let tk = KernelsContext::from_env()?;
         let mut eng = Self {
             m: model as *const Q36Model,
@@ -669,7 +686,7 @@ impl Q36Engine {
                 8
             },
             vt_max: 16,
-            max_batch: 512,
+            max_batch: chunk.max(512),
             n_past: 0,
             cur_T: 0,
             gdn_valid: false,
@@ -1515,6 +1532,7 @@ impl Q36Engine {
             } else {
                 &model.head
             };
+            self.df.verify_rows = self.gemm_t;
             self.use_dflash = self.df.init(
                 &self.tk,
                 &df_path,
@@ -1550,7 +1568,7 @@ impl Q36Engine {
                     .init(self.df.window(), self.df.ring(), self.df.block());
                 self.dp.init("gfx1151", model.has_mtp && self.mtp_d > 0, "");
                 if self.mtp_d == 0 {
-                    self.mtp_d = self.df.n_draft();
+                    self.mtp_d = self.df.n_draft_file();
                 }
                 self.dl.kv8 = self.kv8;
                 self.dl.init_arch("gfx1151", 0);
@@ -1563,6 +1581,11 @@ impl Q36Engine {
 
     /// Reset recurrent state and cache position (`Engine::reset` in `q36_engine.cu:883-894`).
     pub fn reset(&mut self) {
+        if self.cl.is_some() {
+            // talus#47 prompt pipeline: a deferred return is taken in before the sequence it belongs to is cleared
+            // (a no-op unless TALUS_CLUSTER_PF_PIPE left one out)
+            self.cl_pf_drain();
+        }
         let g = &self.model().g;
         let C = g.ssm_qkv_dim() as usize;
         let HV = g.ssm_time_step_rank as usize;
@@ -4825,79 +4848,39 @@ impl Q36Engine {
             } else {
                 0
             };
+            // talus#47 prompt pipeline (TALUS_CLUSTER_PF_PIPE=1 on a cluster head, off by default): the hop of a
+            // chunk whose return nothing needs yet stays open, so the head runs the next chunk while the worker runs
+            // this one. A chunk that is not deferred first takes in the return that is still out. Nothing is armed,
+            // and `deferred` is false, on one process and without the variable.
+            // the chunk's rows for the DFlash2 drafter, if any (the call's last `keep` tokens)
+            let inj = if self.use_dflash && self.df.ready {
+                pf_inject_from(off, T, total, self.df.keep())
+            } else {
+                None
+            };
+            if self.cl.is_some() {
+                self.cl_pf_begin(tokens, off, T, p0, heads, inj);
+            }
             self.cur_p0_h = p0;
             self.forward_full(self.tok_d, T, self.pos0_d, heads, false);
             self.cur_p0_h = -1;
-            if self.use_dflash && self.df.ready {
-                self.dctx.at(p0 as i64);
-                if (off + T + self.df.keep()) > total {
-                    let r0 = (total - self.df.keep() - off).max(0);
-                    self.df.inject_at(T, p0 as i64, r0, self.s_main);
-                    self.dctx.inject((p0 + r0) as i64, T - r0, T - r0);
-                }
-            }
-            if self.model().has_mtp && self.mtp_d > 0 {
-                // Build MTP seed rows [hlast, hmain[0..T-1]] in self.y (size B * V.max(E) floats)
-                let seed_buf = self.y;
-                unsafe {
-                    let _ = hipMemcpyAsync(
-                        seed_buf.cast::<c_void>(),
-                        self.h_mtp.cast::<c_void>(),
-                        E * 4,
-                        HIP_MEMCPY_DEVICE_TO_DEVICE,
-                        self.s_main,
-                    );
-                    if T > 1 {
-                        let _ = hipMemcpyAsync(
-                            seed_buf.add(E).cast::<c_void>(),
-                            self.h_last.cast::<c_void>(),
-                            ((T - 1) as usize) * E * 4,
-                            HIP_MEMCPY_DEVICE_TO_DEVICE,
-                            self.s_main,
-                        );
-                    }
-                    let _ = hipMemcpyAsync(
-                        self.tok_m_d.cast::<c_void>(),
-                        tokens.as_ptr().add(off as usize).cast::<c_void>(),
-                        (T as usize) * 4,
-                        HIP_MEMCPY_HOST_TO_DEVICE,
-                        self.s_main,
-                    );
-                    let _ = hipMemcpyAsync(
-                        self.pos0_m_d.cast::<c_void>(),
-                        self.hpin.add(1).cast::<c_void>(),
-                        4,
-                        HIP_MEMCPY_HOST_TO_DEVICE,
-                        self.s_main,
-                    );
-                }
-                // The MTP rows of the prompt: only their K / V cache rows are read later (the first draft after the
-                // prompt reruns the MTP block on its own row and overwrites h_mtp_b), so KV-only by default.
-                self.kv_only_pass = self.mtp_kv_only;
-                self.forward_mtp_batch(
-                    T,
-                    self.n_past as i64,
-                    seed_buf,
-                    false,
-                    false,
-                    ptr::null_mut(),
-                    -1,
-                );
-                self.kv_only_pass = false;
-            }
-            unsafe {
-                let _ = hipMemcpyAsync(
-                    self.h_mtp.cast::<c_void>(),
-                    self.h_last.add(((T - 1) as usize) * E).cast::<c_void>(),
-                    E * 4,
-                    HIP_MEMCPY_DEVICE_TO_DEVICE,
-                    self.s_main,
-                );
+            if self.cl.is_some() && self.cl_pf_deferred(p0) {
+                // the return this chunk's cut received is the chunk before's: its rows and the work on them now.
+                // This chunk's own return is not here yet: `cl_pf_apply` runs the same work for it one chunk on.
+                self.cl_pf_apply();
+            } else {
+                let toks = unsafe { tokens.as_ptr().add(off as usize) };
+                let pos_h = unsafe { self.hpin.add(1) };
+                self.pf_chunk_tail(toks, T, self.n_past, pos_h, inj);
             }
             self.n_past += T;
             off += T;
             let _ = unsafe { hipStreamSynchronize(self.s_main) };
             on_chunk(off as usize);
+        }
+        if self.cl.is_some() {
+            // talus#47 prompt pipeline: nothing is out when this returns (the last chunk is never deferred)
+            self.cl_pf_drain();
         }
         if want_logits {
             unsafe {
@@ -4914,6 +4897,80 @@ impl Q36Engine {
                     HIP_MEMCPY_DEVICE_TO_HOST,
                 );
             }
+        }
+    }
+
+    /// The prompt loop's work on a chunk once its last layer is done: the DFlash2 drafter's rows (`inj` = the first
+    /// of them, from the tap rows the chunk's layers staged), then, on the final hidden rows in `h_last`, the draft
+    /// (MTP) layer's pass over the chunk and `h_mtp` = the chunk's last row. `toks` are the chunk's `T` tokens, `p0`
+    /// its position and `pos_h` a pinned host word that holds `p0` until the stream has run the copy that reads it.
+    /// The prompt loop calls this right after the chunk's forward; a cluster head's deferred chunk gets it when its
+    /// return is applied (`cl_pf_apply`), one chunk later, which is why the chunk's values are arguments.
+    pub(crate) fn pf_chunk_tail(
+        &mut self,
+        toks: *const i32,
+        T: i32,
+        p0: i32,
+        pos_h: *const i32,
+        inj: Option<i32>,
+    ) {
+        let E = self.d_model() as usize;
+        if self.use_dflash && self.df.ready {
+            self.dctx.at(p0 as i64);
+            if let Some(r0) = inj {
+                self.df.inject_at(T, p0 as i64, r0, self.s_main);
+                self.dctx.inject((p0 + r0) as i64, T - r0, T - r0);
+            }
+        }
+        if self.model().has_mtp && self.mtp_d > 0 {
+            // Build MTP seed rows [hlast, hmain[0..T-1]] in self.y (size B * V.max(E) floats)
+            let seed_buf = self.y;
+            unsafe {
+                let _ = hipMemcpyAsync(
+                    seed_buf.cast::<c_void>(),
+                    self.h_mtp.cast::<c_void>(),
+                    E * 4,
+                    HIP_MEMCPY_DEVICE_TO_DEVICE,
+                    self.s_main,
+                );
+                if T > 1 {
+                    let _ = hipMemcpyAsync(
+                        seed_buf.add(E).cast::<c_void>(),
+                        self.h_last.cast::<c_void>(),
+                        ((T - 1) as usize) * E * 4,
+                        HIP_MEMCPY_DEVICE_TO_DEVICE,
+                        self.s_main,
+                    );
+                }
+                let _ = hipMemcpyAsync(
+                    self.tok_m_d.cast::<c_void>(),
+                    toks.cast::<c_void>(),
+                    (T as usize) * 4,
+                    HIP_MEMCPY_HOST_TO_DEVICE,
+                    self.s_main,
+                );
+                let _ = hipMemcpyAsync(
+                    self.pos0_m_d.cast::<c_void>(),
+                    pos_h.cast::<c_void>(),
+                    4,
+                    HIP_MEMCPY_HOST_TO_DEVICE,
+                    self.s_main,
+                );
+            }
+            // The MTP rows of the prompt: only their K / V cache rows are read later (the first draft after the
+            // prompt reruns the MTP block on its own row and overwrites h_mtp_b), so KV-only by default.
+            self.kv_only_pass = self.mtp_kv_only;
+            self.forward_mtp_batch(T, p0 as i64, seed_buf, false, false, ptr::null_mut(), -1);
+            self.kv_only_pass = false;
+        }
+        unsafe {
+            let _ = hipMemcpyAsync(
+                self.h_mtp.cast::<c_void>(),
+                self.h_last.add(((T - 1) as usize) * E).cast::<c_void>(),
+                E * 4,
+                HIP_MEMCPY_DEVICE_TO_DEVICE,
+                self.s_main,
+            );
         }
     }
 

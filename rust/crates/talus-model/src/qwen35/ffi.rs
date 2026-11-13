@@ -2726,6 +2726,97 @@ pub fn tk_q36_dflash_block_attn(
     }
 }
 
+type DflAttnRowsOkFn = unsafe extern "C" fn(i32, i32, i32, i32) -> i32;
+type DflAttnScratchRowsFn = unsafe extern "C" fn(i32, i32, i32, i32) -> usize;
+type DflBlockAttnRowsFn = unsafe extern "C" fn(
+    *mut tk_ctx,
+    *const f32,
+    *const f32,
+    *const f32,
+    *const i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    f32,
+    i32,
+    *mut f32,
+    *mut f32,
+    tk_stream,
+) -> tk_status;
+
+#[derive(Clone, Copy)]
+struct DflRowsFns {
+    ok: DflAttnRowsOkFn,
+    scratch: DflAttnScratchRowsFn,
+    attn: DflBlockAttnRowsFn,
+}
+
+/// talus-27b-dflash-block: the rows-aware DFlash2 block attention, when the library has all three entry points.
+fn dfl_rows_fns() -> Option<DflRowsFns> {
+    static K: OnceLock<Option<DflRowsFns>> = OnceLock::new();
+    *K.get_or_init(|| {
+        let l = lib();
+        let ok = l.optional_sym("tk_q36_dflash_attn_rows_ok")?;
+        let scratch = l.optional_sym("tk_q36_dflash_attn_scratch_floats_rows")?;
+        let attn = l.optional_sym("tk_q36_dflash_block_attn_rows")?;
+        // SAFETY: the C ABI in include/talus_kernels.h.
+        unsafe {
+            Some(DflRowsFns {
+                ok: std::mem::transmute::<*mut c_void, DflAttnRowsOkFn>(ok),
+                scratch: std::mem::transmute::<*mut c_void, DflAttnScratchRowsFn>(scratch),
+                attn: std::mem::transmute::<*mut c_void, DflBlockAttnRowsFn>(attn),
+            })
+        }
+    })
+}
+
+/// Whether the loaded library can run the DFlash2 block attention on `rows` rows of this shape.
+pub fn tk_q36_dflash_attn_rows_ok(heads: i32, heads_kv: i32, hd: i32, rows: i32) -> bool {
+    dfl_rows_fns().is_some_and(|f| unsafe { (f.ok)(heads, heads_kv, hd, rows) } != 0)
+}
+
+/// Scratch floats of `tk_q36_dflash_block_attn_rows` (`None`: the library has no rows-aware attention).
+pub fn tk_q36_dflash_attn_scratch_floats_rows(
+    heads: i32,
+    hd: i32,
+    window: i32,
+    rows: i32,
+) -> Option<usize> {
+    dfl_rows_fns().map(|f| unsafe { (f.scratch)(heads, hd, window, rows) })
+}
+
+/// `tk_q36_dflash_block_attn` for a block of `rows` rows. Call only after `tk_q36_dflash_attn_rows_ok`.
+#[inline]
+pub fn tk_q36_dflash_block_attn_rows(
+    ctx: *mut tk_ctx,
+    q: *const f32,
+    kring: *const f32,
+    vring: *const f32,
+    pos: *const i32,
+    heads: i32,
+    heads_kv: i32,
+    hd: i32,
+    ring: i32,
+    window: i32,
+    scale: f32,
+    rows: i32,
+    part: *mut f32,
+    out: *mut f32,
+    stream: tk_stream,
+) -> tk_status {
+    match dfl_rows_fns() {
+        Some(f) => unsafe {
+            (f.attn)(
+                ctx, q, kring, vring, pos, heads, heads_kv, hd, ring, window, scale, rows, part,
+                out, stream,
+            )
+        },
+        None => 3, // TK_ERR_UNSUPPORTED
+    }
+}
+
 #[inline]
 pub fn tk_q36_dflash_swiglu(
     ctx: *mut tk_ctx,

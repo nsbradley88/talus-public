@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <type_traits>
 
 #include "strata/kernels/variant_trace.hpp"   // S1
 
@@ -1747,7 +1748,12 @@ __global__ void __launch_bounds__(NW * 32) prompt_attn_wmma_shared_kernel(const 
 // through LDS, and O is rescaled only when some row's maximum moved.  Every value is computed by the same expression
 // on the same operands in the same order (a matrix-core output element is the same dot product either way round), so
 // the output is bitwise prompt_attn_wmma_shared_kernel's (lagattn / talus-laguna-attn-test).
-template <int NW, int NT>
+// talus#80: PAD = conflict-free LDS rows (TALUS_LAGUNA_ATTN=6, opt-in). sK row 136 halves
+// (68 dwords) and sV rows 24 halves (12 dwords) instead of 144 / 16: lanes li and li + 4 no longer share banks on the
+// b128 fragment loads (2-way before: 136 extra LDS cycles per 16-key subtile, = the L1 counter). Same loads, same
+// expressions, same order: bitwise v4.
+typedef _Float16 h16u_t __attribute__((ext_vector_type(16), aligned(16)));
+template <int NW, int NT, bool PAD = false>
 __global__ void __launch_bounds__(NW * 32) prompt_attn_wmma_shared_t_kernel(const float* __restrict__ q,
                                                                             const uint16_t* __restrict__ kp,
                                                                             const uint16_t* __restrict__ vp,
@@ -1758,9 +1764,10 @@ __global__ void __launch_bounds__(NW * 32) prompt_attn_wmma_shared_t_kernel(cons
                                                                             const uint16_t* __restrict__ ksc,
                                                                             const uint16_t* __restrict__ vsc) {
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
-    constexpr int KS = 128 + 16;
+    constexpr int KS = PAD ? 128 + 8 : 128 + 16, VS = PAD ? 24 : 16;
+    using hst_t = typename std::conditional<PAD, h16u_t, h16_t>::type;
     __shared__ __attribute__((aligned(32))) _Float16 sK[NT * 16][KS];
-    __shared__ __attribute__((aligned(32))) _Float16 sV[NT][128][16];
+    __shared__ __attribute__((aligned(32))) _Float16 sV[NT][128][VS];
     const int tid = threadIdx.x, lane = tid % 32, wv = tid / 32, kvh = blockIdx.y;
     const int li = lane & 15, hi = lane >> 4;
     const unsigned sel_lo = hi ? 0x01000504u : 0x05040100u, sel_hi = hi ? 0x03020706u : 0x07060302u;
@@ -1825,7 +1832,7 @@ __global__ void __launch_bounds__(NW * 32) prompt_attn_wmma_shared_t_kernel(cons
 #pragma unroll
                 for (int e = 0; e < 16; ++e) kb16[e] = (_Float16) 0.0f;
             }
-            *reinterpret_cast<h16_t*>(&sK[jj][kc * 16]) = kb16;
+            *reinterpret_cast<hst_t*>(&sK[jj][kc * 16]) = kb16;
         }
         for (int u = tid; u < NT * 128; u += NW * 32) {
             const int n = u >> 7, d = u & 127, k0 = kbase + n * 16;
@@ -1851,7 +1858,7 @@ __global__ void __launch_bounds__(NW * 32) prompt_attn_wmma_shared_t_kernel(cons
                 uint4 tmp[2] = {va, vb2};
                 __builtin_memcpy(&vb, tmp, 32);
             }
-            *reinterpret_cast<h16_t*>(&sV[n][d][0]) = vb;
+            *reinterpret_cast<hst_t*>(&sV[n][d][0]) = vb;
         }
         __syncthreads();
         if (!active) continue;
@@ -1863,7 +1870,7 @@ __global__ void __launch_bounds__(NW * 32) prompt_attn_wmma_shared_t_kernel(cons
             f8_t sacc = {0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
             for (int kc = 0; kc < 8; ++kc) {
-                const h16_t kb16 = *reinterpret_cast<const h16_t*>(&sK[n * 16 + li][kc * 16]);
+                const h16_t kb16 = *reinterpret_cast<const hst_t*>(&sK[n * 16 + li][kc * 16]);
                 sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kb16, qa[kc], sacc);
             }
             float sv[8];
@@ -1906,7 +1913,7 @@ __global__ void __launch_bounds__(NW * 32) prompt_attn_wmma_shared_t_kernel(cons
                 if (rescale)
 #pragma unroll
                     for (int v = 0; v < 8; ++v) o[c][v] *= alpha;
-                const h16_t vb = *reinterpret_cast<const h16_t*>(&sV[n][c * 16 + li][0]);
+                const h16_t vb = *reinterpret_cast<const hst_t*>(&sV[n][c * 16 + li][0]);
                 o[c] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(vb, pb.v, o[c]);
             }
         }
@@ -1928,11 +1935,12 @@ __global__ void __launch_bounds__(NW * 32) prompt_attn_wmma_shared_t_kernel(cons
 #endif
 }
 
-// -1: TALUS_LAGUNA_ATTN (default 4 = shared tiles, transposed), 2 = shared tiles, 3 = shared tiles at every depth,
-// 1 = per-wave tiles.  All bitwise the same.
+// -1: TALUS_LAGUNA_ATTN (default 6 = 4 with conflict-free LDS rows; v0.1.9), 4 = shared tiles,
+// transposed (kill switch for 6), 2 = shared tiles, 3 = shared tiles at every depth, 1 = per-wave tiles.  6 routes
+// exactly as 4.  All bitwise the same.
 int g_prompt_attn_version = -1;
 int prompt_attn_version() {
-    static const int env = [] { const char* e = std::getenv("TALUS_LAGUNA_ATTN"); return e ? std::atoi(e) : 4; }();
+    static const int env = [] { const char* e = std::getenv("TALUS_LAGUNA_ATTN"); return e ? std::atoi(e) : 6; }();
     return g_prompt_attn_version < 0 ? env : g_prompt_attn_version;
 }
 
@@ -1943,7 +1951,7 @@ void prompt_attn_set_version(int v) { g_prompt_attn_version = v; }
 int prompt_attn_wmma_variant(int nq, int q_pos0, int n_split, bool has_ksc, bool has_pos_dev) {
     const int pv = prompt_attn_version();
     if (n_split > 1) return 1;
-    if (pv >= 2 && (has_ksc || has_pos_dev || q_pos0 + nq > 4096 || pv == 3 || pv >= 5)) return pv >= 4 ? 2 : 3;
+    if (pv >= 2 && (has_ksc || has_pos_dev || q_pos0 + nq > 4096 || pv == 3 || pv == 5)) return pv >= 4 ? 2 : 3;
     return 4;
 }
 
@@ -1965,7 +1973,10 @@ void prompt_attn_wmma(const float* q, const uint16_t* k_pool, const uint16_t* v_
         // x1.15-1.93 at 6-30K - talus-laguna-attn-test)
         constexpr int NW = 8, NT = 4;
         const dim3 grid((rows + 16 * NW - 1) / (16 * NW), n_kv);
-        if (wv == 2)
+        if (wv == 2 && prompt_attn_version() == 6)   // conflict-free LDS rows (default; bitwise v4)
+            prompt_attn_wmma_shared_t_kernel<NW, NT, true><<<grid, NW * 32, 0, (cudaStream_t) stream>>>(
+                q, k_pool, v_pool, out, nq, q_pos0, n_head, G, n_kv, window, vt_stride, q_pos0_dev, ksc, vsc);
+        else if (wv == 2)
             prompt_attn_wmma_shared_t_kernel<NW, NT><<<grid, NW * 32, 0, (cudaStream_t) stream>>>(
                 q, k_pool, v_pool, out, nq, q_pos0, n_head, G, n_kv, window, vt_stride, q_pos0_dev, ksc, vsc);
         else

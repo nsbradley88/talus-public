@@ -1012,7 +1012,7 @@ impl Q36StdioBackend {
             if eng.dp.uses_mtp() && cfg.mtp > 0 {
                 cfg.mtp
             } else {
-                eng.df.n_draft()
+                eng.df.n_draft_file()
             }
         } else if eng.model().has_mtp {
             cfg.mtp
@@ -3052,7 +3052,8 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
         cfg
     };
 
-    let mut eng = match Q36Engine::new(&model, cfg.max_context) {
+    // --chunk above 512: the engine has to size its row buffers for it (it used to be set after they were allocated)
+    let mut eng = match Q36Engine::new_with_batch(&model, cfg.max_context, cfg.chunk) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("talus-cli: failed to initialize engine: {e}");
@@ -3071,7 +3072,7 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
         eng.mtp_d = if eng.dp.uses_mtp() {
             mtp_cli
         } else {
-            eng.df.n_draft()
+            eng.df.n_draft_file()
         };
         eprintln!("talus-cli: {}", eng.dp.describe());
     } else {
@@ -3209,11 +3210,16 @@ pub fn run_cli(cfg: &CliConfig) -> i32 {
     if cfg.bench_depth > 0 {
         let d_depth = cfg.bench_depth.max(32);
         let n_steps = cfg.bench_steps.max(1);
-        if d_depth + n_steps * 9 + 16 > eng.max_seq() {
-            eprintln!(
-                "talus-cli: --bench-depth needs --max-context >= {}",
-                d_depth + n_steps * 9 + 16
-            );
+        // one plain token per step, then up to one window of tokens per speculative round (8, or the DFlash2
+        // block when TALUS_Q27_DFL_BLOCK runs a longer one), plus 16 rows of slack
+        let round_max = if eng.use_dflash && eng.df.ready {
+            eng.df.block().max(8)
+        } else {
+            8
+        };
+        let need = d_depth + n_steps * (1 + round_max) + 16;
+        if need > eng.max_seq() {
+            eprintln!("talus-cli: --bench-depth needs --max-context >= {need}");
             return 2;
         }
         let mut rng = SplitMix64::new(1234);

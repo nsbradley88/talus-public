@@ -2843,6 +2843,30 @@ tk_status tk_q36_dflash_block_attn(tk_ctx* ctx, const float* q, const float* kri
     TK_TRY_END(ctx);
 }
 
+int32_t tk_q36_dflash_attn_rows_ok(int32_t heads, int32_t heads_kv, int32_t hd, int32_t rows) TK_NOEXCEPT {
+    return talus::q36::dflash::attn_rows_ok(heads, heads_kv, hd, rows);
+}
+
+size_t tk_q36_dflash_attn_scratch_floats_rows(int32_t heads, int32_t hd, int32_t window,
+                                              int32_t rows) TK_NOEXCEPT {
+    return talus::q36::dflash::attn_scratch_floats_rows(heads, hd, window, rows);
+}
+
+tk_status tk_q36_dflash_block_attn_rows(tk_ctx* ctx, const float* q, const float* kring, const float* vring,
+                                        const int32_t* pos, int32_t heads, int32_t heads_kv, int32_t hd,
+                                        int32_t ring, int32_t window, float scale, int32_t rows, float* part,
+                                        float* out, tk_stream stream) TK_NOEXCEPT {
+    TK_TRY_BEGIN
+    if (!talus::q36::dflash::attn_rows_ok(heads, heads_kv, hd, rows)) {
+        tk_set_error(ctx, "tk_q36_dflash_block_attn_rows: unsupported shape");
+        return TK_ERR_UNSUPPORTED;
+    }
+    talus::q36::dflash::block_attn_rows(q, kring, vring, pos, heads, heads_kv, hd, ring, window, scale, rows, part,
+                                        out, stream);
+    return check_last_cuda_error(ctx, "tk_q36_dflash_block_attn_rows");
+    TK_TRY_END(ctx);
+}
+
 tk_status tk_q36_dflash_swiglu(tk_ctx* ctx, const float* g, const float* u, float* out, int64_t n,
                                tk_stream stream) TK_NOEXCEPT {
     TK_TRY_BEGIN

@@ -8,24 +8,24 @@ serves each model through an OpenAI-compatible HTTP API.
 
 ## How fast is it?
 
-The current release is **v0.1.8**: Claude Code works against the Anthropic endpoint on Qwen models, the server keeps
-less memory after large requests, and Qwen3.8-27B's sampled DFlash2 drafting is exactly rejection-sampled again
+The current release is **v0.1.9**: two-box mode with the prompt cache gives the right replies again, `--chunk` above
+512 no longer faults at start-up, and Laguna-S-2.1 processes long prompts faster
 ([release notes](https://github.com/nsbradley88/talus-public/releases)). Greedy output is unchanged on all five models.
 
-Tokens per second for Talus v0.1.8 (its release candidate 1; see RESULTS for the later candidates) on a Ryzen AI Max+ 395 desktop (GMKtec
-EVO-X2, 128 GB, about 120 W sustained, 15 of its 16 CPU cores online), end to end through the HTTP server, each model in its shipped configuration.
+Tokens per second for Talus v0.1.9 (its release candidate 1) on a Ryzen AI Max+ 395 desktop (GMKtec
+EVO-X2, 128 GB, about 120 W sustained, all 16 CPU cores online), end to end through the HTTP server, each model in its shipped configuration.
 `chat` is the sampled chat mix, `code` the coding-prompt mix, `edit` the code-editing mix, `pp2k` / `pp32k` prompt
-processing and `tg32k` generation at about 2K / 32K tokens of context. In brackets: the change from the published
-v0.1.7 tarball, measured in the same session on the same desktop. Before each timed run, every weight file was read in
+processing and `tg32k` generation at about 2K / 32K tokens of context. In brackets: the change from v0.1.8, measured
+in the same session on the same desktop. Before each timed run, every weight file was read in
 full and checked against its pinned SHA-256.
 
 | Model | chat | code | edit | pp2k | pp32k | tg32k |
 |---|---|---|---|---|---|---|
-| Qwen3.8-27B | 49.5 (+0.6 %) | 66.2 (0.0 %) | 133.2 (+0.1 %) | 597 | 547 (0.0 %) | 38.6 (0.0 %) |
-| Qwen3.8-Flash-Next | 62.1 (−0.6 %) | 73.3 (+0.3 %) | 162.1 (+0.2 %) | 1,320 | 1,736 (−0.1 %) | 65.1 (0.0 %) |
-| GLM-5.3-Flash | 33.4 (−0.3 %) | 34.8 (−0.3 %) | 35.5 (−0.3 %) | 577 | 581 (−0.2 %) | 35.0 (0.0 %) |
-| MiMo-V2.6-Flash | 40.9 (+0.5 %) | 49.8 (0.0 %) | 65.2 (0.0 %) | 737 | 663 (0.0 %) | 42.9 (0.0 %) |
-| Laguna-S-2.1 | 43.1 (−1.6 %) | 54.7 (+0.2 %) | 124.0 (0.0 %) | 1,159 | 1,006 (−0.1 %) | 36.9 (0.0 %) |
+| Qwen3.8-27B | 51.2 (0.0 %) | 66.2 (0.0 %) | 133.2 (0.0 %) | 598 | 554 (+1.3 %) | 38.6 (0.0 %) |
+| Qwen3.8-Flash-Next | 62.4 (−1.0 %) | 73.6 (0.0 %) | 162.2 (−0.4 %) | 1,323 | 1,738 (+0.1 %) | 65.5 (0.0 %) |
+| GLM-5.3-Flash | 33.4 (+1.5 %) | 34.8 (−0.3 %) | 35.5 (−0.3 %) | 577 | 584 (+0.3 %) | 35.0 (0.0 %) |
+| MiMo-V2.6-Flash | 40.8 (+0.2 %) | 49.8 (0.0 %) | 65.1 (0.0 %) | 736 | 662 (0.0 %) | 42.8 (0.0 %) |
+| Laguna-S-2.1 | 43.6 (−0.9 %) | 54.6 (0.0 %) | 123.8 (−0.1 %) | 1,160 | 1,034 (+2.8 %) | 36.8 (−0.3 %) |
 
 The quality gates (long-context recall, an agentic smoke test on five coding tasks, logit rows against a frozen set,
 greedy output with drafts on and off, a 45-minute soak test) ran on both machines: the soaks on the desktop, the others
@@ -70,8 +70,8 @@ the same HTTP client and prompts; package power about 117-120 W for every engine
 
 Prompt processing is where Talus v0.1.3 trailed: gufo and tubo prefill the 27B's `UD-Q4_K_XL` file faster, and gufo
 prefilled Flash-Next 16 % faster at 32K (47 % at 2K). Those gaps are
-v0.1.3's: Talus's Flash-Next prompt processing was faster in each of v0.1.4 to v0.1.6, and in v0.1.7 and v0.1.8 its change is
-within noise (v0.1.8 against v0.1.7 is in the first table above), which narrows them. The other engines have not been re-measured, so this table still shows v0.1.3.
+v0.1.3's: Talus's Flash-Next prompt processing was faster in each of v0.1.4 to v0.1.6, and in v0.1.7 to v0.1.9 its change is
+within noise (v0.1.9 against v0.1.8 is in the first table above), which narrows them. The other engines have not been re-measured, so this table still shows v0.1.3.
 
 Full tables (edit, 2K cells, time to first token, memory, the v0.1.2 figures from the same session, quality gates):
 [docs/RESULTS.md](docs/RESULTS.md). Every figure there names its machine and build. A model whose release run has not

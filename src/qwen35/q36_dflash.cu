@@ -13,6 +13,7 @@ namespace talus::q36::dflash {
 namespace {
 
 constexpr int kRows = 8;      // the block (anchor + 7 masks)
+constexpr int kRowsMax = 16;  // the longest block of the rows-aware attention (k_dfa_part_r): 2 row groups
 constexpr int kChunk = 128;   // keys per attention block
 constexpr int kTile = 32;     // keys per LDS tile
 
@@ -214,6 +215,106 @@ __global__ void k_dfa_merge(const float* part, int heads, int heads_kv, int nch,
     out[((size_t) i * heads + h) * HD + d] = L > 0.f ? o / L : 0.f;
 }
 
+/// k_dfa_part for a block of `rows` rows (9 .. 16; 8 gives the same partials as k_dfa_part).  grid (heads_kv,
+/// chunks, row groups), 256 threads.  A row group is 8 rows x 4 heads = the 32 query vectors of k_dfa_part, so the
+/// LDS use is the same; block rows past `rows` in the last group read no query and see no key.  The partials of
+/// (row group, chunk, KV head) sit at slot (rg * chunks + c) * heads_kv + g.
+__global__ void __launch_bounds__(256) k_dfa_part_r(const float* q, const float* kring, const float* vring,
+                                                    const int32_t* pos, int heads, int heads_kv, int ring, int window,
+                                                    float scale, int rows, float* part) {
+    constexpr int HD = 128, QV = 32;
+    __shared__ float sq[QV][HD];
+    __shared__ float sk[kTile][HD + 1];
+    __shared__ float ss[QV][kChunk];
+    const int g = blockIdx.x, c = blockIdx.y, rg = blockIdx.z, tid = threadIdx.x, gq = heads / heads_kv;
+    const int nch = gridDim.y, r0 = rg * kRows;
+    const int P = *pos, lo = max(0, P - window + 1), hi = P + rows - 1, k0 = lo + c * kChunk;
+    const size_t slot = ((size_t) rg * nch + c) * heads_kv + g, nslot = (size_t) gridDim.z * nch * heads_kv;
+    float* acc = part + slot * QV * HD;
+    float* pm = part + nslot * QV * HD + slot * QV;
+    float* pl = pm + nslot * QV;
+    if (k0 > hi) {
+        if (tid < QV) { pm[tid] = -INFINITY; pl[tid] = 0.f; }
+        return;
+    }
+    for (int idx = tid; idx < QV * HD; idx += 256) {
+        const int qi = idx / HD, d = idx % HD, i = r0 + qi / gq, j = qi % gq;
+        sq[qi][d] = i < rows ? q[((size_t) i * heads + g * gq + j) * HD + d] * scale : 0.f;
+    }
+    for (int t = 0; t < kChunk / kTile; ++t) {
+        __syncthreads();
+        for (int idx = tid; idx < kTile * HD; idx += 256) {
+            const int kk = idx / HD, d = idx % HD, kp = k0 + t * kTile + kk;
+            sk[kk][d] = kp <= hi ? kring[((size_t) (kp % ring) * heads_kv + g) * HD + d] : 0.f;
+        }
+        __syncthreads();
+        const int qi = tid >> 3, i = r0 + qi / gq;
+        for (int m = 0; m < kTile / 8; ++m) {
+            const int kk = (tid & 7) + 8 * m, kp = k0 + t * kTile + kk;
+            float dot = 0.f;
+#pragma unroll 8
+            for (int d = 0; d < HD; ++d) dot += sq[qi][d] * sk[kk][d];
+            const bool ok = i < rows && kp <= hi && kp >= P + i - window + 1;
+            ss[qi][t * kTile + kk] = ok ? dot : -INFINITY;
+        }
+    }
+    __syncthreads();
+    {   // per query vector: max and sum over the chunk (8 lanes per vector)
+        const int qi = tid >> 3, l8 = tid & 7;
+        float mx = -INFINITY;
+        for (int k = l8; k < kChunk; k += 8) mx = fmaxf(mx, ss[qi][k]);
+        for (int o = 4; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor(mx, o, 32));
+        float sum = 0.f;
+        for (int k = l8; k < kChunk; k += 8) {
+            const float p = mx == -INFINITY ? 0.f : expf(ss[qi][k] - mx);
+            ss[qi][k] = p;
+            sum += p;
+        }
+        for (int o = 4; o > 0; o >>= 1) sum += __shfl_xor(sum, o, 32);
+        if (l8 == 0) { pm[qi] = mx; pl[qi] = sum; }
+    }
+    const int d = tid % HD, qh = tid / HD;
+    float a[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r) a[r] = 0.f;
+    for (int t = 0; t < kChunk / kTile; ++t) {
+        __syncthreads();
+        for (int idx = tid; idx < kTile * HD; idx += 256) {
+            const int kk = idx / HD, dd = idx % HD, kp = k0 + t * kTile + kk;
+            sk[kk][dd] = kp <= hi ? vring[((size_t) (kp % ring) * heads_kv + g) * HD + dd] : 0.f;
+        }
+        __syncthreads();
+        for (int kk = 0; kk < kTile; ++kk) {
+            const float v = sk[kk][d];
+#pragma unroll
+            for (int r = 0; r < 16; ++r) a[r] += ss[qh * 16 + r][t * kTile + kk] * v;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 16; ++r) acc[(size_t) (qh * 16 + r) * HD + d] = a[r];
+}
+
+/// grid (heads, rows), hd threads: k_dfa_merge over the partials of k_dfa_part_r (`ngr` row groups)
+__global__ void k_dfa_merge_r(const float* part, int heads, int heads_kv, int nch, int ngr, float* out) {
+    constexpr int HD = 128, QV = 32;
+    const int h = blockIdx.x, i = blockIdx.y, d = threadIdx.x, gq = heads / heads_kv, g = h / gq;
+    const int rg = i / kRows, qi = (i % kRows) * gq + h % gq;
+    const size_t nslot = (size_t) ngr * nch * heads_kv;
+    const float* pm = part + nslot * QV * HD;
+    const float* pl = pm + nslot * QV;
+    float M = -INFINITY;
+    for (int c = 0; c < nch; ++c) M = fmaxf(M, pm[(((size_t) rg * nch + c) * heads_kv + g) * QV + qi]);
+    float L = 0.f, o = 0.f;
+    for (int c = 0; c < nch; ++c) {
+        const size_t mi = (((size_t) rg * nch + c) * heads_kv + g) * QV + qi;
+        if (pm[mi] == -INFINITY) continue;
+        const float e = expf(pm[mi] - M);
+        L += pl[mi] * e;
+        o += part[mi * HD + d] * e;
+    }
+    out[((size_t) i * heads + h) * HD + d] = L > 0.f ? o / L : 0.f;
+}
+
 __global__ void k_swiglu(const float* g, const float* u, float* out, int64_t n, void* q8 = nullptr) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -385,6 +486,21 @@ void block_attn(const float* q, const float* kring, const float* vring, const in
     k_dfa_part<<<dim3(heads_kv, nch), 256, 0, (cudaStream_t) stream>>>(q, kring, vring, pos, heads, heads_kv, ring, window,
                                                                       scale, part);
     k_dfa_merge<<<dim3(heads, kRows), hd, 0, (cudaStream_t) stream>>>(part, heads, heads_kv, nch, out);
+}
+int attn_rows_ok(int heads, int heads_kv, int hd, int rows) {
+    return heads_kv > 0 && heads == 4 * heads_kv && hd == 128 && rows >= 1 && rows <= kRowsMax;
+}
+size_t attn_scratch_floats_rows(int heads, int hd, int window, int rows) {
+    const int ngr = (rows + kRows - 1) / kRows, nch = (window + rows - 1 + kChunk - 1) / kChunk;
+    return (size_t) ngr * nch * heads * kRows / 4 * 4 * (hd + 2) + 64;
+}
+void block_attn_rows(const float* q, const float* kring, const float* vring, const int32_t* pos, int heads,
+                     int heads_kv, int hd, int ring, int window, float scale, int rows, float* part, float* out,
+                     void* stream) {
+    const int ngr = (rows + kRows - 1) / kRows, nch = (window + rows - 1 + kChunk - 1) / kChunk;
+    k_dfa_part_r<<<dim3(heads_kv, nch, ngr), 256, 0, (cudaStream_t) stream>>>(q, kring, vring, pos, heads, heads_kv,
+                                                                             ring, window, scale, rows, part);
+    k_dfa_merge_r<<<dim3(heads, rows), hd, 0, (cudaStream_t) stream>>>(part, heads, heads_kv, nch, ngr, out);
 }
 void swiglu(const float* g, const float* u, float* out, int64_t n, void* stream, void* q8) {
     k_swiglu<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(g, u, out, n, q8);

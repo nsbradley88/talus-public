@@ -2396,6 +2396,28 @@ tk_status tk_q36_draft_support(
 int32_t tk_q36_dflash_attn_chunks(int32_t window) TK_NOEXCEPT;
 size_t tk_q36_dflash_attn_scratch_floats(int32_t heads, int32_t hd, int32_t window) TK_NOEXCEPT;
 
+/* DFlash2 block attention for a block of `rows` rows (1 .. 16). Optional entry points: a host looks them up by name
+ * and keeps the 8-row block without them. `tk_q36_dflash_attn_rows_ok` is non-zero for a shape the kernel handles
+ * (heads == 4 * heads_kv, hd == 128). rows == 8 gives the result of `tk_q36_dflash_block_attn`. */
+int32_t tk_q36_dflash_attn_rows_ok(int32_t heads, int32_t heads_kv, int32_t hd, int32_t rows) TK_NOEXCEPT;
+size_t tk_q36_dflash_attn_scratch_floats_rows(int32_t heads, int32_t hd, int32_t window, int32_t rows) TK_NOEXCEPT;
+tk_status tk_q36_dflash_block_attn_rows(
+    tk_ctx* ctx,
+    const float* q,
+    const float* kring,
+    const float* vring,
+    const int32_t* pos,
+    int32_t heads,
+    int32_t heads_kv,
+    int32_t hd,
+    int32_t ring,
+    int32_t window,
+    float scale,
+    int32_t rows,
+    float* part,
+    float* out,
+    tk_stream stream) TK_NOEXCEPT;
+
 tk_status tk_q36_dflash_rms_rows(
     tk_ctx* ctx,
     const float* x,

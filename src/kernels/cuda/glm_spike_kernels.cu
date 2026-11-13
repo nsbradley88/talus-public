@@ -3963,6 +3963,7 @@ hipError_t glm_dsa_sparse_fa(
 // glm_dsa_sparse_fa_dec_kernel (f16 Q / K / P / V, f32 accumulation); the summation order differs -> not bitwise.
 namespace {
 typedef _Float16 gh16 __attribute__((ext_vector_type(16)));
+typedef _Float16 gh8 __attribute__((ext_vector_type(8)));
 typedef float gf8 __attribute__((ext_vector_type(8)));
 constexpr int kGwD = 512, kGwKT = 16, kGwKS = kGwD + 16;
 template <int PD>   // global prefetch distance in tiles (1 or 2)
@@ -4138,6 +4139,10 @@ __device__ __forceinline__ void g2p_xchg8(const gf8& c, bool hi, float (&d)[8]) 
         d[2 * m + 1] = hi ? c[4 + m] : recv[m];
     }
 }
+// SW8 (v0.1.9, TALUS_ATTN_PAD, default on): Q swizzled in 8-half units (unit u of row h at u ^ (h & 7)) instead of
+// 16-half chunks at c ^ (h & 15): with 1 KiB rows the pass-1 b128 fragment reads of 8 lanes then cover all 32 banks
+// (4-way before). Same values, operands and order: bitwise the unswizzled kernel.
+template <bool SW8>
 __global__ __launch_bounds__(512) void glm_sparse_fa_2p_kernel(const float* __restrict__ q, const _Float16* __restrict__ kv,
                                                                const int32_t* __restrict__ idx, float* __restrict__ dst,
                                                                int H, int n_kv_max, uint32_t q_nb1, uint32_t q_nb2,
@@ -4179,8 +4184,8 @@ __global__ __launch_bounds__(512) void glm_sparse_fa_2p_kernel(const float* __re
         for (int r = 0; r < kG2HB * kG2D / 4 / 512; ++r) {
             const int e = (r * 512 + tid) * 4, h = e / kG2D, d = e % kG2D;
             const float4 a = *reinterpret_cast<const float4*>(q + (size_t) t * q_nb1 + (size_t) (h0 + h) * q_nb2 + d);
-            const int c = (d >> 4) ^ (h & 15);
-            _Float16* p = &lds[h * kG2D + c * 16 + (d & 15)];
+            const int c = SW8 ? (((d >> 3) ^ (h & 7)) << 3) + (d & 7) : (((d >> 4) ^ (h & 15)) << 4) + (d & 15);
+            _Float16* p = &lds[h * kG2D + c];
             p[0] = (_Float16) (a.x * sc); p[1] = (_Float16) (a.y * sc); p[2] = (_Float16) (a.z * sc); p[3] = (_Float16) (a.w * sc);
         }
     }
@@ -4212,7 +4217,15 @@ __global__ __launch_bounds__(512) void glm_sparse_fa_2p_kernel(const float* __re
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
                     const int h = 16 * j + l16;
-                    const gh16 b = *reinterpret_cast<const gh16*>(&lds[h * kG2D + ((ch ^ l16) * 16)]);
+                    gh16 b;
+                    if constexpr (SW8) {
+                        const int u = 2 * ch, x = l16 & 7;
+                        const gh8 b0 = *reinterpret_cast<const gh8*>(&lds[h * kG2D + ((u ^ x) << 3)]);
+                        const gh8 b1 = *reinterpret_cast<const gh8*>(&lds[h * kG2D + (((u + 1) ^ x) << 3)]);
+                        b = __builtin_shufflevector(b0, b1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+                    } else {
+                        b = *reinterpret_cast<const gh16*>(&lds[h * kG2D + ((ch ^ l16) * 16)]);
+                    }
                     acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a.v, b, acc[j]);
                 }
             }
@@ -4440,7 +4453,8 @@ hipError_t glm_dsa_sparse_fa_idx(
     if (kind == 1) {
         if (G2pPool* p = g2p_pool(stream)) {
             TALUS_VTRACE("glm_sparse_fa_idx", "2p", N > 8 ? 9 : N, H, p->nslot, n_kv_max);
-            hipLaunchKernelGGL(glm_sparse_fa_2p_kernel, dim3(static_cast<uint32_t>(N), static_cast<uint32_t>(H) / kG2HB),
+            static const bool sw8 = [] { const char* e = std::getenv("TALUS_ATTN_PAD"); return !(e && std::atoi(e) == 0); }();
+            hipLaunchKernelGGL(sw8 ? glm_sparse_fa_2p_kernel<true> : glm_sparse_fa_2p_kernel<false>, dim3(static_cast<uint32_t>(N), static_cast<uint32_t>(H) / kG2HB),
                 dim3(512), 0, stream, q, reinterpret_cast<const _Float16*>(kv), idx, dst, H, n_kv_max, q_nb1, q_nb2,
                 k_stride, scale, p->pool, p->locks, p->nslot);
             return hipGetLastError();

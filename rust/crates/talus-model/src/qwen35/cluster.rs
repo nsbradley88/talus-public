@@ -17,6 +17,19 @@
 //! - **Graphs.** A captured graph whose body crosses the cut (the decode step `g1`, the verify windows `gA`) is
 //!   captured as segments; `launch_graph` replays segment 0, does the exchange, replays segment 1. The worker
 //!   captures its own segment graph per window shape, so each stage keeps about one graph per round.
+//! - **Prompt pipeline** (`TALUS_CLUSTER_PF_PIPE=1` on the head; off by default). A prompt chunk whose return nothing
+//!   needs before the next chunk's forward ([`pf_may_defer`]) is sent without waiting for it: the head runs the next
+//!   chunk's layers while the worker runs this one, takes the return in at the next cut, before it sends again, and
+//!   applies it, for its own chunk, once that forward is back. At most one return is out at a time. The prompt loop
+//!   takes in what is still out before it returns, so nothing is out outside that loop; a chunk that is not
+//!   deferred takes it in at its own cut, after its own layers and before it waits for its own return
+//!   (`cl_pf_take_and_exchange`), or before its forward where the cut cannot (`cl_pf_drain`: a capture, debug
+//!   rows). The mirrored ops, the cache messages and the goodbye drain first all the same, and any other hop
+//!   refuses to start with a return out. The worker sees the same messages in the same
+//!   order as without the variable, with one difference: the step of a deferred chunk without rows for the DFlash2
+//!   drafter asks for no tap rows (nothing reads them), so its return is `h_last` and its q8 copy only. A deferred
+//!   chunk with such rows asks for them as every hop that waits does; the head keeps its own tap rows of that chunk
+//!   in a save area until the return is applied, and the injection runs then.
 //!
 //! Off by default: without `--cluster-role` no `ClState` exists and every single-process path is unchanged.
 
@@ -77,6 +90,68 @@ pub struct CutRec {
     pub graph: bool,
 }
 
+/// What decides whether a prompt chunk's hop may stay open (`TALUS_CLUSTER_PF_PIPE`), see [`pf_may_defer`].
+#[derive(Debug, Clone, Copy)]
+pub struct PfChunk {
+    /// `TALUS_CLUSTER_PF_PIPE=1` was set when the head attached
+    pub pipe: bool,
+    /// this engine is a cluster head and its link is up
+    pub head_up: bool,
+    /// the chunk is tokens `off .. off + t` of the `total` tokens of this `process` call
+    pub off: i32,
+    pub t: i32,
+    pub total: i32,
+    /// head (logits) rows asked of this chunk
+    pub heads: i32,
+    /// the chunk has rows for the DFlash2 drafter, and the save areas for the head's tap rows exist
+    pub inj: bool,
+    pub taps_kept: bool,
+    /// the cut falls inside a graph capture
+    pub capturing: bool,
+    /// the exact test's per-layer residual taps are on for this chunk's rows
+    pub dbg_on: bool,
+}
+
+/// Whether the head may send this prompt chunk's STEP and go on to the next chunk without waiting for the return.
+/// Only a chunk whose return nothing reads before the next chunk's forward: not the last chunk of the call (the
+/// output head and the caller read its result), no head rows, no debug taps, and not inside a capture. Such a chunk
+/// is never the last one, so it always has `max_batch` rows. A chunk with rows for the DFlash2 drafter may be
+/// deferred too when the head has the save areas for its tap rows: its injection runs when its return is applied,
+/// from the tap rows kept for it (`cl_pf_apply`). Without the areas such a chunk waits, as before.
+pub fn pf_may_defer(c: &PfChunk) -> bool {
+    c.pipe
+        && c.head_up
+        && c.off + c.t < c.total
+        && c.heads == 0
+        && (!c.inj || c.taps_kept)
+        && !c.capturing
+        && !c.dbg_on
+}
+
+/// A deferred prompt chunk (`TALUS_CLUSTER_PF_PIPE`): its STEP was sent, its return is not applied yet.
+pub struct PfPend {
+    /// what the head knew at the chunk's cut (the return's rows and whether it carries the q8 copy)
+    pub rec: CutRec,
+    /// the id of its STEP: the RET that answers it carries the same
+    pub step: u64,
+    /// the chunk's position and tokens: the prompt loop's work on the return runs with these, not the live ones
+    pub p0: i32,
+    pub toks: Vec<i32>,
+    /// the chunk's first row for the DFlash2 drafter (`engine::pf_inject_from`), if it has any; its STEP then asked
+    /// for the worker's tap rows, and the head's own are in `ClState::pf_taps[slot]`
+    pub inj: Option<i32>,
+    pub slot: usize,
+}
+
+/// A prompt chunk the loop armed, taken by its cut (`ClState::pf_arm`): as deferred, or (`wait`) as a chunk that
+/// waits for its own return while the chunk before it is still out, which its cut then takes in first.
+pub struct PfArm {
+    pub p0: i32,
+    pub toks: Vec<i32>,
+    pub inj: Option<i32>,
+    pub wait: bool,
+}
+
 /// Per-process cluster state, present only in a cluster stage.
 pub struct ClState {
     pub role: Role,
@@ -104,6 +179,36 @@ pub struct ClState {
     /// head: the heartbeat on the control connection, and what a reconnect needs (Phase 2)
     pub beat: Option<talus_cluster::Beat>,
     pub recon: Option<Recon>,
+    /// head: the prompt pipeline is on (`TALUS_CLUSTER_PF_PIPE=1`, read once in `cluster_attach_head`)
+    pub pf_pipe: bool,
+    /// head: the prompt loop armed the next cut as deferred (the chunk's position, tokens and drafter rows); the cut
+    /// takes it
+    pub pf_arm: Option<PfArm>,
+    /// head: the deferred chunk whose RET has not been received (at most one)
+    pub pf_out: Option<PfPend>,
+    /// head: the deferred chunk whose RET is in `rx` and whose device copies have not been issued yet
+    pub pf_rx: Option<PfPend>,
+    /// head: a pinned host word holding the position of the deferred chunk being applied (read by an async copy)
+    pub pf_pos: *mut i32,
+    /// head: two device copies of the drafter's tap rows (all taps, `max_rows` rows each), one per deferred chunk
+    /// that can be out with drafter rows; allocated at attach when a drafter is loaded (null: such chunks wait),
+    /// `pf_slot` = the one to fill next
+    pub pf_taps: [*mut f32; 2],
+    pub pf_slot: usize,
+    /// head: deferred hops completed. Of those, the returns received at the next chunk's cut (the overlapped ones),
+    /// the time in their receives and the time the head's own layers still ran after each was in (the worker's idle
+    /// time: the two together say which stage the cut should relieve); and the time in the receives of the others,
+    /// which are taken in with nothing running on the head (`cl_pf_drain`)
+    pub pf_hops: u64,
+    pub pf_cut_n: u64,
+    pub pf_cut_recv_s: f64,
+    pub pf_late_s: f64,
+    pub pf_end_recv_s: f64,
+    /// worker: steps of 64 rows or more served in this session (prompt chunks), and the time in the wait for each
+    /// step's header, the receive of its bundle, the step itself (copies in, layers, copies out) and the send of
+    /// its return, in that order; for the session's log line
+    pub wk_n: u64,
+    pub wk_s: [f64; 4],
 }
 
 unsafe impl Send for ClState {}
@@ -137,6 +242,14 @@ impl Drop for ClState {
             if !self.tap_dev.is_null() {
                 let _ = hipFree(self.tap_dev.cast::<c_void>());
             }
+            if !self.pf_pos.is_null() {
+                let _ = hipHostFree(self.pf_pos.cast::<c_void>());
+            }
+            for p in self.pf_taps {
+                if !p.is_null() {
+                    let _ = hipFree(p.cast::<c_void>());
+                }
+            }
         }
     }
 }
@@ -162,6 +275,20 @@ impl ClState {
             hop_s: 0.0,
             beat: None,
             recon: None,
+            pf_pipe: false,
+            pf_arm: None,
+            pf_out: None,
+            pf_rx: None,
+            pf_pos: ptr::null_mut(),
+            pf_taps: [ptr::null_mut(); 2],
+            pf_slot: 0,
+            pf_hops: 0,
+            pf_cut_n: 0,
+            pf_cut_recv_s: 0.0,
+            pf_late_s: 0.0,
+            pf_end_recv_s: 0.0,
+            wk_n: 0,
+            wk_s: [0.0; 4],
         }
     }
 }
@@ -280,6 +407,36 @@ impl Q36Engine {
             let p = super::weights::hip_malloc_bytes(bytes)?;
             cl.tap_dev = p.cast::<f32>();
         }
+        // the prompt pipeline (opt-in): read once here; unset, nothing below this line is allocated or armed
+        cl.pf_pipe = std::env::var("TALUS_CLUSTER_PF_PIPE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if cl.pf_pipe {
+            cl.pf_pos = pinned(std::mem::size_of::<i32>())?.cast::<i32>();
+            if self.use_dflash && self.df.ready {
+                // two copies of the drafter's tap rows, so a chunk with rows for the drafter can be deferred. If
+                // they cannot be had, such chunks wait for their return as they do without the pipeline.
+                let bytes = (self.df.max_rows.max(1) as usize)
+                    * (e as usize)
+                    * 4
+                    * super::graphs::K_DFLASH_TAPS;
+                let a = super::weights::hip_malloc_bytes(bytes);
+                let b2 = super::weights::hip_malloc_bytes(bytes);
+                match (a, b2) {
+                    (Ok(p0), Ok(p1)) => cl.pf_taps = [p0.cast::<f32>(), p1.cast::<f32>()],
+                    (a, b2) => {
+                        for p in [a, b2].into_iter().flatten() {
+                            let _ = unsafe { hipFree(p.cast::<c_void>()) };
+                        }
+                        eprintln!(
+                            "talus-cluster: prompt pipeline: no memory for two copies of the drafter's tap rows \
+                             ({:.0} MiB each): prompt chunks with rows for the drafter will wait for their return",
+                            bytes as f64 / 1048576.0
+                        );
+                    }
+                }
+            }
+        }
         eprintln!(
             "talus-cluster: head stage layers 0..{} (+ embedding, head, drafters); worker owns {}..{} at {}; \
              DFlash2 taps from the worker: {:?}; buffers {:.1} + {:.1} MiB pinned",
@@ -291,6 +448,12 @@ impl Q36Engine {
             tx_need as f64 / 1048576.0,
             rx_need as f64 / 1048576.0
         );
+        if cl.pf_pipe {
+            eprintln!(
+                "talus-cluster: prompt pipeline on (TALUS_CLUSTER_PF_PIPE=1): the head starts the next prompt chunk \
+                 while the worker runs the one before"
+            );
+        }
         self.cl = Some(Box::new(cl));
         Ok(())
     }
@@ -397,7 +560,8 @@ impl Q36Engine {
         m.dense && t <= self.gemm_t && tk_q36_mmvq_supported(m.head.raw_qtype())
     }
 
-    /// Head, in `forward_full` right after layer `cut - 1`: ship the live set, get the worker's return.
+    /// Head, in `forward_full` right after layer `cut - 1`: ship the live set, get the worker's return. (A prompt
+    /// chunk the loop armed as deferred only ships: its return is taken in later, see `cl_pf_begin`.)
     pub(crate) fn cl_cut(&mut self, pos0: *const i32, n_tok: i32, verify: bool) {
         let e = self.d_model();
         let t = n_tok;
@@ -413,6 +577,13 @@ impl Q36Engine {
             dbg_row: self.dbg_row,
             graph: false,
         };
+        // the prompt pipeline: the prompt loop armed this cut as deferred (`cl_pf_begin`). The arm ends at this cut,
+        // whatever happens below, and counts only for the chunk it was made for (its position and rows): one left
+        // behind by a chunk that unwound before its cut defers nothing.
+        let arm =
+            self.cl.as_mut().unwrap().pf_arm.take().filter(|a| {
+                !verify && a.p0 == rec.cur_p0_h && (a.wait || a.toks.len() == t as usize)
+            });
         let s = self.s_main;
         let (tx, capturing) = {
             let cl = self.cl.as_ref().unwrap();
@@ -473,6 +644,12 @@ impl Q36Engine {
             }
         }
         if capturing {
+            if arm.is_some() {
+                die(
+                    "cluster pipeline",
+                    "a deferred hop was armed inside a graph capture",
+                );
+            }
             // end this segment, start the next one: the exchange happens between their launches
             let mut gr: hipGraph_t = ptr::null_mut();
             let mut ex: hipGraphExec_t = ptr::null_mut();
@@ -494,10 +671,53 @@ impl Q36Engine {
             if unsafe { hipStreamBeginCapture(s, HIP_STREAM_CAPTURE_MODE_RELAXED) } != hipSuccess {
                 die("graph capture at the cut", "hipStreamBeginCapture failed");
             }
+        } else if let Some(PfArm {
+            inj, wait: true, ..
+        }) = arm
+        {
+            // this chunk waits for its own return and the chunk before it is still out (`cl_pf_begin` left it so):
+            // its layers have run meanwhile; the return is taken in here, between this chunk's STEP and its RET
+            self.cl_pf_take_and_exchange(&rec, inj);
+        } else if let Some(PfArm { p0, toks, inj, .. }) = arm {
+            // deferred: the return still out (the chunk before this one) is received in full before this STEP is
+            // sent (both ends send blocking on the one connection), then the STEP goes and its RET stays out. No
+            // `cl_post` here: `cl_pf_apply` issues those copies when the return is in. The receive does not wait
+            // for the stream: this chunk's layers and its bundle copies are still running there and none of them
+            // reads the return buffer, so the wire time of the return overlaps the head's own work. The STEP asks
+            // for no DFlash2 tap rows (nothing reads a deferred chunk's: see `cl_pf_apply`), which keeps its return
+            // to `h_last` and its q8 copy, unless the chunk has rows for the drafter: then the head's own tap rows
+            // (this chunk's layers have just staged them) are copied aside before the next chunk's layers overwrite
+            // them, and the STEP asks for the worker's as every hop that waits does.
+            let slot = match inj {
+                Some(_) => self.cl_pf_save_taps(t),
+                None => 0,
+            };
+            let got = self.cl_pf_recv(false);
+            let t0 = Instant::now();
+            let _ = unsafe { hipStreamSynchronize(s) };
+            let late = t0.elapsed().as_secs_f64();
+            let step = self.cl_step_send(&rec, inj.is_some());
+            let cl = self.cl.as_mut().unwrap();
+            if let Some(recv_s) = got {
+                // (the first deferred chunk of a call has no return to take in here and is not counted)
+                cl.pf_cut_n += 1;
+                cl.pf_cut_recv_s += recv_s;
+                cl.pf_late_s += late;
+            }
+            cl.hop_s += t0.elapsed().as_secs_f64();
+            cl.pf_out = Some(PfPend {
+                rec,
+                step,
+                p0,
+                toks,
+                inj,
+                slot,
+            });
+            return;
         } else {
             self.cl_exchange(&rec);
         }
-        self.cl_post(&rec);
+        self.cl_post(&rec, true);
     }
 
     /// Head: the host part of a hop. Waits for the bundle, sends STEP, receives RET into the pinned return buffer.
@@ -507,71 +727,20 @@ impl Q36Engine {
         let n = self.model().layers.len();
         let lo_w = self.model().stage_hi;
         let s = self.s_main;
-        let _ = unsafe { hipStreamSynchronize(s) };
+        {
+            // the prompt pipeline: a hop that waits for its return never starts with a deferred one still out (its
+            // RET would be read as this hop's, or overwrite a return not applied yet); `cl_pf_drain` runs before
+            let cl = self.cl.as_ref().unwrap();
+            if cl.pf_out.is_some() || cl.pf_rx.is_some() {
+                die(
+                    "cluster pipeline",
+                    "a hop that waits started with a deferred prompt return still out",
+                );
+            }
+        }
+        let step = self.cl_step_send(rec, true);
+        self.cl_step_recv(rec, step);
         let cl = self.cl.as_mut().unwrap();
-        let mut c = StepCtl {
-            t: rec.t,
-            verify: rec.verify as u32,
-            cur_p0_h: rec.cur_p0_h,
-            q8: rec.q8 as u32,
-            dbg_on: rec.dbg_on as u32,
-            dbg_row: rec.dbg_row,
-            graph: rec.graph as u32,
-            n_taps: cl.wtaps.len() as u32,
-            q8ret: rec.q8ret as u32,
-            ..Default::default()
-        };
-        for (i, &li) in cl.wtaps.iter().enumerate() {
-            c.taps[i] = li;
-        }
-        unsafe {
-            let src = (&c as *const StepCtl).cast::<u8>().add(CTL_HOST_OFF);
-            ptr::copy_nonoverlapping(
-                src,
-                cl.tx.add(CTL_HOST_OFF),
-                std::mem::size_of::<StepCtl>() - CTL_HOST_OFF,
-            );
-        }
-        let (_, _, _, _, len) = bundle_layout(rec.t, e, rec.q8);
-        cl.step += 1;
-        let mut h = Header::new(MsgType::Step);
-        h.rows = rec.t as u32;
-        h.step = cl.step;
-        h.pos0 = rec.cur_p0_h.max(0) as u32;
-        let bundle = unsafe { std::slice::from_raw_parts(cl.tx, len) };
-        let link = cl.link.as_mut().unwrap();
-        // the stepping thread receives every step: start TALUS_CLUSTER_SPIN_US here (once; a no-op afterwards)
-        link.steady();
-        if let Err(err) = link.send(h, &[bundle]) {
-            die("send to the worker", err);
-        }
-        let rh = match link.recv_header() {
-            Ok(rh) => rh,
-            Err(err) => die("receive from the worker", err),
-        };
-        if rh.msg() != Some(MsgType::Ret) || rh.step != cl.step {
-            let body = link.recv_vec(&rh).unwrap_or_default();
-            die(
-                "worker step",
-                format!(
-                    "expected RET {}, got {:?} {}: {}",
-                    cl.step,
-                    rh.msg(),
-                    rh.step,
-                    String::from_utf8_lossy(&body)
-                ),
-            );
-        }
-        let rbuf = unsafe { std::slice::from_raw_parts_mut(cl.rx, cl.rx_cap) };
-        if let Err(err) = link.recv_into(&rh, rbuf) {
-            die("receive the return", err);
-        }
-        if (rh.layout_id & 1 != 0) != rec.q8ret {
-            die(
-                "worker step",
-                "the worker's final q8 mark differs from the head's prediction",
-            );
-        }
         cl.hops += 1;
         cl.hop_s += t0.elapsed().as_secs_f64();
         if rec.dbg_on && !self.dbg.is_null() {
@@ -595,8 +764,92 @@ impl Q36Engine {
         }
     }
 
-    /// Head: device-side part after a hop: `h_last` (+ its q8 copy) and the worker's DFlash2 taps.
-    fn cl_post(&mut self, rec: &CutRec) {
+    /// Head: the send half of a hop. Waits for the bundle, writes the host part of the control block, sends STEP.
+    /// With `taps` the step asks for the worker's DFlash2 tap rows (every hop that waits does); without, for none,
+    /// and the worker's return is that much shorter (it sizes the return from the step's own tap list). Returns the
+    /// step id, which the RET that answers it carries.
+    fn cl_step_send(&mut self, rec: &CutRec, taps: bool) -> u64 {
+        let e = self.d_model();
+        let s = self.s_main;
+        let _ = unsafe { hipStreamSynchronize(s) };
+        let cl = self.cl.as_mut().unwrap();
+        let mut c = StepCtl {
+            t: rec.t,
+            verify: rec.verify as u32,
+            cur_p0_h: rec.cur_p0_h,
+            q8: rec.q8 as u32,
+            dbg_on: rec.dbg_on as u32,
+            dbg_row: rec.dbg_row,
+            graph: rec.graph as u32,
+            n_taps: if taps { cl.wtaps.len() as u32 } else { 0 },
+            q8ret: rec.q8ret as u32,
+            ..Default::default()
+        };
+        if taps {
+            for (i, &li) in cl.wtaps.iter().enumerate() {
+                c.taps[i] = li;
+            }
+        }
+        unsafe {
+            let src = (&c as *const StepCtl).cast::<u8>().add(CTL_HOST_OFF);
+            ptr::copy_nonoverlapping(
+                src,
+                cl.tx.add(CTL_HOST_OFF),
+                std::mem::size_of::<StepCtl>() - CTL_HOST_OFF,
+            );
+        }
+        let (_, _, _, _, len) = bundle_layout(rec.t, e, rec.q8);
+        cl.step += 1;
+        let mut h = Header::new(MsgType::Step);
+        h.rows = rec.t as u32;
+        h.step = cl.step;
+        h.pos0 = rec.cur_p0_h.max(0) as u32;
+        let bundle = unsafe { std::slice::from_raw_parts(cl.tx, len) };
+        let link = cl.link.as_mut().unwrap();
+        // the stepping thread receives every step: start TALUS_CLUSTER_SPIN_US here (once; a no-op afterwards)
+        link.steady();
+        if let Err(err) = link.send(h, &[bundle]) {
+            die("send to the worker", err);
+        }
+        cl.step
+    }
+
+    /// Head: the receive half of a hop: RET `step` into the pinned return buffer. The caller has made sure that
+    /// nothing on the stream still reads that buffer.
+    fn cl_step_recv(&mut self, rec: &CutRec, step: u64) {
+        let cl = self.cl.as_mut().unwrap();
+        let link = cl.link.as_mut().unwrap();
+        let rh = match link.recv_header() {
+            Ok(rh) => rh,
+            Err(err) => die("receive from the worker", err),
+        };
+        if rh.msg() != Some(MsgType::Ret) || rh.step != step {
+            let body = link.recv_vec(&rh).unwrap_or_default();
+            die(
+                "worker step",
+                format!(
+                    "expected RET {}, got {:?} {}: {}",
+                    step,
+                    rh.msg(),
+                    rh.step,
+                    String::from_utf8_lossy(&body)
+                ),
+            );
+        }
+        let rbuf = unsafe { std::slice::from_raw_parts_mut(cl.rx, cl.rx_cap) };
+        if let Err(err) = link.recv_into(&rh, rbuf) {
+            die("receive the return", err);
+        }
+        if (rh.layout_id & 1 != 0) != rec.q8ret {
+            die(
+                "worker step",
+                "the worker's final q8 mark differs from the head's prediction",
+            );
+        }
+    }
+
+    /// Head: device-side part after a hop: `h_last` (+ its q8 copy) and, with `taps`, the worker's DFlash2 taps.
+    fn cl_post(&mut self, rec: &CutRec, taps: bool) {
         let e = self.d_model();
         let s = self.s_main;
         let (rx, tap_dev, wtaps) = {
@@ -624,7 +877,7 @@ impl Q36Engine {
         } else {
             self.mark_q8(ptr::null(), 0, 0);
         }
-        if self.use_dflash && self.df.ready {
+        if taps && self.use_dflash && self.df.ready {
             for (k, &li) in wtaps.iter().enumerate() {
                 let dst = unsafe { tap_dev.cast::<u8>().add(k * row) };
                 hcopy(
@@ -640,7 +893,252 @@ impl Q36Engine {
         }
     }
 
+    // ------------------------------------------------------------------------------------------------------------
+    // Prompt pipeline (TALUS_CLUSTER_PF_PIPE=1; nothing below runs past its first check without it)
+    // ------------------------------------------------------------------------------------------------------------
+
+    /// Prompt loop, before the forward of the chunk `tokens[off .. off + t]` at position `p0`: when
+    /// [`pf_may_defer`] allows it, arm the chunk's cut as deferred. Otherwise take in what is still out, so the
+    /// chunk runs as it always did. Never arms without `TALUS_CLUSTER_PF_PIPE=1` on a cluster head.
+    pub(crate) fn cl_pf_begin(
+        &mut self,
+        tokens: &[i32],
+        off: i32,
+        t: i32,
+        p0: i32,
+        heads: i32,
+        inj: Option<i32>,
+    ) {
+        let Some(cl) = self.cl.as_ref() else {
+            return;
+        };
+        let c = PfChunk {
+            pipe: cl.pf_pipe,
+            head_up: cl.role == Role::Head && self.cluster_link_up(),
+            off,
+            t,
+            total: tokens.len() as i32,
+            heads,
+            inj: inj.is_some(),
+            taps_kept: !cl.pf_taps[0].is_null() && !cl.pf_taps[1].is_null(),
+            capturing: cl.cap_on,
+            // (as `cl_cut` sets it in the step's control block)
+            dbg_on: !self.dbg.is_null() && (self.dbg_row + t) as usize <= super::engine::Q27_VMAX,
+        };
+        if !pf_may_defer(&c) {
+            // A chunk that waits for its own return. If the chunk before it is out, it stays out while this
+            // chunk's layers run and this chunk's cut takes it in (`cl_pf_take_and_exchange`); where the cut cannot
+            // do that (a capture, debug rows) or nothing is out, everything is taken in here, as before.
+            if c.pipe && c.head_up && !c.capturing && !c.dbg_on && cl.pf_out.is_some() {
+                self.cl.as_mut().unwrap().pf_arm = Some(PfArm {
+                    p0,
+                    toks: Vec::new(),
+                    inj,
+                    wait: true,
+                });
+            } else {
+                self.cl_pf_drain();
+            }
+            return;
+        }
+        let toks = tokens[off as usize..(off + t) as usize].to_vec();
+        self.cl.as_mut().unwrap().pf_arm = Some(PfArm {
+            p0,
+            toks,
+            inj,
+            wait: false,
+        });
+    }
+
+    /// Head, at the cut of a prompt chunk that waits for its own return while the chunk before it is still out:
+    /// receive that return (this chunk's layers were running meanwhile), send this chunk's STEP, apply the return
+    /// (its copies and the prompt loop's work on it) while the worker runs this chunk, then receive this chunk's
+    /// RET. The same messages in the same order as a drain before the chunk followed by a hop that waits; only this
+    /// chunk's layers have moved ahead of the receive. When both chunks have rows for the drafter, this chunk's tap
+    /// rows are kept aside over the apply, which puts the earlier chunk's in their place, and put back after it.
+    fn cl_pf_take_and_exchange(&mut self, rec: &CutRec, inj: Option<i32>) {
+        let s = self.s_main;
+        let e = self.d_model() as usize;
+        let prev_inj = self
+            .cl
+            .as_ref()
+            .unwrap()
+            .pf_out
+            .as_ref()
+            .is_some_and(|p| p.inj.is_some());
+        let kept = (prev_inj && inj.is_some()).then(|| self.cl_pf_save_taps(rec.t));
+        let got = self.cl_pf_recv(false);
+        let t0 = Instant::now();
+        let _ = unsafe { hipStreamSynchronize(s) };
+        let late = t0.elapsed().as_secs_f64();
+        let step = self.cl_step_send(rec, true);
+        if let Some(recv_s) = got {
+            let cl = self.cl.as_mut().unwrap();
+            cl.pf_cut_n += 1;
+            cl.pf_cut_recv_s += recv_s;
+            cl.pf_late_s += late;
+        }
+        // (ends with the stream idle, so the receive below may write the return buffer)
+        self.cl_pf_apply();
+        if let Some(slot) = kept {
+            let full = (self.df.max_rows.max(1) as usize) * e * 4;
+            let rows = (rec.t as usize).min(self.df.max_rows.max(0) as usize) * e * 4;
+            let base = self.cl.as_ref().unwrap().pf_taps[slot].cast::<u8>();
+            for j in 0..super::graphs::K_DFLASH_TAPS {
+                hcopy(
+                    self.df.tap_buf[j].cast(),
+                    unsafe { base.add(j * full) }.cast_const().cast(),
+                    rows,
+                    HIP_MEMCPY_DEVICE_TO_DEVICE,
+                    s,
+                );
+            }
+        }
+        self.cl_step_recv(rec, step);
+        let cl = self.cl.as_mut().unwrap();
+        cl.hops += 1;
+        cl.hop_s += t0.elapsed().as_secs_f64();
+    }
+
+    /// Head, at the cut of a deferred chunk with rows for the drafter: copy the drafter's tap rows (every tap; the
+    /// worker's are stale here and are staged over at apply time, as after a hop that waits) into the next of the two
+    /// save areas, on the stream, behind the layers that staged them. Returns the area used.
+    fn cl_pf_save_taps(&mut self, t: i32) -> usize {
+        let e = self.d_model() as usize;
+        let s = self.s_main;
+        let full = (self.df.max_rows.max(1) as usize) * e * 4;
+        let rows = (t as usize).min(self.df.max_rows.max(0) as usize) * e * 4;
+        let cl = self.cl.as_mut().unwrap();
+        let slot = cl.pf_slot;
+        cl.pf_slot ^= 1;
+        if cl.pf_taps[slot].is_null() {
+            // (`cl_pf_begin` arms a chunk with drafter rows only when both areas exist)
+            die(
+                "cluster pipeline",
+                "a chunk with drafter rows was deferred without a tap save area",
+            );
+        }
+        let base = cl.pf_taps[slot].cast::<u8>();
+        for j in 0..super::graphs::K_DFLASH_TAPS {
+            hcopy(
+                unsafe { base.add(j * full) }.cast(),
+                self.df.tap_buf[j].cast_const().cast(),
+                rows,
+                HIP_MEMCPY_DEVICE_TO_DEVICE,
+                s,
+            );
+        }
+        slot
+    }
+
+    /// Prompt loop, right after the forward of the chunk at `p0`: whether its cut left the return out (it does
+    /// exactly when `cl_pf_begin` armed it). The cut decides; the loop asks, so the two cannot disagree.
+    pub(crate) fn cl_pf_deferred(&self, p0: i32) -> bool {
+        self.cl
+            .as_ref()
+            .is_some_and(|c| c.pf_out.as_ref().is_some_and(|p| p.p0 == p0))
+    }
+
+    /// Head: receive the deferred return that is still out (blocking) into the pinned return buffer. A no-op when
+    /// none is out. `wait_stream`: wait for the stream first. The return buffer is free either way (the return
+    /// before this one was applied by `cl_pf_apply`, which ends with the stream idle, and nothing queued since reads
+    /// the buffer); a cut passes false so its receive overlaps the layers it has just queued, every other caller
+    /// passes true and so leaves the stream idle as before. Returns the seconds spent in the receive when a return
+    /// was received.
+    fn cl_pf_recv(&mut self, wait_stream: bool) -> Option<f64> {
+        let s = self.s_main;
+        let cl = self.cl.as_mut()?;
+        let p = cl.pf_out.take()?;
+        if cl.pf_rx.is_some() {
+            die(
+                "cluster pipeline",
+                "the return buffer holds a return that was not applied",
+            );
+        }
+        let t0 = Instant::now();
+        if wait_stream {
+            let _ = unsafe { hipStreamSynchronize(s) };
+        }
+        let t1 = Instant::now();
+        self.cl_step_recv(&p.rec, p.step);
+        let cl = self.cl.as_mut().unwrap();
+        // the hop is complete: its host time is its sync + send (added at its cut) and this sync + receive; the
+        // receive alone is what the head waited for the worker (and the wire)
+        let recv_s = t1.elapsed().as_secs_f64();
+        cl.hops += 1;
+        cl.hop_s += t0.elapsed().as_secs_f64();
+        cl.pf_hops += 1;
+        cl.pf_rx = Some(p);
+        Some(recv_s)
+    }
+
+    /// Head: apply the deferred return that was received, for its own chunk: `h_last` (+ its q8 copy and the q8
+    /// mark) as `cl_post` issues them, then the prompt loop's work on those rows (the draft layer's pass, `h_mtp`)
+    /// with that chunk's position, row count and tokens. A chunk with rows for the drafter first gets its tap rows
+    /// back: the head's from the save area its cut filled, then the worker's from the return, staged over them as
+    /// `cl_post` does after a hop that waits; the injection itself is part of the loop's work (`pf_chunk_tail`). A
+    /// chunk without such rows asked for no tap rows and stages none. A no-op when no return is waiting.
+    pub(crate) fn cl_pf_apply(&mut self) {
+        let s = self.s_main;
+        let Some(cl) = self.cl.as_mut() else {
+            return;
+        };
+        let Some(p) = cl.pf_rx.take() else {
+            return;
+        };
+        let pos = cl.pf_pos;
+        unsafe {
+            // the pinned position word is read by an asynchronous copy: the stream is idle before it is rewritten
+            let _ = hipStreamSynchronize(s);
+            *pos = p.p0;
+        }
+        if p.inj.is_some() {
+            let e = self.d_model() as usize;
+            let full = (self.df.max_rows.max(1) as usize) * e * 4;
+            let rows = (p.rec.t as usize).min(self.df.max_rows.max(0) as usize) * e * 4;
+            let base = self.cl.as_ref().unwrap().pf_taps[p.slot].cast::<u8>();
+            for j in 0..super::graphs::K_DFLASH_TAPS {
+                hcopy(
+                    self.df.tap_buf[j].cast(),
+                    unsafe { base.add(j * full) }.cast_const().cast(),
+                    rows,
+                    HIP_MEMCPY_DEVICE_TO_DEVICE,
+                    s,
+                );
+            }
+        }
+        self.cl_post(&p.rec, p.inj.is_some());
+        self.pf_chunk_tail(p.toks.as_ptr(), p.rec.t, p.p0, pos, p.inj);
+        // the copies above read the return buffer, the position word and `p.toks`: done before any of them goes
+        let _ = unsafe { hipStreamSynchronize(s) };
+    }
+
+    /// Head: take in every deferred return: apply the one already received, receive the one still out (blocking)
+    /// and apply it. After this the engine is where the hops that wait leave it. A no-op when nothing is out, which
+    /// is always the case without `TALUS_CLUSTER_PF_PIPE=1`. The prompt loop runs it before a chunk that is not
+    /// deferred and before `process_with_callback` returns, so nothing is ever out outside that loop; `reset`, the
+    /// mirrored ops, the cache messages and the goodbye run it first all the same. Two uses of the link do not:
+    /// a hop that waits refuses to start with a return out (`cl_exchange`: draining there would run the draft
+    /// layer's pass in the middle of a forward), and a reconnect drops the state (`cluster_reconnect`).
+    pub(crate) fn cl_pf_drain(&mut self) {
+        let Some(cl) = self.cl.as_mut() else {
+            return;
+        };
+        // (an arm left behind by a prompt chunk that unwound before its cut goes here too)
+        cl.pf_arm = None;
+        if cl.pf_rx.is_none() && cl.pf_out.is_none() {
+            return;
+        }
+        self.cl_pf_apply();
+        if let Some(recv_s) = self.cl_pf_recv(true) {
+            self.cl.as_mut().unwrap().pf_end_recv_s += recv_s;
+        }
+        self.cl_pf_apply();
+    }
+
     fn cl_send_ctl(&mut self, ty: MsgType, keep: u32, payload: &[u8]) {
+        // (the prompt pipeline: a deferred return is in before any control message goes)
+        self.cl_pf_drain();
         if let Some(cl) = self.cl.as_mut() {
             if cl.role != Role::Head {
                 return;
@@ -668,6 +1166,8 @@ impl Q36Engine {
         if !self.is_cluster_head() {
             return;
         }
+        // (the prompt pipeline: a deferred return is in before `gctl` is read for the worker)
+        self.cl_pf_drain();
         let mut g = [0i32; 4];
         unsafe {
             let _ = hipStreamSynchronize(self.s_main);
@@ -723,6 +1223,11 @@ impl Q36Engine {
             cl.beat = None;
             cl.link = None;
             cl.step = 0;
+            // the prompt pipeline: a deferred return belonged to the lost link's sequence, which `reset` clears on
+            // both stages below; it is dropped here, not received
+            cl.pf_arm = None;
+            cl.pf_out = None;
+            cl.pf_rx = None;
         }
         let _ = unsafe { hipStreamSynchronize(s) };
         let m = unsafe { &*self.m };
@@ -1295,9 +1800,24 @@ pub fn worker_main(model: &mut Q36Model, addr: &str) -> i32 {
             e.reset();
             if let Some(cl) = e.cl.as_ref() {
                 eprintln!("talus-cluster: session served {} steps", cl.step);
+                if cl.wk_n > 0 {
+                    let ms = |i: usize| 1000.0 * cl.wk_s[i] / cl.wk_n as f64;
+                    eprintln!(
+                        "talus-cluster: {} of them prompt chunks (64 rows or more): mean {:.1} ms waiting for the \
+                         step, {:.1} ms receiving its bundle, {:.1} ms in the step (copies in, layers, copies \
+                         out), {:.1} ms sending the return",
+                        cl.wk_n,
+                        ms(0),
+                        ms(1),
+                        ms(2),
+                        ms(3)
+                    );
+                }
             }
             if let Some(cl) = e.cl.as_mut() {
                 cl.step = 0;
+                cl.wk_n = 0;
+                cl.wk_s = [0.0; 4];
             }
         }
         if once {
@@ -1351,7 +1871,8 @@ fn worker_session(
         model.opts.max_seq = want.ctx;
         model.cfg.max_seq = want.ctx;
         let t0 = Instant::now();
-        let mut e = Q36Engine::new(model, want.ctx).map_err(|e| format!("engine init: {e}"))?;
+        let mut e = Q36Engine::new_with_batch(model, want.ctx, want.max_batch)
+            .map_err(|e| format!("engine init: {e}"))?;
         e.max_batch = want.max_batch;
         e.cluster_attach_worker()
             .map_err(|e| format!("cluster buffers: {e}"))?;
@@ -1382,13 +1903,18 @@ fn worker_session(
     // this stage's shard of the prompt cache (created by the head's first cache message; dropped with the session)
     let mut pc: Option<Q36PromptCache> = None;
     loop {
+        let t_wait = Instant::now();
         let h = link.recv_header().map_err(io)?;
+        let wait_s = t_wait.elapsed().as_secs_f64();
         match h.msg() {
             Some(MsgType::Step) => {
+                let t0 = Instant::now();
                 let cl = e.cl.as_ref().unwrap();
                 let buf = unsafe { std::slice::from_raw_parts_mut(cl.rx, cl.rx_cap) };
                 link.recv_into(&h, buf).map_err(io)?;
+                let t1 = Instant::now();
                 let (len, q8ret) = e.cl_worker_step();
+                let t2 = Instant::now();
                 let cl = e.cl.as_mut().unwrap();
                 cl.step = h.step;
                 let mut r = Header::new(MsgType::Ret);
@@ -1397,6 +1923,14 @@ fn worker_session(
                 r.layout_id = q8ret as u32;
                 let out = unsafe { std::slice::from_raw_parts(cl.tx, len) };
                 link.send(r, &[out]).map_err(io)?;
+                if h.rows >= 64 {
+                    // (a prompt chunk: where this stage's time for it went, for the session's log line)
+                    cl.wk_n += 1;
+                    cl.wk_s[0] += wait_s;
+                    cl.wk_s[1] += (t1 - t0).as_secs_f64();
+                    cl.wk_s[2] += (t2 - t1).as_secs_f64();
+                    cl.wk_s[3] += t2.elapsed().as_secs_f64();
+                }
             }
             Some(MsgType::Reset) => {
                 let _ = link.recv_vec(&h).map_err(io)?;
@@ -1435,6 +1969,8 @@ pub fn default_split(n_layer: usize) -> usize {
 
 /// Head: say goodbye (the worker keeps its weights and waits for the next head).
 pub fn cluster_bye(eng: &mut Q36Engine) {
+    // (the prompt pipeline: a deferred return is in before the goodbye goes)
+    eng.cl_pf_drain();
     if let Some(cl) = eng.cl.as_mut() {
         if cl.role == Role::Head {
             if let Some(l) = cl.link.as_mut() {
@@ -1445,6 +1981,25 @@ pub fn cluster_bye(eng: &mut Q36Engine) {
                     "talus-cluster: {} hops, mean {:.3} ms host time per hop (sync + send + worker + receive)",
                     cl.hops,
                     1000.0 * cl.hop_s / cl.hops as f64
+                );
+            }
+            if cl.pf_hops > 0 {
+                // A return is taken in either at the next chunk's cut, while the head's own layers for that chunk
+                // run, or at the end of a call, with nothing running on the head. For the first kind: a long receive
+                // followed by no wait means the worker is the slower stage, and a later cut would even them; a short
+                // receive followed by a wait means the head is, and the worker idled for that wait.
+                let end_n = cl.pf_hops - cl.pf_cut_n;
+                let per = |s: f64, n: u64| if n > 0 { 1000.0 * s / n as f64 } else { 0.0 };
+                eprintln!(
+                    "talus-cluster: prompt pipeline: {} of those hops deferred; {} returns taken at the next cut, \
+                     mean {:.3} ms in the receive, then {:.3} ms until the head's own layers were done; {} taken \
+                     at a call's end, mean {:.3} ms in the receive",
+                    cl.pf_hops,
+                    cl.pf_cut_n,
+                    per(cl.pf_cut_recv_s, cl.pf_cut_n),
+                    per(cl.pf_late_s, cl.pf_cut_n),
+                    end_n,
+                    per(cl.pf_end_recv_s, end_n)
                 );
             }
         }
@@ -1670,6 +2225,8 @@ impl Q36Engine {
     }
 
     fn cl_head_cache(&mut self, payload: &[u8], want_reply: bool) -> Option<Vec<u8>> {
+        // (the prompt pipeline: a deferred return is in before any cache message goes)
+        self.cl_pf_drain();
         let cl = self.cl.as_mut()?;
         if cl.role != Role::Head {
             return None;
@@ -1817,9 +2374,13 @@ impl Q36Engine {
                     .ok_or("cache op before INIT")?
                     .restore_with_pf(&mut view, &ids, &live, live_pf, pf_only);
                 if r > 0 {
-                    // as sync_layer_state_view_back on the head: the restored state is committed
+                    // as sync_layer_state_view_back on the head: the restored state is committed, and a restore
+                    // copies f16 KV cells only, so their int8 copy (the decode and verify attention read it) is
+                    // rebuilt for this stage's layers too. Without this a restore from the KV stash left the
+                    // worker's int8 cells stale and the reply differed from one process from its second token on.
                     self.gdn_pending = 0;
                     self.gdn_valid = true;
+                    self.kv8_rebuild(0, r as i32);
                 }
                 let mut b = Vec::new();
                 put_u64(&mut b, r as u64);
@@ -1905,5 +2466,143 @@ mod tests {
         assert_eq!(default_split(64), 32);
         assert_eq!(default_split(48), 24);
         assert_eq!(default_split(46), 20);
+    }
+
+    /// A chunk `off .. off + t` of a `total`-token call on a head with the pipeline on and nothing in its way.
+    fn pf_chunk(off: i32, t: i32, total: i32) -> PfChunk {
+        PfChunk {
+            pipe: true,
+            head_up: true,
+            off,
+            t,
+            total,
+            heads: 0,
+            inj: false,
+            taps_kept: false,
+            capturing: false,
+            dbg_on: false,
+        }
+    }
+
+    #[test]
+    fn pf_defer_needs_every_condition() {
+        let ok = pf_chunk(0, 512, 2048);
+        assert!(pf_may_defer(&ok));
+        assert!(!pf_may_defer(&PfChunk { pipe: false, ..ok }));
+        assert!(!pf_may_defer(&PfChunk {
+            head_up: false,
+            ..ok
+        }));
+        assert!(!pf_may_defer(&PfChunk { heads: 1, ..ok }));
+        assert!(!pf_may_defer(&PfChunk {
+            capturing: true,
+            ..ok
+        }));
+        assert!(!pf_may_defer(&PfChunk { dbg_on: true, ..ok }));
+        // rows for the drafter: deferred only when the head can keep their tap rows aside
+        assert!(!pf_may_defer(&PfChunk { inj: true, ..ok }));
+        assert!(pf_may_defer(&PfChunk {
+            inj: true,
+            taps_kept: true,
+            ..ok
+        }));
+        assert!(pf_may_defer(&PfChunk {
+            taps_kept: true,
+            ..ok
+        }));
+        // the chunk before the last one is deferred, the last one never: full, short, or the only one
+        assert!(pf_may_defer(&pf_chunk(1024, 512, 2048)));
+        assert!(!pf_may_defer(&pf_chunk(1536, 512, 2048)));
+        assert!(!pf_may_defer(&pf_chunk(1536, 100, 1636)));
+        assert!(!pf_may_defer(&pf_chunk(0, 512, 512)));
+        assert!(!pf_may_defer(&pf_chunk(0, 1, 1)));
+    }
+
+    #[test]
+    fn pf_inject_rows_are_the_calls_last_keep_tokens() {
+        use super::super::engine::pf_inject_from;
+        // 2048 tokens, keep 528: the drafter gets tokens 1520..2048, so chunk 2 (1024..1536) gives its rows 496..512
+        // and chunk 3 all of its rows; chunks 0 and 1 give none
+        assert_eq!(pf_inject_from(0, 512, 2048, 528), None);
+        assert_eq!(pf_inject_from(512, 512, 2048, 528), None);
+        assert_eq!(pf_inject_from(1024, 512, 2048, 528), Some(496));
+        assert_eq!(pf_inject_from(1536, 512, 2048, 528), Some(0));
+        // a chunk that ends exactly where the drafter's tokens start gives none; one token further it gives one row
+        assert_eq!(pf_inject_from(0, 512, 1040, 528), None);
+        assert_eq!(pf_inject_from(0, 512, 1039, 528), Some(511));
+        // a call shorter than `keep`: every row of every chunk
+        assert_eq!(pf_inject_from(0, 512, 1024, 2064), Some(0));
+        assert_eq!(pf_inject_from(512, 512, 1024, 2064), Some(0));
+        // over any chunking the rows given add up to the call's last `keep` tokens, in order and without a gap
+        for batch in [16, 512, 896] {
+            for keep in [24, 528, 2064] {
+                for total in [
+                    1,
+                    batch - 1,
+                    batch,
+                    batch + 1,
+                    3 * batch + 7,
+                    8 * batch + 511,
+                ] {
+                    let (mut off, mut next) = (0, (total - keep).max(0));
+                    while off < total {
+                        let t = (total - off).min(batch);
+                        if let Some(r0) = pf_inject_from(off, t, total, keep) {
+                            assert!(r0 < t);
+                            assert_eq!(off + r0, next, "batch {batch} keep {keep} total {total}");
+                            next = off + t;
+                        }
+                        off += t;
+                    }
+                    assert_eq!(next, total);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pf_pipe_variable_is_not_in_the_handshake_identity() {
+        // the variable is read on the head only: a worker started without it must not refuse the head (`check_hello`
+        // compares the variables `env_relevant` selects)
+        assert!(!ident::env_relevant("TALUS_CLUSTER_PF_PIPE"));
+        assert!(!ident::env_relevant("STRATA_CLUSTER_PF_PIPE"));
+    }
+
+    #[test]
+    fn pf_deferred_chunks_are_a_prefix_of_full_chunks() {
+        // The prompt loop's chunking. Every deferred chunk has `batch` rows (so the work that runs one chunk late
+        // sees the row count the forward before it saw), no deferred chunk follows one that waited (one drain per
+        // call), and exactly the call's last chunk waits (nothing is out at its end).
+        for batch in [16, 512, 896] {
+            let totals = [
+                1,
+                2,
+                batch - 1,
+                batch,
+                batch + 1,
+                2 * batch,
+                3 * batch + 7,
+                8 * batch,
+                8 * batch + 511,
+            ];
+            for total in totals {
+                let (mut off, mut waited, mut n_chunks, mut n_deferred) = (0, false, 0, 0);
+                while off < total {
+                    let t = (total - off).min(batch);
+                    if pf_may_defer(&pf_chunk(off, t, total)) {
+                        assert!(!waited, "batch {batch} total {total} off {off}");
+                        assert_eq!(t, batch);
+                        assert!(off + t < total);
+                        n_deferred += 1;
+                    } else {
+                        waited = true;
+                    }
+                    n_chunks += 1;
+                    off += t;
+                }
+                assert!(waited);
+                assert_eq!(n_deferred, n_chunks - 1);
+            }
+        }
     }
 }

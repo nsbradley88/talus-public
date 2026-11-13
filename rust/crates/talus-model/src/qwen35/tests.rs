@@ -414,6 +414,65 @@ fn test_dfctx_and_drafter_pick_depth_policy() {
     assert_eq!(dp.n_fallback, 1);
 }
 
+/// talus-27b-dflash-block: the opt-in block length (`TALUS_Q27_DFL_BLOCK`), and the two DFlash2 stop rules over a
+/// 15-draft window (block 16). The cost tables here are examples for the rule's arithmetic, not measurements.
+#[test]
+fn test_dfl_block_request_and_long_window_stop_rules() {
+    use super::graphs::{dfl_block_request, DflBlockAsk, K_DFLASH_BLOCK_RUN_MAX};
+    assert_eq!(K_DFLASH_BLOCK_RUN_MAX, 16);
+    // (text, the file's block, the engine's verify rows)
+    assert_eq!(dfl_block_request(None, 8, 16), DflBlockAsk::Unset);
+    assert_eq!(dfl_block_request(Some(""), 8, 16), DflBlockAsk::Unset);
+    assert_eq!(dfl_block_request(Some("  "), 8, 16), DflBlockAsk::Unset);
+    assert_eq!(dfl_block_request(Some("8"), 8, 16), DflBlockAsk::Run(8));
+    assert_eq!(dfl_block_request(Some(" 12 "), 8, 16), DflBlockAsk::Run(12));
+    assert_eq!(dfl_block_request(Some("16"), 8, 16), DflBlockAsk::Run(16));
+    for bad in ["7", "17", "-1", "x", "99999999999"] {
+        assert_eq!(
+            dfl_block_request(Some(bad), 8, 16),
+            DflBlockAsk::Bad(bad.to_string())
+        );
+    }
+    // an engine that verifies 8 rows per verify pass (--no-v16) takes the file's block only: longer windows would
+    // run as prompt chunks
+    assert_eq!(dfl_block_request(Some("8"), 8, 8), DflBlockAsk::Run(8));
+    assert_eq!(dfl_block_request(Some("9"), 8, 8), DflBlockAsk::TooWide(9));
+    assert_eq!(
+        dfl_block_request(Some("16"), 8, 8),
+        DflBlockAsk::TooWide(16)
+    );
+    assert_eq!(
+        dfl_block_request(Some("12"), 8, 0),
+        DflBlockAsk::TooWide(12)
+    );
+    assert_eq!(dfl_block_request(Some("8"), 8, 0), DflBlockAsk::Run(8));
+
+    // the product rule (the default DFlash2 stop rule) over 15 selector weights: a weak weight at any of the
+    // positions 8 .. 15 ends the window there (so every one of them is read)
+    let dl = DraftLen::default();
+    let sure = [0.95f32; 16];
+    assert_eq!(dl.keep_dfl(&sure, 15, false), 15); // 0.95^15 = 0.46 >= 0.40
+    for at in 7..15usize {
+        let mut dip = sure;
+        dip[at] = 0.2;
+        assert_eq!(dl.keep_dfl(&dip, 15, false), at as i32, "dip at {at}");
+    }
+    assert_eq!(dl.keep_dfl(&sure, 7, false), 7);
+
+    // the cost rule: its table holds 16 rows. With a step at row 9 (the wider weight-pass path) a window whose
+    // 8th draft is a coin toss stops at 7 drafts; a table extrapolated from 8 rows would take it.
+    let mut w = [0.5f32; 16];
+    w[..7].fill(0.9);
+    let rows8 = [72.3, 73.9, 75.4, 77.0, 78.5, 80.0, 81.6, 83.1];
+    let mut rows16 = rows8.to_vec();
+    rows16.extend([89.5, 90.9, 94.0, 97.1, 98.5, 99.8, 101.2, 102.5]);
+    let stepped = talus_spec::CostDepth::new(&rows16, &[], 32768.0, 1.0, 2).unwrap();
+    let linear = talus_spec::CostDepth::new(&rows8, &[], 32768.0, 1.0, 2).unwrap();
+    assert_eq!(stepped.keep(&w, 15, 0.0), 7);
+    assert!(linear.keep(&w, 15, 0.0) > 7);
+    assert_eq!(stepped.keep(&sure, 15, 0.0), 15);
+}
+
 /// : the 27B's load plan with its real sizes: int8 prompt weights 26.1 GiB, KV 105.5 KiB/token with int8 KV.
 mod mem_plan {
     use super::super::engine::{q27_mem_plan, q27_pick_context, Q27_AUTO_RESERVE_GIB};
